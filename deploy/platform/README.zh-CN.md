@@ -43,7 +43,8 @@ DB管理员密码不交给app。普通app只能管理它自己的数据库对象
 5. 将本目录的部署文件和仅含非秘密引用的 `site.env` 放在同一release目录。以下命令只说明未来人工部署步骤，本轮没有执行。
 
 ```sh
-docker compose --env-file site.env -f compose.yaml config --format json | python3 check_config.py
+compose_version="$(/usr/bin/docker compose version --short)"
+/usr/bin/docker compose --env-file site.env -f compose.yaml config --format json | python3 check_config.py --compose-version "$compose_version"
 docker compose --env-file site.env -f compose.yaml up -d db
 docker compose --env-file site.env -f compose.yaml run --rm db-init
 docker compose --env-file site.env -f compose.yaml run --rm --no-deps app python -m studio_platform.manage init-db

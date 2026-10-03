@@ -182,8 +182,11 @@ def compose(directory, environment, *arguments, timeout=180):
 
 
 def approved_configuration(directory, environment):
+    # Serialization changed across Compose versions. Trust only the installed
+    # root-controlled binary's version, never a field supplied by the bundle.
+    version = command(["compose", "version", "--short"], environment=environment).decode("ascii").strip()
     config = json.loads(compose(directory, environment, "config", "--format", "json"))
-    validate(config, deployment_directory=directory)
+    validate(config, deployment_directory=directory, compose_version=version)
     require(config["services"]["app"]["image"] == environment["SIXNINE_IMAGE"]
             and config["services"]["db"]["image"] == environment["SIXNINE_POSTGRES_IMAGE"]
             and config["services"]["caddy"]["image"] == environment["SIXNINE_CADDY_IMAGE"],

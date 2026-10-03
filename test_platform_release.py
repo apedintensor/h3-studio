@@ -110,6 +110,20 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("sudo -n /opt/sixnine-release/release.py", text)
         self.assertNotIn("sudo -n bash '$target/", text)
 
+    def test_compose_serialization_version_comes_only_from_trusted_docker(self):
+        environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "SIXNINE_IMAGE": "fixture-app",
+                       "SIXNINE_POSTGRES_IMAGE": "fixture-db", "SIXNINE_CADDY_IMAGE": "fixture-proxy"}
+        rendered = {"untrusted_bundle_claim": "5.5.1", "services": {
+            name: {"image": environment[key]} for name, key in (
+                ("app", "SIXNINE_IMAGE"), ("db", "SIXNINE_POSTGRES_IMAGE"), ("caddy", "SIXNINE_CADDY_IMAGE"))}}
+        with patch.object(release, "command", return_value=b"v2.38.2\n") as command, \
+             patch.object(release, "compose", return_value=json.dumps(rendered)) as compose, \
+             patch.object(release, "validate") as validate:
+            release.approved_configuration(self.incoming, environment)
+        command.assert_called_once_with(["compose", "version", "--short"], environment=environment)
+        compose.assert_called_once_with(self.incoming, environment, "config", "--format", "json")
+        validate.assert_called_once_with(rendered, deployment_directory=self.incoming, compose_version="v2.38.2")
+
     def archive(self, *, extra=False, unsafe=None):
         filename = self.root / "test-image.tar.gz"
         config = "b"*64+".json"
@@ -172,6 +186,7 @@ class ApplyReleaseTests(unittest.TestCase):
             "load_approved_image": lambda *args: self.calls.append(("load", args[2])) or self.expected,
             "regular": lambda *args, **kwargs: None,
             "validate": lambda *args, **kwargs: None,
+            "command": lambda *args, **kwargs: b"v5.5.1\n",
             "compose": compose,
             "wait_ready": lambda *args, **kwargs: None,
             "verify_running_app": lambda *args: None,

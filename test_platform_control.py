@@ -476,6 +476,7 @@ class ControlTests(LedgerCase):
         configured_db = root / "explicit-local-test.sqlite3"
         config_file = root / "local-test-dsn.txt"
         config_file.write_text("sqlite:///"+configured_db.as_posix(), encoding="utf-8")
+        config_file.chmod(0o600)  # Match the protected-file contract on POSIX too.
         data_dir = root / "separate-data"
         output = io.StringIO()
         with patch.dict(os.environ, {"SIXNINE_DATABASE_URL_FILE": str(config_file)}, clear=True), contextlib.redirect_stdout(output):

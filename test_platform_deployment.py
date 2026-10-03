@@ -62,6 +62,7 @@ class DeploymentPolicyTests(unittest.TestCase):
         result = docker("compose", "--env-file", str(empty), "-f", str(DEPLOY / "compose.yaml"),
                         "config", "--format", "json", env=env)
         cls.rendered = json.loads(result.stdout)
+        cls.compose_version = docker("compose", "version", "--short", env=env).stdout.strip()
 
     @classmethod
     def tearDownClass(cls):
@@ -69,7 +70,7 @@ class DeploymentPolicyTests(unittest.TestCase):
             cls.temp.cleanup()
 
     def test_rendered_compose_has_strict_production_policy(self):
-        self.assertTrue(policy.validate(self.rendered))
+        self.assertTrue(policy.validate(self.rendered, compose_version=self.compose_version))
 
     def test_insecure_configuration_changes_are_rejected(self):
         changes = [lambda c: c["services"]["app"]["environment"].update(SIXNINE_GENERATION_ENABLED="1"),
@@ -86,7 +87,7 @@ class DeploymentPolicyTests(unittest.TestCase):
                 broken = copy.deepcopy(self.rendered)
                 change(broken)
                 with self.assertRaises(policy.ConfigurationError):
-                    policy.validate(broken)
+                    policy.validate(broken, compose_version=self.compose_version)
 
     def test_only_public_proxy_publishes_ports_and_secrets_are_references(self):
         services = self.rendered["services"]
@@ -129,7 +130,7 @@ class DeploymentPolicyTests(unittest.TestCase):
                 broken = copy.deepcopy(self.rendered)
                 change(broken)
                 with self.assertRaises(policy.ConfigurationError):
-                    policy.validate(broken)
+                    policy.validate(broken, compose_version=self.compose_version)
 
     def test_root_owned_controller_selects_exact_release_directory(self):
         # The controller chooses a reviewed absolute directory after copying the
@@ -138,11 +139,44 @@ class DeploymentPolicyTests(unittest.TestCase):
         config = copy.deepcopy(self.rendered)
         config["services"]["db-init"]["volumes"][0]["source"] = str(trusted / "init_database.py")
         config["services"]["caddy"]["volumes"][0]["source"] = str(trusted / "Caddyfile")
-        self.assertTrue(policy.validate(config, deployment_directory=trusted))
+        self.assertTrue(policy.validate(config, deployment_directory=trusted, compose_version=self.compose_version))
         with self.assertRaises(policy.ConfigurationError):
-            policy.validate(config)
+            policy.validate(config, compose_version=self.compose_version)
         with self.assertRaises(policy.ConfigurationError):
-            policy.validate(config, deployment_directory="relative-directory")
+            policy.validate(config, deployment_directory="relative-directory", compose_version=self.compose_version)
+
+    def test_legacy_compose_2382_omitted_false_requires_trusted_exact_version(self):
+        legacy = copy.deepcopy(self.rendered)
+        for service in legacy["services"].values():
+            for mount in service.get("volumes", []):
+                if mount["type"] == "bind":
+                    mount["bind"] = {}
+        before = copy.deepcopy(legacy)
+        for version in ("2.38.2", "v2.38.2"):
+            self.assertTrue(policy.validate(legacy, compose_version=version))
+        self.assertEqual(legacy, before)  # Do not mutate the approved rendered input.
+        for version in (None, "", "2.38.1", "2.39.0", "5.5.1", "v5.5.1"):
+            with self.subTest(version=version), self.assertRaises(policy.ConfigurationError):
+                policy.validate(legacy, compose_version=version)
+
+    def test_bind_creation_cannot_be_enabled_or_hidden_as_legacy_default(self):
+        explicit = copy.deepcopy(self.rendered)
+        for service in explicit["services"].values():
+            for mount in service.get("volumes", []):
+                if mount["type"] == "bind":
+                    mount["bind"] = {"create_host_path": False}
+        self.assertTrue(policy.validate(explicit))
+        for options in (None, {"create_host_path": True}, {"create_host_path": 0},
+                        {"create_host_path": "false"}, {"create_host_path": False, "propagation": "shared"}):
+            for version in (None, "2.38.2", "5.5.1"):
+                broken = copy.deepcopy(explicit)
+                broken["services"]["app"]["volumes"][0]["bind"] = options
+                with self.subTest(options=options, version=version), self.assertRaises(policy.ConfigurationError):
+                    policy.validate(broken, compose_version=version)
+        broken = copy.deepcopy(explicit)
+        broken["services"]["app"]["volumes"][0].pop("bind")
+        with self.assertRaises(policy.ConfigurationError):
+            policy.validate(broken, compose_version="2.38.2")
 
     def test_caddy_adapts_without_network_or_tls_issuance(self):
         image = "caddy:2.10.2-alpine"

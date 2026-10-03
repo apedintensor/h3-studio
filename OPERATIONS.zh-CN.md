@@ -28,7 +28,7 @@ Linux 镜像内使用 `python -m studio_platform.diagnostics`。此命令只查�
 
 15分钟只是初始运维提示阈值，不是测得的服务承诺。CPU粗剪/不同GPU配置需要分别测样本，再设实际延迟目标。排队年龄描述已过去的时间，不是剩余时间预测。
 
-`waiting_capacity` 与可领取的 `queued` 分开统计，避免把机器尚未就绪解释成推理卡死。`recovery_hold` 是恢复备份后的核对状态；用户取消只记录取消意图，不能因此释放尚不清楚的供应商费用或再次付费提交。`python -m studio_platform.capacity_cli` 默认关闭；显式只读 dry-run 不创建表、实例或云客户端，advance 只做本地批准/来源/期限核对及激活，尚未接自动云端开机。
+`waiting_capacity` 与可领取的 `queued` 分开统计，避免把机器尚未就绪解释成推理卡死。`recovery_hold` 用于恢复备份或状态与attempt证据矛盾/缺失后的核对；用户取消只记录取消意图，不能因此释放尚不清楚的供应商费用或再次付费提交。`python -m studio_platform.capacity_cli` 默认关闭；显式只读 dry-run 不创建表、实例或云客户端，advance 只做本地批准/来源/期限核对及激活，尚未接自动云端开机。
 
 账单查询超时或返回非法金额时，已通过解码与持久保存的成片仍可交付，费用保持 pending，预留不释放。实际结算使用原 job/账单证据幂等更新；不能因为成片已经可下载就记作零成本。
 

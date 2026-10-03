@@ -6,6 +6,7 @@ No network requests or service starts. Secret source files are not read.
 from __future__ import annotations
 
 import json
+import argparse
 from pathlib import Path
 import re
 import sys
@@ -20,7 +21,8 @@ def require(condition, message):
         raise ConfigurationError(message)
 
 
-def validate(config, *, deployment_directory=None):
+def validate(config, *, deployment_directory=None, compose_version=None):
+    require(compose_version is None or isinstance(compose_version, str), "Compose version must be trusted binary output")
     deployment = Path(deployment_directory) if deployment_directory is not None else Path(__file__).resolve().parent
     require(deployment.is_absolute(), "Deployment directory must be an explicit absolute trusted path")
     require(config.get("name") == "sixnine-platform", "Compose project identity differs")
@@ -153,7 +155,24 @@ def validate(config, *, deployment_directory=None):
                   {"type": "volume", "source": "caddy_config", "target": "/config", "volume": {}}],
     }.items():
         mounts = services[service_name].get("volumes", [])
-        require(mounts == expected, "Mount set/source/options differ from the reviewed trusted deployment")
+        require(isinstance(mounts, list), "Mounts must be a rendered list")
+        normalized = []
+        for item in mounts:
+            require(isinstance(item, dict), "Mount must be a rendered object")
+            item = dict(item)
+            if item.get("type") == "bind":
+                options = item.get("bind")
+                # Compose 2.38.2 / compose-go 2.7.1 uses bool+omitempty:
+                # explicit false serializes as bind:{}. New Compose uses an
+                # OptOut type where omission can mean TRUE. The version must
+                # come from the trusted installed binary, never the bundle.
+                if compose_version in {"2.38.2", "v2.38.2"} and options == {}:
+                    options = {"create_host_path": False}
+                require(isinstance(options, dict) and options.get("create_host_path") is False,
+                        "Bind must explicitly disable host path creation for this Compose version")
+                item["bind"] = options
+            normalized.append(item)
+        require(normalized == expected, "Mount set/source/options differ from the reviewed trusted deployment")
     require(config.get("volumes") == {name: {"name": "sixnine-platform_"+name} for name in ("caddy_data", "caddy_config")},
             "Named volumes must not use external or driver-configured host sources")
     ports = caddy.get("ports", [])
@@ -166,9 +185,12 @@ def validate(config, *, deployment_directory=None):
     return True
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--compose-version", help="Version obtained from the trusted installed Compose binary; never from bundle metadata")
+    args = parser.parse_args(argv)
     try:
-        validate(json.load(sys.stdin))
+        validate(json.load(sys.stdin), compose_version=args.compose_version)
         print("Production configuration policy passed; secret contents and online readiness were not checked")
         return 0
     except Exception:

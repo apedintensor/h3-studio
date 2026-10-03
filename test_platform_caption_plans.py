@@ -46,7 +46,7 @@ class CaptionPlanTests(unittest.TestCase):
         self.assertTrue(any("永久烧进" in item for item in warnings))
         self.assertTrue(validate_render_source(value, compiled))
 
-    def test_confirmation_matches_actual_canonical_javascript_for_edit_and_audio(self):
+    def test_confirmation_matches_released_javascript_for_edit_and_audio(self):
         value = self.draft()
         value["entities"][2]["data"].update(seconds=1.99, selectedVideoRange={
             "assetId": "clip", "fileId": "local-clip", "cloudAssetId": "asset-one", "cloudArtifactId": None,
@@ -55,7 +55,12 @@ class CaptionPlanTests(unittest.TestCase):
             "shotId": "shot-one", "start": .1, "end": 1, "muted": True, "offset": None,
             "generatedFrom": {"jobId": "job-a", "videoEntityId": "clip", "videoArtifactId": "video-a", "audioArtifactId": "audio-a"},
             "needsReview": True}]
-        module = (Path(__file__).resolve().parent.parent/"video-studio-design"/"studio-app"/"src"/"caption-model.js").as_uri()
+        # The standalone repository/CI contains the verified source snapshot,
+        # not the creator's sibling workspace. Snapshot integrity is gated
+        # separately; parity must use the exact JavaScript shipped to users.
+        module_path = Path(__file__).resolve().parent/"yingxu"/"src"/"caption-model.js"
+        self.assertTrue(module_path.is_file())
+        module = module_path.as_uri()
         code = "import{captionSignature}from"+json.dumps(module)+";let raw='';for await(const part of process.stdin)raw+=part;console.log(JSON.stringify(captionSignature(JSON.parse(raw),'chapter-one')));"
         child = subprocess.run(["node", "--input-type=module", "-e", code], input=json.dumps(value),
                                text=True, encoding="utf-8", capture_output=True, check=True, timeout=15)
