@@ -1,0 +1,9 @@
+{
+	admin off
+}
+
+{$H3_DOMAIN} {
+	# Public HTTPS entry. The application requires provisioned password accounts.
+	# No trusted_proxies: do not trust client-provided forwarding headers.
+	reverse_proxy 127.0.0.1:8844
+}

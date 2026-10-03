@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "purpose": "Self-hosted H3-Base FL2VA and Ref2VA with unpruned BF16 transformers; hosted Context-IR and 2K regeneration are not included.",
+  "repository": "Comfy-Org/MiniMax-H3",
+  "revision": "e5eb578a89295337b8ff433a035929ce0279e0b6",
+  "metadata_verified_date": "2026-10-03",
+  "metadata_source": "https://huggingface.co/api/models/Comfy-Org/MiniMax-H3/tree/e5eb578a89295337b8ff433a035929ce0279e0b6",
+  "total_weight_bytes": 189880333296,
+  "comfyui_repository": "https://github.com/Comfy-Org/ComfyUI.git",
+  "comfyui_revision": "e9027f2b30f37bb3052714eb08fcf479542f4fc0",
+  "files": [
+    {
+      "role": "fl2va_transformer",
+      "path": "diffusion_models/minimax_h3_fl2va_bf16.safetensors",
+      "size_bytes": 66280487368,
+      "upstream_lfs_sha256": "907d4add438438ec1544f5240c3b38532ed934fe6be75677a6bbda2a6fdd6182",
+      "precision": "BF16 export, unpruned transformer; selected projections retain their checkpoint dtype",
+      "tasks": ["text-to-audio-video", "first-last-frame-to-audio-video"]
+    },
+    {
+      "role": "ref2va_transformer",
+      "path": "diffusion_models/minimax_h3_ref2va_bf16.safetensors",
+      "size_bytes": 66280487368,
+      "upstream_lfs_sha256": "e32c54c1a7b4f5f397f195cea267ccb18806303bb665678c4bee60953bdf3026",
+      "precision": "BF16 export, unpruned transformer; selected projections retain their checkpoint dtype",
+      "tasks": ["multimodal-reference-to-audio-video"]
+    },
+    {
+      "role": "h3_text_visual_encoder",
+      "path": "text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
+      "size_bytes": 51506295256,
+      "upstream_lfs_sha256": "600d567f6a9629c8574e8e7041b199bdd9c59a986afa7906910a81919610607d",
+      "precision": "BF16",
+      "note": "H3-specific Qwen3-VL export through layer 50 without final normalization, matching H3 conditioning; not a complete standalone Qwen chat model."
+    },
+    {
+      "role": "video_vae",
+      "path": "vae/minimax_h3_video_vae_fp16.safetensors",
+      "size_bytes": 5207808496,
+      "upstream_lfs_sha256": "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522",
+      "precision": "FP16 export",
+      "note": "The original MiniMaxAI checkpoint contains an FP32 visual VAE; this is Comfy's FP16 conversion."
+    },
+    {
+      "role": "audio_vae",
+      "path": "vae/minimax_h3_audio_vae_fp32.safetensors",
+      "size_bytes": 605254808,
+      "upstream_lfs_sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48",
+      "precision": "FP32"
+    }
+  ],
+  "integrity_policy": "Known upstream LFS SHA256 values are provenance only; bootstrap verifies exact file sizes and pinned cache revision, without rehashing 190GB.",
+  "public_download": true,
+  "download_workers": 2,
+  "generation_policy": "No Turbo LoRA, implicit quantization, sparse attention, or sampler caching is added by bootstrap. Actual generation acceptance must be recorded separately."
+}

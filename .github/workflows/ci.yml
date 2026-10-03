@@ -1,0 +1,102 @@
+name: Test and release H3 Studio
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: Publish this tested main commit to Lightsail (CPU only)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m pip install -r requirements.lock.txt
+      - name: Offline tests (temporary data, no model inference)
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+      - run: node --check web/app.js
+      - run: bash -n deploy/release.sh
+      - name: Check deployment config without secrets
+        env:
+          H3_IMAGE: h3-studio:test
+          H3_RELEASE: test
+          H3_DOMAIN: studio.example.test
+        run: docker compose -f deploy/compose.yaml config --quiet
+      - name: Build CPU runtime and test it with synthetic accounts
+        run: |
+          docker build --label org.opencontainers.image.revision="$GITHUB_SHA" -t "h3-studio:$GITHUB_SHA" .
+          python tools/check_container.py "h3-studio:$GITHUB_SHA"
+      - name: Export the tested image
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/main'
+        run: |
+          docker save "h3-studio:$GITHUB_SHA" | gzip > image.tar.gz
+          sha256sum image.tar.gz > image.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/main'
+        with:
+          name: h3-image-${{ github.sha }}
+          path: |
+            image.tar.gz
+            image.tar.gz.sha256
+          retention-days: 1
+          compression-level: 0
+
+  deploy:
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    concurrency:
+      group: h3-studio-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: h3-image-${{ github.sha }}
+      - run: sha256sum --check image.tar.gz.sha256
+      - name: Send CPU release and apply it
+        env:
+          DEPLOY_HOST: ${{ vars.LIGHTSAIL_HOST }}
+          DEPLOY_USER: ${{ vars.LIGHTSAIL_SSH_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9.-]+$ ]] && [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          test -n "$SSH_PRIVATE_KEY" && test -n "$SSH_KNOWN_HOSTS"
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/h3_deploy"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          unset SSH_PRIVATE_KEY SSH_KNOWN_HOSTS
+          remote="$DEPLOY_USER@$DEPLOY_HOST"
+          target="/srv/h3-studio/incoming/$GITHUB_SHA"
+          opts=(-i "$HOME/.ssh/h3_deploy" -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          ssh "${opts[@]}" "$remote" "mkdir -p '$target'"
+          scp "${opts[@]}" image.tar.gz image.tar.gz.sha256 deploy/release.sh deploy/compose.yaml deploy/Caddyfile deploy/check_release.py "$remote:$target/"
+          ssh "${opts[@]}" "$remote" "sudo -n bash '$target/release.sh' '$GITHUB_SHA'"
