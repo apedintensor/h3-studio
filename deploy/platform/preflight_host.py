@@ -1,0 +1,168 @@
+#!/usr/bin/python3
+"""Read-only Linux host metadata checks; never read secrets or start services.
+
+Install this reviewed file beside the root-owned release controller. It accepts
+no arbitrary CLI paths, writes no files, and never inspects registry credentials.
+"""
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import subprocess
+
+ROOT = Path("/srv/sixnine")
+SECRETS = Path("/run/sixnine-secrets")
+DOCKER_CONFIG = Path("/opt/sixnine-release/docker-config")
+SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+GIB = 1024**3
+
+
+class PreflightError(Exception):
+    """Stable non-secret diagnostic code."""
+
+
+def require(value, code):
+    if not value:
+        raise PreflightError(code)
+
+
+def metadata(path):
+    value = path.lstat()
+    return {"mode": value.st_mode, "uid": value.st_uid, "gid": value.st_gid,
+            "links": value.st_nlink, "bytes": value.st_size}
+
+
+def _directory(info, code, *, owner=0, group=None, mode=None, writable_group=False):
+    require(stat.S_ISDIR(info["mode"]) and info["uid"] == owner, code)
+    if group is not None:
+        require(info["gid"] == group, code)
+    bits = stat.S_IMODE(info["mode"])
+    require(not bits & (0o002 if writable_group else 0o022), code)
+    if mode is not None:
+        require(bits == mode, code)
+
+
+def validate_snapshot(snapshot):
+    """Pure validation used by fake-host tests; input is metadata, never content."""
+    require(snapshot["platform"] == "posix" and snapshot["euid"] == 0, "preflight_requires_linux_root")
+    for info in snapshot["parents"]:
+        _directory(info, "preflight_parent_not_root_controlled")
+    dirs = snapshot["directories"]
+    require(set(dirs) == {"root", "incoming", "releases", "approved-releases", "platform-data",
+                         "upload-spool", "postgres", "secret-root", "docker-config"}, "preflight_directory_set_invalid")
+    for name in ("root", "releases", "approved-releases"):
+        _directory(dirs[name], "preflight_release_directory_not_protected")
+    _directory(dirs["incoming"], "preflight_incoming_directory_not_protected", writable_group=True)
+    for name in ("platform-data", "upload-spool"):
+        # Private writable directories for the actual non-root app identity.
+        info = dirs[name]
+        require(stat.S_ISDIR(info["mode"]) and (info["uid"], info["gid"]) == (10001, 10001)
+                and stat.S_IMODE(info["mode"]) == 0o700, "preflight_app_directory_owner_or_mode")
+    pg = dirs["postgres"]
+    # PGDATA is a CHILD of this bind root. The entrypoint chowns PGDATA only;
+    # a root:root 0700 parent remains inaccessible after dropping privileges.
+    # Match the reviewed official PostgreSQL 17 Alpine (70) / Debian (999) UID.
+    require(stat.S_ISDIR(pg["mode"]) and (pg["uid"], pg["gid"]) in {(70, 70), (999, 999)}
+            and stat.S_IMODE(pg["mode"]) == 0o700, "preflight_postgres_directory_owner_or_mode")
+    for name in ("secret-root", "docker-config"):
+        _directory(dirs[name], "preflight_private_root_directory_required", group=0, mode=0o700)
+    require(snapshot["docker_config_empty"] is True, "preflight_docker_config_must_be_empty")
+    require(set(snapshot["secrets"]) == {"db_admin_password", "app_database_url"}, "preflight_secret_set_invalid")
+    for name, info in snapshot["secrets"].items():
+        require(stat.S_ISREG(info["mode"]) and info["uid"] == 0 and info["links"] == 1
+                and 1 <= info["bytes"] <= 16384, "preflight_secret_file_not_protected_regular")
+        if name == "db_admin_password":
+            allowed, group = {0o400, 0o600}, 0
+        else:
+            allowed, group = {0o440, 0o640}, 10001
+        require(stat.S_IMODE(info["mode"]) in allowed and info["gid"] == group,
+                "preflight_secret_owner_or_mode")
+    require(snapshot["secret_filesystems"] == {"secret-root": "tmpfs", "db_admin_password": "tmpfs",
+                                               "app_database_url": "tmpfs"}, "preflight_runtime_secrets_require_tmpfs")
+    docker = snapshot["docker"]
+    require(docker.get("os") == "linux" and type(docker.get("cpus")) is int and docker["cpus"] >= 2,
+            "preflight_docker_requires_two_linux_cpus")
+    require(type(docker.get("memory_bytes")) is int and docker["memory_bytes"] >= 6*GIB,
+            "preflight_docker_memory_below_reviewed_floor")
+    return {"state": "host_metadata_ready", "cpu_count": docker["cpus"],
+            "secret_contents_checked": False, "services_started": False,
+            "remaining": ["dependency_images_and_archive_identity", "subnet_and_port_conflicts",
+                          "approved_runtime_secret_source", "disk_capacity_and_backups", "formal_accounts",
+                          "public_dns_tls_and_user_acceptance"]}
+
+
+def _mount_path(value):
+    # /proc/self/mountinfo escapes whitespace and backslashes in mount points.
+    return PurePosixPath(re.sub(r"\\(040|011|012|134)", lambda m: chr(int(m[1], 8)), value))
+
+
+def filesystem_for(path, mountinfo):
+    path = PurePosixPath(path.as_posix())
+    found = []
+    for line in mountinfo.splitlines():
+        before, separator, after = line.partition(" - ")
+        fields, filesystem = before.split(), after.split()
+        if not separator or len(fields) < 6 or not filesystem:
+            raise PreflightError("preflight_mountinfo_invalid")
+        mount = _mount_path(fields[4])
+        if mount.is_absolute() and path.is_relative_to(mount):
+            found.append((len(mount.parts), filesystem[0]))
+    require(bool(found), "preflight_mount_not_identified")
+    # A bind-mounted persistent secret file overrides a tmpfs parent and fails.
+    return max(found, key=lambda item: item[0])[1]
+
+
+def check_host(*, root=ROOT, secret_root=SECRETS, docker_config=DOCKER_CONFIG):
+    """Read only fixed trusted host metadata and local Docker capacity."""
+    require(os.name == "posix" and os.geteuid() == 0, "preflight_requires_linux_root")
+    require((root, secret_root, docker_config) == (ROOT, SECRETS, DOCKER_CONFIG), "preflight_unreviewed_host_paths")
+    paths = {"root": root, **{name: root/name for name in ("incoming", "releases", "approved-releases",
+             "platform-data", "upload-spool", "postgres")}, "secret-root": secret_root, "docker-config": docker_config}
+    try:
+        parents = set(root.parents) | set(secret_root.parents) | set(docker_config.parents)
+        snapshot = {"platform": os.name, "euid": os.geteuid(), "parents": [metadata(path) for path in parents],
+                    "directories": {name: metadata(path) for name, path in paths.items()}}
+        # Validate parent chains before looking below them; never traverse a link.
+        for info in snapshot["parents"]:
+            _directory(info, "preflight_parent_not_root_controlled")
+        for name in ("secret-root", "docker-config"):
+            _directory(snapshot["directories"][name], "preflight_private_root_directory_required", group=0, mode=0o700)
+        with os.scandir(docker_config) as entries:
+            snapshot["docker_config_empty"] = next(entries, None) is None
+        snapshot["secrets"] = {name: metadata(secret_root/name) for name in ("db_admin_password", "app_database_url")}
+        with Path("/proc/self/mountinfo").open("r", encoding="utf-8") as source:
+            mounts = source.read(1024*1024+1)
+        require(len(mounts) <= 1024*1024, "preflight_mountinfo_too_large")
+        snapshot["secret_filesystems"] = {name: filesystem_for(path, mounts) for name, path in {
+            "secret-root": secret_root, "db_admin_password": secret_root/"db_admin_password",
+            "app_database_url": secret_root/"app_database_url"}.items()}
+        # Empty config disables accidental use of root's registry/login/context
+        # files. Only the local daemon is queried; no network command is issued.
+        info = subprocess.run(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "info",
+                               "--format", "{{.OSType}} {{.NCPU}} {{.MemTotal}}"],
+            env={"PATH": SAFE_PATH, "LANG": "C.UTF-8", "DOCKER_CONFIG": str(docker_config)},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=15, check=True).stdout.strip().split()
+        require(len(info) == 3, "preflight_docker_capacity_invalid")
+        snapshot["docker"] = {"os": info[0], "cpus": int(info[1]), "memory_bytes": int(info[2])}
+        return validate_snapshot(snapshot)
+    except PreflightError:
+        raise
+    except Exception:
+        raise PreflightError("preflight_host_metadata_unavailable") from None
+
+
+def main():
+    try:
+        print(json.dumps(check_host()))
+        return 0
+    except PreflightError as error:
+        print(json.dumps({"state": "host_preflight_refused", "reason": str(error)}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,329 @@
+{
+  "title": "最后一班来信",
+  "prototype": true,
+  "generationExecuted": false,
+  "characters": [
+    {
+      "id": "char-lin",
+      "name": "林岚",
+      "age": "30岁 · 车站档案管理员",
+      "identity": "短发、沉静、观察细致",
+      "role": "想查明父亲失踪的真相",
+      "sheets": [
+        "正面",
+        "3/4侧面",
+        "全身",
+        "背面",
+        "紧张表情",
+        "雨衣造型"
+      ],
+      "requested": []
+    },
+    {
+      "id": "char-zhou",
+      "name": "周屿",
+      "age": "42岁 · 旧车站值班员",
+      "identity": "瘦高、深色制服、说话克制",
+      "role": "知道旧事，但不愿重提",
+      "sheets": [
+        "正面",
+        "侧面",
+        "全身",
+        "背面",
+        "犹疑表情",
+        "制服造型"
+      ],
+      "requested": []
+    }
+  ],
+  "locations": [
+    {
+      "id": "station",
+      "title": "旧车站 · 售票厅",
+      "desc": "柜台在北侧，入口在南侧，失物间门在右侧。",
+      "worldStatus": "未创建",
+      "version": 1
+    },
+    {
+      "id": "storage",
+      "title": "旧车站 · 失物间",
+      "desc": "狭窄过道、旧储物柜与桌上的录音机。",
+      "worldStatus": "未创建",
+      "version": 1
+    }
+  ],
+  "episodes": [
+    {
+      "id": "ep-01",
+      "title": "明天的信",
+      "hook": "一封寄自明天的信，在停运车站出现。",
+      "scenes": [
+        {
+          "id": "sc-01",
+          "title": "收到来信",
+          "place": "station",
+          "time": "故事日1 · 夜",
+          "goal": "让观众发现信封的日期来自明天。",
+          "script": "内景 · 售票厅 · 夜\n\n林岚推开门，雨水顺着衣角落下。柜台上躺着一封没有收件人姓名的信。\n\n林岚：今天……不是二十二号吗？\n\n周屿看见邮戳，收起原本准备递出的钥匙。\n\n广播响起：林岚，请不要离开。",
+          "props": "信封未拆 → 拆开；钥匙在周屿右手",
+          "version": 1,
+          "castRefs": [
+            {
+              "characterId": "char-lin",
+              "identityVersion": 1
+            },
+            {
+              "characterId": "char-zhou",
+              "identityVersion": 1
+            }
+          ],
+          "look": "雨衣 · v1",
+          "review": false,
+          "camera": null,
+          "shots": [
+            {
+              "id": "sc-01-01",
+              "title": "先交代空间",
+              "action": "用一个建立镜头交代人物、地点和当前状态。",
+              "seconds": 6
+            },
+            {
+              "id": "sc-01-02",
+              "title": "靠近关键变化",
+              "action": "中景观察关键动作，让剧情中的新信息可见。",
+              "seconds": 8
+            },
+            {
+              "id": "sc-01-03",
+              "title": "看人物的反应",
+              "action": "用反应镜头承接动作，留下下一场需要回答的问题。",
+              "seconds": 6
+            }
+          ]
+        },
+        {
+          "id": "sc-02",
+          "title": "门后的声音",
+          "place": "storage",
+          "time": "故事日1 · 夜",
+          "goal": "让录音机成为下一集的线索。",
+          "script": "内景 · 失物间 · 夜\n\n林岚拿着已拆的信封跟进来。录音机突然转动。\n\n录音：如果你已经收到这封信……\n\n周屿猛地按下停止键。",
+          "props": "已拆信封在林岚手中；录音机从停止到转动",
+          "version": 1,
+          "castRefs": [
+            {
+              "characterId": "char-lin",
+              "identityVersion": 1
+            },
+            {
+              "characterId": "char-zhou",
+              "identityVersion": 1
+            }
+          ],
+          "look": "雨衣 · v1",
+          "review": false,
+          "camera": null,
+          "shots": [
+            {
+              "id": "sc-02-01",
+              "title": "先交代空间",
+              "action": "用一个建立镜头交代人物、地点和当前状态。",
+              "seconds": 6
+            },
+            {
+              "id": "sc-02-02",
+              "title": "靠近关键变化",
+              "action": "中景观察关键动作，让剧情中的新信息可见。",
+              "seconds": 8
+            },
+            {
+              "id": "sc-02-03",
+              "title": "看人物的反应",
+              "action": "用反应镜头承接动作，留下下一场需要回答的问题。",
+              "seconds": 6
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ep-02",
+      "title": "失物间",
+      "hook": "录音里的人，知道他们还没做出的选择。",
+      "scenes": [
+        {
+          "id": "sc-03",
+          "title": "未播完的录音",
+          "place": "storage",
+          "time": "故事日1 · 夜（接上一集）",
+          "goal": "揭示父亲留下的信息，但保留最重要的一句。",
+          "script": "内景 · 失物间 · 夜\n\n林岚拦住周屿的手，重新按下播放键。\n\n林岚：让我听完。\n\n录音：别去追那班车。真正离开的人，不在车上。",
+          "props": "信封保持已拆；录音机继续；雨衣仍湿",
+          "version": 1,
+          "castRefs": [
+            {
+              "characterId": "char-lin",
+              "identityVersion": 1
+            },
+            {
+              "characterId": "char-zhou",
+              "identityVersion": 1
+            }
+          ],
+          "look": "雨衣 · v1",
+          "review": false,
+          "camera": null,
+          "shots": [
+            {
+              "id": "sc-03-01",
+              "title": "先交代空间",
+              "action": "用一个建立镜头交代人物、地点和当前状态。",
+              "seconds": 6
+            },
+            {
+              "id": "sc-03-02",
+              "title": "靠近关键变化",
+              "action": "中景观察关键动作，让剧情中的新信息可见。",
+              "seconds": 8
+            },
+            {
+              "id": "sc-03-03",
+              "title": "看人物的反应",
+              "action": "用反应镜头承接动作，留下下一场需要回答的问题。",
+              "seconds": 6
+            }
+          ]
+        },
+        {
+          "id": "sc-04",
+          "title": "怀表的主人",
+          "place": "station",
+          "time": "故事日1 · 夜",
+          "goal": "把周屿与十年前的事件联系起来。",
+          "script": "内景 · 售票厅 · 夜\n\n林岚将一枚旧怀表放上柜台。周屿下意识摸向空空的口袋。\n\n林岚：这不是他的表，是你的。",
+          "props": "怀表放在柜台；信封在林岚外套口袋",
+          "version": 1,
+          "castRefs": [
+            {
+              "characterId": "char-lin",
+              "identityVersion": 1
+            },
+            {
+              "characterId": "char-zhou",
+              "identityVersion": 1
+            }
+          ],
+          "look": "雨衣 · v1",
+          "review": false,
+          "camera": null,
+          "shots": [
+            {
+              "id": "sc-04-01",
+              "title": "先交代空间",
+              "action": "用一个建立镜头交代人物、地点和当前状态。",
+              "seconds": 6
+            },
+            {
+              "id": "sc-04-02",
+              "title": "靠近关键变化",
+              "action": "中景观察关键动作，让剧情中的新信息可见。",
+              "seconds": 8
+            },
+            {
+              "id": "sc-04-03",
+              "title": "看人物的反应",
+              "action": "用反应镜头承接动作，留下下一场需要回答的问题。",
+              "seconds": 6
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ep-03",
+      "title": "回信",
+      "hook": "她终于知道，第一封信是谁写的。",
+      "scenes": [
+        {
+          "id": "sc-05",
+          "title": "最后一班",
+          "place": "station",
+          "time": "故事日1 · 将近午夜",
+          "goal": "让林岚作出选择，不再追逐过去。",
+          "script": "内景 · 售票厅 · 夜\n\n时钟接近十二点。林岚没有走向出口，而是坐到柜台前。\n\n林岚：如果明天还能收到信，那就由我来写。",
+          "props": "旧信已拆；新信纸空白；怀表在柜台",
+          "version": 1,
+          "castRefs": [
+            {
+              "characterId": "char-lin",
+              "identityVersion": 1
+            }
+          ],
+          "look": "雨衣 · v1",
+          "review": false,
+          "camera": null,
+          "shots": [
+            {
+              "id": "sc-05-01",
+              "title": "先交代空间",
+              "action": "用一个建立镜头交代人物、地点和当前状态。",
+              "seconds": 6
+            },
+            {
+              "id": "sc-05-02",
+              "title": "靠近关键变化",
+              "action": "中景观察关键动作，让剧情中的新信息可见。",
+              "seconds": 8
+            },
+            {
+              "id": "sc-05-03",
+              "title": "看人物的反应",
+              "action": "用反应镜头承接动作，留下下一场需要回答的问题。",
+              "seconds": 6
+            }
+          ]
+        },
+        {
+          "id": "sc-06",
+          "title": "写给明天",
+          "place": "storage",
+          "time": "故事日2 · 午夜后",
+          "goal": "收束来信的因果，留下克制的余味。",
+          "script": "内景 · 失物间 · 午夜后\n\n林岚把新写的信放进储物柜。\n\n镜头停在信封上。收件人一栏，她写下了自己的名字。\n\n远处，第一声清晨广播响起。",
+          "props": "新信封封好；旧信仍在口袋；不可混用两封信",
+          "version": 1,
+          "castRefs": [
+            {
+              "characterId": "char-lin",
+              "identityVersion": 1
+            }
+          ],
+          "look": "雨衣 · v1",
+          "review": false,
+          "camera": null,
+          "shots": [
+            {
+              "id": "sc-06-01",
+              "title": "先交代空间",
+              "action": "用一个建立镜头交代人物、地点和当前状态。",
+              "seconds": 6
+            },
+            {
+              "id": "sc-06-02",
+              "title": "靠近关键变化",
+              "action": "中景观察关键动作，让剧情中的新信息可见。",
+              "seconds": 8
+            },
+            {
+              "id": "sc-06-03",
+              "title": "看人物的反应",
+              "action": "用反应镜头承接动作，留下下一场需要回答的问题。",
+              "seconds": 6
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "changes": []
+}

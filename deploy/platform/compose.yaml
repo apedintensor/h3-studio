@@ -1,0 +1,183 @@
+name: sixnine-platform
+
+x-logs: &bounded-logs
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
+services:
+  db:
+    image: ${SIXNINE_POSTGRES_IMAGE:?Set an approved PostgreSQL 17 image digest}
+    pull_policy: never
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 1g
+    shm_size: 256m
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_admin_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256 --auth-local=peer
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      - postgres
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - log_statement=none
+      - -c
+      - log_min_error_statement=panic
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+      - -c
+      - max_connections=64
+    secrets: [db_admin_password]
+    volumes:
+      - type: bind
+        source: /srv/sixnine/postgres
+        target: /var/lib/postgresql/data
+        bind: {create_host_path: false}
+    tmpfs:
+      - /tmp:size=67108864,mode=1777
+      - /var/run/postgresql:size=16777216,mode=3775
+    networks: [database]
+    healthcheck:
+      test: [CMD, pg_isready, -U, postgres, -d, postgres]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+    logging: *bounded-logs
+
+  db-init:
+    image: ${SIXNINE_IMAGE:?Set the exact tested platform image}
+    pull_policy: never
+    user: "0:0"
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    mem_limit: 256m
+    command: [python, /bootstrap/init_database.py]
+    secrets: [db_admin_password, app_database_url]
+    volumes:
+      - type: bind
+        source: ./init_database.py
+        target: /bootstrap/init_database.py
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:size=16777216,mode=1777"]
+    networks: [database]
+    depends_on:
+      db: {condition: service_healthy}
+    logging: *bounded-logs
+
+  app:
+    image: ${SIXNINE_IMAGE:?Set the exact tested platform image}
+    pull_policy: never
+    user: "10001:10001"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 3g
+    cpus: 2
+    stop_grace_period: 60s
+    environment:
+      SIXNINE_DATA: /data
+      SIXNINE_DATABASE_URL_FILE: /run/secrets/app_database_url
+      SIXNINE_PUBLIC_ORIGIN: https://www.sixnine.art
+      SIXNINE_AUTH_MODE: password
+      SIXNINE_GENERATION_ENABLED: "0"
+      SIXNINE_RENDER_ENABLED: "0"
+      SIXNINE_EXECUTION_BACKEND: disabled
+      SIXNINE_CLOUD_CREATION_ENABLED: "0"
+      SIXNINE_STORAGE_PROVIDER: local
+      SIXNINE_FRONTEND_DIR: /app/yingxu-dist
+    # Trust only this Caddy container. Caddy overwrites the client-supplied XFF.
+    command: [python, -m, uvicorn, "platform_app:app", --host, 0.0.0.0, --port, "8845", --workers, "1", --no-access-log, --proxy-headers, --forwarded-allow-ips, "172.29.69.2"]
+    secrets: [app_database_url]
+    volumes:
+      - type: bind
+        source: /srv/sixnine/platform-data
+        target: /data
+        bind: {create_host_path: false}
+      # Dedicated HTTP upload spool: persistent disk, not an unbounded RAM tmpfs.
+      - type: bind
+        source: /srv/sixnine/upload-spool
+        target: /tmp
+        bind: {create_host_path: false}
+    networks:
+      database: {}
+      web: {}
+    depends_on:
+      db: {condition: service_healthy}
+      db-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import json,urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8845/healthz',timeout=5)); assert h['auth_ready'] and not h['generation_enabled'] and not h['render_enabled'] and not h['cloud_creation_enabled'] and h['execution_backend']=='disabled'"]
+      interval: 15s
+      timeout: 6s
+      retries: 4
+      start_period: 30s
+    logging: *bounded-logs
+
+  caddy:
+    image: ${SIXNINE_CADDY_IMAGE:?Set an approved Caddy image digest}
+    pull_policy: never
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind: {create_host_path: false}
+      - caddy_data:/data
+      - caddy_config:/config
+    tmpfs: ["/tmp:size=16777216,mode=1777"]
+    networks:
+      web: {ipv4_address: 172.29.69.2}
+      edge: {}
+    depends_on:
+      app: {condition: service_healthy}
+    logging: *bounded-logs
+
+secrets:
+  # Existing protected files hydrated into host /run tmpfs by a separate,
+  # approved secret mechanism. No secret values belong in an env file.
+  db_admin_password:
+    file: ${SIXNINE_DB_ADMIN_SECRET_FILE:?Set an existing protected admin secret file}
+  app_database_url:
+    file: ${SIXNINE_APP_DSN_SECRET_FILE:?Set an existing protected app DSN secret file}
+
+networks:
+  database:
+    internal: true
+  web:
+    internal: true
+    ipam:
+      # Dynamic app/one-off containers cannot consume the proxy's static .2.
+      config: [{subnet: 172.29.69.0/28, ip_range: 172.29.69.8/29}]
+  edge: {}
+
+volumes:
+  caddy_data:
+  caddy_config:

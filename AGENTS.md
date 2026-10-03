@@ -1,5 +1,11 @@
 # H3 Studio
 
+2026-10-04 十小时实现进行中：新的统一平台入口是 `platform_app.py` / `studio_platform/`，使用独立数据库与对象根，不覆盖旧 `data/`。映序 canonical 源码在 `../video-studio-design/studio-app`，`yingxu/` 是由 `tools/sync_yingxu_source.py` 产生的只读发布快照。当前架构见 `ARCHITECTURE.zh-CN.md`；新生产包在 `deploy/platform/`，旧 `deploy/` 只保留兼容。不能把下文初始“只有设计”的状态当作新代码未实现，也不能把本地代码/模拟验证当作公网或GPU已上线。
+
+新平台已实现 PostgreSQL/SQLite 持久任务、计划/预算、worker/fleet、受限私有存储、云项目/素材及CPU章节粗剪；运行证据见本轮验收记录。真实GPU默认关、云创建上限0、scaler默认dry-run；FakeProvider和模拟视频不是线上模型验收。Hippius只为实验adapter，不能替换缺少条件创建保证的AssetService。远端Linux中央凭据加载尚未完成，不复制DPAPI库或生成项目.env。
+
+`SIXNINE_RENDER_ENABLED` 单独控制CPU粗剪；不通过开启它恢复GPU。正式站点必须密码认证，`local-test`和mock仅隔离loopback测试使用。公网发布仅使用测试后的 `sixnine-platform:<commit>`；主机要求独立root批准manifest摘要，部署身份不得覆盖host controller或自批准。处理项目删除/模型迁移仍需先读中央HOUSEKEEPING并核实云账单与唯一资产。
+
 2026-10-04 部署接入：GitHub CI 与 Lightsail CPU 发布配置见 `LIGHTSAIL.md`。公网容器固定 `H3_AUTH_MODE=password`、`H3_GENERATION_ENABLED=0`，不包含中央 DPAPI 库、GPU 控制器、SSH 文件或用户数据。正式密码仅由目标服务器 `tools/manage_users.py` 交互建立；不要写入聊天、代码或普通配置。本机默认 username-test 仅兼容历史测试，不能当正式认证。多 GPU / API 路由当前仅设计，见 `SCALING.zh-CN.md`，不得写成已运行自动扩容。现有 default AWS CLI 指向第三方存储，不能当 Lightsail 账户使用。
 
 本目录是用户授权部署的 MiniMax H3 多模态参考工作台和异步 API。

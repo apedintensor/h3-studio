@@ -1,0 +1,1 @@
+{"name":"yingxu-studio-prototype","version":"0.6.0","private":true,"type":"module","scripts":{"build":"vite build","test":"node --test src/*.test.js"},"dependencies":{"@xyflow/react":"^12.9.0","react":"^19.1.0","react-dom":"^19.1.0","jszip":"^3.10.1","lucide-react":"^0.468.0"},"devDependencies":{"vite":"^6.1.0"}}

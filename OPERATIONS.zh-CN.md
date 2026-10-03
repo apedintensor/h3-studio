@@ -1,0 +1,61 @@
+# 运行诊断与故障处理
+
+本平台把业务任务状态、推理实例状态和实际账单分开记录。网页“成功”表示产物已校验并可访问；它不证明供应商账单已经结算。任务收集或对账失败时，不新建生成来替代原任务。
+
+## 已实现的入口
+
+在服务相同的非秘密 `SIXNINE_DATA` 或受保护 `SIXNINE_DATABASE_URL_FILE` 配置下执行：
+
+```powershell
+.venv\Scripts\python.exe -m studio_platform.diagnostics
+```
+
+Linux 镜像内使用 `python -m studio_platform.diagnostics`。此命令只查询已有数据库，不初始化表、不构建存储/云客户端、不读取业务请求快照。SQLite 使用 `mode=ro`，PostgreSQL 使用只读事务。数据库不存在时退出，不创建空数据库掩盖错误。
+
+输出包含任务各状态数量、最老排队时间、首次尝试与重试的排队年龄、过期执行租约、待核账记录，以及本控制数据库内工作机/实例的聚合状态。过期心跳归为 `unknown`，不会算空闲。多个预算账户可能同时覆盖一笔任务，汇总值是计数器之和，不能当去重账单、现金余额或可花额度。
+
+网页通过 `GET /v1/activity-summary?client_project_id=<project_id>` 读取本人已授权项目的总量。服务身份还必须具有该项目的 `jobs:read` 权限。它不暴露其他作者的任务、实例清单或预算；不能把最近100条任务列表当全量统计。列表已有 `limit/offset`，批量产物查询避免逐条再读取大输入快照。
+
+## 告警对应的处理
+
+| 提示 | 含义 | 应做的操作 |
+|---|---|---|
+| submission_unknown_requires_reconciliation_not_resubmission | 创建请求可能已被上游接受 | 保留 attempt，查原标识；不得直接重发或换供应商 |
+| stale_worker_or_lease_is_not_idle | 心跳或租约过期 | 先核对原进程、推理队列、收集进度；未查清不接新任务、不释放实例 |
+| billing_unsettled_keep_reservations | 任务结束/实例销毁后仍缺实际费用证据 | 保留预算预留；取得供应商终态与账单证据后单独结算 |
+| queue_older_than_15_minutes_review_capacity_and_fairness | 已经排队较久 | 看首次/重试分别积压原因、已验收可用槽位与冷启动收益；不要只看任务个数租机 |
+| capacity_wait_older_than_15_minutes_review_boot_and_qualification | 已接受任务还在等待已批准容量 | 检查独立 capacity approval、报价/验收/TTL和原创建意图；不要另租第二台替代状态未知的实例 |
+
+15分钟只是初始运维提示阈值，不是测得的服务承诺。CPU粗剪/不同GPU配置需要分别测样本，再设实际延迟目标。排队年龄描述已过去的时间，不是剩余时间预测。
+
+`waiting_capacity` 与可领取的 `queued` 分开统计，避免把机器尚未就绪解释成推理卡死。`recovery_hold` 是恢复备份后的核对状态；用户取消只记录取消意图，不能因此释放尚不清楚的供应商费用或再次付费提交。`python -m studio_platform.capacity_cli` 默认关闭；显式只读 dry-run 不创建表、实例或云客户端，advance 只做本地批准/来源/期限核对及激活，尚未接自动云端开机。
+
+账单查询超时或返回非法金额时，已通过解码与持久保存的成片仍可交付，费用保持 pending，预留不释放。实际结算使用原 job/账单证据幂等更新；不能因为成片已经可下载就记作零成本。
+
+诊断不含 `job_id`、用户名、提示词、原始URL或自由文本错误标签，避免把敏感内容和无界标签导入监控。后续接 CloudWatch/OpenTelemetry 时复用这些有界状态，原始任务只在鉴权业务页面查看。[OpenTelemetry 指标说明](https://opentelemetry.io/docs/concepts/signals/metrics/)
+
+将首次执行积压和失败重试积压分开观察，有助于区分容量不足和反复失败；扩容仍必须通过已验收配置、预算和TTL检查。[AWS 队列积压实践](https://aws.amazon.com/builders-library/avoiding-insurmountable-queue-backlogs/)
+
+## 当前边界
+
+- 这是按需读取的诊断和网页汇总，尚未配置外部告警接收人、监控托管或自动修复。
+- 结果是多个只读查询的采样，任务在查询期间可能变化，不承诺所有计数来自同一瞬间。
+- CPU粗剪缓存、上传暂存、已写对象和写入不明的预留均保留归属；本轮没有自动删除失败文件或用户媒体。
+- 扩容器默认关闭、真实Lium接入仍需单独验收；不得用“可以生成扩容建议”冒充已经能自动租机并加载H3。
+- 生产切换前必须验证备份恢复、运行时凭据来源、DNS/TLS和实际执行池。现有主机和Docker本地验收不代表公网服务已发布。
+
+## 请求资源与公平性
+
+新增进程内准入保护鉴权数据库、密码CPU、owner请求、上传与下载。拒绝发生在昂贵工作之前，返回429/Retry-After，不排一个无界的后台等待队列。配额持续到完整ASGI响应结束，流式下载不能在仅发送headers后提前释放。映序将GET读取排队，每页最多4并发，其中媒体最多2并发；有限重试只适用于429读取，所有写入保持显式确认。
+
+登录正文另有15秒总期限，避免两个匿名滴流占住全部登录槽。响应单次写入空闲超过30秒会关闭连接；本地媒体响应总期限5分钟，不允许持续滴流永久占住下载槽。已发送部分文件时不会拼接JSON假装下载完成，应重新鉴权并按Range读取原文件，或重新下载；不重新生成。Caddy另设15分钟整体写期限，配置已经本地2.10.2验证。反向代理与应用限制各自生效；[Caddy超时说明](https://caddyserver.com/docs/caddyfile/options#timeouts)并不意味着当前版本支持文档中的所有新增指令。
+
+批次列表默认/最高10批，只查询有界状态投影，不读取每个任务的大prompt快照；单批详情最多100项、批量查任务投影及artifact，避免列表请求扇出成千上万个SQL查询。两用户/多个机器client共享owner额度的公平性、慢下载、断连释放和鉴权过载均有实际ASGI测试。
+
+## 本机控制面压力证据
+
+`tools/stress_platform.py` 只对独立测试目录与隔离数据库发起进程内 ASGI 请求，不创建云资源。2026-10-04 的 PostgreSQL 测试使用专用 loopback `sixnine_test` 数据库与独立临时 schema：24并发、1200/1200请求返回200，耗时8.697秒，约137.99请求/秒，p50 155.22ms、p95 199.17ms、p99 220.86ms。工作集40项目/120阻挡状态任务，原始汇总在 `.platform-stress-20261004-pg-c24/report.json`。
+
+同日 SQLite 24并发测试1200/1200成功，约162.78请求/秒、p95 297.79ms。上述两组发生在本轮新增请求准入限制之前；新版本超过准入上限会有意返回429，不可继续把旧1200/1200视为新版本承诺。两者只是本机读控制面的不同运行观察，不能由这个小样本判断生产数据库优劣；没有测网络、视频上传、GPU吞吐或付费供应商并发。长期CPU模拟测试另记录，不把运行时间与本组短时压力混为一个结果。
+
+新增准入之后，按两用户各4个GET的客户端上限复测：SQLite 8并发600/600成功、161.68请求/秒、p95 121.27ms；PostgreSQL 8并发600/600成功、156.25请求/秒、p95 68.92ms。对应 `.platform-stress-20261004-admission-sqlite-c8/report.json` 与 `.platform-stress-20261004-admission-pg-c8-confirmed/report.json`。另一个目录名含 `admission-pg-c8` 的试跑实际遗漏数据库参数，其报告明确为SQLite，不能计入PG成绩。

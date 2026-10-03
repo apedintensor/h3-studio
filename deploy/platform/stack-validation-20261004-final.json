@@ -1,0 +1,41 @@
+{
+  "state": "passed",
+  "run_id": "9ed02a47240c4680ab8203d32f2d939e",
+  "images": {
+    "sixnine-platform:captions-precommit-20261004": "sha256:536bb0a318828945138eec69a71e62746a3f75f4c1821493dcb8dbdd124adcfb",
+    "postgres:17-alpine": "sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24",
+    "caddy:2.10.2-alpine": "sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d"
+  },
+  "tls": "internal-ca-client-context-only",
+  "host_ports": [],
+  "external_network": false,
+  "stages": [
+    {
+      "stage": "ready_for_restart",
+      "https_verified": true,
+      "media_sha256": "d1e878fd9946f6b749da02bb1822aea8f16c3f825589dceb8c1d5a1b387f7f5f",
+      "cross_user_isolation": true,
+      "range_and_head": true
+    },
+    {
+      "stage": "client_complete",
+      "restart_persistence": true,
+      "spoofed_xff_rejected": true
+    },
+    {
+      "stage": "second_source_complete",
+      "distinct_client_budget": true
+    },
+    {
+      "stage": "ledger_audited",
+      "least_privilege": true,
+      "proxy_sources_verified": true,
+      "attempt_count": 0,
+      "execution_disabled": true
+    }
+  ],
+  "app_admin_secret_unreadable": true,
+  "real_supplier_requests": false,
+  "production_deployed": false,
+  "cleanup_verified": true
+}

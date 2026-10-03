@@ -1,0 +1,353 @@
+"""HTTP contract/isolation tests. Temporary DB and CPU media only; no provider calls."""
+import copy
+import io
+import os
+from pathlib import Path
+import secrets
+import tempfile
+import unittest
+import uuid
+
+from fastapi.testclient import TestClient
+from PIL import Image
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
+
+from studio_platform.api import create_app
+from studio_platform.settings import Settings
+
+
+def project(project_id="story-one"):
+    def entity(i, kind, parent=None):
+        return dict(id=i, type=kind, parentId=parent, title=i, description="A traveller in a rainy street",
+                    version=1, order=0, status="draft", data={"seconds": 5} if kind == "shot" else {})
+    return dict(schemaVersion=4, id=project_id, title="测试短剧", logline="A short story",
+        entities=[entity("chapter-one", "chapter"), entity("scene-one", "scene", "chapter-one"),
+                  entity("shot-one", "shot", "scene-one")], links=[], jobs=[],
+        layout={"positions": {}, "viewport": {"x": 0, "y": 0, "zoom": 1}})
+
+
+def generation_request(project_id="story-one", **overrides):
+    return {"client_ref": {"project_id": project_id, "shot_id": "shot-one", "shot_version": 1},
+        "recipe_id": "h3-base-fl2va-v1", "prompt": "A traveller walks down a rainy street.",
+        "controls": {"duration": 5, "resolution": "480P", "seed": "18446744073709551615"}, **overrides}
+
+
+def png():
+    out = io.BytesIO()
+    Image.new("RGB", (512, 512), "navy").save(out, format="PNG")
+    return out.getvalue()
+
+
+class ApiTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        database_url = ""
+        postgres = os.environ.get("PLATFORM_TEST_DATABASE_URL")
+        if postgres:
+            parsed = make_url(postgres)
+            if parsed.host not in {"127.0.0.1", "localhost"} or parsed.database != "sixnine_test":
+                raise RuntimeError("API tests only allow the explicit local sixnine_test database")
+            schema = "api_test_" + uuid.uuid4().hex
+            bootstrap = create_engine(parsed, echo=False, hide_parameters=True)
+            with bootstrap.begin() as conn:
+                conn.execute(text('CREATE SCHEMA "' + schema + '"'))
+            def drop_test_schema():
+                try:
+                    with bootstrap.begin() as conn:
+                        conn.execute(text('DROP SCHEMA "' + schema + '" CASCADE'))
+                finally:
+                    bootstrap.dispose()
+            self.addCleanup(drop_test_schema)
+            database_url = parsed.update_query_dict({"options": "-csearch_path="+schema}).render_as_string(hide_password=False)
+        self.settings = Settings(Path(self.tmp.name), auth_mode="local-test", database_url=database_url)
+        self.app = create_app(self.settings)
+        self.client = TestClient(self.app)
+        self.client.__enter__()
+        self.addCleanup(self.client.__exit__, None, None, None)
+
+    def login(self, who="superdan"):
+        response = self.client.post("/api/auth/login", json={"username": who})
+        self.assertEqual(response.status_code, 200, response.text)
+
+    def setup_project(self, ident="story-one"):
+        self.login()
+        r = self.client.post("/v1/projects", json={"project": project(ident)})
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def make_plan(self, **changes):
+        r = self.client.post("/v1/generation-plans", json=generation_request(**changes))
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def test_activity_summary_counts_only_authorized_owner_project(self):
+        self.setup_project()
+        plan = self.make_plan()
+        response = self.client.post("/v1/jobs", json={"plan_id": plan["plan_id"]},
+            headers={"Idempotency-Key": "activity-summary-one"})
+        self.assertEqual(response.status_code, 202)
+        summary = self.client.get("/v1/activity-summary", params={"client_project_id": "story-one"})
+        self.assertEqual(summary.status_code, 200, summary.text)
+        self.assertEqual(summary.json()["total"], 1)
+        self.assertEqual(summary.json()["counts"]["blocked"], 1)
+        self.assertNotIn("prompt", summary.text)
+        self.login("supervan")
+        self.assertEqual(self.client.get("/v1/activity-summary", params={"client_project_id": "story-one"}).status_code, 404)
+        self.client.post("/v1/projects", json={"project": project()}).raise_for_status()
+        self.assertEqual(self.client.get("/v1/activity-summary", params={"client_project_id": "story-one"}).json()["total"], 0)
+        token = secrets.token_urlsafe(32)
+        self.app.state.auth.register_client("activity-scope-test", token, "superdan", ["story-one"], ["projects:read"])
+        headers = {"Authorization": "Bearer "+token}
+        self.assertEqual(self.client.get("/v1/activity-summary", params={"client_project_id": "story-one"}, headers=headers).status_code, 404)
+
+    def test_auth_required_and_bad_host_origin(self):
+        self.assertEqual(self.client.get("/v1/projects").status_code, 401)
+        self.assertEqual(self.client.get("/healthz", headers={"host": "attacker.example"}).status_code, 400)
+        self.assertEqual(self.client.post("/api/auth/login", json={"username": "superdan"},
+            headers={"origin": "https://attacker.example"}).status_code, 403)
+        self.login()
+        self.assertEqual(self.client.get("/api/auth/me").json()["username"], "superdan")
+        self.client.post("/api/auth/logout")
+        self.assertEqual(self.client.get("/api/auth/me").status_code, 401)
+
+    def test_character_studio_look_bindings_save_and_invalidate_source(self):
+        self.login()
+        value = project()
+        actor = dict(id="actor-one", type="character", parentId=None, title="Traveller", description="A traveller",
+            version=1, order=0, status="draft", data={"looks": [{"id": "look-rain", "name": "Raincoat", "description": "Blue coat",
+                "version": 1, "gallery": {"front": "portrait-one"}}]})
+        picture = dict(id="portrait-one", type="image", parentId=None, title="Portrait", description="Reference",
+            version=1, order=0, status="draft", data={"fileId": "local-file-one"})
+        value["entities"].extend((actor, picture))
+        value["entities"][1]["data"]["cast"] = [{"characterId": "actor-one", "lookId": "look-rain"}]
+        r = self.client.post("/v1/projects", json={"project": value})
+        self.assertEqual(r.status_code, 201, r.text)
+        plan = self.make_plan()
+        # A changed image in the character look is relevant even without a
+        # visible reference edge or a manually incremented scene/shot version.
+        value["entities"][-1]["data"]["fileId"] = "local-file-two"
+        self.assertEqual(self.client.put("/v1/projects/story-one", json={"project": value, "expected_version": 1}).status_code, 200)
+        self.assertEqual(self.client.post("/v1/jobs", json={"plan_id": plan["plan_id"]},
+            headers={"Idempotency-Key": "old-character-reference"}).status_code, 409)
+        value["entities"][1]["data"]["cast"][0]["lookId"] = "missing-look"
+        self.assertEqual(self.client.put("/v1/projects/story-one", json={"project": value, "expected_version": 2}).status_code, 422)
+
+    def test_projects_version_conflict_and_two_user_isolation(self):
+        created = self.setup_project()
+        self.assertEqual(created["version"], 1)
+        modified = project()
+        modified["title"] = "Updated"
+        r = self.client.put("/v1/projects/story-one", json={"project": modified, "expected_version": 1})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["version"], 2)
+        self.assertEqual(self.client.put("/v1/projects/story-one", json={"project": project(),
+            "expected_version": 1}).status_code, 409)
+        self.login("supervan")
+        self.assertEqual(self.client.get("/v1/projects").json(), {"projects": []})
+        self.assertEqual(self.client.get("/v1/projects/story-one").status_code, 404)
+        # Names and local IDs can coincide; the owner remains part of the namespace.
+        self.assertEqual(self.client.post("/v1/projects", json={"project": project()}).status_code, 201)
+        self.assertEqual(self.client.get("/v1/projects/story-one").json()["version"], 1)
+
+    def test_blocked_plan_job_is_idempotent_and_private(self):
+        self.setup_project()
+        plan = self.make_plan()
+        self.assertEqual(plan["status"], "blocked")
+        self.assertIsNone(plan["estimate"]["cost_microusd"])
+        self.assertEqual(plan["effective_request"]["seed"], "18446744073709551615")
+        headers = {"Idempotency-Key": "one-click"}
+        a = self.client.post("/v1/jobs", json={"plan_id": plan["plan_id"]}, headers=headers)
+        self.assertEqual(a.status_code, 202, a.text)
+        b = self.client.post("/v1/jobs", json={"plan_id": plan["plan_id"]}, headers=headers)
+        self.assertEqual(a.json()["id"], b.json()["id"])
+        self.assertFalse(b.json()["created"])
+        self.assertEqual(a.json()["status"], "blocked")
+        self.login("supervan")
+        self.assertEqual(self.client.get("/v1/jobs/"+a.json()["id"]).status_code, 404)
+        self.assertEqual(self.client.post("/v1/jobs/"+a.json()["id"]+"/cancel").status_code, 404)
+        self.assertEqual(self.client.post("/v1/jobs", json={"plan_id": plan["plan_id"]}, headers=headers).status_code, 404)
+
+    def test_plan_rejects_edited_shot_and_hidden_controls(self):
+        self.setup_project()
+        plan = self.make_plan()
+        changed = project()
+        changed["entities"][2]["version"] = 2
+        self.client.put("/v1/projects/story-one", json={"project": changed, "expected_version": 1})
+        self.assertEqual(self.client.post("/v1/jobs", json={"plan_id": plan["plan_id"]},
+            headers={"Idempotency-Key": "late-click"}).status_code, 409)
+        self.assertEqual(self.client.post("/v1/generation-plans", json=generation_request(
+            controls={"audio_decode": "tiled"})).status_code, 422)
+        self.assertEqual(self.client.post("/v1/generation-plans", json=generation_request(
+            controls={"mystery": "silently-ignore"})).status_code, 422)
+
+    def test_private_upload_real_normalization_ranges_and_foreign_reference(self):
+        self.setup_project()
+        raw = png()
+        r = self.client.post("/v1/assets", data={"client_project_id": "story-one", "client_asset_id": "local-one"},
+                             files={"file": ("人像.png", raw, "image/png")})
+        self.assertEqual(r.status_code, 201, r.text)
+        asset = r.json()
+        self.assertTrue(asset["metadata"]["model_ready"])
+        self.assertNotIn("original", asset)
+        download = self.client.get(asset["content_url"])
+        self.assertEqual(download.content, raw)
+        attachment = self.client.get(asset["content_url"]+"?download=1")
+        self.assertEqual(attachment.content, raw)
+        self.assertTrue(attachment.headers["content-disposition"].startswith("attachment;"))
+        self.assertTrue(download.headers["content-disposition"].startswith("inline;"))
+        partial = self.client.get(asset["content_url"], headers={"Range": "bytes=2-6"})
+        self.assertEqual(partial.status_code, 206)
+        self.assertEqual(partial.content, raw[2:7])
+        self.assertEqual(self.client.head(asset["content_url"]).headers["content-length"], str(len(raw)))
+        self.assertEqual(self.client.get(asset["content_url"], headers={"Range": "bytes=100000-"}).status_code, 416)
+        self.make_plan(inputs={"first_frame": asset["id"]})
+        self.login("supervan")
+        self.client.post("/v1/projects", json={"project": project()})
+        self.assertEqual(self.client.get(asset["content_url"]).status_code, 404)
+        self.assertEqual(self.client.get(asset["content_url"]+"?download=1").status_code, 404)
+        self.assertEqual(self.client.post("/v1/generation-plans", json=generation_request(
+            inputs={"first_frame": asset["id"]})).status_code, 404)
+
+    def test_rejected_upload_never_becomes_ready(self):
+        self.setup_project()
+        r = self.client.post("/v1/assets", data={"client_project_id": "story-one"},
+                             files={"file": ("fake.png", b"not an image", "image/png")})
+        self.assertEqual(r.status_code, 422, r.text)
+        entries = self.client.get("/v1/assets", params={"client_project_id": "story-one"}).json()["assets"]
+        self.assertEqual(entries[0]["status"], "failed")
+        self.assertEqual(self.client.get(entries[0]["content_url"]).status_code, 409)
+
+    def test_service_client_scopes_and_rotation(self):
+        self.setup_project()
+        token = secrets.token_urlsafe(32)
+        self.app.state.auth.register_client("yingxu-test", token, "superdan", ["story-one"], ["projects:read"])
+        auth = {"Authorization": "Bearer "+token}
+        self.client.cookies.clear()
+        self.assertEqual(self.client.get("/v1/projects/story-one", headers=auth).status_code, 200)
+        self.assertEqual(self.client.post("/v1/generation-plans", json=generation_request(), headers=auth).status_code, 404)
+        self.assertEqual(self.client.post("/v1/projects", json={"project": project("new")}, headers=auth).status_code, 403)
+        self.app.state.auth.register_client("yingxu-test", secrets.token_urlsafe(32), "superdan", ["story-one"], ["projects:read"])
+        self.assertEqual(self.client.get("/v1/projects/story-one", headers=auth).status_code, 401)
+
+    def test_login_attempt_limit(self):
+        for _ in range(5):
+            self.assertEqual(self.client.post("/api/auth/login", json={"username": "invalid"}).status_code, 401)
+        self.assertEqual(self.client.post("/api/auth/login", json={"username": "superdan"}).status_code, 429)
+
+    def test_machine_list_pagination_filters_before_sql_limit(self):
+        self.login()
+        for ident in ("allowed-one", "allowed-two", "private-one", "private-two"):
+            self.client.post("/v1/projects", json={"project": project(ident)}).raise_for_status()
+            plan = self.make_plan(project_id=ident)
+            self.client.post("/v1/jobs", json={"plan_id": plan["plan_id"]},
+                headers={"Idempotency-Key": "page-"+ident}).raise_for_status()
+        token = secrets.token_urlsafe(32)
+        self.app.state.auth.register_client("paged-client", token, "superdan", ["allowed-one", "allowed-two"],
+            ["projects:read", "jobs:read"])
+        headers = {"Authorization": "Bearer "+token}
+        for path, key, field in (("/v1/projects", "projects", "id"), ("/v1/jobs", "jobs", "project_id")):
+            pages = [self.client.get(path, params={"limit": 1, "offset": n}, headers=headers).json()[key] for n in range(3)]
+            self.assertEqual([len(page) for page in pages], [1, 1, 0])
+            self.assertEqual({page[0][field] for page in pages[:2]}, {"allowed-one", "allowed-two"})
+            for invalid in ({"limit": 101}, {"limit": 0}, {"offset": -1}):
+                self.assertEqual(self.client.get(path, params=invalid, headers=headers).status_code, 422)
+        self.app.state.auth.register_client("paged-client", token, "superdan", ["allowed-one", "allowed-two"], ["projects:read"])
+        self.assertEqual(self.client.get("/v1/jobs", headers=headers).json(), {"jobs": []})
+
+    def test_stale_browser_account_cannot_overwrite_new_owners_same_project_id(self):
+        self.setup_project()
+        stale_draft = project()
+        stale_draft["title"] = "superdan unsaved work"
+        self.login("supervan")
+        self.client.post("/v1/projects", json={"project": project()}).raise_for_status()
+        response = self.client.put("/v1/projects/story-one", json={"project": stale_draft, "expected_version": 1},
+            headers={"X-Expected-Account": "superdan"})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "account_context_changed")
+        self.assertEqual(response.headers["x-authenticated-account"], "supervan")
+        response = self.client.get("/v1/projects/story-one", headers={"X-Expected-Account": "supervan"})
+        self.assertEqual(response.headers["x-authenticated-account"], "supervan")
+        self.assertEqual(response.json()["version"], 1)
+        self.assertEqual(response.json()["project"]["title"], "测试短剧")
+        uploaded = self.client.post("/v1/assets", headers={"X-Expected-Account": "superdan"},
+            data={"client_project_id": "story-one"}, files={"file": ("old-account.png", png(), "image/png")})
+        self.assertEqual(uploaded.status_code, 409)
+        self.assertEqual(self.client.get("/v1/assets?client_project_id=story-one").json()["assets"], [])
+
+    def test_machine_identity_is_not_reinterpreted_by_browser_expected_account_header(self):
+        self.setup_project()
+        token = secrets.token_urlsafe(32)
+        self.app.state.auth.register_client("expected-header", token, "superdan", ["story-one"], ["projects:read"])
+        self.login("supervan")
+        response = self.client.get("/v1/projects/story-one", headers={"Authorization": "Bearer "+token, "X-Expected-Account": "supervan"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["x-authenticated-account"], "superdan")
+
+    def test_unchanged_manual_version_still_invalidates_changed_content(self):
+        self.setup_project()
+        old = self.make_plan()
+        accepted = self.client.post("/v1/jobs", json={"plan_id": old["plan_id"]}, headers={"Idempotency-Key": "accepted"}).json()
+        changed = project()
+        changed["entities"][1]["description"] = "The scene and costume are different now"
+        self.assertEqual(self.client.put("/v1/projects/story-one", json={"project": changed, "expected_version": 1}).status_code, 200)
+        self.assertEqual(self.client.post("/v1/jobs", json={"plan_id": old["plan_id"]}, headers={"Idempotency-Key": "new-click"}).status_code, 409)
+        retry = self.client.post("/v1/jobs", json={"plan_id": old["plan_id"]}, headers={"Idempotency-Key": "accepted"})
+        self.assertEqual(retry.status_code, 202)
+        self.assertEqual(retry.json()["id"], accepted["id"])
+
+    def test_forged_chapter_and_scene_sources_rejected(self):
+        self.setup_project()
+        body = generation_request()
+        body["client_ref"]["scene_id"] = "some-other-scene"
+        self.assertEqual(self.client.post("/v1/generation-plans", json=body).status_code, 409)
+
+    def test_batch_resume_cancel_and_owner_isolation(self):
+        self.setup_project()
+        plan = self.make_plan()
+        body = {"client_project_id": "story-one", "plan_ids": [plan["plan_id"], "no-such-plan"]}
+        head = {"Idempotency-Key": "batch-one"}
+        response = self.client.post("/v1/batches", json=body, headers=head)
+        self.assertEqual(response.status_code, 202, response.text)
+        batch = response.json()
+        self.assertEqual(batch["items"][0]["status"], "blocked")
+        self.assertEqual(batch["items"][1]["status"], "rejected")
+        again = self.client.post("/v1/batches", json=body, headers=head).json()
+        self.assertEqual(batch["id"], again["id"])
+        self.assertEqual(batch["items"][0]["job_id"], again["items"][0]["job_id"])
+        self.assertEqual(len(self.client.get("/v1/batches", params={"client_project_id": "story-one"}).json()["batches"]), 1)
+        bad = {**body, "plan_ids": [plan["plan_id"]]}
+        self.assertEqual(self.client.post("/v1/batches", json=bad, headers=head).status_code, 409)
+        cancelled = self.client.post("/v1/batches/"+batch["id"]+"/cancel")
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["items"][0]["status"], "cancelled")
+        self.login("supervan")
+        self.assertEqual(self.client.get("/v1/batches/"+batch["id"]).status_code, 404)
+        self.assertEqual(self.client.post("/v1/batches/"+batch["id"]+"/cancel").status_code, 404)
+
+    def test_streaming_limit_without_content_length(self):
+        self.login()
+        body = (b' ' * 9000 for _ in range(2))
+        r = self.client.post("/api/auth/login", content=body, headers={"Content-Type": "application/json"})
+        self.assertEqual(r.status_code, 413, r.text)
+
+    def test_different_tenant_rejects_same_session_and_machine_token(self):
+        self.setup_project()
+        from studio_platform.auth import Auth
+        other = Auth(self.app.state.repository.engine, tenant="different", mode="local-test")
+        browser = other.login("superdan", "")
+        self.assertIsNone(self.app.state.auth.session(browser))
+        token = secrets.token_urlsafe(32)
+        other.register_client("other-client", token, "superdan", ["story-one"], ["projects:read"])
+        self.assertIsNone(self.app.state.auth.bearer(token))
+
+    def test_public_settings_refuse_insecure_auth_and_mock(self):
+        with self.assertRaises(ValueError):
+            Settings(Path(self.tmp.name), public_origin="https://www.sixnine.art", auth_mode="local-test")
+        with self.assertRaises(ValueError):
+            Settings(Path(self.tmp.name), public_origin="https://www.sixnine.art", execution_backend="mock")
+
+
+if __name__ == "__main__":
+    unittest.main()

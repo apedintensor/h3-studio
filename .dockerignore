@@ -14,3 +14,20 @@
 !web/app.js
 !web/styles.css
 !web/h3-ref-bf16-workflow.json
+
+# Separate v1 image inputs. No runtime directories or central vault are included.
+!Dockerfile.platform
+!platform_app.py
+!studio_platform/
+!studio_platform/*.py
+!yingxu/
+!yingxu/package.json
+!yingxu/package-lock.json
+!yingxu/index.html
+!yingxu/vite.config.js
+!yingxu/source-manifest.json
+!yingxu/src/
+!yingxu/src/*.js
+!yingxu/src/*.jsx
+!yingxu/src/*.css
+!yingxu/src/*.json

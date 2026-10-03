@@ -1,0 +1,78 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Sixnine CPU host only. No application bootstrap, credentials, DNS or GPU resources. Review cost and restore plan before deployment.",
+  "Metadata": {
+    "AWSToolsMetrics": {"AWSAgentToolkit": "aws-cloudformation@3"},
+    "com.aws.cloudformation.Context": {
+      "ref": [{"at": "deploy/platform/INFRASTRUCTURE.zh-CN.md", "has": "region and cost evidence, release constraints and retention risks"}],
+      "must": ["CPU only; no credentials, DNS mutation or GPU creation", "Review retained resources separately before stopping billing"]
+    },
+    "Sixnine": {
+      "Scope": "Reviewed infrastructure draft; not deployed",
+      "RegionEvidenceDate": "2026-10-04",
+      "RuntimeGuide": "deploy/platform/README.zh-CN.md",
+      "RetentionWarning": "Retained instance and IP can continue billing after stack deletion. Local database/media require separate consistent backups."
+    }
+  },
+  "Parameters": {
+    "InstanceName": {"Type": "String", "AllowedPattern": "sixnine-[a-z0-9-]{1,40}", "Description": "A new reviewed instance name; do not reuse an existing workload name."},
+    "AvailabilityZone": {"Type": "String", "AllowedPattern": "ap-southeast-[12][a-z]", "Description": "Confirm availability through Lightsail GetRegions with includeAvailabilityZones=true."},
+    "Capacity": {"Type": "String", "AllowedValues": ["control8gb", "cpu16gb"], "Description": "Explicit capacity choice: 8GiB/2vCPU for control plane or 16GiB/4vCPU for initial CPU work. No GPU."},
+    "KeyPairName": {"Type": "String", "MinLength": 1, "MaxLength": 255, "AllowedPattern": "[A-Za-z0-9_.-]+", "Description": "Existing regional Lightsail key-pair NAME; never private key content."},
+    "AdminIpv4Cidr": {"Type": "String", "AllowedPattern": "(?:[0-9]{1,3}\\.){3}[0-9]{1,3}/32", "Description": "One approved public administrator or fixed runner IPv4 address /32. Never 0.0.0.0/0."},
+    "DailySnapshot": {"Type": "String", "AllowedValues": ["disabled", "enabled"], "Default": "disabled", "Description": "Separately billed disk snapshots; not a consistent application backup or an off-account backup."}
+  },
+  "Mappings": {
+    "RegionalBundles": {
+      "ap-southeast-1": {"control8gb": "large_3_0", "cpu16gb": "xlarge_3_0"},
+      "ap-southeast-2": {"control8gb": "large_3_2", "cpu16gb": "xlarge_3_2"}
+    }
+  },
+  "Rules": {
+    "SupportedRegion": {"Assertions": [{"Assert": {"Fn::Contains": [["ap-southeast-1", "ap-southeast-2"], {"Ref": "AWS::Region"}]}, "AssertDescription": "This reviewed bundle mapping is only for Singapore or Sydney."}]}
+  },
+  "Conditions": {"SnapshotsEnabled": {"Fn::Equals": [{"Ref": "DailySnapshot"}, "enabled"]}},
+  "Resources": {
+    "WebHost": {
+      "Type": "AWS::Lightsail::Instance",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Keep the initial private database and application together; separate GPU workers scale independently.",
+        "must": ["SSH limited to the confirmed administrator address", "Preserve local database and media before replacement", "Use a reviewed regional offer and existing public key pair"],
+        "mutable": "review-required"
+      }},
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "InstanceName": {"Ref": "InstanceName"},
+        "AvailabilityZone": {"Ref": "AvailabilityZone"},
+        "BlueprintId": "ubuntu_24_04",
+        "BundleId": {"Fn::FindInMap": ["RegionalBundles", {"Ref": "AWS::Region"}, {"Ref": "Capacity"}]},
+        "KeyPairName": {"Ref": "KeyPairName"},
+        "Networking": {"Ports": [
+          {"FromPort": 22, "ToPort": 22, "Protocol": "tcp", "AccessDirection": "inbound", "Cidrs": [{"Ref": "AdminIpv4Cidr"}], "Ipv6Cidrs": []},
+          {"FromPort": 80, "ToPort": 80, "Protocol": "tcp", "AccessDirection": "inbound", "Cidrs": ["0.0.0.0/0"], "Ipv6Cidrs": []},
+          {"FromPort": 443, "ToPort": 443, "Protocol": "tcp", "AccessDirection": "inbound", "Cidrs": ["0.0.0.0/0"], "Ipv6Cidrs": []},
+          {"FromPort": 443, "ToPort": 443, "Protocol": "udp", "AccessDirection": "inbound", "Cidrs": ["0.0.0.0/0"], "Ipv6Cidrs": []}
+        ]},
+        "AddOns": {"Fn::If": ["SnapshotsEnabled", [{"AddOnType": "AutoSnapshot", "Status": "Enabled", "AutoSnapshotAddOnRequest": {"SnapshotTimeOfDay": "16:00"}}], {"Ref": "AWS::NoValue"}]},
+        "Tags": [{"Key": "Project", "Value": "sixnine"}, {"Key": "Role", "Value": "cpu-control-plane"}, {"Key": "ManagedBy", "Value": "cloudformation"}]
+      }
+    },
+    "PublicAddress": {
+      "Type": "AWS::Lightsail::StaticIp",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Keep the DNS target stable across ordinary host restarts.",
+        "must": ["Attach to one reviewed host only", "Review DNS before changing attachment", "Retained detached IP can continue billing"],
+        "mutable": "review-required"
+      }},
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {"AttachedTo": {"Ref": "WebHost"}, "StaticIpName": {"Fn::Sub": "${InstanceName}-ipv4"}}
+    }
+  },
+  "Outputs": {
+    "InstanceName": {"Value": {"Ref": "WebHost"}},
+    "StaticIpv4": {"Value": {"Fn::GetAtt": ["PublicAddress", "IpAddress"]}, "Description": "Proposed DNS A record target only; template does not change DNS."},
+    "SiteUrl": {"Value": "https://www.sixnine.art", "Description": "Intended public URL, not evidence that the site is online."}
+  }
+}

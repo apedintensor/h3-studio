@@ -1,0 +1,462 @@
+"""Temporary SQLite/media tests and opt-in isolated real PostgreSQL drill."""
+import hashlib
+from contextlib import closing
+import io
+import json
+import os
+from pathlib import Path
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import unittest
+import uuid
+from unittest import mock
+
+from sqlalchemy import insert
+
+from studio_platform.backup import backup_local, verify_local, restore_local, dump_postgres, BackupError
+from studio_platform.assets import AssetService, AssetNotFound
+from studio_platform.auth import Auth, accounts, sessions, clients
+from studio_platform.repository import Repository, Scope
+from studio_platform.queue import TaskQueue
+from studio_platform.storage import LocalObjectStore
+from test_platform_assets import png
+
+
+class BackupTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="sixnine-backup-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.live = self.root/"live"
+        self.live.mkdir()
+        self.database = self.live/"platform.sqlite3"
+        self.repo = Repository("sqlite:///"+self.database.as_posix())
+        self.addCleanup(self.repo.close)
+        self.repo.create_schema()
+        self.scope = Scope("sixnine", "superdan", "my-project")
+        self.store = LocalObjectStore(self.live/"objects")
+        self.assets = AssetService(self.repo.engine, self.store, self.live, max_bytes=1024*1024)
+        self.asset = self.assets.upload("superdan", "my-project", io.BytesIO(png()), "scene.png")
+        self.repo.put_document(self.scope, "project", "my-project", {"title": "Example chapter", "asset_id": self.asset["id"]})
+        plan = self.repo.create_plan(self.scope, {"prompt": "protected creative draft"},
+            {"pool": "test-pool", "enabled": True}, expires_at=9999999999, estimated_cost_microusd=0)
+        self.job = self.repo.create_job(self.scope, plan["id"], "unfinished")
+        self.repo.configure_capacity(max_instances=2, max_physical_gpus=2)
+        auth = Auth(self.repo.engine)
+        self.canary = "fake-auth-secret-must-not-enter-backup"
+        with self.repo.engine.begin() as conn:
+            conn.execute(insert(accounts).values(tenant="sixnine", username="superdan", password_hash=self.canary, disabled=0, updated=1))
+            conn.execute(insert(sessions).values(tenant="sixnine", token_hash=self.canary, username="superdan",
+                auth_mode="password", created=1, expires=9999999999, password_version=1))
+            conn.execute(insert(clients).values(tenant="sixnine", id="fake-client", token_hash=self.canary,
+                owner="superdan", projects='["my-project"]', scopes='["read"]', disabled=0))
+        (self.live/".env").write_text("FAKE_API_KEY="+self.canary)
+        patch = mock.patch.object(socket.socket, "connect", side_effect=AssertionError("No network in backup tests"))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def backup(self):
+        destination = self.root/"backup"
+        result = backup_local(self.database, self.store.root, destination)
+        self.assertEqual(result["state"], "backed_up")
+        return destination
+
+    def test_real_asset_project_backup_and_isolated_restore_preserve_owner_and_disable_jobs(self):
+        source = self.backup()
+        manifest = verify_local(source)
+        from studio_platform.backup_cli import main as runtime_main
+        from tools.backup_platform import main as script_main
+        self.assertIs(runtime_main, script_main)
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            self.assertEqual(runtime_main(["verify", "--backup", str(source)]), 0)
+        self.assertEqual(json.loads(output.getvalue())["state"], "verified")
+        self.assertNotIn(str(source), output.getvalue())
+        self.assertEqual(len(manifest["objects"]), 2)
+        destination = self.root/"recovered"
+        result = restore_local(source, destination)
+        self.assertEqual(result["held_jobs"], 1)
+        self.assertFalse(result["execution_enabled"])
+        restored = Repository("sqlite:///"+(destination/"platform.sqlite3").as_posix())
+        self.addCleanup(restored.close)
+        store = LocalObjectStore(destination/"objects")
+        service = AssetService(restored.engine, store, destination)
+        asset = service.get("superdan", self.asset["id"])
+        with store.open(asset["original"]["key"]) as data:
+            self.assertEqual(data.read(), png())
+        with self.assertRaises(AssetNotFound):
+            service.get("supervan", self.asset["id"])
+        self.assertEqual(restored.get_document(self.scope, "project", "my-project")["payload"]["title"], "Example chapter")
+        held = restored.get_job(self.scope, self.job["id"])
+        self.assertEqual(held["status"], "recovery_hold")
+        self.assertFalse(held["execution_plan"]["enabled"])
+        self.assertIsNone(TaskQueue(restored).claim("must-not-run", "test-pool"))
+        self.assertFalse(Auth(restored.engine).ready())
+        self.assertEqual(self.repo.get_job(self.scope, self.job["id"])["status"], "queued")
+
+    def test_no_auth_rows_or_secret_files_ever_written_to_backup_database(self):
+        source = self.backup()
+        self.assertNotIn(self.canary.encode(), (source/"database.sqlite3").read_bytes())
+        self.assertNotIn(self.canary, (source/"manifest.json").read_text(encoding="utf-8"))
+        with closing(sqlite3.connect(source/"database.sqlite3")) as db:
+            names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertFalse(names & {"platform_accounts", "platform_sessions", "platform_service_clients"})
+        self.assertEqual({p.name for p in source.iterdir()}, {"database.sqlite3", "media", "manifest.json"})
+        self.assertTrue((self.live/".env").exists())
+        if os.name != "nt":
+            self.assertEqual(source.stat().st_mode & 0o077, 0)
+            self.assertEqual((source/"database.sqlite3").stat().st_mode & 0o077, 0)
+
+    def test_wal_committed_changes_are_in_consistent_snapshot(self):
+        connection = sqlite3.connect(self.database)
+        self.addCleanup(connection.close)
+        self.assertEqual(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        connection.execute("UPDATE platform_jobs SET error_code='committed-in-wal' WHERE id=?", (self.job["id"],))
+        connection.commit()
+        source = self.backup()
+        with closing(sqlite3.connect(source/"database.sqlite3")) as db:
+            self.assertEqual(db.execute("SELECT error_code FROM platform_jobs WHERE id=?", (self.job["id"],)).fetchone()[0], "committed-in-wal")
+
+    def test_existing_target_never_overwritten_and_no_source_database_change(self):
+        source = self.backup()
+        marker = self.live/"preserve.txt"
+        marker.write_text("preserve")
+        with self.assertRaises(BackupError):
+            restore_local(source, self.live)
+        self.assertEqual(marker.read_text(), "preserve")
+        with self.assertRaises(BackupError):
+            backup_local(self.database, self.store.root, source)
+        self.assertEqual(verify_local(source)["kind"], "sixnine-local-business-backup")
+
+    def test_corrupted_media_and_manifest_path_rejected_before_restore_directory(self):
+        source = self.backup()
+        manifest = verify_local(source)
+        target = source/"media"/manifest["objects"][0]["file"]
+        original = target.read_bytes()
+        target.write_bytes(b"corrupt")
+        with self.assertRaises(BackupError):
+            restore_local(source, self.root/"must-not-exist")
+        self.assertFalse((self.root/"must-not-exist").exists())
+        target.write_bytes(original)
+        manifest["objects"][0]["file"] = "../../outside"
+        (source/"manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        with self.assertRaises(BackupError):
+            verify_local(source)
+
+    def test_missing_referenced_object_does_not_publish_success_manifest(self):
+        asset = self.assets.get("superdan", self.asset["id"])
+        self.store.delete(asset["model"]["key"])
+        with self.assertRaises(BackupError):
+            self.backup()
+        self.assertFalse((self.root/"backup"/"manifest.json").exists())
+
+    def test_unknown_table_requires_review_instead_of_copying_possible_secret(self):
+        with closing(sqlite3.connect(self.database)) as db, db:
+            db.execute("CREATE TABLE unreviewed_secrets(value TEXT)")
+            db.execute("INSERT INTO unreviewed_secrets VALUES (?)", (self.canary,))
+        with self.assertRaises(BackupError):
+            self.backup()
+        self.assertFalse((self.root/"backup").exists())
+
+    def test_pg_dump_credentials_only_in_child_memory_no_auth_tables_or_argv_secrets(self):
+        url_file = self.root/"protected-url"
+        url_file.write_text("postgresql+psycopg://testuser:fake-db-private@127.0.0.1:5432/sixnine_test")
+        url_file.chmod(0o600)
+        original = subprocess.run
+        observed = []
+        def fake(command, **kwargs):
+            if command[0] != "fake-pg-dump":
+                return original(command, **kwargs)  # Windows ACL commands only.
+            observed.append(command)
+            self.assertFalse(any("fake-db-private" in argument for argument in command))
+            self.assertEqual(kwargs["env"]["PGPASSWORD"], "fake-db-private")
+            self.assertNotIn("PGSERVICE", kwargs["env"])
+            self.assertFalse(any(any(name in item for name in ("platform_accounts", "platform_sessions", "platform_service_clients")) for item in command))
+            output = Path(next(item[7:] for item in command if item.startswith("--file=")))
+            output.write_bytes(b"fake-custom-format-archive")
+            return subprocess.CompletedProcess(command, 0)
+        with mock.patch("studio_platform.backup.subprocess.run", side_effect=fake):
+            result = dump_postgres(url_file, self.root/"pg-backup", pg_dump="fake-pg-dump")
+        self.assertEqual(len(observed), 1)
+        self.assertFalse(result["restore_verified"])
+        self.assertFalse(result["media_included"])
+        self.assertNotIn(b"fake-db-private", (self.root/"pg-backup"/"manifest.json").read_bytes())
+        with self.assertRaises(BackupError):
+            restore_local(self.root/"pg-backup", self.root/"not-a-local-backup")
+
+    def test_pg_errors_are_generic_and_missing_explicit_host_does_not_start_process(self):
+        url_file = self.root/"protected-url"
+        url_file.write_text("postgresql://user:fake-secret@/database")
+        url_file.chmod(0o600)
+        with mock.patch("studio_platform.backup.subprocess.run", side_effect=AssertionError("No default host fallback")):
+            with self.assertRaises(BackupError) as caught:
+                dump_postgres(url_file, self.root/"not-created")
+        self.assertNotIn("fake-secret", str(caught.exception))
+        self.assertFalse((self.root/"not-created").exists())
+
+    def test_private_compose_dsn_requires_explicit_exact_network_opt_in(self):
+        from studio_platform.backup import _postgres_environment
+        source = self.root/"synthetic-private-url"
+        original = "postgresql+psycopg://sixnine_app:synthetic-private-password-only@db:5432/sixnine"
+        source.write_text(original)
+        source.chmod(0o600)
+        with self.assertRaises(BackupError):
+            _postgres_environment(source)
+        environment = _postgres_environment(source, private_platform_network=True)
+        self.assertEqual(environment["PGSSLMODE"], "disable")
+        self.assertEqual(environment["PGHOST"], "db")
+        for value in (original.replace("@db:", "@other-host:"), original.replace("sixnine_app:", "postgres:"),
+                      original.replace(":5432/", ":6543/"), original+"?sslmode=disable"):
+            source.write_text(value)
+            with self.assertRaises(BackupError):
+                _postgres_environment(source, private_platform_network=True)
+
+    def test_remote_database_cannot_disable_tls_via_url_query(self):
+        from studio_platform.backup import _postgres_environment
+        source = self.root/"synthetic-remote-url"
+        source.touch()
+        source.chmod(0o600)
+        for hostname in ("remote.example", "10.0.0.5", "db"):
+            source.write_text("postgresql://testuser:fake-tls-secret@"+hostname+":5432/sixnine_test?sslmode=disable")
+            with self.subTest(hostname=hostname), self.assertRaises(BackupError) as caught:
+                _postgres_environment(source)
+            self.assertNotIn("fake-tls-secret", str(caught.exception))
+        source.write_text("postgresql://testuser:fake-tls-secret@remote.example:5432/sixnine_test?sslmode=verify-full")
+        self.assertEqual(_postgres_environment(source)["PGSSLMODE"], "verify-full")
+        source.write_text("postgresql://testuser:fake-tls-secret@127.0.0.1:5432/sixnine_test?sslmode=disable")
+        self.assertEqual(_postgres_environment(source)["PGSSLMODE"], "disable")
+
+    def test_inflight_upstream_evidence_survives_but_restore_never_reclaims_job(self):
+        queue = TaskQueue(self.repo)
+        claim = queue.claim("old-worker", "test-pool")
+        queue.begin_submission(claim.lease)
+        queue.record_submitted(claim.lease, "fake-upstream-still-needs-reconciliation")
+        source = self.backup()
+        destination = self.root/"restored-unknown"
+        restore_local(source, destination)
+        restored = Repository("sqlite:///"+(destination/"platform.sqlite3").as_posix())
+        self.addCleanup(restored.close)
+        job = restored.get_job(self.scope, self.job["id"])
+        self.assertEqual(job["status"], "recovery_hold")
+        self.assertGreater(job["fence"], claim.lease.fence)
+        self.assertIsNone(job["lease_worker_id"])
+        attempt = TaskQueue(restored).get_attempt(self.scope, self.job["id"])
+        self.assertEqual(attempt["upstream_task_id"], "fake-upstream-still-needs-reconciliation")
+        self.assertEqual(attempt["upstream_stopped"], 0)
+        self.assertIsNone(TaskQueue(restored).claim("new-worker", "test-pool", purpose="reconcile"))
+
+    def test_restored_capacity_approval_is_disabled_and_waiter_evidence_is_held(self):
+        from sqlalchemy import select, update
+        from studio_platform.repository import capacity_approvals, capacity_cycles, capacity_waiters, jobs, instance_intents, budget_accounts as budgets
+        self.repo.configure_pool("test-pool", max_instances=2, max_physical_gpus=2)
+        self.repo.configure_budget("capacity-backup-budget", tenant_id="sixnine", owner_id="superdan", limit_microusd=1000)
+        intent = self.repo.reserve_instance_intent(self.scope, "test-pool", "fake-capacity-intent",
+            physical_gpus=1, hard_deadline=9999999999, reserved_cost_microusd=23,
+            budget_account_ids=["capacity-backup-budget"], dry_run=False)
+        self.repo.update_instance(intent["id"], "creating")
+        self.repo.update_instance(intent["id"], "creation_unknown")
+        evidence = {"source": "synthetic-test", "provider": "fake", "max_price_microusd": 23}
+        with self.repo.engine.begin() as conn:
+            conn.execute(insert(capacity_approvals).values(id="backup-capacity", tenant_id="sixnine", pool="test-pool",
+                configuration_id="test-config", approval_hash="a"*64, payload=evidence, enabled=1,
+                expires_at=9999999999, created_at=1))
+            conn.execute(insert(capacity_cycles).values(approval_id="backup-capacity", intent_id=intent["id"], created_at=1))
+            conn.execute(insert(capacity_waiters).values(job_id=self.job["id"], approval_id="backup-capacity",
+                approval_hash="a"*64, deadline=9999999999, intent_id=intent["id"], state="waiting", created_at=1))
+            conn.execute(update(jobs).where(jobs.c.id == self.job["id"]).values(status="waiting_capacity"))
+            budget_before = dict(conn.execute(select(budgets).where(budgets.c.id == "capacity-backup-budget")).mappings().one())
+        source = self.backup()
+        target = self.root/"capacity-recovery"
+        restore_local(source, target)
+        restored = Repository("sqlite:///"+(target/"platform.sqlite3").as_posix())
+        self.addCleanup(restored.close)
+        with restored.engine.connect() as conn:
+            approval = conn.execute(select(capacity_approvals)).mappings().one()
+            self.assertEqual(approval["enabled"], 0)
+            self.assertEqual(approval["payload"], evidence)
+            self.assertEqual(approval["expires_at"], 9999999999)
+            waiter = conn.execute(select(capacity_waiters)).mappings().one()
+            self.assertEqual(waiter["state"], "recovery_hold")
+            self.assertEqual(waiter["intent_id"], intent["id"])
+            self.assertEqual((waiter["approval_hash"], waiter["deadline"]), ("a"*64, 9999999999))
+            self.assertEqual(conn.execute(select(capacity_cycles.c.intent_id)).scalar_one(), intent["id"])
+            self.assertEqual(conn.execute(select(instance_intents.c.state)).scalar_one(), "creation_unknown")
+            self.assertEqual(dict(conn.execute(select(budgets).where(budgets.c.id == "capacity-backup-budget")).mappings().one()), budget_before)
+        self.assertEqual(restored.get_job(self.scope, self.job["id"])["status"], "recovery_hold")
+        with self.repo.engine.connect() as conn:
+            self.assertEqual(conn.execute(select(capacity_approvals.c.enabled)).scalar_one(), 1)
+
+    def test_older_backup_without_capacity_tables_restores_with_empty_disabled_defaults(self):
+        source = self.backup()
+        names = ("platform_capacity_waiters", "platform_capacity_cycles", "platform_capacity_approvals")
+        with closing(sqlite3.connect(source/"database.sqlite3")) as db, db:
+            for name in names:
+                db.execute('DROP TABLE "'+name+'"')
+        manifest = json.loads((source/"manifest.json").read_text())
+        for name in names:
+            manifest["tables"].pop(name)
+        manifest["database_sha256"] = hashlib.sha256((source/"database.sqlite3").read_bytes()).hexdigest()
+        (source/"manifest.json").write_text(json.dumps(manifest))
+        verify_local(source)
+        target = self.root/"older-version-recovery"
+        restore_local(source, target)
+        with closing(sqlite3.connect(target/"platform.sqlite3")) as db:
+            for name in names:
+                self.assertEqual(db.execute('SELECT count(*) FROM "'+name+'"').fetchone(), (0,))
+        self.assertEqual(hashlib.sha256((source/"database.sqlite3").read_bytes()).hexdigest(), manifest["database_sha256"])
+
+    def test_real_cpu_simulation_video_artifact_round_trip_keeps_verified_bytes(self):
+        from studio_platform.worker import MockBackend, WorkerRunner
+        from studio_platform.repository import artifacts
+        from sqlalchemy import select
+        plan = self.repo.create_plan(self.scope,
+            {"request": {"duration": 4, "width": 256, "height": 256, "generate_audio": False},
+             "output_spec": {"width": 256, "height": 256}},
+            {"pool": "backup-video", "backend": "mock", "enabled": True},
+            expires_at=9999999999, estimated_cost_microusd=0)
+        job = self.repo.create_job(self.scope, plan["id"], "video-for-backup")
+        work = self.root/"worker"
+        runner = WorkerRunner(self.repo, self.store, work, backend=MockBackend(work/"mock", enabled=True))
+        self.assertEqual(runner.run_once("offline-cpu", "backup-video")["state"], "succeeded")
+        with self.repo.engine.connect() as conn:
+            spec = conn.execute(select(artifacts.c.metadata).where(artifacts.c.job_id == job["id"])).scalar_one()
+        source = self.backup()
+        destination = self.root/"restored-video"
+        restore_local(source, destination)
+        restored_store = LocalObjectStore(destination/"objects")
+        with restored_store.open(spec["object_key"]) as media:
+            self.assertEqual(hashlib.sha256(media.read()).hexdigest(), spec["sha256"])
+
+    def test_hardlinked_backup_media_is_refused(self):
+        source = self.backup()
+        item = verify_local(source)["objects"][0]
+        media = source/"media"/item["file"]
+        os.link(media, self.root/"linked-media")
+        with self.assertRaises(BackupError):
+            verify_local(source)
+
+    @unittest.skipUnless(os.environ.get("SIXNINE_TEST_PG_BACKUP") == "1", "Explicit dedicated PostgreSQL test container only")
+    def test_real_postgres_dump_restore_into_new_database_and_media_manifest(self):
+        from sqlalchemy import MetaData, JSON, Integer
+        from sqlalchemy.schema import CreateTable
+        from sqlalchemy.dialects.postgresql import dialect
+        from studio_platform.backup import _tables
+        container = "sixnine-platform-test-db-20261004"
+        inspected = subprocess.run(["docker", "inspect", "--format", "{{.Name}} {{.Config.Image}} {{.State.Running}}", container],
+            capture_output=True, text=True, timeout=15, check=True)
+        self.assertEqual(inspected.stdout.strip(), "/"+container+" postgres:17-alpine true")
+        suffix = uuid.uuid4().hex
+        schema, target_db = "backup_test_"+suffix, "sixnine_restore_"+suffix
+        self.assertRegex(schema, r"^backup_test_[0-9a-f]{32}$")
+        self.assertRegex(target_db, r"^sixnine_restore_[0-9a-f]{32}$")
+        source_created = target_created = False
+        def run(command, data=None):
+            # Only the configured non-secret role name is loaded. Unix-socket
+            # authentication is internal to this already-authorized test container.
+            result = subprocess.run(["docker", "exec", "-i", "--user", "postgres", container,
+                "sh", "-c", 'export PGUSER="$POSTGRES_USER"; exec "$@"', "backup-test", *command],
+                input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+            self.assertEqual(result.returncode, 0, "Dedicated PG test command failed; no secret output echoed")
+            return result.stdout
+        def sql(database, value):
+            return run(["psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-d", database], value.encode()).decode().strip()
+        queue = TaskQueue(self.repo)
+        claim = queue.claim("lost-test-worker", "test-pool")
+        queue.begin_submission(claim.lease)
+        queue.record_submitted(claim.lease, "fake-postgres-upstream-needs-review")
+        self.repo.configure_pool("test-pool", max_instances=2, max_physical_gpus=2)
+        self.repo.configure_budget("backup-test-budget", tenant_id="sixnine", owner_id="superdan",
+                                   limit_microusd=1000)
+        intent = self.repo.reserve_instance_intent(self.scope, "test-pool", "fake-uncertain-create",
+            physical_gpus=1, hard_deadline=9999999999, reserved_cost_microusd=1,
+            budget_account_ids=["backup-test-budget"], dry_run=False)
+        self.repo.update_instance(intent["id"], "creating")
+        self.repo.update_instance(intent["id"], "creation_unknown")
+        source = self.backup()
+        manifest = verify_local(source)
+        try:
+            sql("sixnine_test", 'CREATE SCHEMA "'+schema+'";')
+            source_created = True
+            copied = MetaData()
+            for table in _tables().values():
+                table.to_metadata(copied, schema=schema)
+            commands = [str(CreateTable(table).compile(dialect=dialect()))+";" for table in copied.sorted_tables]
+            with closing(sqlite3.connect(source/"database.sqlite3")) as snapshot:
+                snapshot.row_factory = sqlite3.Row
+                for table in copied.sorted_tables:
+                    name = table.name
+                    rows = snapshot.execute('SELECT * FROM "'+name+'"').fetchall()
+                    for row in rows:
+                        value = dict(row)
+                        for column in table.columns:
+                            if isinstance(column.type, JSON) and value[column.name] is not None:
+                                value[column.name] = json.loads(value[column.name])
+                        payload = json.dumps(value, ensure_ascii=True).replace("'", "''")
+                        relation = '"'+schema+'"."'+name+'"'
+                        commands.append("INSERT INTO "+relation+" SELECT * FROM json_populate_record(NULL::"+relation+",'"+payload+"');")
+                    if len(table.primary_key.columns) == 1:
+                        column = next(iter(table.primary_key.columns))
+                        if isinstance(column.type, Integer) and rows:
+                            relation = '"'+schema+'"."'+name+'"'
+                            commands.append("SELECT setval(pg_get_serial_sequence('"+relation+"','"+column.name+"'), (SELECT MAX(\""+column.name+'\") FROM '+relation+"));")
+            commands += ['CREATE TABLE "'+schema+'".platform_accounts (secret TEXT);',
+                         'INSERT INTO "'+schema+'".platform_accounts VALUES (\''+self.canary+"');"]
+            sql("sixnine_test", "\n".join(commands))
+            archive = run(["pg_dump", "--dbname=sixnine_test", "--format=custom", "--no-owner", "--no-acl",
+                           "--no-password", "--no-blobs", "--strict-names",
+                           *["--table="+schema+"."+name for name in sorted(_tables())]])
+            self.assertTrue(archive.startswith(b"PGDMP"))
+            (source/"postgres-test.dump").write_bytes(archive)  # Existing private backup ACL.
+            run(["createdb", "--maintenance-db=sixnine_test", target_db])
+            target_created = True
+            sql(target_db, 'CREATE SCHEMA "'+schema+'";')
+            run(["pg_restore", "--dbname="+target_db, "--no-owner", "--no-acl", "--exit-on-error"], archive)
+            self.assertEqual(sql(target_db,
+                "SELECT count(*) FROM information_schema.tables WHERE table_schema='"+schema+"' AND table_name='platform_accounts';"), "0")
+            for name, count in manifest["tables"].items():
+                self.assertEqual(sql(target_db, 'SELECT count(*) FROM "'+schema+'"."'+name+'";'), str(count))
+            # Validate real restored PG media references against the same immutable
+            # manifest and byte copies selected from the consistent source snapshot.
+            records = sql(target_db, 'SELECT record FROM "'+schema+'".platform_assets;').splitlines()
+            expected = {item["key"]: item for item in manifest["objects"]}
+            for raw in records:
+                asset = json.loads(raw)
+                for role in ("original", "model"):
+                    obj = asset[role]
+                    item = expected[obj["key"]]
+                    self.assertEqual(obj["sha256"], item["sha256"])
+                    self.assertEqual(hashlib.sha256((source/"media"/item["file"]).read_bytes()).hexdigest(), item["sha256"])
+            # Test-only isolation after restore; no production PG restore CLI is exposed.
+            relation = '"'+schema+'".'
+            sql(target_db,
+                "UPDATE "+relation+"platform_jobs SET status='recovery_hold',fence=fence+1,lease_worker_id=NULL,lease_expires_at=NULL WHERE status NOT IN ('succeeded','failed','cancelled');"
+                "UPDATE "+relation+"platform_jobs SET execution_plan=(execution_plan::jsonb || '{\"enabled\":false}'::jsonb)::json;"
+                "UPDATE "+relation+"platform_plans SET execution_plan=(execution_plan::jsonb || '{\"enabled\":false}'::jsonb)::json,expires_at=0;"
+                "UPDATE "+relation+"platform_registered_workers SET state='unknown',drain_requested=1,fence=fence+1,expires_at=0 WHERE state!='retired';"
+                "UPDATE "+relation+"platform_registered_devices SET state='unknown' WHERE state!='released';"
+                "UPDATE "+relation+"platform_cpu_slots SET state='unknown';"
+                "UPDATE "+relation+"platform_pool_limits SET max_instances=0,max_physical_gpus=0;"
+                "UPDATE "+relation+"platform_capacity_approvals SET enabled=0;"
+                "UPDATE "+relation+"platform_capacity_waiters SET state='recovery_hold';"
+                "UPDATE "+relation+"platform_scaler_leaders SET expires_at=0,fence=fence+1;"
+                "UPDATE "+relation+"platform_capacity_gate SET max_instances=0,max_physical_gpus=0;")
+            self.assertEqual(sql(target_db, "SELECT status FROM "+relation+"platform_jobs WHERE id='"+self.job["id"]+"';"), "recovery_hold")
+            self.assertEqual(sql(target_db, "SELECT execution_plan->>'enabled' FROM "+relation+"platform_jobs WHERE id='"+self.job["id"]+"';"), "false")
+            self.assertEqual(sql(target_db, "SELECT upstream_task_id FROM "+relation+"platform_attempts WHERE id='"+claim.lease.attempt_id+"';"), "fake-postgres-upstream-needs-review")
+            self.assertEqual(sql(target_db, "SELECT state FROM "+relation+"platform_instance_intents WHERE id='"+intent["id"]+"';"), "creation_unknown")
+            self.assertEqual(sql("sixnine_test", "SELECT status FROM "+relation+"platform_jobs WHERE id='"+self.job["id"]+"';"), "running")
+        finally:
+            if target_created:
+                # Exact unique DB created successfully by this test; never sixnine_test.
+                self.assertNotEqual(target_db, "sixnine_test")
+                run(["dropdb", "--maintenance-db=sixnine_test", target_db])
+                self.assertEqual(sql("sixnine_test", "SELECT count(*) FROM pg_database WHERE datname='"+target_db+"';"), "0")
+            if source_created:
+                sql("sixnine_test", 'DROP SCHEMA "'+schema+'" CASCADE;')
+                self.assertEqual(sql("sixnine_test", "SELECT count(*) FROM pg_namespace WHERE nspname='"+schema+"';"), "0")
+
+
+if __name__ == "__main__":
+    unittest.main()

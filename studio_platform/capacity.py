@@ -1,0 +1,387 @@
+"""Explicit, revocable cold-start approvals and the durable waiting-capacity loop.
+
+No boot agent, credential loader or cloud daemon is configured here. Only an
+explicitly enabled, injected scaler/provider and current operator-policy guard
+can create an instance. Provider running is never model qualification.
+"""
+from dataclasses import asdict, replace
+import math
+import re
+
+from sqlalchemy import insert, select, update
+from sqlalchemy.exc import IntegrityError
+
+from .autoscale import Demand, ScalePolicy, ScaleState, Slot, recommend
+from .repository import (BudgetExceeded, Conflict, NotFound, Scope, budget_accounts,
+    capacity_approvals, capacity_cycles, capacity_gate, capacity_waiters, canonical,
+    documents, instance_intents, jobs, pool_limits, registered_workers, request_hash)
+from .scaler import LaunchSpec, _safe_id
+
+
+def _future(value, now):
+    return type(value) in (float, int) and math.isfinite(value) and now < value <= 1e12
+
+
+def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configuration_id,
+        recipe_ids, policy_hash, qualification_evidence_id, qualification_expires_at,
+        quote_expires_at, expires_at, launch, scale_policy, budget_scope,
+        budget_account_ids, enabled=False):
+    """Operator-only immutable approval. Revoke separately; never mutate its quote.
+
+    This is not a public API and does not reserve/create an instance. A new
+    approval ID is required after its sole bootstrap intent has ended.
+    """
+    for value in (approval_id, tenant_id, pool, model_id, configuration_id, qualification_evidence_id):
+        _safe_id(value)
+    now = repo.clock()
+    if (type(enabled) is not bool or not isinstance(launch, LaunchSpec)
+            or not isinstance(scale_policy, ScalePolicy) or not isinstance(budget_scope, Scope)
+            or not isinstance(recipe_ids, (tuple, list)) or not 1 <= len(recipe_ids) <= 32
+            or len(set(recipe_ids)) != len(recipe_ids)
+            or not isinstance(policy_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", policy_hash)
+            or budget_scope.tenant_id != tenant_id
+            or launch.model_id != model_id or launch.configuration_id != configuration_id
+            or any(not _future(value, now) for value in (expires_at, quote_expires_at, qualification_expires_at))
+            or expires_at > min(quote_expires_at, qualification_expires_at)
+            or scale_policy.dry_run is not False or scale_policy.max_instances < 1
+            or scale_policy.max_physical_gpus < scale_policy.new_instance_physical_gpus
+            or not _future(scale_policy.hard_deadline, now)
+            or not isinstance(budget_account_ids, (tuple, list)) or not 1 <= len(budget_account_ids) <= 8
+            or len(set(budget_account_ids)) != len(budget_account_ids)):
+        raise ValueError("invalid_capacity_approval")
+    from .autoscale import recommend
+    recommend([], [], [], now=now, policy=scale_policy)  # pure complete numeric validation
+    if (not scale_policy.instance_reservation_microusd
+            or scale_policy.approved_remaining_microusd is None
+            or scale_policy.instance_reservation_microusd > scale_policy.approved_remaining_microusd):
+        raise ValueError("capacity_instance_budget_not_approved")
+    for value in (*recipe_ids, *budget_account_ids):
+        _safe_id(value)
+    payload = canonical(dict(tenant_id=tenant_id, pool=pool, model_id=model_id,
+        configuration_id=configuration_id, recipe_ids=sorted(recipe_ids), policy_hash=policy_hash,
+        qualification_evidence_id=qualification_evidence_id,
+        qualification_expires_at=qualification_expires_at, quote_expires_at=quote_expires_at,
+        expires_at=expires_at, launch=asdict(launch), scale_policy=asdict(scale_policy),
+        budget_scope=asdict(budget_scope), budget_account_ids=sorted(budget_account_ids)))
+    digest = request_hash(payload)
+    try:
+        with repo.transaction() as connection:
+            existing = repo._locked(connection, select(capacity_approvals).where(capacity_approvals.c.id == approval_id))
+            if existing:
+                if existing["approval_hash"] != digest:
+                    raise Conflict("capacity_approval_immutable")
+                return dict(existing)  # do not silently re-enable a revoked approval
+            row = dict(id=approval_id, tenant_id=tenant_id, pool=pool, configuration_id=configuration_id,
+                approval_hash=digest, payload=payload, enabled=int(enabled), expires_at=expires_at, created_at=now)
+            connection.execute(insert(capacity_approvals).values(**row))
+            return row
+    except IntegrityError:
+        raise Conflict("capacity_approval_conflict") from None
+
+
+def _approval_live(repo, connection, row):
+    now, p = repo.clock(), row["payload"]
+    if (row["enabled"] != 1 or row["expires_at"] <= now or p["quote_expires_at"] <= now
+            or p["qualification_expires_at"] <= now or p["scale_policy"]["hard_deadline"] <= now):
+        raise Conflict("capacity_approval_unavailable")
+    gate = connection.execute(select(capacity_gate).where(capacity_gate.c.id == "global")).mappings().first()
+    pool = connection.execute(select(pool_limits).where(pool_limits.c.pool == row["pool"])).mappings().first()
+    if gate is None or pool is None or min(gate["max_instances"], gate["max_physical_gpus"],
+            pool["max_instances"], pool["max_physical_gpus"]) <= 0:
+        raise BudgetExceeded("capacity_start_disabled")
+    cycle = connection.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == row["id"])).mappings().first()
+    if cycle:
+        intent = connection.execute(select(instance_intents).where(instance_intents.c.id == cycle["intent_id"])).mappings().one()
+        if intent["state"] in ("destroyed", "destroying", "draining") or intent["hard_deadline"] <= now:
+            raise Conflict("capacity_cycle_unavailable")
+        return dict(cycle)
+    # Admission makes no promise to create beyond the existing shared gates.
+    # Reservations themselves are atomically enforced later by the same ledger.
+    policy = p["scale_policy"]
+    usage = repo._global_usage(connection)
+    active = list(connection.execute(select(instance_intents.c.state, instance_intents.c.physical_gpus).where(
+        instance_intents.c.pool == row["pool"], instance_intents.c.state != "destroyed")).mappings())
+    if (any(r["state"] in ("reserved", "creating", "creation_unknown") for r in active)
+            or usage["instances"]+1 > gate["max_instances"]
+            or usage["physical_gpus"]+policy["new_instance_physical_gpus"] > gate["max_physical_gpus"]
+            or len(active)+1 > pool["max_instances"]
+            or sum(r["physical_gpus"] for r in active)+policy["new_instance_physical_gpus"] > pool["max_physical_gpus"]):
+        raise BudgetExceeded("capacity_start_limit")
+    billing = Scope(**p["budget_scope"])
+    for account_id in p["budget_account_ids"]:
+        query = select(budget_accounts).where(budget_accounts.c.id == account_id)
+        # A read is sufficient here: reserve_instance_intent locks/checks these
+        # accounts before the only create. Do not lock in a different order.
+        account = connection.execute(query).mappings().first()
+        if (account is None or account["tenant_id"] != billing.tenant_id
+                or account["owner_id"] is not None and account["owner_id"] != billing.owner_id
+                or account["project_id"] is not None and account["project_id"] != billing.project_id
+                or account["spent_microusd"]+account["reserved_microusd"]+policy["instance_reservation_microusd"] > account["limit_microusd"]):
+            raise BudgetExceeded("capacity_instance_budget_unavailable")
+    return None
+
+
+def find_capacity_approval(repo, scope, *, pool, model_id, configuration_id, recipe_id, policy_hash):
+    with repo.engine.connect() as connection:
+        candidates = list(connection.execute(select(capacity_approvals).where(capacity_approvals.c.tenant_id == scope.tenant_id,
+            capacity_approvals.c.pool == pool, capacity_approvals.c.configuration_id == configuration_id,
+            capacity_approvals.c.enabled == 1, capacity_approvals.c.expires_at > repo.clock()).limit(101)).mappings())
+        if len(candidates) > 100:
+            return None  # truncated operator configuration cannot prove uniqueness
+        matching = []
+        for row in candidates:
+            p = row["payload"]
+            if p["model_id"] != model_id or recipe_id not in p["recipe_ids"] or p["policy_hash"] != policy_hash:
+                continue
+            try:
+                _approval_live(repo, connection, row)
+            except (Conflict, BudgetExceeded):
+                continue
+            matching.append(dict(row))
+        return matching[0] if len(matching) == 1 else None  # never pick the first conflicting approval
+
+
+def admit_waiter(repo, connection, scope, job, plan):
+    execution = plan["execution_plan"]
+    approval = repo._locked(connection, select(capacity_approvals).where(
+        capacity_approvals.c.id == execution.get("capacity_approval_id")))
+    if approval is None:
+        raise Conflict("capacity_approval_unavailable")
+    p, request = approval["payload"], plan["request"]
+    if (approval["tenant_id"] != scope.tenant_id or approval["approval_hash"] != execution.get("capacity_approval_hash")
+            or p["policy_hash"] != execution.get("policy_hash") or p["pool"] != job["pool"]
+            or p["model_id"] != request.get("request", {}).get("model")
+            or request.get("recipe_id") not in p["recipe_ids"]
+            or p["configuration_id"] != execution.get("configuration_id")
+            or execution.get("backend") != "comfy-worker" or execution.get("enabled") is not True
+            or execution.get("quote_known") is not True
+            or p["qualification_evidence_id"] != execution.get("qualification_evidence_id")
+            or job["attempt_no"] or job.get("current_attempt_id")):
+        raise Conflict("capacity_plan_approval_mismatch")
+    cycle = _approval_live(repo, connection, approval)
+    # The 15-minute plan window governs confirmation of NEW work, not the
+    # lifetime of an already confirmed cold-start wait. Large model boot may
+    # take longer; its independent approval/quote/qualification/TTL still bound
+    # waiting. Repeated HTTP retries retain the original approved job.
+    deadline = min(approval["expires_at"], p["quote_expires_at"], p["qualification_expires_at"],
+        p["scale_policy"]["hard_deadline"]-job["expected_runtime_s"])
+    if deadline <= repo.clock():
+        raise Conflict("capacity_wait_deadline_expired")
+    connection.execute(insert(capacity_waiters).values(job_id=job["id"], approval_id=approval["id"],
+        approval_hash=approval["approval_hash"], deadline=deadline,
+        intent_id=cycle["intent_id"] if cycle else None, state="waiting_capacity", created_at=repo.clock()))
+
+
+class ColdStartCoordinator:
+    """Bounded trusted turn; default disabled and no current-policy guard means deny.
+
+    A grant has exactly one bootstrap intent for its lifetime. Failed/unknown/TTL
+    cycles cannot be recycled by a second leader or another waiting user.
+    """
+    def __init__(self, repository, *, scaler=None, enabled=False, approval_guard=None, activation_guard=None):
+        if type(enabled) is not bool:
+            raise ValueError("invalid_capacity_controller_switch")
+        # No implicit adapter construction. The operational activation-only
+        # CLI has no scaler at all; paid coordination needs explicit injection.
+        self.repo, self.scaler = repository, scaler
+        self.enabled = enabled
+        self.approval_guard = approval_guard or (lambda payload: False)
+        self.activation_guard = activation_guard or (lambda job: False)
+
+    def _valid(self, approval):
+        try:
+            return bool(approval["enabled"] == 1 and approval["expires_at"] > self.repo.clock()
+                and approval["payload"]["quote_expires_at"] > self.repo.clock()
+                and approval["payload"]["qualification_expires_at"] > self.repo.clock()
+                and self.approval_guard(approval["payload"]) is True)
+        except Exception:
+            return False
+
+    def _approval(self, approval_id):
+        _safe_id(approval_id)
+        with self.repo.engine.connect() as connection:
+            row = connection.execute(select(capacity_approvals).where(capacity_approvals.c.id == approval_id)).mappings().first()
+            if row is None:
+                raise NotFound("capacity_approval_not_found")
+            return dict(row)
+
+    def preview(self, approval_id):
+        """Read-only aggregate proposal. No DDL, observation, provider or mutation."""
+        approval = self._approval(approval_id)
+        p = approval["payload"]
+        with self.repo.engine.connect() as connection:
+            approved = self._valid(approval)
+            try:
+                _approval_live(self.repo, connection, approval)
+            except (Conflict, BudgetExceeded):
+                approved = False
+            rows = connection.execute(select(jobs.c.id, jobs.c.owner_id, jobs.c.created_at, jobs.c.expected_runtime_s)
+                .join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
+                    capacity_waiters.c.approval_id == approval_id, capacity_waiters.c.state == "waiting_capacity",
+                    capacity_waiters.c.deadline > self.repo.clock(), jobs.c.status == "waiting_capacity")
+                .order_by(jobs.c.created_at, jobs.c.id).limit(4096)).mappings()
+            demands = [Demand(r["id"], r["owner_id"], r["created_at"], r["expected_runtime_s"], "operator-qualified") for r in rows]
+        from .control import WorkerControl
+        capacity = WorkerControl(self.repo).pool_status(p["pool"], model_id=p["model_id"],
+            configuration_id=p["configuration_id"])
+        # Busy slots have unknown remaining runtime here, so conservatively
+        # omit them from the pure prediction rather than invent an ETA.
+        slots = [Slot("ready-"+str(i)) for i in range(capacity["ready"])]
+        decision = recommend(demands, slots, self.repo.list_instance_intents(pool=p["pool"]), now=self.repo.clock(),
+            policy=replace(ScalePolicy(**p["scale_policy"]), dry_run=True), state=ScaleState())
+        return {"state": "dry_run", "approval_current": approved, "waiting_count": len(demands),
+            "healthy_ready_slots": capacity["ready"], "healthy_busy_slots": capacity["busy"],
+            "recommendation": decision.action, "reason": decision.reason,
+            "cloud_creation_enabled": False, "provider_calls_enabled": False}
+
+    def advance_once(self, approval_id):
+        """Local activation/rejection only; no scaler/provider access whatsoever."""
+        if not self.enabled:
+            return {"state": "disabled"}
+        activated, failed = self._advance(self._approval(approval_id))
+        return {"state": "advanced", "activated": len(activated), "failed": len(failed),
+            "cloud_creation_enabled": False, "provider_calls_enabled": False}
+
+    def _before_create(self, approval_id):
+        with self.repo.engine.connect() as connection:
+            row = connection.execute(select(capacity_approvals).where(capacity_approvals.c.id == approval_id)).mappings().one()
+            demand = connection.execute(select(jobs.c.id).join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id)
+                .where(capacity_waiters.c.approval_id == approval_id, capacity_waiters.c.state == "waiting_capacity",
+                    capacity_waiters.c.deadline > self.repo.clock(), jobs.c.status == "waiting_capacity").limit(1)).first()
+            return bool(demand and self._valid(row))
+
+    def _attach(self, connection, intent, approval_id):
+        approval = self.repo._locked(connection, select(capacity_approvals).where(capacity_approvals.c.id == approval_id))
+        if not self._valid(approval):
+            raise Conflict("capacity_approval_unavailable")
+        if connection.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == approval_id)).first():
+            raise Conflict("capacity_cycle_already_started")
+        connection.execute(insert(capacity_cycles).values(approval_id=approval_id, intent_id=intent["id"], created_at=self.repo.clock()))
+        connection.execute(update(capacity_waiters).where(capacity_waiters.c.approval_id == approval_id,
+            capacity_waiters.c.state == "waiting_capacity").values(intent_id=intent["id"]))
+
+    @staticmethod
+    def _source_current(connection, job):
+        # Public HTTP plans always carry a server-owned source hash. The small
+        # trusted ledger fixtures/clients that omit it have no mutable project
+        # source to compare. This does not trust a browser-supplied version.
+        expected = job["request"].get("server_source_hash")
+        if expected is None:
+            return True
+        from .source_snapshot import source_snapshot, validate_source_ref
+        try:
+            ref = job["request"]["client_ref"]
+            project = connection.execute(select(documents.c.payload).where(
+                documents.c.tenant_id == job["tenant_id"], documents.c.owner_id == job["owner_id"],
+                documents.c.project_id == "__projects", documents.c.kind == "project",
+                documents.c.document_id == job["project_id"])).scalar_one_or_none()
+            return bool(project is not None and ref["project_id"] == job["project_id"]
+                and validate_source_ref(project, ref) and source_snapshot(project, ref["shot_id"]) == expected)
+        except (KeyError, ValueError, TypeError):
+            return False
+
+    def _advance(self, approval, *, limit=100):
+        """CAS each owned job; no budget reservation during activation.
+
+        Job-before-waiter lock order matches cancellation. A cancelled/held job
+        cannot reactivate even if a healthy worker registers later.
+        """
+        with self.repo.engine.connect() as connection:
+            ids = list(connection.execute(select(capacity_waiters.c.job_id).where(
+                capacity_waiters.c.approval_id == approval["id"], capacity_waiters.c.state == "waiting_capacity")
+                .order_by(capacity_waiters.c.created_at, capacity_waiters.c.job_id).limit(limit)).scalars())
+        activated, failed = [], []
+        for jid in ids:
+            with self.repo.transaction() as connection:
+                job = self.repo._job(connection, jid, lock=True)
+                waiter = connection.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == jid)).mappings().one()
+                if job["status"] != "waiting_capacity" or waiter["state"] != "waiting_capacity":
+                    continue
+                grant = connection.execute(select(capacity_approvals).where(capacity_approvals.c.id == approval["id"])).mappings().one()
+                reason = None
+                if job["attempt_no"] or job["current_attempt_id"] or job["lease_worker_id"]:
+                    connection.execute(update(jobs).where(jobs.c.id == jid).values(status="recovery_hold",
+                        error_code="capacity_waiter_has_attempt_requires_review", updated_at=self.repo.clock()))
+                    connection.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(state="recovery_hold"))
+                    continue
+                if not self._valid(grant):
+                    reason = "capacity_approval_expired_or_revoked"
+                elif waiter["deadline"] <= self.repo.clock():
+                    reason = "capacity_wait_deadline_expired"
+                elif self.activation_guard(job) is not True:
+                    reason = "execution_policy_unavailable_before_activation"
+                elif not self._source_current(connection, job):
+                    reason = "capacity_source_changed_before_activation"
+                intent = None
+                if waiter["intent_id"]:
+                    intent = connection.execute(select(instance_intents).where(instance_intents.c.id == waiter["intent_id"])).mappings().one()
+                    if intent["state"] in ("destroyed", "draining", "destroying"):
+                        reason = reason or "capacity_cycle_unavailable"
+                    elif intent["hard_deadline"] <= self.repo.clock()+job["expected_runtime_s"]:
+                        reason = reason or "capacity_instance_deadline_unsafe"
+                if reason:
+                    self.repo._settle(connection, "job", jid, 0)
+                    connection.execute(update(jobs).where(jobs.c.id == jid).values(status="failed", error_code=reason,
+                        fence=job["fence"]+1, updated_at=self.repo.clock()))
+                    connection.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(state="failed"))
+                    self.repo._emit(connection, "job.failed", jid, {"job_id": jid, "status": "failed", "error_code": reason})
+                    failed.append(jid)
+                    continue
+                # No cycle yet can accept a separately provisioned, qualified
+                # exact slot. A linked cycle requires that precise instance.
+                candidates = connection.execute(select(registered_workers).where(registered_workers.c.pool == job["pool"],
+                    registered_workers.c.state == "ready", registered_workers.c.current_job_id.is_(None),
+                    registered_workers.c.drain_requested == 0, registered_workers.c.expires_at > self.repo.clock())
+                    .order_by(registered_workers.c.id).limit(128)).mappings()
+                p = grant["payload"]
+                match = next((w for w in candidates if w["spec"]["backend"] == "comfy-worker"
+                    and w["spec"]["model_id"] == p["model_id"] and w["spec"]["configuration_id"] == p["configuration_id"]
+                    and job["request"]["recipe_id"] in w["spec"]["recipe_ids"]
+                    and (intent is None or w["provider"] == intent["provider"]
+                         and w["instance_id"] == intent["provider_instance_id"])), None)
+                if match is None:
+                    continue
+                # Activation locks approval before waiter, matching the
+                # scaler's budget->approval->waiter order. Failure settles
+                # budget before waiter above without holding an approval lock.
+                grant = self.repo._locked(connection, select(capacity_approvals).where(capacity_approvals.c.id == approval["id"]))
+                if not self._valid(grant):
+                    continue  # the next bounded turn records zero-cost failure
+                waiter = self.repo._locked(connection, select(capacity_waiters).where(capacity_waiters.c.job_id == jid))
+                if waiter["state"] != "waiting_capacity":
+                    continue
+                connection.execute(update(jobs).where(jobs.c.id == jid).values(status="queued", not_before=self.repo.clock(), updated_at=self.repo.clock()))
+                connection.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(state="activated"))
+                self.repo._emit(connection, "job.queued", jid, {"job_id": jid, "status": "queued"})
+                activated.append(jid)
+        return activated, failed
+
+    def tick(self, leader_id, approval_id):
+        if not self.enabled:
+            return {"state": "disabled"}
+        if self.scaler is None:
+            return {"state": "cloud_controller_not_configured"}
+        approval = self._approval(approval_id)
+        activated, failed = self._advance(approval)
+        with self.repo.engine.connect() as connection:
+            cycle = connection.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == approval_id)).mappings().first()
+            rows = connection.execute(select(jobs.c.id, jobs.c.owner_id, jobs.c.created_at, jobs.c.expected_runtime_s)
+                .join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
+                    capacity_waiters.c.approval_id == approval_id, capacity_waiters.c.state == "waiting_capacity",
+                    capacity_waiters.c.deadline > self.repo.clock(),
+                    jobs.c.status == "waiting_capacity").order_by(jobs.c.created_at, jobs.c.id).limit(4096)).mappings()
+            demands = [Demand(r["id"], r["owner_id"], r["created_at"], r["expected_runtime_s"], "operator-qualified") for r in rows]
+        p = approval["payload"]
+        policy = ScalePolicy(**p["scale_policy"])
+        # Existing cycle is permanently single-use. Keep reconciliation and
+        # drain active, but prevent a second proposal even after it is destroyed.
+        if cycle or not self._valid(approval):
+            policy = replace(policy, max_instances=0, max_physical_gpus=0)
+        if not demands and cycle is None:
+            return {"state": "no_waiters", "activated": len(activated), "failed": len(failed)}
+        result = self.scaler.tick(leader_id, Scope(**p["budget_scope"]), p["pool"], demands, (),
+            policy=policy, launch=LaunchSpec(**p["launch"]), budget_account_ids=p["budget_account_ids"],
+            on_intent_reserved=lambda conn, intent: self._attach(conn, intent, approval_id),
+            before_create=lambda: self._before_create(approval_id))
+        newly_activated, newly_failed = self._advance(approval)
+        return {**result, "activated": len(activated)+len(newly_activated), "failed": len(failed)+len(newly_failed)}

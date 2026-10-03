@@ -1,0 +1,45 @@
+{
+    admin off
+    servers {
+        timeouts {
+            read_header 10s
+            read_body 10m
+            write 15m
+            idle 2m
+        }
+    }
+}
+
+www.sixnine.art {
+    encode zstd gzip
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy no-referrer
+        Strict-Transport-Security "max-age=31536000"
+        -Server
+    }
+    # 512 MiB file + 1 MiB multipart envelope; app checks actual receive bytes.
+    request_body {
+        max_size 537919488
+    }
+    reverse_proxy app:8845 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto https
+        header_up X-Forwarded-Host www.sixnine.art
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 15m
+        }
+    }
+    # Access logs are deliberately not enabled: cookies, signed Location URLs,
+    # prompts and media parameters must not become request logs.
+}
+
+sixnine.art {
+    redir https://www.sixnine.art{uri} 308
+}
+
+h3.sixnine.art {
+    # A UI redirect only; this hostname does not proxy API requests to H3/GPU.
+    redir https://www.sixnine.art/freestyle 308
+}

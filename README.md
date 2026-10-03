@@ -1,4 +1,21 @@
-# H3 Studio
+# Sixnine · 映序与 H3 Studio
+
+当前主线是映序引导制作、ReactFlow画布、`/freestyle`共用项目、私有素材和版本化`/v1` API的平台。代码入口为 `platform_app.py` / `studio_platform/`，新部署包位于 `deploy/platform/`。
+
+本轮功能、检查入口和待上线事项先看[交付报告](DELIVERY-REPORT.zh-CN.md)；报告中的执行状态与最终验证时间分开记录。
+
+- [当前架构与实现边界](ARCHITECTURE.zh-CN.md)
+- [实际v1 API接入方式](API-USAGE.zh-CN.md)
+- [统一平台部署与首次账户初始化](deploy/platform/README.zh-CN.md)
+- [Lightsail主机模板与费用观察](deploy/platform/INFRASTRUCTURE.zh-CN.md)
+- [sixnine.art域名观察与切换方案](deploy/platform/DNS-CUTOVER.zh-CN.md)
+- [发布、回滚与CI](deploy/platform/RELEASE.zh-CN.md)
+- [部署和恢复的实际就绪复核](deploy/platform/READINESS-REVIEW.zh-CN.md)
+- [备份恢复](BACKUP-RECOVERY.zh-CN.md)、[运行诊断](OPERATIONS.zh-CN.md)、[迭代证据](ITERATIONS.zh-CN.md)
+
+前端canonical源码在同级`../video-studio-design/studio-app`；本仓库`yingxu/`是经哈希核对的发布源码快照，由`tools/sync_yingxu_source.py`维护。不要直接编辑快照或将本机草稿/素材放进镜像。
+
+以下为保留的早期独立H3工具背景；`server.py`、`web/`和旧`deploy/`仍保留兼容测试，统一平台以以上新入口为准。
 
 MiniMax H3 multimodal workbench with separate image/video/audio references,
 timeline guides, native workflow controls, owned assets, jobs and downloads.

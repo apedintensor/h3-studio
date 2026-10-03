@@ -1,0 +1,70 @@
+"""Protected runtime DSN loading with synthetic local values only."""
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+from studio_platform.settings import Settings, database_url_from_environment
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "database-url"
+        self.environment = patch.dict(os.environ, {}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
+    def write(self, value):
+        self.path.write_bytes(value)
+        self.path.chmod(0o600)
+        os.environ["SIXNINE_DATABASE_URL_FILE"] = str(self.path)
+
+    def test_default_and_explicit_direct_source(self):
+        settings = Settings.from_environment()
+        self.assertTrue(settings.database_url.startswith("sqlite:///"))
+        os.environ["SIXNINE_DATABASE_URL"] = "sqlite:///synthetic.db"
+        self.assertEqual(database_url_from_environment(), "sqlite:///synthetic.db")
+        self.assertNotIn("synthetic", repr(Settings.from_environment()))
+
+    def test_file_loaded_without_changing_environment(self):
+        self.write(b"postgresql+psycopg://fake:synthetic-only@localhost/fake\r\n")
+        self.assertEqual(database_url_from_environment(), "postgresql+psycopg://fake:synthetic-only@localhost/fake")
+        self.assertNotIn("SIXNINE_DATABASE_URL", os.environ)
+        self.assertNotIn("synthetic-only", repr(Settings.from_environment()))
+
+    def test_conflicting_sources_never_pick_one(self):
+        self.write(b"sqlite:///synthetic.db")
+        os.environ["SIXNINE_DATABASE_URL"] = "sqlite:///another.db"
+        with self.assertRaisesRegex(ValueError, "only one"):
+            database_url_from_environment()
+
+    def test_invalid_files_reject_without_content_in_error(self):
+        for raw in (b"", b"x"*16385, b"postgresql://fake:synthetic-secret@host/db\nother", b"\xff", b" sqlite:///fake", b"sqlite:///fake\x00"):
+            with self.subTest(size=len(raw)):
+                self.write(raw)
+                with self.assertRaises(ValueError) as caught:
+                    database_url_from_environment()
+                self.assertNotIn("synthetic-secret", str(caught.exception))
+        os.environ["SIXNINE_DATABASE_URL_FILE"] = "relative.txt"
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            database_url_from_environment()
+        os.environ["SIXNINE_DATABASE_URL_FILE"] = str(self.path.parent / "missing")
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            database_url_from_environment()
+
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits; verified in Linux container")
+    def test_posix_permissions(self):
+        self.write(b"sqlite:///fake.db")
+        for mode in (0o644, 0o666, 0o620, 0o601):
+            self.path.chmod(mode)
+            with self.assertRaisesRegex(ValueError, "permissions"):
+                database_url_from_environment()
+        self.path.chmod(0o640)
+        self.assertEqual(database_url_from_environment(), "sqlite:///fake.db")
+
+
+if __name__ == "__main__":
+    unittest.main()
