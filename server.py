@@ -300,7 +300,8 @@ def capability():
             available=False;reason='GPU已按要求停止；历史作品仍可查看和下载。重新生成需重新部署GPU。'
     if not GENERATION_ENABLED:
         available=False;reason='GPU生成已关闭；可以上传素材、设计工作流和下载已保存的作品。'
-        lease.update(phase='destroyed',status='DISABLED')
+        # Disabling this website does not establish a provider's billing status.
+        lease['generation_disabled']=True
     return {'backends':[{'id':'comfy-local','label':'Lium · 自部署 H3 Base BF16','available':available,
         'reason':reason,'modes':['ref','fl'],'limits':LIMITS,'models':[{'id':MODEL,
         'label':'H3 Base · BF16 · 无Turbo','min_duration':4,'max_duration':15,'resolutions':['480P','576P','768P','custom']}]}],

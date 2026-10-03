@@ -42,7 +42,8 @@ class CpuDeploymentTests(unittest.TestCase):
                 caps = client.get('/api/capabilities').json()
                 self.assertFalse(caps['backends'][0]['available'])
                 self.assertIsNone(caps['expert_url'])
-                self.assertEqual(caps['lease']['status'], 'DISABLED')
+                self.assertTrue(caps['lease']['generation_disabled'])
+                self.assertEqual(caps['lease']['status'], 'DESTROYED')
                 job = client.post('/api/jobs', json={
                     'backend':'comfy-local','model':self.server.MODEL,'mode':'fl',
                     'prompt':'Offline CPU deployment test','duration':5,'resolution':'768P',
