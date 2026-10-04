@@ -1,8 +1,12 @@
 """Repeated real-job cold-start lifecycle using local ledger/fake cloud only."""
 from dataclasses import asdict, replace
+import contextlib
+import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from sqlalchemy import select, update
 
@@ -10,7 +14,7 @@ from studio_platform.autoscale import ScalePolicy
 from studio_platform.capabilities import compile_request
 from studio_platform.control import WorkerControl
 from studio_platform.execution_policy import ExecutionPolicies
-from studio_platform.on_demand_scaler import OnDemandConfig, OnDemandController
+from studio_platform.on_demand_scaler import OnDemandConfig, OnDemandController, main, json_config, verified_service_receipt
 from studio_platform.production_scaler import MODEL, RECIPE, ScalerError
 from studio_platform.queue import TaskQueue
 from studio_platform.repository import Scope, request_hash, instance_intents, attempts, capacity_waiters
@@ -255,6 +259,70 @@ class OnDemandTests(LedgerCase):
         self.assertTrue(self.controller.stopping())
         self.assertEqual(self.controller.sequence, 1)
         self.assertEqual(len(self.provider.creates), 1)
+
+    def run_cli_offline(self):
+        """Probe CLI boundaries without a database/SSH/provider connection."""
+        config_path = self.root/"cli-operator.json"
+        config_path.write_text(json.dumps(json_config(self.config)))
+        settings = replace(self.settings, database_url="postgresql+psycopg://localhost/synthetic")
+        from studio_platform.production_scaler import validate_settings
+        controller = SimpleNamespace(initialize=lambda: None,
+            tick=lambda: {"phase": "drained", "drained": True, "sequence": 1, "billing_pending": 0})
+        output = io.StringIO()
+        with patch("studio_platform.on_demand_scaler.Settings.from_environment", return_value=settings), \
+                patch("studio_platform.on_demand_scaler.validate_settings", wraps=validate_settings) as validate, \
+                patch("studio_platform.on_demand_scaler.Repository") as repo, \
+                patch("studio_platform.on_demand_scaler.verify_sources") as sources, \
+                patch("studio_platform.on_demand_scaler.verify_identity_files") as identity, \
+                patch("studio_platform.on_demand_scaler.AwsLiumLoader") as loader, \
+                patch("studio_platform.on_demand_scaler.LiumProvider") as provider, \
+                patch("studio_platform.on_demand_scaler.OnDemandController", return_value=controller), \
+                contextlib.redirect_stdout(output):
+            code = main(["--config", str(config_path), "--enabled"])
+        return code, validate, repo, sources, identity, loader, provider
+
+    def test_exact_prior_receipt_allows_cleanup_entry_after_policy_changed(self):
+        self.path.write_text(json.dumps({**self.value, "enabled": False}))
+        self.assertTrue(verified_service_receipt(self.config))
+        code, validate, repo, sources, identity, loader, provider = self.run_cli_offline()
+        self.assertEqual(code, 0)
+        self.assertFalse(validate.call_args.kwargs["require_policy"])
+        for check in (repo, sources, identity, loader, provider):
+            self.assertEqual(check.call_count, 1)
+
+    def test_new_start_policy_changed_fails_before_provider_or_database(self):
+        self.controller.receipt_path.unlink()
+        self.path.write_text(json.dumps({**self.value, "enabled": False}))
+        code, validate, repo, sources, identity, loader, provider = self.run_cli_offline()
+        self.assertEqual(code, 1)
+        self.assertTrue(validate.call_args.kwargs["require_policy"])
+        for boundary in (repo, sources, identity, loader, provider):
+            self.assertEqual(boundary.call_count, 0)
+
+    def test_wrong_receipt_hash_never_bypasses_policy_or_loads_runtime(self):
+        value = json.loads(self.controller.receipt_path.read_text())
+        value["config_hash"] = "0"*64
+        self.controller.receipt_path.write_text(json.dumps(value))
+        code, validate, repo, sources, identity, loader, provider = self.run_cli_offline()
+        self.assertEqual(code, 1)
+        for boundary in (validate, repo, sources, identity, loader, provider):
+            self.assertEqual(boundary.call_count, 0)
+
+    def test_restart_with_missing_policy_only_drains_existing_rental(self):
+        scope, job = self.start_job()
+        self.path.unlink()
+        restart = OnDemandController(self.repo, self.settings, self.config,
+            provider=self.provider, boot_factory=HeartbeatBoot)
+        # Synthetic process handoff uses the same leader; no elapsed fake-time
+        # lease expiry is mistaken for a dead worker or an idle proof.
+        restart.leader_id = self.controller.leader_id
+        restart.initialize()
+        result = restart.tick()
+        self.assertTrue(restart.stopping())
+        self.assertTrue(result["drained"])
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(len(self.provider.destroys), 1)
+        self.assertEqual(self.repo.get_job(scope, job["id"])["status"], "cancelled")
 
 
 if __name__ == "__main__":

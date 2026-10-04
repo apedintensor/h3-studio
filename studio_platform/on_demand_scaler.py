@@ -75,6 +75,43 @@ def read_config(path):
         raise ScalerError("ondemand_config_unavailable_or_invalid") from None
 
 
+def verified_service_receipt(config):
+    """Only an exact protected prior service identity enables cleanup recovery.
+
+    Missing state means a fresh start, which must validate today's policy.
+    Mismatched/malformed state never downgrades into fresh-start behavior.
+    """
+    path = config.work_dir/"service-state.json"
+    try:
+        if not path.exists() and not path.is_symlink():
+            return False
+        if path.is_symlink():
+            raise ValueError
+        with path.open("rb") as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or os.name != "nt" and info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                raise ValueError
+            raw = source.read(16385)
+        if len(raw) > 16384:
+            raise ValueError
+        value = json.loads(raw, object_pairs_hook=unique)
+        required = {"version", "config_hash", "sequence", "created_at"}
+        if (not isinstance(value, dict) or not required <= set(value)
+                or set(value)-required-{"transfer_from"} or type(value["version"]) is not int or value["version"] != 1
+                or value["config_hash"] != config.fingerprint()
+                or value["created_at"] != config.created_at
+                or type(value["sequence"]) is not int or not 1 <= value["sequence"] <= config.max_cycles):
+            raise ValueError
+        previous = value.get("transfer_from")
+        if previous is not None and (value["sequence"] <= 1
+                or previous != cycle_config(config, value["sequence"]-1).capacity_approval_id):
+            raise ValueError
+        return True
+    except Exception:
+        raise ScalerError("ondemand_service_configuration_changed") from None
+
+
 def cycle_config(config, sequence):
     if type(sequence) is not int or not 1 <= sequence <= config.max_cycles:
         raise ScalerError("ondemand_cycle_limit")
@@ -119,7 +156,6 @@ class ServiceCycle(FiniteController):
             save(receipt, {"config_hash": c.fingerprint(), "ports": {}, "created_at": self.repo.clock()})
         self.remaining_budget()
         from .execution_policy import read_policy
-        policy = read_policy(self.settings.execution_policy_file)
         with self.repo.engine.connect() as conn:
             existing = conn.execute(select(capacity_approvals).where(
                 capacity_approvals.c.id == c.capacity_approval_id)).mappings().first()
@@ -130,6 +166,7 @@ class ServiceCycle(FiniteController):
             if existing["enabled"] != 1 or not self.approval_current(existing["payload"]):
                 self.request_drain()
             return
+        policy = read_policy(self.settings.execution_policy_file)
         self.repo.approve_capacity(c.capacity_approval_id, tenant_id=c.tenant, pool=c.pool,
             model_id=MODEL, configuration_id=c.configuration_id, recipe_ids=[RECIPE],
             policy_hash=c.execution_policy_sha256, qualification_evidence_id=c.qualification_evidence_id,
@@ -346,14 +383,18 @@ def main(argv=None):
                 "config_hash": config.fingerprint(), "provider_calls_enabled": False}))
             return 0
         if args.request_drain:
-            record = json.loads((config.work_dir/"service-state.json").read_text())
-            if record.get("config_hash") != config.fingerprint():
+            if not verified_service_receipt(config):
                 raise ScalerError("ondemand_service_configuration_changed")
             (config.work_dir/"drain.flag").touch()
             print(json.dumps({"phase": "drain_requested", "drained": False}))
             return 0
+        recovering = verified_service_receipt(config)
         settings = Settings.from_environment()
-        validate_settings(config, settings, require_policy=not args.status)
+        # Recovery may reconcile an existing rental after policy revocation.
+        # The exact prior receipt, production Settings, pinned sources and SSH
+        # identity remain required. The controller rechecks policy and drains;
+        # skipping this one preflight never authorizes another rental.
+        validate_settings(config, settings, require_policy=not args.status and not recovering)
         repo = Repository(settings.database_url)
         if args.status:
             print(json.dumps(OnDemandController(repo, settings, config, provider=None).status(fresh_ledger_only=True)))
