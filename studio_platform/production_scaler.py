@@ -95,12 +95,18 @@ class FiniteConfig:
     launches: list[dict]
     manifests: list[dict]
     interval_s: int = 15
+    allowed_owners: list[str] | None = None
 
     def __post_init__(self):
         if (type(self.version) is not int or self.version != 1 or type(self.enabled) is not bool
                 or self.tenant != "sixnine" or self.owner not in ("superdan", "supervan")
                 or type(self.trust_first_host_key) is not bool):
             raise ScalerError("finite_identity_invalid")
+        if self.allowed_owners is not None and (not isinstance(self.allowed_owners, list)
+                or len(self.allowed_owners) != 2
+                or any(not isinstance(owner, str) for owner in self.allowed_owners)
+                or set(self.allowed_owners) != {"superdan", "supervan"}):
+            raise ScalerError("finite_shared_owners_invalid")
         for value in (self.cycle_id, self.project_id, self.pool, self.configuration_id,
                       self.capacity_approval_id, self.qualification_evidence_id):
             if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
@@ -111,7 +117,7 @@ class FiniteConfig:
                 raise ScalerError("finite_absolute_paths_required")
             object.__setattr__(self, field, path)
         if (any(type(x) not in (int, float) or not math.isfinite(x) for x in (self.created_at, self.hard_deadline))
-                or not 0 < self.hard_deadline-self.created_at <= 14400
+                or not 0 < self.hard_deadline-self.created_at <= (86400 if self.allowed_owners is not None else 14400)
                 or type(self.drain_margin_s) is not int or not 120 <= self.drain_margin_s <= 3600
                 or type(self.collection_margin_s) is not int or not 30 <= self.collection_margin_s <= 900
                 or type(self.interval_s) is not int or not 5 <= self.interval_s <= 30
@@ -162,9 +168,28 @@ class FiniteConfig:
 
     def fingerprint(self):
         value = asdict(self)
+        # Preserve the legacy exact-story configuration identity. Shared scope
+        # is an explicit opt-in and must be part of its new immutable identity.
+        if self.allowed_owners is None:
+            value.pop("allowed_owners")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
+
+
+def job_scope_filter(config):
+    """Same queue boundary in the parent and child; absent opt-in stays exact."""
+    identity = (jobs.c.owner_id.in_(config.allowed_owners) if config.allowed_owners is not None
+        else and_(jobs.c.owner_id == config.owner, jobs.c.project_id == config.project_id))
+    return and_(jobs.c.tenant_id == config.tenant, identity, jobs.c.pool == config.pool,
+        jobs.c.execution_plan["configuration_id"].as_string() == config.configuration_id)
+
+
+def job_scope_allowed(config, job):
+    return bool(job["tenant_id"] == config.tenant and job["pool"] == config.pool
+        and job["execution_plan"].get("configuration_id") == config.configuration_id
+        and (job["owner_id"] in config.allowed_owners if config.allowed_owners is not None
+             else job["owner_id"] == config.owner and job["project_id"] == config.project_id))
 
 
 def read_config(path):
@@ -300,16 +325,10 @@ class FiniteController:
         return self.repo.clock() >= self.config.stop_claiming_at or (self.config.work_dir/"drain.flag").exists()
 
     def scope_filter(self):
-        c = self.config
-        return and_(jobs.c.tenant_id == c.tenant, jobs.c.owner_id == c.owner,
-                    jobs.c.project_id == c.project_id, jobs.c.pool == c.pool,
-                    jobs.c.execution_plan["configuration_id"].as_string() == c.configuration_id)
+        return job_scope_filter(self.config)
 
     def job_allowed(self, job):
-        c = self.config
-        return bool(job["tenant_id"] == c.tenant and job["owner_id"] == c.owner
-            and job["project_id"] == c.project_id and job["pool"] == c.pool
-            and self.policies.activation_allowed(job))
+        return bool(job_scope_allowed(self.config, job) and self.policies.activation_allowed(job))
 
     def approval_current(self, payload):
         c = self.config
@@ -463,13 +482,13 @@ class FiniteController:
         self.repo.set_capacity_approval_enabled(self.config.capacity_approval_id, enabled=False)
         self.cold.advance_once(self.config.capacity_approval_id)
         with self.repo.engine.connect() as conn:
-            pending = list(conn.execute(select(jobs.c.id).where(self.scope_filter(),
+            pending = list(conn.execute(select(jobs.c.id, jobs.c.tenant_id, jobs.c.owner_id, jobs.c.project_id).where(self.scope_filter(),
                 jobs.c.status.in_(("planned", "blocked", "queued", "claimed", "waiting_capacity")))
-                .order_by(jobs.c.created_at, jobs.c.id).limit(256)).scalars())
-        for job_id in pending:
+                .order_by(jobs.c.created_at, jobs.c.id).limit(256)).mappings())
+        for row in pending:
             # A simultaneous POST can change state before this call; the
             # repository then records cancel_requested/hold, never a false $0.
-            self.repo.request_cancel(self.config.scope, job_id)
+            self.repo.request_cancel(Scope(row["tenant_id"], row["owner_id"], row["project_id"]), row["id"])
 
     def tick(self):
         c = self.config
@@ -524,6 +543,12 @@ class FiniteController:
             if row["state"] == "destroyed":
                 self.scaler.settle(intent)
                 if intent in self.boots:
+                    # Idle retirement may become provider-confirmed within
+                    # scaler.tick, before boot.tick observes the draining row.
+                    # Explicitly wake the existing child's graceful drain path;
+                    # otherwise an idle child can wait forever and block the
+                    # next on-demand cycle. This never force-kills a process.
+                    self.boots[intent].request_drain()
                     self.boots[intent].close_if_safe(destroyed=True)
                 continue
             if not row["provider_instance_id"]:

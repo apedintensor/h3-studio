@@ -397,9 +397,11 @@ class ControlTests(LedgerCase):
         self.control.queue.begin_submission(first.lease)
         self.control.queue.record_submitted(first.lease, "fake-existing-prompt")
         self.control.queue.release(first.lease, retry_after_s=0)
+        later = self.controlled_job()  # Already admitted before shutdown began.
         self.control.drain("worker")
         self.repo.update_instance(intent["id"], "draining")
-        later = self.controlled_job()
+        with self.assertRaisesRegex(Conflict, "capacity_drain_repreflight"):
+            self.controlled_job()  # A stale ready plan must not add new demand.
         with self.assertRaisesRegex(Conflict, "worker_instance_not_admitting"):
             self.control.mark_ready("worker", upstream_idle_confirmed=True)
         self.assertIsNone(self.control.claim("worker", "control-test"))

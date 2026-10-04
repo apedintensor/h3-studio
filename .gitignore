@@ -210,3 +210,6 @@ inventory.json
 !AGENT-API-RELEASE-20261004.zh-CN.md
 !BACKEND-HANDOFF-20261004.zh-CN.md
 !AGENT-ONBOARDING.zh-CN.md
+!studio_platform/on_demand_scaler.py
+!studio_platform/scaler_entry.py
+!ON-DEMAND-GPU.zh-CN.md

@@ -173,6 +173,12 @@ class ExecutionPolicies:
             blockers.append("此执行配置尚未验收或验收记录已过期")
         if quote["expires_at"] <= now:
             blockers.append("费用预留策略已过期，请等待更新")
+        # A live heartbeat is not enough if the operator's serving window is
+        # about to close. Do not accept a NEW task that cannot fit its own
+        # conservative runtime. Running attempts still reconcile normally.
+        latest_start = min(qualification["expires_at"], quote["expires_at"]) - quote["expected_runtime_s"]
+        if latest_start <= now:
+            blockers.append("当前服务时段剩余时间不足以完成此配方，请等待服务续期后重新预检")
         if compiled["recipe_id"] not in policy["recipe_ids"] or compiled["request"]["model"] != policy["model_id"]:
             blockers.append("执行池未验收此模型或配方")
         request, output = compiled["request"], compiled["output_spec"]
@@ -221,7 +227,7 @@ class ExecutionPolicies:
         base["admission_state"] = "blocked" if blockers else "waiting_capacity" if approval else "queued"
         if approval:
             base.update(capacity_approval_id=approval["id"], capacity_approval_hash=approval["approval_hash"])
-        expiry = min(now+900, quote["expires_at"], qualification["expires_at"]) if not blockers else now+900
+        expiry = min(now+900, latest_start) if not blockers else now+900
         if approval:
             expiry = min(expiry, approval["expires_at"],
                 approval["payload"]["scale_policy"]["hard_deadline"]-quote["expected_runtime_s"])
@@ -319,6 +325,7 @@ class ExecutionPolicies:
                 and qualification["status"] == "accepted"
                 and qualification["verified_at"] <= now < qualification["expires_at"]
                 and now < quote["expires_at"]
+                and now + quote["expected_runtime_s"] < min(qualification["expires_at"], quote["expires_at"])
                 and job["request"]["recipe_id"] in policy["recipe_ids"]
                 and job["request"]["request"]["model"] == policy["model_id"]
                 and execution.get("pool") == policy["pool"]

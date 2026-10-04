@@ -22,7 +22,8 @@ from studio_platform.control import WorkerControl, WorkerSpec
 from studio_platform.execution_policy import ExecutionPolicies
 from studio_platform.lium_provider import LiumManifest
 from studio_platform.production_scaler import (FiniteConfig, FiniteController, MODEL, RECIPE,
-    ScalerError, main, read_config, stdin_loader, validate_settings, verify_policy, verify_sources)
+    ScalerError, main, read_config, stdin_loader, validate_settings, verify_policy, verify_sources,
+    job_scope_filter, job_scope_allowed)
 from studio_platform.production_scaler_boot import ProductionBoot
 from studio_platform.repository import Scope, capacity_approvals, jobs, request_hash
 from studio_platform.scaler import LaunchSpec, ProviderFact
@@ -58,6 +59,8 @@ def configuration(root, now=1000):
 
 def as_json(config):
     value = asdict(config)
+    if value["allowed_owners"] is None:
+        value.pop("allowed_owners")
     for field in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[field] = str(value[field])
     return value
@@ -226,6 +229,51 @@ class FiniteTests(LedgerCase):
             self.controller.tick()
         self.assertFalse(self.provider.creates)
 
+    def test_explicit_shared_scope_admits_both_accounts_across_stories_and_cancels_real_scopes(self):
+        shared = replace(self.config, allowed_owners=["superdan", "supervan"], work_dir=self.root/"shared-control")
+        controller = FiniteController(self.repo, self.settings, shared, provider=self.provider, boot_factory=FakeBoot)
+        controller.initialize()
+        scopes = [Scope("sixnine", "superdan", "new-story-a"), Scope("sixnine", "supervan", "new-story-b")]
+        waiting = [self.waiting("shared-"+scope.owner_id, scope=scope) for scope in scopes]
+        controller.tick()
+        self.now += 16
+        controller.tick()
+        self.now += 16
+        controller.tick()
+        self.assertEqual(len(self.provider.creates), 1)
+        with self.repo.engine.connect() as conn:
+            selected = set(conn.execute(select(jobs.c.id).where(job_scope_filter(shared))).scalars())
+        self.assertEqual(selected, {job["id"] for job in waiting})
+        for scope, job in zip(scopes, waiting):
+            current = self.repo.get_job(scope, job["id"])
+            self.assertEqual(current["status"], "queued")
+            self.assertTrue(controller.job_allowed(current))
+        controller.request_drain()
+        self.now += 16
+        self.assertTrue(controller.tick()["drained"])
+        for scope, job in zip(scopes, waiting):
+            self.assertEqual(self.repo.get_job(scope, job["id"])["status"], "cancelled")
+        self.assertEqual(self.repo.get_budget("job-budget")["reserved_microusd"], 0)
+
+    def test_shared_scope_filters_unknown_owner_other_tenant_pool_configuration(self):
+        shared = replace(self.config, allowed_owners=["superdan", "supervan"])
+        valid = {"tenant_id": "sixnine", "owner_id": "supervan", "project_id": "arbitrary-story",
+            "pool": shared.pool, "execution_plan": {"configuration_id": shared.configuration_id}}
+        self.assertTrue(job_scope_allowed(shared, valid))
+        self.assertFalse(job_scope_allowed(self.config, valid))
+        for change in ({"owner_id": "another-user"}, {"tenant_id": "another-tenant"}, {"pool": "another-pool"},
+                       {"execution_plan": {"configuration_id": "another-config"}}):
+            self.assertFalse(job_scope_allowed(shared, {**valid, **change}))
+        scopes = [Scope("sixnine", owner, "arbitrary-story") for owner in ("superdan", "supervan", "another-user")]
+        inserted = []
+        for number, scope in enumerate(scopes + [Scope("another-tenant", "superdan", "arbitrary-story")]):
+            plan = self.repo.create_plan(scope, {}, valid["execution_plan"] | {"pool": shared.pool},
+                expires_at=self.now+1000)
+            inserted.append(self.repo.create_job(scope, plan["id"], "filter-"+str(number)))
+        with self.repo.engine.connect() as conn:
+            selected = set(conn.execute(select(jobs.c.id).where(job_scope_filter(shared))).scalars())
+        self.assertEqual(selected, {job["id"] for job in inserted[:2]})
+
     def test_no_synthetic_demand_or_budget_raise(self):
         before = self.repo.get_budget("finite-budget")
         for _ in range(3):
@@ -343,6 +391,27 @@ class ConfigAndCredentialTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.config = configuration(self.root)
+
+    def test_shared_approval_window_extends_only_explicit_pair_not_provider_ttl(self):
+        deadline = self.config.created_at+24*3600
+        change = {"hard_deadline": deadline, "scale_policy": {**self.config.scale_policy, "hard_deadline": deadline}}
+        with self.assertRaisesRegex(ScalerError, "deadline"):
+            replace(self.config, **change)
+        shared = replace(self.config, allowed_owners=["superdan", "supervan"], **change)
+        self.assertEqual(shared.hard_deadline, deadline)
+        self.assertEqual(shared.scope, self.config.scope)
+        self.assertNotEqual(shared.fingerprint(), self.config.fingerprint())
+        for owners in ([], ["superdan"], ["supervan", "supervan"], ["superdan", "other"], "superdan"):
+            with self.assertRaisesRegex(ScalerError, "owners"):
+                replace(self.config, allowed_owners=owners)
+        manifests = [dict(row, termination_hours=24) for row in shared.manifests]
+        with self.assertRaisesRegex(ScalerError, "manifest"):
+            replace(shared, manifests=manifests)
+
+    def test_legacy_fingerprint_remains_without_optional_shared_field(self):
+        legacy = as_json(self.config)
+        self.assertNotIn("allowed_owners", legacy)
+        self.assertEqual(self.config.fingerprint(), request_hash(legacy))
 
     def envelope(self):
         return {"secret_arn": ARN, "version_id": VERSION, "payload": {"schema_version": 1, "service": "lium",
@@ -484,6 +553,40 @@ class ProductionBootTests(LedgerCase):
         result = self.boot.tick(self.intent["id"])
         self.assertEqual(result["state"], "draining")
         self.assertEqual(control.get(worker)["state"], "retired")
+
+    def test_shared_child_preserves_account_scope_policy_and_actual_instance_deadline(self):
+        from studio_platform.production_scaler_boot import run_child
+        from studio_platform.storage import LocalObjectStore
+        self.backend.outcome = Outcome("succeeded", "task-test")
+        process = SimpleNamespace(pid=4242, poll=lambda: None, send_signal=lambda value: None)
+        with patch.object(self.boot, "_popen_impl", return_value=process):
+            self.boot.tick(self.intent["id"])
+        self.boot.fleet.config.work_dir.mkdir(exist_ok=True, parents=True)
+        shared = replace(self.config, allowed_owners=["superdan", "supervan"])
+        def fake_slot(fleet, worker_id, settings, **kw):
+            runner = kw["runner_factory"](self.repo, LocalObjectStore(Path(self.temp.name)/"objects"),
+                Path(self.temp.name)/"child", backend=self.backend, control=WorkerControl(self.repo))
+            base = {"tenant_id": "sixnine", "owner_id": "superdan", "project_id": "different-story",
+                "pool": shared.pool, "expected_runtime_s": 100,
+                "execution_plan": {"configuration_id": shared.configuration_id,
+                    "policy_hash": shared.execution_policy_sha256}}
+            self.assertTrue(runner._allowed_new_job(base))
+            self.assertTrue(runner._allowed_new_job({**base, "owner_id": "supervan"}))
+            for delta in ({"owner_id": "other"}, {"tenant_id": "other"}, {"pool": "other"},
+                          {"expected_runtime_s": 6000},
+                          {"execution_plan": {**base["execution_plan"], "policy_hash": "0"*64}}):
+                # Use a genuinely different policy hash when fixture hash is zero.
+                if "execution_plan" in delta:
+                    delta["execution_plan"]["policy_hash"] = "f"*64
+                self.assertFalse(runner._allowed_new_job({**base, **delta}))
+            self.now += 5000
+            self.assertTrue(runner.stopped())
+            return 0
+        with patch("studio_platform.production_scaler_boot.Repository", return_value=SimpleNamespace(
+                engine=self.repo.engine, close=lambda: None, clock=lambda: self.now)), \
+                patch("studio_platform.production_scaler_boot.run_slot", side_effect=fake_slot):
+            self.assertEqual(run_child(shared, self.intent["id"], self.boot.fleet.config.fingerprint(),
+                Settings(Path(self.temp.name)/"data")), 0)
 
 
 if __name__ == "__main__":

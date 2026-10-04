@@ -12,7 +12,7 @@ import re
 from typing import Protocol
 import uuid
 
-from sqlalchemy import case, insert, or_, select, update
+from sqlalchemy import case, func, insert, or_, select, update
 
 from .autoscale import ScalePolicy, ScaleState, recommend
 from .control import WorkerControl
@@ -247,41 +247,27 @@ class ScaleCoordinator:
         self._apply(lease, intent["id"], fact, at)
 
     def _drain_or_destroy(self, lease, intent, policy):
-        action = self._action(intent["id"])
-        if action is None:
-            return
-        fact = ProviderFact(**action["last_observation"]) if action["last_observation"] else ProviderFact("unknown")
-        now = self.repo.clock()
-        fresh = action["last_observed_at"] is not None and 0 <= now-action["last_observed_at"] <= 30
-        idle = fresh and fact.idle_confirmed and fact.state == "running" and fact.instance_id == intent["provider_instance_id"]
-        idle_due = (idle and fact.idle_since is not None and fact.idle_since <= now
-                    and now-fact.idle_since >= policy.idle_before_drain_s)
-        ttl_due = intent["hard_deadline"] <= now
-        if idle_due and not ttl_due:
-            # Upstream idle is not application-demand idle. Cold-start waiters
-            # and queued work may not have an attempt yet; do not drain their
-            # only instance in the gap before a qualified slot claims them.
-            with self.repo.engine.connect() as connection:
-                pending = connection.execute(select(jobs.c.id).where(jobs.c.pool == intent["pool"],
-                    jobs.c.status.in_(("queued", "waiting_capacity"))).limit(1)).first()
-            if pending:
-                idle_due = False
-        if intent["state"] not in ("draining", "destroying") and not (ttl_due or idle_due):
-            return
         destroy = False
         with self.repo.transaction() as connection:
             self._leader(connection, lease)
+            # Admission takes this same row lock before inserting/enqueueing.
+            # A concurrent new job either keeps this instance alive, or sees
+            # its committed drain and gets an explicit re-preflight conflict.
+            self.repo._lock_capacity(connection)
             row = self.repo._locked(connection, select(instance_intents).where(instance_intents.c.id == intent["id"]))
             if row["state"] in ("destroyed", "destroying", "creating", "creation_unknown", "reserved"):
                 return
+            action = self.repo._locked(connection, select(scaler_actions).where(scaler_actions.c.intent_id == row["id"]))
+            if action is None:
+                return
+            now = self.repo.clock()
+            fact = ProviderFact(**action["last_observation"]) if action["last_observation"] else ProviderFact("unknown")
+            fresh = action["last_observed_at"] is not None and 0 <= now-action["last_observed_at"] <= 30
+            idle = fresh and fact.idle_confirmed and fact.state == "running" and fact.instance_id == row["provider_instance_id"]
+            ttl_due = row["hard_deadline"] <= now
             workers = list(connection.execute(select(registered_workers).where(
                 registered_workers.c.provider == row["provider"], registered_workers.c.instance_id == row["provider_instance_id"])
                 .order_by(registered_workers.c.id).with_for_update()).mappings())
-            connection.execute(update(registered_workers).where(
-                registered_workers.c.provider == row["provider"], registered_workers.c.instance_id == row["provider_instance_id"],
-                registered_workers.c.state != "retired").values(drain_requested=1, state="draining", updated_at=now))
-            if row["state"] != "draining":
-                self.repo.update_instance(row["id"], "draining", connection=connection)
             # A stale/dead worker is not an idle proof, even if VM state is running.
             blocked = any(w["current_job_id"] or w["state"] != "retired" and w["expires_at"] <= now for w in workers)
             if workers:
@@ -291,6 +277,34 @@ class ScaleCoordinator:
                     or_(jobs.c.status != "queued", attempts.c.submission_started_at.is_not(None),
                         attempts.c.upstream_task_id.is_not(None)))).first()
                 blocked = blocked or related is not None
+            # The provider's idle_since can precede a lengthy download/decode
+            # or pending queue. Start our durable timer only after the entire
+            # business queue is clear; fresh work resets it. Planned/blocked
+            # drafts have not been admitted and do not keep a GPU rented.
+            pending = connection.execute(select(jobs.c.id).where(jobs.c.pool == row["pool"],
+                jobs.c.status.not_in(("succeeded", "failed", "cancelled", "planned", "blocked"))).limit(1)).first()
+            latest_activity = connection.execute(select(func.max(jobs.c.updated_at)).where(
+                jobs.c.pool == row["pool"], jobs.c.status.not_in(("planned", "blocked")))).scalar_one()
+            application_idle_since = action["application_idle_since"]
+            if not idle or blocked or pending is not None:
+                application_idle_since = None
+            elif (application_idle_since is None or application_idle_since > now
+                    or latest_activity is not None and latest_activity > application_idle_since):
+                # A fast job may be admitted and finished between controller
+                # polls. Its committed timestamp still restarts the full wait.
+                application_idle_since = now
+            connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == row["id"])
+                .values(application_idle_since=application_idle_since))
+            idle_due = application_idle_since is not None and now-application_idle_since >= policy.idle_before_drain_s
+            if row["state"] != "draining" and not (ttl_due or idle_due):
+                return
+            connection.execute(update(registered_workers).where(
+                registered_workers.c.provider == row["provider"], registered_workers.c.instance_id == row["provider_instance_id"],
+                registered_workers.c.state != "retired").values(drain_requested=1, state="draining", updated_at=now))
+            if row["state"] != "draining":
+                self.repo.update_instance(row["id"], "draining", connection=connection)
+            if not ttl_due and pending is not None:
+                return
             if not idle or blocked or action["destroy_started_at"] is not None:
                 return
             self.repo.update_instance(row["id"], "destroying", connection=connection)

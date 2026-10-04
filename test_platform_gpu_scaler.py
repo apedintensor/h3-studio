@@ -28,6 +28,13 @@ def configuration():
         'secret_version_id': 'synthetic-version-'+'a'*32}
 
 
+def on_demand_configuration():
+    return {**configuration(), 'service_mode': 'on-demand', 'max_cycles': 8,
+        'allowed_owners': ['superdan', 'supervan'], 'created_at': 1999913600,
+        'scale_policy': {'idle_before_drain_s': 600, 'max_instances': 1, 'max_physical_gpus': 1,
+                         'new_instance_slots': 1, 'new_instance_physical_gpus': 1}}
+
+
 def good_status(config):
     return {'cycle_id': config['cycle_id'], 'config_hash': scaler.fingerprint(config),
         'hard_deadline': config['hard_deadline'], 'observed_at': time.time(),
@@ -76,6 +83,7 @@ class FiniteComposeTests(unittest.TestCase):
         control = self.config['services'][scaler.SERVICE]
         self.assertNotIn('--enabled', control['command'])
         self.assertNotIn('--credential-stdin', control['command'])
+        self.assertEqual(control['command'][2], 'studio_platform.scaler_entry')
         self.assertEqual(set(control['networks']), {'database', 'edge'})
         self.assertEqual(control['environment']['AWS_EC2_METADATA_DISABLED'], 'true')
 
@@ -115,6 +123,23 @@ class FiniteComposeTests(unittest.TestCase):
 
 
 class FiniteControlTests(unittest.TestCase):
+    def test_on_demand_requires_exact_owner_pair_and_single_gpu_idle_policy(self):
+        config = on_demand_configuration()
+        self.assertTrue(scaler.on_demand_config(config))
+        self.assertFalse(scaler.on_demand_config(configuration()))
+        for field, value in [('service_mode', 'warm'), ('service_mode', ''), ('max_cycles', 0),
+                             ('max_cycles', 9), ('max_cycles', True), ('allowed_owners', ['superdan']),
+                             ('allowed_owners', ['superdan', 'other']), ('created_at', False),
+                             ('created_at', 1999913599), ('hard_deadline', float('inf'))]:
+            with self.subTest(field=field, value=value), self.assertRaises(release.ReleaseError):
+                scaler.on_demand_config({**config, field: value})
+        for field, value in [('idle_before_drain_s', 599), ('idle_before_drain_s', 601),
+                             ('max_instances', 2), ('max_physical_gpus', 2), ('max_instances', True),
+                             ('new_instance_slots', 2), ('new_instance_physical_gpus', 2)]:
+            changed = {**config, 'scale_policy': {**config['scale_policy'], field: value}}
+            with self.subTest(field=field, value=value), self.assertRaises(release.ReleaseError):
+                scaler.on_demand_config(changed)
+
     def test_operator_policy_sources_and_runtime_identity_are_bound_before_start(self):
         with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
             root = Path(temporary)
@@ -144,6 +169,16 @@ class FiniteControlTests(unittest.TestCase):
             stack.enter_context(patch.object(Path, 'lstat', autospec=True, side_effect=lambda path:
                 SimpleNamespace(st_uid=10001 if path in (root/'control', root/'tmp') else 0, st_mode=stat.S_IFDIR|0o700)))
             self.assertEqual(scaler.protected_inputs(starting=True, now=4000), config)
+            ondemand = {**config, **{key: value for key, value in on_demand_configuration().items()
+                if key in ('service_mode', 'max_cycles', 'allowed_owners', 'scale_policy')},
+                'created_at': 4000, 'hard_deadline': 4000+24*3600}
+            config_path.write_text(json.dumps(ondemand))
+            self.assertEqual(scaler.protected_inputs(starting=True, now=4000), ondemand)
+            legacy_long = {**config, 'created_at': 4000, 'hard_deadline': 4000+24*3600}
+            config_path.write_text(json.dumps(legacy_long))
+            with self.assertRaisesRegex(release.ReleaseError, 'finite_authorization'):
+                scaler.protected_inputs(starting=True, now=4000)
+            config_path.write_text(json.dumps(config))
             for field, value in [('owner', 'supervan'), ('work_dir', '/other'), ('secret_version_id', 'wrong')]:
                 changed = {**config, field: value}
                 config_path.write_text(json.dumps(changed))
@@ -190,6 +225,7 @@ class FiniteControlTests(unittest.TestCase):
         self.assertEqual(kwargs['stdout'], subprocess.DEVNULL)
         self.assertEqual(kwargs['stderr'], subprocess.DEVNULL)
         self.assertIn('--credential-stdin', args[0])
+        self.assertIn('studio_platform.scaler_entry', args[0])
         self.assertNotIn('--rm', args[0])
         process.wait.assert_not_called()
         process.terminate.assert_not_called()
@@ -267,6 +303,45 @@ class FiniteControlTests(unittest.TestCase):
             self.assertIn('--rm', compose.call_args.args)
             self.assertNotIn('--enabled', compose.call_args.args)
             self.assertNotIn('--credential-stdin', compose.call_args.args)
+            self.assertIn('studio_platform.scaler_entry', compose.call_args.args)
+
+    def test_readiness_wait_requires_live_exact_container_and_fresh_admission_proof(self):
+        config = on_demand_configuration()
+        ready = {**good_status(config), 'admission_ready': True}
+        not_ready = {**ready, 'admission_ready': False}
+        process = Mock()
+        process.poll.return_value = None
+        states = [container(config, running=True)['State']]*2
+        with patch.object(scaler, 'inspect_controller', side_effect=states), \
+                patch.object(scaler, 'controller_control', side_effect=[not_ready, ready]) as control:
+            scaler.wait_until_ready(process, Path('/release'), {}, config, sleep=lambda _: None)
+        self.assertEqual(control.call_count, 2)
+        self.assertTrue(all(call.args[-1] == '--status' for call in control.call_args_list))
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_invalid_or_stale_readiness_proof_never_enables_api(self):
+        config = on_demand_configuration()
+        good = {**good_status(config), 'admission_ready': True}
+        self.assertTrue(scaler.fresh_ready(good, config))
+        for key, value in [('snapshot_only', True), ('admission_ready', False), ('observed_at', 0),
+                           ('observed_at', float('nan')), ('cycle_id', 'another'), ('config_hash', 'another'),
+                           ('hard_deadline', config['hard_deadline']+1)]:
+            with self.subTest(key=key):
+                self.assertFalse(scaler.fresh_ready({**good, key: value}, config))
+        process = Mock()
+        process.poll.return_value = None
+        with patch.object(scaler, 'inspect_controller', return_value=container(config, running=True)['State']), \
+                patch.object(scaler, 'controller_control', return_value={}), \
+                self.assertRaisesRegex(release.ReleaseError, 'admission_not_ready'):
+            scaler.wait_until_ready(process, Path('/release'), {}, config, timeout=0)
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+        process.poll.return_value = 1
+        with patch.object(scaler, 'controller_control') as control, \
+                self.assertRaisesRegex(release.ReleaseError, 'exited_before_admission'):
+            scaler.wait_until_ready(process, Path('/release'), {}, config, timeout=0)
+        control.assert_not_called()
 
     def test_term_only_requests_drain_without_signalling_container(self):
         handlers, events = {}, []
@@ -321,6 +396,36 @@ class FiniteControlTests(unittest.TestCase):
                 self.assertLess(events.index('cpu'), events.index(('marker', False)))
             else:
                 self.assertNotIn(('marker', False), events)
+
+    def test_on_demand_start_cannot_enable_app_before_startup_admission_ready(self):
+        config, events = on_demand_configuration(), []
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules, {'fcntl': SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=lambda *_: None)}))
+            stack.enter_context(patch.object(release, 'ROOT', Path(tmp)))
+            stack.enter_context(patch.object(release, 'check_host'))
+            stack.enter_context(patch.object(release, 'command', return_value=b'2.38.2'))
+            stack.enter_context(patch.object(scaler, 'checked_release', return_value=(
+                'a'*40, Path(tmp), {'SIXNINE_IMAGE': 'sixnine-platform:'+'a'*40})))
+            stack.enter_context(patch.object(scaler, 'protected_inputs', return_value=config))
+            for name in ('require_new_controller', 'atomic', 'validate'):
+                stack.enter_context(patch.object(scaler, name))
+            compose = stack.enter_context(patch.object(scaler, 'compose', return_value=b'{}'))
+            stack.enter_context(patch.object(scaler, 'controller_control', return_value={
+                'config_valid': True, 'provider_calls_enabled': False, 'config_hash': scaler.fingerprint(config)}))
+            process = Mock()
+            launch = stack.enter_context(patch.object(scaler, 'launch', return_value=process))
+            stack.enter_context(patch.object(scaler, 'marker', side_effect=lambda c, x, a: events.append(('marker', a))))
+            wait = stack.enter_context(patch.object(scaler, 'wait_until_ready',
+                side_effect=release.ReleaseError('synthetic_not_ready')))
+            stack.enter_context(patch.object(scaler, 'close_admission', side_effect=lambda *_: events.append('cpu')))
+            stack.enter_context(patch('sys.stderr', new=io.StringIO()))
+            self.assertEqual(scaler.main(['start']), 1)
+        launch.assert_called_once()
+        wait.assert_called_once()
+        self.assertEqual(events, [('marker', True), 'cpu'])
+        self.assertTrue(all('up' not in call.args for call in compose.call_args_list))
+        process.kill.assert_not_called()
+        process.terminate.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -219,9 +219,7 @@ class ProductionBoot(BootController):
 
 def run_child(config, intent_id, expected_hash, settings):
     from .drain_safe_runner import DrainSafeRunner
-    from .production_scaler import ScalerError
-    from .repository import jobs
-    from sqlalchemy import and_
+    from .production_scaler import ScalerError, job_scope_filter, job_scope_allowed
     repo = Repository(settings.database_url)
     try:
         fleet_path = config.work_dir/"boot"/intent_id/"fleet.json"
@@ -245,14 +243,11 @@ def run_child(config, intent_id, expected_hash, settings):
         def job_allowed(job):
             # Called under the worker/queue transaction; no separate DB read.
             duration = job.get("expected_runtime_s")
-            return (job["tenant_id"] == config.tenant and job["owner_id"] == config.owner
-                and job["project_id"] == config.project_id and job["pool"] == config.pool
-                and job["execution_plan"].get("configuration_id") == config.configuration_id
+            return (job_scope_allowed(config, job)
+                and job["execution_plan"].get("policy_hash") == config.execution_policy_sha256
                 and type(duration) in (float, int) and duration > 0
                 and repo.clock()+duration+config.collection_margin_s < deadline)
-        predicate = and_(jobs.c.tenant_id == config.tenant, jobs.c.owner_id == config.owner,
-            jobs.c.project_id == config.project_id, jobs.c.pool == config.pool,
-            jobs.c.execution_plan["configuration_id"].as_string() == config.configuration_id)
+        predicate = job_scope_filter(config)
         return run_slot(fleet, worker_id, settings, repository=repo,
             runner_factory=lambda *a, **kw: DrainSafeRunner(*a, stop_new=stop_new, job_allowed=job_allowed,
                 job_filter=predicate, collection_lock_dir=config.work_dir/"collection-lock", **kw)) or 0

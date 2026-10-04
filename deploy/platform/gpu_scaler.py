@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Root-only, finite production GPU cycle. No action is the default.
+"""Root-only, bounded production GPU control. No action is the default.
 
 The host reads one pinned encrypted runtime credential into a private stdin pipe.
 Only the controller owns provider reconciliation. Never stop/kill its container
@@ -26,6 +26,7 @@ from gpu_acceptance import bind, GPU_HEALTH
 
 ROOT = Path('/srv/sixnine/gpu-scaler')
 SERVICE = 'gpu-controller'
+ENTRY_MODULE = 'studio_platform.scaler_entry'
 CONFIG_SOURCE = ROOT/'operator'/'scaler.json'
 CONFIG_TARGET = '/control-config/scaler.json'
 POLICY_SOURCE = ROOT/'operator'/'execution-policy.json'
@@ -57,7 +58,7 @@ def controller(image):
             'AWS_EC2_METADATA_DISABLED': 'true'},
         # Accidental compose up validates then exits. Only host start appends
         # both enable flags and supplies the bounded, single-use stdin envelope.
-        'command': ['python', '-m', 'studio_platform.production_scaler', '--config', CONFIG_TARGET],
+        'command': ['python', '-m', ENTRY_MODULE, '--config', CONFIG_TARGET],
         'secrets': [{'source': 'app_database_url', 'target': '/run/secrets/app_database_url'}],
         'volumes': [bind('/srv/sixnine/platform-data', '/data'),
             bind(ROOT/'control', '/control'), bind(ROOT/'tmp', '/tmp'),
@@ -141,6 +142,29 @@ def read_json(path, maximum=65536):
     return value
 
 
+def on_demand_config(config):
+    """The host accepts one narrow on-demand mode; unknown modes fail closed."""
+    mode = config.get('service_mode')
+    release.require(mode in (None, 'on-demand'), 'scaler_service_mode_invalid')
+    if mode is None:
+        return False
+    policy = config.get('scale_policy')
+    release.require(isinstance(policy, dict)
+        and type(config.get('max_cycles')) is int and 1 <= config['max_cycles'] <= 8
+        and config.get('allowed_owners') == ['superdan', 'supervan']
+        and type(policy.get('idle_before_drain_s')) is int and policy['idle_before_drain_s'] == 600
+        and type(policy.get('max_instances')) is int and policy['max_instances'] == 1
+        and type(policy.get('max_physical_gpus')) is int and policy['max_physical_gpus'] == 1
+        and type(policy.get('new_instance_slots', 1)) is int and policy.get('new_instance_slots', 1) == 1
+        and type(policy.get('new_instance_physical_gpus', 1)) is int and policy.get('new_instance_physical_gpus', 1) == 1,
+        'scaler_on_demand_limits_invalid')
+    created, deadline = config.get('created_at'), config.get('hard_deadline')
+    release.require(type(created) in (int, float) and type(deadline) in (int, float)
+        and math.isfinite(created) and math.isfinite(deadline) and 0 < deadline-created <= 24*3600,
+        'scaler_on_demand_authorization_window_invalid')
+    return True
+
+
 def protected_inputs(*, starting=False, now=None):
     for path in (ROOT, ROOT/'operator', ROOT/'identity', SOURCE):
         info = path.lstat()
@@ -154,6 +178,7 @@ def protected_inputs(*, starting=False, now=None):
     release.require(key.st_uid == 10001 and stat.S_IMODE(key.st_mode) == 0o400,
                     'scaler_ssh_identity_permissions_invalid')
     config, policy, metadata = read_json(CONFIG_SOURCE), read_json(POLICY_SOURCE), read_json(RUNTIME_METADATA)
+    on_demand = on_demand_config(config)
     expected_paths = {'work_dir': '/control', 'data_dir': '/data', 'source_dir': '/bootstrap-source',
                      'ssh_key_file': '/worker-identity/key', 'known_hosts_file': '/control/known_hosts'}
     release.require(all(config.get(k) == v for k, v in expected_paths.items())
@@ -174,7 +199,7 @@ def protected_inputs(*, starting=False, now=None):
         now = time.time() if now is None else now
         deadline = config.get('hard_deadline')
         release.require(config.get('enabled') is True and type(deadline) in (int, float)
-            and math.isfinite(deadline) and now+300 < deadline <= now+4*3600,
+            and math.isfinite(deadline) and now+300 < deadline <= now+(24 if on_demand else 4)*3600,
             'scaler_explicit_finite_authorization_required')
         # Never resume an uncertain previous lifecycle via a fresh start.
         entries = {path.name for path in (ROOT/'control').iterdir()}
@@ -218,7 +243,7 @@ def controller_control(directory, environment, action):
     release.require(action in ('--status', '--request-drain', '--validate'), 'controller_control_action_invalid')
     extra = [] if action == '--validate' else [action]
     raw = compose(directory, environment, 'run', '--rm', '--no-deps', '-T', '--entrypoint', 'python',
-        SERVICE, '-m', 'studio_platform.production_scaler', '--config', CONFIG_TARGET, *extra, timeout=45)
+        SERVICE, '-m', ENTRY_MODULE, '--config', CONFIG_TARGET, *extra, timeout=45)
     release.require(len(raw) <= 32768, 'controller_status_too_large')
     value = json.loads(raw)
     release.require(isinstance(value, dict), 'controller_status_invalid')
@@ -250,6 +275,37 @@ def inspect_controller(environment, config):
         and labels.get('com.docker.compose.service') == SERVICE
         and labels.get('com.sixnine.finite.config-hash') == fingerprint(config), 'controller_container_identity_mismatch')
     return value.get('State', {})
+
+
+def fresh_ready(value, config, *, now=None):
+    """A durable startup admission proof, distinct from an offline validation."""
+    now = time.time() if now is None else now
+    observed = value.get('observed_at')
+    return (value.get('cycle_id') == config['cycle_id'] and value.get('config_hash') == fingerprint(config)
+        and value.get('hard_deadline') == config['hard_deadline']
+        and type(observed) in (int, float) and math.isfinite(observed) and 0 <= now-observed <= 30
+        and value.get('snapshot_only') is False and value.get('admission_ready') is True)
+
+
+def wait_until_ready(process, directory, environment, config, *, timeout=90,
+                     clock=time.monotonic, sleep=time.sleep):
+    """Do not expose generation until this exact controller's admission is ready."""
+    deadline = clock()+timeout
+    while True:
+        release.require(process.poll() is None, 'controller_exited_before_admission_ready')
+        try:
+            state = inspect_controller(environment, config)
+            if (state.get('Running') is True and state.get('Restarting') is False
+                    and state.get('OOMKilled') is False and state.get('Status') == 'running'):
+                proof = controller_control(directory, environment, '--status')
+                if fresh_ready(proof, config):
+                    return
+        except (release.ReleaseError, ValueError, KeyError):
+            # The initial container/receipt may not yet exist. Keep admission
+            # closed and retry reads only, never launch another process.
+            pass
+        release.require(clock() < deadline, 'controller_admission_not_ready_barrier_retained')
+        sleep(3)
 
 
 def close_admission(directory, environment):
@@ -290,7 +346,7 @@ def launch(directory, environment, config, *, loader_factory=None, popen=subproc
         args = [release.DOCKER, '--host', 'unix:///var/run/docker.sock', *compose_args(directory,
             'run', '-T', '--name', container_name(config), '--no-deps', '--label',
             'com.sixnine.finite.config-hash='+fingerprint(config), '--entrypoint', 'python', SERVICE,
-            '-m', 'studio_platform.production_scaler', '--config', CONFIG_TARGET, '--enabled', '--credential-stdin')]
+            '-m', ENTRY_MODULE, '--config', CONFIG_TARGET, '--enabled', '--credential-stdin')]
         process = popen(args, env=environment, stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
         # Bounded one-time write, explicit EOF; child subprocesses get DEVNULL.
@@ -394,6 +450,8 @@ def main(argv=None):
                 and validation.get('config_hash') == fingerprint(config), 'finite_configuration_validation_failed')
             marker(commit, config, True)
             process = launch(directory, environment, config)
+            if on_demand_config(config):
+                wait_until_ready(process, directory, environment, config)
             compose(directory, environment, 'up', '-d', '--no-deps', 'app')
             release.wait_ready(directory, environment)
         # Caller runs this root helper under a persistent systemd unit. Release

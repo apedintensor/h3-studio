@@ -129,6 +129,41 @@ class ExecutionPolicyTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.policies.ensure_current(plan, self.scope)
 
+    def test_both_owners_share_warm_pool_across_stories_but_unfunded_owner_is_blocked(self):
+        self.repo.configure_budget("test-owner:sixnine:supervan", tenant_id="sixnine", owner_id="supervan",
+            limit_microusd=1000000)
+        for owner in ("superdan", "supervan"):
+            for story in ("existing-story", "new-story"):
+                admission = self.policies.evaluate(self.compiled, Scope("sixnine", owner, story), self.fingerprint)
+                self.assertTrue(admission.execution["enabled"], admission.execution["blockers"])
+                self.assertEqual(admission.execution["admission_state"], "queued")
+        denied = self.policies.evaluate(self.compiled, Scope("sixnine", "unfunded-user", "new-story"), self.fingerprint)
+        self.assertFalse(denied.execution["enabled"])
+
+    def test_near_expiry_blocks_new_work_without_changing_policy_or_existing_reservation(self):
+        now = self.repo.clock()
+        self.repo.clock = lambda: now
+        self.value["qualification"]["expires_at"] = now + 700
+        self.value["reservation"]["expires_at"] = now + 1000
+        self.write()
+        admission = self.evaluate()
+        self.assertTrue(admission.execution["enabled"])
+        self.assertEqual(admission.expires_at, now + 400)
+        plan = self.repo.create_plan(self.scope, self.compiled, admission.execution,
+            expires_at=admission.expires_at, estimated_cost_microusd=admission.cost)
+        job = self.repo.create_job(self.scope, plan["id"], "before-service-expiry",
+            budget_account_ids=admission.execution["budget_account_ids"])
+        original_hash = admission.execution["policy_hash"]
+        self.repo.clock = lambda: now + 400
+        late = self.evaluate()
+        self.assertEqual(late.execution["policy_hash"], original_hash)
+        self.assertFalse(late.execution["enabled"])
+        self.assertTrue(any("剩余时间不足" in item for item in late.execution["blockers"]))
+        self.assertFalse(self.policies.submission_allowed(job))
+        with self.assertRaises(Conflict):
+            self.policies.ensure_current(plan, self.scope)
+        self.assertEqual(self.repo.get_budget("test-owner:sixnine:superdan")["reserved_microusd"], 500000)
+
     def test_submission_guard_does_not_reserve_twice_and_honors_revocation(self):
         admission = self.evaluate()
         plan = self.repo.create_plan(self.scope, self.compiled, admission.execution,

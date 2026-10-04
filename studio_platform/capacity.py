@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from .autoscale import Demand, ScalePolicy, ScaleState, Slot, recommend
 from .repository import (BudgetExceeded, Conflict, NotFound, Scope, budget_accounts,
     capacity_approvals, capacity_cycles, capacity_gate, capacity_waiters, canonical,
-    documents, instance_intents, jobs, pool_limits, registered_workers, request_hash)
+    documents, instance_intents, jobs, pool_limits, registered_workers, request_hash, attempts)
 from .scaler import LaunchSpec, _safe_id
 
 
@@ -172,6 +172,103 @@ def admit_waiter(repo, connection, scope, job, plan):
         intent_id=cycle["intent_id"] if cycle else None, state="waiting_capacity", created_at=repo.clock()))
 
 
+def proven_unsubmitted_capacity_job(connection, job):
+    """Never infer safe replay from a queued label; retain every old attempt."""
+    if job["status"] not in ("queued", "waiting_capacity") or job["lease_worker_id"] is not None:
+        return False
+    history = list(connection.execute(select(attempts).where(attempts.c.job_id == job["id"])
+        .order_by(attempts.c.number).limit(1001)).mappings())
+    if (len(history) > 1000 or len(history) != job["attempt_no"]
+            or any(row["submission_started_at"] is not None or row["upstream_task_id"] is not None for row in history)):
+        return False
+    if not history:
+        return job["current_attempt_id"] is None
+    # A deferred preparation turn never called the inference provider. Keep
+    # the attempt ID/count intact and let the normal queue create its next turn.
+    return bool(job["status"] == "queued" and history[-1]["id"] == job["current_attempt_id"]
+        and all(row["status"] in ("deferred", "cancelled") for row in history))
+
+
+def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
+                                  children_done_confirmed=False, limit=4096):
+    """Move accepted unsubmitted jobs to a fresh one-use grant without rebilling.
+
+    Operator-only. The old pod must already have an authoritative destroyed
+    ledger state and its children must have naturally exited. Shared capacity,
+    worker and job locks exclude an old claim/POST racing this handoff.
+    """
+    if (children_done_confirmed is not True or allowed_owners != ["superdan", "supervan"]
+            or previous_id == next_id or type(limit) is not int or not 1 <= limit <= 4096):
+        raise Conflict("capacity_transfer_requires_confirmed_retirement")
+    with repo.transaction() as conn:
+        repo._lock_capacity(conn)
+        grants = {r["id"]: dict(r) for r in conn.execute(select(capacity_approvals).where(
+            capacity_approvals.c.id.in_((previous_id, next_id)))).mappings()}
+        if len(grants) != 2:
+            raise Conflict("capacity_transfer_grants_missing")
+        old, new = grants[previous_id], grants[next_id]
+        a, b = old["payload"], new["payload"]
+        exact = ("tenant_id", "pool", "model_id", "configuration_id", "recipe_ids", "policy_hash",
+                 "qualification_evidence_id", "qualification_expires_at", "quote_expires_at",
+                 "budget_scope", "budget_account_ids")
+        if (a["tenant_id"] != "sixnine" or old["enabled"] != 0 or new["enabled"] != 1 or any(a[k] != b[k] for k in exact)
+                or new["expires_at"] <= repo.clock()):
+            raise Conflict("capacity_transfer_grant_identity_mismatch")
+        cycle = conn.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == previous_id)).mappings().one()
+        rows = list(conn.execute(select(instance_intents).where(instance_intents.c.pool == a["pool"])).mappings())
+        if (not any(row["id"] == cycle["intent_id"] and row["state"] == "destroyed" for row in rows)
+                or any(row["state"] != "destroyed" for row in rows)):
+            raise Conflict("capacity_transfer_old_instance_not_removed")
+        workers = list(conn.execute(select(registered_workers).where(registered_workers.c.pool == a["pool"])
+            .order_by(registered_workers.c.id).with_for_update()).mappings())
+        if any(w["state"] != "retired" or w["current_job_id"] for w in workers):
+            raise Conflict("capacity_transfer_worker_not_retired")
+        candidates = list(conn.execute(select(jobs.c.id).where(jobs.c.tenant_id == a["tenant_id"],
+            jobs.c.owner_id.in_(allowed_owners), jobs.c.pool == a["pool"],
+            jobs.c.execution_plan["configuration_id"].as_string() == a["configuration_id"],
+            jobs.c.status.not_in(("succeeded", "failed", "cancelled")))
+            .order_by(jobs.c.id).limit(limit+1)).scalars())
+        if len(candidates) > limit:
+            raise Conflict("capacity_transfer_window_exceeded")
+        moved = []
+        for jid in candidates:
+            job = repo._job(conn, jid, lock=True)
+            execution = job["execution_plan"]
+            existing = conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == jid)).mappings().first()
+            if execution.get("capacity_approval_id") == next_id and existing and existing["approval_id"] == next_id:
+                continue  # Idempotent recovery after the transaction committed.
+            if (not proven_unsubmitted_capacity_job(conn, job) or execution.get("policy_hash") != a["policy_hash"]
+                    or execution.get("capacity_approval_id") not in (None, previous_id)
+                    or execution.get("capacity_approval_id") == previous_id
+                        and execution.get("capacity_approval_hash") != old["approval_hash"]
+                    or existing and existing["approval_id"] != previous_id
+                    or existing and existing["approval_hash"] != old["approval_hash"]
+                    or execution.get("backend") != "comfy-worker" or execution.get("enabled") is not True
+                    or execution.get("qualification_evidence_id") != a["qualification_evidence_id"]
+                    or job["request"].get("recipe_id") not in b["recipe_ids"]
+                    or job["request"].get("request", {}).get("model") != b["model_id"]):
+                raise Conflict("capacity_transfer_job_requires_reconciliation")
+            deadline = min(new["expires_at"], b["quote_expires_at"], b["qualification_expires_at"],
+                b["scale_policy"]["hard_deadline"]-job["expected_runtime_s"])
+            if deadline <= repo.clock():
+                raise Conflict("capacity_transfer_deadline_expired")
+            execution = {**execution, "capacity_approval_id": next_id,
+                "capacity_approval_hash": new["approval_hash"], "admission_state": "waiting_capacity"}
+            state = "queued" if job["attempt_no"] else "waiting_capacity"
+            conn.execute(update(jobs).where(jobs.c.id == jid).values(execution_plan=execution,
+                status=state, fence=job["fence"]+1, not_before=repo.clock(), updated_at=repo.clock()))
+            waiter = dict(approval_id=next_id, approval_hash=new["approval_hash"], deadline=deadline,
+                intent_id=None, state="waiting_capacity", created_at=repo.clock())
+            if existing:
+                conn.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(**waiter))
+            else:
+                conn.execute(insert(capacity_waiters).values(job_id=jid, **waiter))
+            repo._emit(conn, "job.capacity_rollover", jid, {"job_id": jid, "status": state,
+                "reason": "instance_lifetime_rollover", "generation_resubmitted": False})
+            moved.append(jid)
+        return moved
+
+
 class ColdStartCoordinator:
     """Bounded trusted turn; default disabled and no current-policy guard means deny.
 
@@ -218,7 +315,7 @@ class ColdStartCoordinator:
             rows = connection.execute(select(jobs.c.id, jobs.c.owner_id, jobs.c.created_at, jobs.c.expected_runtime_s)
                 .join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
                     capacity_waiters.c.approval_id == approval_id, capacity_waiters.c.state == "waiting_capacity",
-                    capacity_waiters.c.deadline > self.repo.clock(), jobs.c.status == "waiting_capacity")
+                    capacity_waiters.c.deadline > self.repo.clock(), jobs.c.status.in_(("waiting_capacity", "queued")))
                 .order_by(jobs.c.created_at, jobs.c.id).limit(4096)).mappings()
             demands = [Demand(r["id"], r["owner_id"], r["created_at"], r["expected_runtime_s"], "operator-qualified") for r in rows]
         from .control import WorkerControl
@@ -245,10 +342,11 @@ class ColdStartCoordinator:
     def _before_create(self, approval_id):
         with self.repo.engine.connect() as connection:
             row = connection.execute(select(capacity_approvals).where(capacity_approvals.c.id == approval_id)).mappings().one()
-            demand = connection.execute(select(jobs.c.id).join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id)
+            demand = connection.execute(select(jobs).join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id)
                 .where(capacity_waiters.c.approval_id == approval_id, capacity_waiters.c.state == "waiting_capacity",
-                    capacity_waiters.c.deadline > self.repo.clock(), jobs.c.status == "waiting_capacity").limit(1)).first()
-            return bool(demand and self._valid(row))
+                    capacity_waiters.c.deadline > self.repo.clock(), jobs.c.status.in_(("waiting_capacity", "queued")))
+                .limit(1)).mappings().first()
+            return bool(demand and proven_unsubmitted_capacity_job(connection, demand) and self._valid(row))
 
     def _attach(self, connection, intent, approval_id):
         approval = self.repo._locked(connection, select(capacity_approvals).where(capacity_approvals.c.id == approval_id))
@@ -295,11 +393,12 @@ class ColdStartCoordinator:
             with self.repo.transaction() as connection:
                 job = self.repo._job(connection, jid, lock=True)
                 waiter = connection.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == jid)).mappings().one()
-                if job["status"] != "waiting_capacity" or waiter["state"] != "waiting_capacity":
+                if (job["status"] not in ("waiting_capacity", "queued") or waiter["state"] != "waiting_capacity"
+                        or waiter["approval_id"] != approval["id"]):
                     continue
                 grant = connection.execute(select(capacity_approvals).where(capacity_approvals.c.id == approval["id"])).mappings().one()
                 reason = None
-                if job["attempt_no"] or job["current_attempt_id"] or job["lease_worker_id"]:
+                if not proven_unsubmitted_capacity_job(connection, job):
                     connection.execute(update(jobs).where(jobs.c.id == jid).values(status="recovery_hold",
                         error_code="capacity_waiter_has_attempt_requires_review", updated_at=self.repo.clock()))
                     connection.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(state="recovery_hold"))
@@ -369,7 +468,7 @@ class ColdStartCoordinator:
                 .join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
                     capacity_waiters.c.approval_id == approval_id, capacity_waiters.c.state == "waiting_capacity",
                     capacity_waiters.c.deadline > self.repo.clock(),
-                    jobs.c.status == "waiting_capacity").order_by(jobs.c.created_at, jobs.c.id).limit(4096)).mappings()
+                    jobs.c.status.in_(("waiting_capacity", "queued"))).order_by(jobs.c.created_at, jobs.c.id).limit(4096)).mappings()
             demands = [Demand(r["id"], r["owner_id"], r["created_at"], r["expected_runtime_s"], "operator-qualified") for r in rows]
         p = approval["payload"]
         policy = ScalePolicy(**p["scale_policy"])

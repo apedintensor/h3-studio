@@ -73,7 +73,7 @@ export function createCloudClient({fetcher=(...args)=>fetch(...args),onUnauthori
           const delay=retryDelay(response);
           if(delay!==null&&Date.now()+delay<deadline){await waitForRetry(delay,controller.signal);continue;}
         }
-        const reason=typeof detail?.detail==='string'?detail.detail:typeof detail?.message==='string'?detail.message:response.status===409?'云端版本已改变。你的草稿已保留，请先比较新版本。':response.status===404?'此云功能尚未连接，或该内容不存在。':response.status===401?'请重新登录云工作室。':`服务暂未完成请求（${response.status}）。`;
+        const reason=response.status===409&&detail?.detail==='capacity_drain_repreflight'?'GPU 正在休眠或切换，任务尚未提交。请重新检查后生成；作品和素材已保留。':typeof detail?.detail==='string'?detail.detail:typeof detail?.message==='string'?detail.message:response.status===409?'云端版本已改变。你的草稿已保留，请先比较新版本。':response.status===404?'此云功能尚未连接，或该内容不存在。':response.status===401?'请重新登录云工作室。':`服务暂未完成请求（${response.status}）。`;
         throw new CloudError(reason,{status:response.status,detail});
       }
       const result=blob?await response.blob():response.status===204?null:await response.json();

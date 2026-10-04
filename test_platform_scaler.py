@@ -8,7 +8,7 @@ from sqlalchemy import select, update
 from studio_platform.autoscale import Demand, ScalePolicy, Slot
 from studio_platform.control import WorkerControl, WorkerSpec
 from studio_platform.repository import (
-    Conflict, instance_intents, registered_workers, scaler_actions, scaler_observations,
+    Conflict, instance_intents, jobs, registered_workers, scaler_actions, scaler_observations,
 )
 from studio_platform.scaler import DisabledProvider, LaunchSpec, ProviderFact, ScaleCoordinator
 from test_platform_repository import LedgerCase
@@ -196,6 +196,10 @@ class ScalerTests(LedgerCase):
         self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"], idle_confirmed=True, idle_since=0)
         self.now += 16
         self.tick(demands=[])
+        self.assertEqual(self.provider.destroys, [])
+        self.now += self.policy.idle_before_drain_s
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        self.tick(demands=[])
         gone = self.repo.list_instance_intents()[0]
         self.assertEqual(gone["state"], "destroyed")
         self.assertEqual(gone["billing_status"], "pending")
@@ -273,7 +277,7 @@ class ScalerTests(LedgerCase):
             raise TimeoutError("fake-destroy-response-lost")
         self.provider.destroy = uncertain
         self.now += 16
-        self.tick(demands=[])
+        self.tick(demands=[], policy=replace(self.policy, idle_before_drain_s=0))
         self.assertEqual(self.repo.list_instance_intents()[0]["state"], "destroying")
         self.now += 16
         self.tick(demands=[])
@@ -291,7 +295,7 @@ class ScalerTests(LedgerCase):
         self.ready_instance(instance)
         self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"], idle_confirmed=True, idle_since=0)
         self.now += 16
-        self.tick(demands=[])
+        self.tick(demands=[], policy=replace(self.policy, idle_before_drain_s=0))
         self.now += 16
         self.tick()
         self.now += 16
@@ -334,6 +338,172 @@ class ScalerTests(LedgerCase):
         self.assertEqual(self.tick(demands=[])["reason"], "provider_identity_mismatch")
         self.assertEqual(len(self.provider.lookups), before)
         self.assertEqual(self.provider.destroys, [])
+
+    def business_plan(self):
+        return self.repo.create_plan(self.scope,
+            {"recipe_id": "test-recipe", "request": {"model": "test-model"}},
+            {"pool": "scale-test", "backend": "comfy-worker", "configuration_id": "test-manifest", "enabled": True},
+            expires_at=9000, estimated_cost_microusd=0)
+
+    def application_idle_since(self, instance):
+        with self.repo.engine.connect() as connection:
+            return connection.execute(select(scaler_actions.c.application_idle_since)
+                .where(scaler_actions.c.intent_id == instance["id"])).scalar_one()
+
+    def test_idle_600_starts_after_collection_finished_not_after_upstream_empty(self):
+        instance = self.create()
+        control, spec = self.ready_instance(instance)
+        job = self.repo.create_job(self.scope, self.business_plan()["id"], "collecting-real-result")
+        claim = control.claim(spec.worker_id, spec.pool, lease_seconds=3600)
+        control.queue.begin_submission(claim.lease)
+        control.queue.record_submitted(claim.lease, "fake-complete-upstream")
+        control.queue.begin_collection(claim.lease)
+        self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"],
+            idle_confirmed=True, idle_since=0)
+        policy = replace(self.policy, idle_before_drain_s=600)
+        self.now += 700
+        self.tick(demands=[], policy=policy)
+        self.assertIsNone(self.application_idle_since(instance))
+        self.assertEqual(self.provider.destroys, [])
+        self.assertEqual(self.repo.get_job(self.scope, job["id"])["status"], "collecting")
+        # Finish the synthetic collection with a terminal fixture failure;
+        # production success reaches the same terminal ledger/slot barrier.
+        control.queue.fail(claim.lease, "synthetic-fixture-finished", actual_cost_microusd=0, upstream_stopped=True)
+        control.observe(spec.worker_id, job["id"])
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        self.tick(demands=[], policy=policy)
+        self.assertEqual(self.application_idle_since(instance), self.now)
+        self.now += 599
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        self.tick(demands=[], policy=policy)
+        self.assertEqual(self.provider.destroys, [])
+        self.now += 1
+        self.tick(demands=[], policy=policy)
+        self.assertEqual(len(self.provider.destroys), 1)
+
+    def test_new_job_resets_persisted_idle_timer_even_after_controller_replacement(self):
+        instance = self.create()
+        control, spec = self.ready_instance(instance)
+        self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"],
+            idle_confirmed=True, idle_since=0)
+        policy = replace(self.policy, idle_before_drain_s=600)
+        self.tick(demands=[], policy=policy)
+        self.now += 500
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        job = self.repo.create_job(self.scope, self.business_plan()["id"], "new-user-demand")
+        self.tick(demands=[], policy=policy)
+        self.assertIsNone(self.application_idle_since(instance))
+        self.repo.request_cancel(self.scope, job["id"])
+        self.now += 16
+        self.tick(demands=[], policy=policy)
+        self.assertEqual(self.application_idle_since(instance), self.now)
+        replacement = ScaleCoordinator(self.repo, provider=self.provider, enabled=True)
+        self.now += 599
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        self.tick(leader="replacement", demands=[], policy=policy, scaler=replacement)
+        self.assertEqual(self.provider.destroys, [])
+        self.now += 1
+        self.tick(leader="replacement", demands=[], policy=policy, scaler=replacement)
+        self.assertEqual(len(self.provider.destroys), 1)
+
+    def test_stale_preflight_cannot_enqueue_after_idle_destroy_and_replay_is_preserved(self):
+        instance = self.create()
+        self.ready_instance(instance)
+        plan = self.business_plan()
+        accepted = self.repo.create_job(self.scope, plan["id"], "accepted-before-shutdown")
+        self.repo.request_cancel(self.scope, accepted["id"])
+        draft = self.repo.create_job(self.scope, plan["id"], "planned-before-shutdown", initial_status="planned")
+        self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"],
+            idle_confirmed=True, idle_since=0)
+        self.tick(demands=[], policy=replace(self.policy, idle_before_drain_s=0))
+        self.assertEqual(len(self.provider.destroys), 1)
+        with self.assertRaisesRegex(Conflict, "capacity_drain_repreflight"):
+            self.repo.create_job(self.scope, plan["id"], "arrived-after-shutdown")
+        with self.assertRaisesRegex(Conflict, "capacity_drain_repreflight"):
+            self.repo.enqueue(self.scope, draft["id"])
+        replay = self.repo.create_job(self.scope, plan["id"], "accepted-before-shutdown")
+        self.assertEqual(replay["id"], accepted["id"])
+        self.assertEqual(replay["status"], "cancelled")
+
+    def test_existing_scaler_ledger_migration_does_not_inherit_provider_idle_time(self):
+        instance = self.create()
+        with self.repo.transaction() as connection:
+            connection.exec_driver_sql("ALTER TABLE platform_scaler_actions DROP COLUMN application_idle_since")
+        self.repo.create_schema()
+        self.assertIsNone(self.application_idle_since(instance))
+        self.assertEqual(self.repo.list_instance_intents()[0]["state"], "starting")
+
+    def test_concurrent_user_submit_and_idle_shutdown_never_strand_accepted_job(self):
+        instance = self.create()
+        self.ready_instance(instance)
+        plan = self.business_plan()
+        self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"],
+            idle_confirmed=True, idle_since=0)
+        barrier = threading.Barrier(2)
+        def race(index):
+            barrier.wait(timeout=10)
+            if index == 0:
+                return self.tick(demands=[], policy=replace(self.policy, idle_before_drain_s=0))
+            try:
+                return self.repo.create_job(self.scope, plan["id"], "concurrent-user-submit")
+            except Conflict as exc:
+                return {"conflict": str(exc)}
+        _, submitted = self.parallel(race, count=2)
+        if submitted.get("conflict"):
+            self.assertEqual(submitted["conflict"], "capacity_drain_repreflight")
+            self.assertEqual(len(self.provider.destroys), 1)
+            self.assertIsNone(self.repo.lookup_job_by_idempotency(self.scope, "concurrent-user-submit"))
+        else:
+            self.assertEqual(submitted["status"], "queued")
+            self.assertEqual(self.provider.destroys, [])
+            self.assertEqual(self.repo.get_job(self.scope, submitted["id"])["status"], "queued")
+
+    def test_demand_created_and_cancelled_between_polls_still_resets_idle_timer(self):
+        instance = self.create()
+        control, spec = self.ready_instance(instance)
+        self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"],
+            idle_confirmed=True, idle_since=0)
+        policy = replace(self.policy, idle_before_drain_s=600)
+        self.tick(demands=[], policy=policy)
+        self.now += 590
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        job = self.repo.create_job(self.scope, self.business_plan()["id"], "fast-cancel-between-polls")
+        self.repo.request_cancel(self.scope, job["id"])
+        self.now += 10
+        self.tick(demands=[], policy=policy)
+        self.assertEqual(self.provider.destroys, [])
+        self.assertEqual(self.application_idle_since(instance), self.now)
+
+    def test_every_admitted_nonterminal_state_resets_idle_but_another_ready_pool_can_serve(self):
+        instance = self.create()
+        control, spec = self.ready_instance(instance)
+        self.provider.facts[instance["id"]] = ProviderFact("running", instance["provider_instance_id"],
+            idle_confirmed=True, idle_since=0)
+        plan = self.business_plan()
+        job = self.repo.create_job(self.scope, plan["id"], "pending-business-demand")
+        for status in ("waiting_capacity", "queued", "claimed", "submitting", "running", "collecting",
+                       "checking", "submission_unknown", "cancel_requested", "recovery_hold"):
+            with self.subTest(status=status):
+                with self.repo.transaction() as connection:
+                    connection.execute(update(jobs).where(jobs.c.id == job["id"]).values(status=status))
+                self.now += 16
+                control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+                self.tick(demands=[], policy=replace(self.policy, idle_before_drain_s=0))
+                self.assertIsNone(self.application_idle_since(instance))
+                self.assertEqual(self.provider.destroys, [])
+        with self.repo.transaction() as connection:
+            connection.execute(update(jobs).where(jobs.c.id == job["id"]).values(status="cancelled"))
+        self.tick(demands=[], policy=replace(self.policy, idle_before_drain_s=0))
+        self.assertEqual(len(self.provider.destroys), 1)
+        replacement = replace(spec, worker_id="another-worker", instance_id="another-instance", physical_gpu_ids=("another-gpu",))
+        control.register(replacement)
+        control.mark_ready(replacement.worker_id, upstream_idle_confirmed=True)
+        queued = self.repo.create_job(self.scope, plan["id"], "replacement-now-serves")
+        claim = control.claim(replacement.worker_id, replacement.pool)
+        control.observe(replacement.worker_id, claim.job["id"])
+        self.assertEqual(control.get(replacement.worker_id)["state"], "busy")
+        newer = self.repo.create_job(self.scope, plan["id"], "queue-while-replacement-busy")
+        self.assertEqual(newer["status"], "queued")
 
 
 if __name__ == "__main__":

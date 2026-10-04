@@ -228,7 +228,8 @@ scaler_actions = Table("platform_scaler_actions", metadata,
     Column("intent_id", String(36), ForeignKey("platform_instance_intents.id"), primary_key=True),
     Column("pool", String(200), nullable=False), Column("launch_spec", JSON, nullable=False),
     Column("create_started_at", Float), Column("destroy_started_at", Float),
-    Column("last_observation", JSON), Column("last_observed_at", Float))
+    Column("last_observation", JSON), Column("last_observed_at", Float),
+    Column("application_idle_since", Float))
 scaler_receipts = Table("platform_scaler_receipts", metadata,
     Column("id", String(36), primary_key=True), Column("intent_id", String(36), ForeignKey("platform_instance_intents.id"), nullable=False),
     Column("operation", String(30), nullable=False), Column("observed_at", Float, nullable=False),
@@ -305,6 +306,10 @@ class Repository:
                     "ALTER TABLE platform_registered_workers ADD COLUMN drain_requested INTEGER NOT NULL DEFAULT 0")
                 connection.exec_driver_sql(
                     "UPDATE platform_registered_workers SET drain_requested=1 WHERE state='draining'")
+            scaler_columns = {column["name"] for column in inspect(connection).get_columns("platform_scaler_actions")}
+            if "application_idle_since" not in scaler_columns:
+                connection.exec_driver_sql(
+                    "ALTER TABLE platform_scaler_actions ADD COLUMN application_idle_since FLOAT")
 
     def close(self):
         self.engine.dispose()
@@ -490,6 +495,36 @@ class Repository:
             connection.execute(update(budget_reservations).where(budget_reservations.c.id == row["id"])
                 .values(state="released" if actual_cost == 0 else "settled", actual_cost_microusd=actual_cost))
 
+    def _require_pool_not_stopping(self, connection, pool, execution, compiled):
+        """Close the preflight/shutdown race while holding the global gate.
+
+        Already committed jobs return idempotently before this check. A new
+        stale warm-capacity plan receives an explicit conflict and must be
+        preflighted against a fresh cold-start approval; it is never silently
+        queued onto a destroyed instance or changed into a different purchase.
+        """
+        if (execution.get("backend") != "comfy-worker" or execution.get("enabled") is not True
+                or execution.get("admission_state") == "waiting_capacity"):
+            return
+        stopping = set(connection.execute(select(instance_intents.c.provider, instance_intents.c.provider_instance_id)
+            .where(instance_intents.c.pool == pool,
+                instance_intents.c.state.in_(("draining", "destroying", "destroyed")),
+                instance_intents.c.provider_instance_id.is_not(None))).tuples())
+        if not stopping:
+            return
+        workers = connection.execute(select(registered_workers).where(registered_workers.c.pool == pool)).mappings()
+        now = self.clock()
+        for worker in workers:
+            spec = worker["spec"]
+            if (worker["state"] in ("ready", "leased", "busy", "reconciling") and not worker["drain_requested"]
+                    and worker["expires_at"] > now and (worker["provider"], worker["instance_id"]) not in stopping
+                    and spec.get("backend") == "comfy-worker"
+                    and spec.get("configuration_id") == execution.get("configuration_id")
+                    and spec.get("model_id") == compiled.get("request", compiled).get("model")
+                    and compiled.get("recipe_id") in spec.get("recipe_ids", ())):
+                return
+        raise Conflict("capacity_drain_repreflight")
+
     def create_job(self, scope, plan_id, idempotency_key, *, budget_account_ids=(), initial_status="queued"):
         identifier(idempotency_key)
         if initial_status not in ("queued", "planned", "blocked", "waiting_capacity"):
@@ -498,6 +533,11 @@ class Repository:
                          jobs.c.idempotency_key == idempotency_key)
         try:
             with self.transaction() as connection:
+                if initial_status in ("queued", "waiting_capacity"):
+                    # Same lock as idle shutdown: an admitted job cannot appear
+                    # between its empty-pool check and its destroy commitment.
+                    # Legacy/mock ledgers may have no physical capacity gate.
+                    self._locked(connection, select(capacity_gate).where(capacity_gate.c.id == "global"))
                 plan = self._locked(connection, select(plans).where(plans.c.id == plan_id,
                     self._scope(plans, scope)))
                 if plan is None:
@@ -516,6 +556,8 @@ class Repository:
                 if execution.get("admission_state") == "waiting_capacity" and initial_status == "queued":
                     raise Conflict("capacity_plan_requires_waiting")
                 pool = identifier(execution.get("pool", "h3-base-ref"))
+                if initial_status == "queued":
+                    self._require_pool_not_stopping(connection, pool, execution, plan["request"])
                 runtime = float(execution.get("expected_runtime_s", 600))
                 if not 0 < runtime <= 86400:
                     raise ValueError("invalid_expected_runtime")
@@ -544,12 +586,14 @@ class Repository:
 
     def enqueue(self, scope, job_id, *, budget_account_ids=()):
         with self.transaction() as connection:
+            self._locked(connection, select(capacity_gate).where(capacity_gate.c.id == "global"))
             job = self._job(connection, job_id, scope, lock=True)
             if job["status"] not in ("planned", "blocked") or job["attempt_no"]:
                 raise InvalidTransition("job_not_admissible")
             plan = connection.execute(select(plans).where(plans.c.id == job["plan_id"])).mappings().one()
             if plan["expires_at"] <= self.clock():
                 raise Conflict("plan_expired")
+            self._require_pool_not_stopping(connection, job["pool"], plan["execution_plan"], plan["request"])
             self._reserve(connection, scope, budget_account_ids, "job", job_id, job["estimated_cost_microusd"])
             status = "waiting_capacity" if plan["execution_plan"].get("admission_state") == "waiting_capacity" else "queued"
             if status == "waiting_capacity":
