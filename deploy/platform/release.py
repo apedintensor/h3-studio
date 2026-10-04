@@ -233,6 +233,10 @@ def prepare_bundle(root, commit):
                 os.fsync(destination.fileno())
             (staging / name).chmod(0o644)
         require(manifest(staging, commit) == expected, "copied_release_differs")
+        # Incoming remains writable by the deploy identity. Bind the private
+        # staged copy to independent approval BEFORE publishing its commit
+        # directory, so a swap after the initial check cannot poison retries.
+        approved_manifest(root, staging, commit)
         staging.rename(target)
         target.chmod(0o755)
         sync_directory(target.parent)

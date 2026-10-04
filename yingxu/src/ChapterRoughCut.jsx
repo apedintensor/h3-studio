@@ -3,7 +3,7 @@ import {store} from './store.js';
 import {cloudController as cloud} from './cloud-controller.js';
 import {useCloud} from './CloudStudio.jsx';
 import {roughCutSnapshot,roughCutSummary,roughCutJobs} from './roughcut-model.js';
-import {stableJSON,activeJobStatuses,jobLabels,recoveryMessage,estimateLabel} from './cloud-model.js';
+import {stableJSON,activeJobStatuses,jobLabels,jobMessage,estimateLabel} from './cloud-model.js';
 import ArtifactResult from './ArtifactResult.jsx';
 import {burnCaptionStatus} from './caption-model.js';
 import './roughcut.css';
@@ -40,7 +40,7 @@ export default function ChapterRoughCut({project,chapterId,onFix}){
     {held&&<p className="cloud-warning">粗剪任务恢复后待核对，先由管理员确认原任务；本章仍可编辑，但不会重新提交。</p>}{pending&&<div className="cloud-warning" role="alert"><p>{c.busy?'正在向服务确认本次提交，请稍候。':'有一次粗剪提交尚未确认。原计划和标识已保留，即使后来修改章节，也只核对这次原任务。'}</p><button disabled={c.busy||held} onClick={()=>run(cloud.submitRender(chapterId))}>用原标识恢复粗剪</button></div>}
     <div className="cloud-section-head"><h4>本章粗剪版本</h4><button disabled={c.busy} onClick={()=>run(cloud.refresh())}>刷新粗剪进度</button></div><p>每次结果属于提交时的时间线快照，不会自动替换你之后的修改。</p>
     {!jobs.length&&<p className="muted">尚未提交本章粗剪。先预检，确认后才会创建任务。</p>}
-    <div className="roughcut-jobs">{jobs.map(job=><article key={job.id}><div className="cloud-section-head"><b>{job.simulation?'模拟来源 · ':''}{jobLabels[job.status]||job.status}</b>{activeJobStatuses.has(job.status)&&<button disabled={c.busy} onClick={()=>run(cloud.cancel(job.id))}>请求取消粗剪</button>}</div><p role="status">{job.status==='recovery_hold'?recoveryMessage(job):job.status==='running'?'正在拼接、对齐与核验视频。':job.message||job.error?.message||job.error_code||''}</p><p>{job.effective_request?.render?.version>=3?(job.effective_request.render.subtitles?"这次成片配置：字幕烧入画面，播放器不能关闭。":"这次成片配置：未添加本项目手动字幕。"):("历史版本未提供字幕配置证据；以实际文件为准。")}</p><small>{job.created_at?new Date(typeof job.created_at==='number'?job.created_at*1000:job.created_at).toLocaleString():''}{job.effective_request?.duration?` · ${number(job.effective_request.duration)} 秒`: ''} · 任务 {job.id}</small>{job.status==='succeeded'&&(job.artifacts||[]).filter(a=>['video','audio'].includes(a.kind)).map(artifact=><ArtifactResult key={artifact.id} artifact={artifact} job={job} title={summary.chapterTitle}/>)}</article>)}</div>
+    <div className="roughcut-jobs">{jobs.map(job=><article key={job.id}><div className="cloud-section-head"><b>{job.simulation?'模拟来源 · ':''}{jobLabels[job.status]||job.status}</b>{activeJobStatuses.has(job.status)&&<button disabled={c.busy} onClick={()=>run(cloud.cancel(job.id))}>请求取消粗剪</button>}</div><p role="status">{job.status==='running'?'正在拼接、对齐与核验视频。':jobMessage(job)}</p><p>{job.effective_request?.render?.version>=3?(job.effective_request.render.subtitles?"这次成片配置：字幕烧入画面，播放器不能关闭。":"这次成片配置：未添加本项目手动字幕。"):("历史版本未提供字幕配置证据；以实际文件为准。")}</p><small>{job.created_at?new Date(typeof job.created_at==='number'?job.created_at*1000:job.created_at).toLocaleString():''}{job.effective_request?.duration?` · ${number(job.effective_request.duration)} 秒`: ''} · 任务 {job.id}</small>{job.status==='succeeded'&&(job.artifacts||[]).filter(a=>['video','audio'].includes(a.kind)).map(artifact=><ArtifactResult key={artifact.id} artifact={artifact} job={job} title={summary.chapterTitle}/>)}</article>)}</div>
   </>}
   </section>;
 }

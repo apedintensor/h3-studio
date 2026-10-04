@@ -41,6 +41,10 @@ class NotReady(BackendError):
     pass
 
 
+class RenderCacheCapacityExceeded(BackendError):
+    """Local CPU cache cannot admit another attempt; operator action is required."""
+
+
 class SubmissionUncertain(BackendError):
     pass
 
@@ -526,6 +530,15 @@ class WorkerRunner:
                         actual_cost_microusd=0, upstream_stopped=True))
                 try:
                     prepared = self.backend.prepare(job, tag, self.store, heartbeat)
+                except RenderCacheCapacityExceeded:
+                    # No submission intent/POST exists. Retained input/cache
+                    # evidence stays untouched; do not grow attempts forever
+                    # against an operator-managed cache with no automatic GC.
+                    if self.backend.kind == "cpu-render":
+                        return self._summary(self.queue.fail(lease, "render_cache_capacity_exhausted",
+                            actual_cost_microusd=0, upstream_stopped=True))
+                    return self._summary(self.queue.defer_unsubmitted(lease, retry_after_s=30,
+                        error_code="worker_preparation_not_ready"))
                 except (BackendError, OSError, ValueError):
                     job = self.queue.defer_unsubmitted(lease, retry_after_s=30, error_code="worker_preparation_not_ready")
                     return self._summary(job)

@@ -25,6 +25,7 @@ Linux 镜像内使用 `python -m studio_platform.diagnostics`。此命令只查�
 | billing_unsettled_keep_reservations | 任务结束/实例销毁后仍缺实际费用证据 | 保留预算预留；取得供应商终态与账单证据后单独结算 |
 | queue_older_than_15_minutes_review_capacity_and_fairness | 已经排队较久 | 看首次/重试分别积压原因、已验收可用槽位与冷启动收益；不要只看任务个数租机 |
 | capacity_wait_older_than_15_minutes_review_boot_and_qualification | 已接受任务还在等待已批准容量 | 检查独立 capacity approval、报价/验收/TTL和原创建意图；不要另租第二台替代状态未知的实例 |
+| render_cache_capacity_exhausted | CPU粗剪工作根无法再预留一次任务；在提交/编码前已停止 | 保留现有素材、缓存和收据。管理员核对正在使用的文件、唯一资产与容量，按另行批准的归档/扩容方案处理；之后用户重新预检并确认新任务。系统不会无限重试或自动删除文件 |
 
 15分钟只是初始运维提示阈值，不是测得的服务承诺。CPU粗剪/不同GPU配置需要分别测样本，再设实际延迟目标。排队年龄描述已过去的时间，不是剩余时间预测。
 

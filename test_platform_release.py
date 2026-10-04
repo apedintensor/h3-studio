@@ -1,4 +1,5 @@
 """Host release contract tests using inert flat bundles, no service starts."""
+from contextlib import contextmanager
 import hashlib
 import io
 import importlib.util
@@ -46,6 +47,25 @@ class ReleaseTests(unittest.TestCase):
     def manifest(self):
         (self.incoming / "release-manifest.json").write_text(json.dumps(self.value), encoding="utf-8")
 
+    @contextmanager
+    def approved_bundle(self):
+        approval_dir = self.root / "approved-releases"
+        approval_dir.mkdir()
+        (approval_dir / (COMMIT+".sha256")).write_text(
+            release.checksum(self.incoming / "release-manifest.json"), encoding="ascii")
+        original = release.approved_manifest
+
+        def check_approval(*args):
+            # Only emulate root ownership during this check, so unprivileged
+            # Linux CI still exercises real approval contents/checksums and
+            # regular-file/link validation. Production permission policy stays
+            # unchanged; all other filesystem operations use the real OS.
+            with patch.object(release.os, "name", "nt"):
+                return original(*args)
+
+        with patch.object(release, "approved_manifest", side_effect=check_approval):
+            yield
+
     def test_exact_commit_and_file_manifest(self):
         self.assertEqual(release.manifest(self.incoming, COMMIT), self.value)
         for commit in ("../escape", "a"*39, "a"*40+"\n"):
@@ -64,7 +84,8 @@ class ReleaseTests(unittest.TestCase):
 
     def test_publish_is_atomic_and_no_incoming_controller_copied(self):
         (self.incoming / "release.py").write_text("never copy", encoding="utf-8")
-        result = release.prepare_bundle(self.root, COMMIT)
+        with self.approved_bundle():
+            result = release.prepare_bundle(self.root, COMMIT)
         self.assertEqual({p.name for p in result.iterdir()}, release.FILES | {"release-manifest.json"})
         self.assertEqual(release.manifest(result, COMMIT), self.value)
         self.assertEqual(list((self.root / "releases").iterdir()), [result])
@@ -75,7 +96,47 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 release.prepare_bundle(self.root, COMMIT)
         self.assertEqual(list((self.root / "releases").iterdir()), [])
-        self.assertTrue(release.prepare_bundle(self.root, COMMIT).is_dir())
+        with self.approved_bundle():
+            self.assertTrue(release.prepare_bundle(self.root, COMMIT).is_dir())
+
+    def test_swap_after_incoming_approval_does_not_publish_or_poison_retry(self):
+        original_files = {path.name: path.read_bytes() for path in self.incoming.iterdir()}
+        existing = self.root / "releases" / ("c"*40)
+        existing.mkdir()
+        preserved = existing / "existing-approved-release-marker"
+        preserved.write_bytes(b"preserve existing release")
+        original_prepare = release.prepare_bundle
+        swap_once = True
+
+        def swap_then_prepare(root, commit):
+            nonlocal swap_once
+            if swap_once:
+                swap_once = False
+                # A complete, self-consistent replacement with the same commit
+                # arrives AFTER apply_locked checked independent approval.
+                replacement = json.loads(original_files["release-manifest.json"])
+                for name in release.FILES:
+                    body = b"INERT UNAPPROVED REPLACEMENT " + name.encode()
+                    (self.incoming / name).write_bytes(body)
+                    replacement["files"][name] = hashlib.sha256(body).hexdigest()
+                replacement["image_id"] = "sha256:"+"e"*64
+                (self.incoming / "release-manifest.json").write_text(json.dumps(replacement), encoding="utf-8")
+            return original_prepare(root, commit)
+
+        with self.approved_bundle(), patch.object(release, "prepare_bundle", side_effect=swap_then_prepare), \
+             patch.object(release, "command", side_effect=AssertionError("Docker must not be called")) as command:
+            with self.assertRaisesRegex(release.ReleaseError, "release_has_no_matching_independent_approval"):
+                release.apply_locked(self.root, COMMIT)
+            self.assertFalse((self.root / "releases" / COMMIT).exists())
+            self.assertEqual(list((self.root / "releases").iterdir()), [existing])
+            self.assertFalse((self.root / "release-state.json").exists())
+            self.assertEqual(preserved.read_bytes(), b"preserve existing release")
+            for name, body in original_files.items():
+                (self.incoming / name).write_bytes(body)
+            result = release.prepare_bundle(self.root, COMMIT)
+            self.assertEqual(release.manifest(result, COMMIT), self.value)
+            self.assertEqual(preserved.read_bytes(), b"preserve existing release")
+            command.assert_not_called()
 
     def test_hardlink_input_rejected(self):
         path = self.incoming / "compose.yaml"

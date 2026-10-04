@@ -24,7 +24,7 @@
 | 选择 | 当前状态 | 启用前具体缺口 |
 |---|---|---|
 | Local | 生产包唯一选择；媒体在 `/srv/sixnine/platform-data`，HTTP 临时上传在独立 `/srv/sixnine/upload-spool`，数据库在 `/srv/sixnine/postgres` | 准备正确目录 owner/权限；磁盘容量告警；批准加密离机目标及备份周期；在新目标演练恢复。逻辑配额不是整个文件系统硬限额 |
-| R2 | 首选远端候选；中央 `cloudflare-r2 / cloudflare-r2--rig-root`、资源 `provider-r2-crypto-config` 仅 configured_unverified。适配代码已离线验证 | Linux 运行身份/中央授权入口、私有桶与当前权限、受控出口、实际对象读回、签名到期与 Range、故障恢复及费用核验；没有完成浏览器 CORS/直传验收 |
+| R2 | 首选远端候选；中央 `cloudflare-r2 / cloudflare-r2--rig-root`、资源 `provider-r2-crypto-config` 仅 configured_unverified。适配代码已离线验证 | Linux 运行身份/中央授权入口、私有桶与当前权限、受控出口、实际对象读回、签名到期与 Range、故障恢复及费用核验；没有完成浏览器 CORS/直传验收；已有Local资产还需独立迁移/双读及字节核验，不能只改环境变量在线无缝切换 |
 | Hippius | 实验适配器；尚无已登记匹配 profile。固定 key 条件 PUT 明确拒绝，随机 `write_new` 不宣称服务器强制防覆盖；AssetService 所需保证不满足，因此不作为可用生产选择 | 正式身份/桶、运行版本与官方文档差异、条件创建替代协议、multipart/CORS/持久性专项验收。失败不会悄悄切 R2 |
 | AWS S3 | 独立显式区域 endpoint/provider 的适配器，非当前启用后端 | 目标身份/桶/区域、网络与权限、线上恢复与成本验收；不能沿用当前机器默认 AWS profile 猜账户 |
 
@@ -46,6 +46,7 @@ R2 的 S3 签名 URL 必须保留已签名 API host，不能换为 `media.sixnin
 - 灾难恢复保留原 task ID、attempt、实例 ID、费用预留及创建未知状态。它们是核对依据；不能因为新主机没有 worker 就释放预算或自动补生成。
 - 所有未终结任务一律 `recovery_hold`，包括 waiting_capacity。恢复的容量审批 `enabled=0`、waiter 为 hold；原 intent/hash/deadline 保留。旧队列/设备租约不能直接继续执行。
 - 操作者需要先核对上游是否仍运行、结果能否收集、实际费用与实例状态，再制定逐项恢复动作。普通取消请求不能把 hold 变成可重新投递状态。重新建密码不会自动解除 hold。
+- 恢复到新Local根后，旧上传/输出收据、active与存储预留仍绑定原根，可能阻止新上传。当前管理CLI只恢复同位置收据，不能跨根核销；重新开放写入需独立核对未决资产与迁移，不清零绕过。退役时先冻结全部写入，再制作最后备份并另存唯一staging/工作目录；在线快照不包含后续提交。
 - 本地恢复不停止云实例；Lightsail 模板 Retain 同样意味着删除 stack 不会自动停止实例/静态 IP 计费。没有把“没有运行本地 worker”作为停费证据。
 
 ## 本轮修复与回归

@@ -409,6 +409,50 @@ class RenderTests(unittest.TestCase):
                                     max_attempt_bytes=1024*1024, max_state_bytes=2*1024*1024)
         self.assertGreaterEqual(restarted._state_usage(), 2*1024*1024)
 
+    def test_full_render_cache_stops_unsubmitted_job_instead_of_growing_retries(self):
+        from sqlalchemy import func, select
+        from studio_platform.repository import Repository, Scope, attempts
+        from studio_platform.worker import WorkerRunner
+        self.backend = CPURenderBackend(self.root / "renders", enabled=True,
+            max_attempt_bytes=64*1024, max_state_bytes=128*1024)
+        self.video("tiny", "blue", seconds=1, audio=False)
+        request = self.job(shots=[{"shot_id": "tiny-shot", "source_id": "tiny", "frames": 24}])
+        for tag in ("retained-first", "retained-second"):
+            self.backend.prepare(request, tag, self.store, lambda: None)
+        retained = {p: p.read_bytes() for tag in ("retained-first", "retained-second")
+                    for p in (self.backend.state_dir / tag).iterdir()}
+        clock = [1000.0]
+        repo = Repository("sqlite:///"+str(self.root / "capacity.sqlite3").replace("\\", "/"), clock=lambda: clock[0])
+        try:
+            repo.create_schema()
+            scope = Scope("cache-test", "owner", "project")
+            plan = repo.create_plan(scope, request["request"],
+                {"pool": "cpu-render", "backend": "cpu-render", "enabled": True,
+                 "configuration_id": "cpu-render-v1", "expected_runtime_s": 1},
+                expires_at=2000, estimated_cost_microusd=0)
+            job = repo.create_job(scope, plan["id"], "same-cache-full-job")
+            runner = WorkerRunner(repo, self.store, self.root / "worker", backend=self.backend,
+                                  submission_guard=lambda job: True)
+            with mock.patch.object(self.store, "open", side_effect=AssertionError("No source read with full cache")), \
+                 mock.patch.object(self.backend, "submit", side_effect=AssertionError("No render submission with full cache")):
+                self.assertEqual(runner.run_once("cpu-worker", "cpu-render")["state"], "failed")
+                first = repo.get_job(scope, job["id"])
+                self.assertEqual(first["error_code"], "render_cache_capacity_exhausted")
+                self.assertEqual(first["result"]["actual_cost_microusd"], 0)
+                self.assertEqual(first["result"]["billing_status"], "settled")
+                clock[0] += 31
+                self.assertEqual(runner.run_once("cpu-worker", "cpu-render")["state"], "idle")
+            with repo.engine.connect() as connection:
+                self.assertEqual(connection.execute(select(func.count()).select_from(attempts)).scalar_one(), 1)
+                row = connection.execute(select(attempts)).mappings().one()
+                self.assertIsNone(row["submission_started_at"])
+                self.assertIsNone(row["upstream_task_id"])
+            self.assertEqual(repo.get_job(scope, job["id"])["attempt_no"], 1)
+            self.assertEqual({p: p.read_bytes() for p in retained}, retained)
+            self.assertEqual(self.backend._state_usage(), 128*1024)
+        finally:
+            repo.close()
+
     def test_unknown_root_entry_is_rejected_without_recursive_scan_or_cleanup(self):
         job = self.job()
         self.backend.state_dir.mkdir()

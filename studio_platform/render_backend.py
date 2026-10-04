@@ -18,7 +18,8 @@ import time
 from . import media
 from .caption_server import validate_normalized_subtitles
 from .storage import _check_ancestors, _copy, _no_links, _sync_directory, key_belongs_to, validate_key
-from .worker import BackendError, NotReady, Outcome, SubmissionRejected, SubmissionUncertain, TAG, _slot_lock
+from .worker import (BackendError, NotReady, Outcome, RenderCacheCapacityExceeded,
+                     SubmissionRejected, SubmissionUncertain, TAG, _slot_lock)
 
 MIB = 1024*1024
 SOURCE_ID = re.compile(r"[A-Za-z0-9_:\-]{1,160}$")
@@ -342,7 +343,7 @@ class CPURenderBackend:
                 old = self._load(directory) if already else None
                 old_charge = self._attempt_charge(directory, old) if old else 0
                 if current-old_charge+self.max_attempt_bytes > self.max_state_bytes:
-                    raise NotReady("render_state_capacity_exhausted")
+                    raise RenderCacheCapacityExceeded("render_state_capacity_exhausted")
                 state.update(phase="preparing", reserved_bytes=self.max_attempt_bytes)
                 self._save(directory, state)
             for index, (source_id, snapshot) in enumerate(payload["sources"].items()):
@@ -411,7 +412,8 @@ class CPURenderBackend:
             checked = self._path(directory, item.name)
             total += checked.stat().st_size
         _require(total <= self.max_attempt_bytes, "render_work_directory_limit")
-        _require(self._state_usage() <= self.max_state_bytes, "render_state_capacity_exhausted")
+        if self._state_usage() > self.max_state_bytes:
+            raise RenderCacheCapacityExceeded("render_state_capacity_exhausted")
 
     def _attempt_charge(self, directory, state):
         actual = 0

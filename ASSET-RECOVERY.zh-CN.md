@@ -60,6 +60,8 @@ python tools/recover_platform_assets.py --mode settle-incomplete --tenant sixnin
 
 ## 已验证与限制
 
-2026-10-04：17项专门恢复测试分别在临时SQLite与真实本机隔离PostgreSQL schema全部通过；recovery/assets/media_admission/upload_route合并65项通过。仅小PNG和假存储故障，覆盖处理中断、ready-before-release、部分receive、活线程/另一个进程持锁拒绝、双管理员竞争、当前版本/owner/project/storage绑定、同key未知读回、缺对象不重写/保留预留、默认只读、错误DB不建表及秘密错误脱敏。具体测试为 `test_platform_asset_recovery.py`；没有访问真实作品、云存储或付费生成。Linux锁路径将随最终镜像测试另行核验，不把Windows本机结果写成Linux已运行。
+2026-10-04：17项专门恢复测试分别在临时SQLite与真实本机隔离PostgreSQL schema全部通过；recovery/assets/media_admission/upload_route合并65项通过。仅小PNG和假存储故障，覆盖处理中断、ready-before-release、部分receive、活线程/另一个进程持锁拒绝、双管理员竞争、当前版本/owner/project/storage绑定、同key未知读回、缺对象不重写/保留预留、默认只读、错误DB不建表及秘密错误脱敏。具体测试为 `test_platform_asset_recovery.py`；没有访问真实作品、云存储或付费生成。最终45d3cccb不可变Linux镜像已通过97项专项，其中包括这17项恢复测试及实际Linux锁路径；同级发布收据见验收索引。
 
 本轮仅Local支持；R2/S3/Hippius及异机存储恢复拒绝，不加载中央API凭据。该命令可使用现有PostgreSQL DSN，但不会迁移数据库或自动初始化空库。运维仍需确认实际已停止写入者、独立备份和可用磁盘空间；本机测试不是生产灾备演练或跨主机fencing。
+
+业务备份恢复到另一Local目录后，旧上传收据仍保留原storage_binding和预留。本工具不能用来跨目录自动核销旧busy状态或“修好”新目录配额；这属于尚未实现的迁移/灾备写入恢复流程，见[备份恢复边界](BACKUP-RECOVERY.zh-CN.md)。

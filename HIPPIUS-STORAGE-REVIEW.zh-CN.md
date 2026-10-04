@@ -6,6 +6,8 @@
 
 建议生产媒体的首选候选仍为 **R2 Standard**；Hippius 加入可插拔的实验存储后端。当前实际接入由主服务选择独立 `LocalObjectStore`，不因新增后端便切换现有存储。AWS 承载业务服务不要求视频也存 AWS。若计算将来固定在 AWS 同一 Region，再比较同区 S3 的性能、治理与总成本。
 
+“可插拔”指代码适配接口，当前每个部署仍只绑定一个store；没有旧资产跨供应商双读或自动迁移。更换后端需要独立的迁移、归属/字节核验和回滚方案，不能仅修改R2配置便继续读取旧Local对象。本轮没有搬迁本机作品。
+
 Hippius 是实际提供 S3 接口的服务，SN75 身份不构成吞吐、可用性或持久性的线上验收。价格较低值得测试，但不能用补贴或“兼容 S3”代替文件读取、私有访问和故障恢复证明。公开服务介绍说明它属于 Bittensor Subnet 75，官方代码和接口文档提供了进一步依据。[服务介绍](https://hippius.com/blog/migrate-s3-buckets-to-hippius-in-a-few-clicks)
 
 已实现 `studio_platform/storage.py` 和 `storage_config.py`：

@@ -63,6 +63,8 @@ python tools/backup_platform.py restore-local --backup <已有备份目录绝对
 
 管理员后续顺序：验证私有目录与 checksum → 核对作品 owner/媒体 → 重新建立认证 → 在不执行生成的环境查看恢复内容 → 查询有上游 ID/实例 ID 的未知任务和实际账单 → 逐项决定账本处理与是否允许新任务。当前没有通用“解除全部 hold”按钮，也没有自动重投接口。
 
+**恢复已发布作品可供查看，不等于已经能够继续全部写入。** 素材收据、active上传数量及存储预留仍保留原始证据；若源快照带有busy上传，新目录中可能仍占满名额。Local根与工作目录属于原storage_binding，现有素材恢复工具明确拒绝跨目录补绑或核销；必须另做未决收据、实际文件、原位置与新位置的人工核对和迁移设计。不能为恢复上传功能直接清零active、删收据或修改绑定，源staging内唯一原件仍需独立保全。代码依据为`backup.py`的隔离恢复、`assets.py`的存储绑定和`storage_asset_journal.py`的配额检查。
+
 ## PostgreSQL + Local：完整便携业务备份
 
 ```text
@@ -127,4 +129,4 @@ $env:SIXNINE_TEST_PG_BACKUP='1'
 - [Cloudflare R2 S3 兼容表](https://developers.cloudflare.com/r2/api/s3/api/)：不能假定 S3 Bucket Versioning / Object Lock API 同样可用。[R2 Bucket Locks](https://developers.cloudflare.com/r2/buckets/bucket-locks/) 是独立的保留控制，不等于历史版本备份。
 - [Amazon S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html)：后续若选择 S3 的版本与锁定策略，需单独配置权限、保留范围和费用；本轮没有改变任何桶设置。
 
-删除当前项目之前，仍必须按中央 `HOUSEKEEPING.md` 核对唯一未发布素材、模型/环境共享关系与云计费资源。存在这份工具或一次成功演练，不构成删除数据的授权。
+删除当前项目之前，仍必须按中央 `HOUSEKEEPING.md` 核对唯一未发布素材、模型/环境共享关系与云计费资源。退役的最后一次备份须先冻结所有API编辑/上传、worker收集及其它写入，再核实它们确实停止，制作并验证最终一致备份，并单独归档未纳入portable包的唯一staging/工作目录资料。日常在线快照可以保持服务运行，但不包含快照之后的新提交，不能凭在线备份verify成功就删除仍在写的源。存在这份工具或一次成功演练，不构成删除数据的授权。

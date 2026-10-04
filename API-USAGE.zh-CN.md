@@ -6,7 +6,7 @@
 
 ## 身份与项目归属
 
-网页使用HttpOnly会话Cookie；正式模式必须密码登录。`superdan`、`supervan`的项目、素材、任务和下载按服务端认证身份隔离。网页向所有`/v1`请求加`X-Expected-Account`，服务端发现Cookie实际账号改变会在操作前返回409、`code=account_context_changed`；前端应保存旧账号草稿并重新核对身份。响应头`X-Authenticated-Account`是非秘密账号名，可核对迟到响应。
+网页使用HttpOnly会话Cookie；正式模式必须密码登录。`superdan`、`supervan`的项目、素材、任务和下载按服务端认证身份隔离。网页API客户端的fetch请求加`X-Expected-Account`，服务端发现Cookie实际账号改变会在操作前返回409、`code=account_context_changed`；前端应保存旧账号草稿并重新核对身份。响应头`X-Authenticated-Account`是非秘密账号名，可核对迟到响应。原生下载链接及video/audio媒体地址不携带自定义请求头，依靠Cookie及服务端owner授权；换账户时前端卸载旧媒体。
 
 机器客户端使用`Authorization: Bearer ...`，绑定一个owner、明确的项目ID列表及scopes。由操作员在受保护终端运行`python -m studio_platform.manage register-client --help`查看入口；token只通过隐藏交互输入、存储哈希，不作为命令参数或文档内容。它不是用户密码，也不是供应商API key。注册/轮换权限不开放给网页或CI部署身份。
 
@@ -43,7 +43,7 @@ Swagger/OpenAPI由服务生成，访问仍需本账户身份。表中的模型�
 
 ## H3请求与确认
 
-现有两个配方：`h3-base-fl2va-v1`首尾帧/文生音视频、`h3-base-ref2va-v1`参考生成。准确上游模型标识是`MiniMax-H3-Base-BF16`；它不等于配方ID，也没有被静默替换成VDN或供应商小模型。
+现有两个配方：`h3-base-fl2va-v1`首尾帧/文生音视频、`h3-base-ref2va-v1`参考生成。平台能力返回的`model_id`为`MiniMax-H3-Base-BF16`；这是本平台模型标识，不是远端供应商API的通用model参数。请求通过`recipe_id`选择配置，不接受顶层`model`字段；Comfy实际权重文件映射见`comfy_workflow.py`。它没有被静默替换成VDN或供应商小模型。
 
 下面是请求结构示例，ID必须换成当前账号真实已有的项目、镜头和ready素材。这里没有执行生成，也没有给出凭据值。
 
@@ -80,7 +80,7 @@ Swagger/OpenAPI由服务生成，访问仍需本账户身份。表中的模型�
 
 典型路径：waiting_capacity → queued → claimed → submitting → running → collecting → succeeded。未知提交为submission_unknown；此时继续查同一个job，不新投。cancel_requested需要上游核对。recovery_hold表示灾难恢复或状态与attempt证据矛盾/缺失，需操作员核对；不允许从网页恢复成新的付费执行。
 
-任务succeeded后取artifacts，使用同身份访问content_url或download_url。MP4与实际返回的独立音频artifact各有大小/哈希；只有清单包含FLAC时才承诺独立声音文件，H3有声任务或CPU粗剪都不应仅凭开关猜文件存在。`result.billing_status=pending`时已校验的成片仍可下载；`actual_cost=null`代表费用未确认，不代表免费。保存后核对SHA256；不要把临时签名URL作为作品长期ID。如果对象存储返回重定向，客户端不应将Authorization转发给别的主机；签名查询串不得写日志。API下载通过的证据与浏览器最终保存到磁盘是两件事。
+任务succeeded后取artifacts，使用同身份访问content_url或download_url。MP4与实际返回的独立音频artifact各有大小/哈希；只有清单包含FLAC时才承诺独立声音文件，H3有声任务或CPU粗剪都不应仅凭开关猜文件存在。`result.billing_status=pending`时已校验的成片仍可下载；`result.actual_cost_microusd=null`代表费用未确认，不代表免费。有值时单位为微美元，除以1,000,000才是美元；不存在名为`actual_cost`的返回字段。保存后核对SHA256；不要把临时签名URL作为作品长期ID。如果对象存储返回重定向，客户端不应将Authorization转发给别的主机；签名查询串不得写日志。API下载通过的证据与浏览器最终保存到磁盘是两件事。
 
 轮询建议从2秒开始，持续运行时降到5–10秒；429遵守Retry-After，401重新鉴权，409核对版本/账号/计划，503保留本地稿后重试。错误详情不应被当成可重放的供应商请求。当前没有已部署webhook，不用假定job callback已经可用。
 
