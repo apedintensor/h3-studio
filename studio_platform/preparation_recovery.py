@@ -254,9 +254,14 @@ def prepare(repo, previous, target, proof, *, apply=False):
 
 def verify(repo, target, receipt, *, release_leader=False):
     """Recheck the receipt before host flags/state change and leader release."""
+    sequence = receipt.get("previous_sequence")
     require(receipt.get("version") == 1 and receipt.get("phase") == "jobs_restored"
         and receipt.get("target_config_hash") == target.fingerprint()
         and receipt.get("created_at") == target.created_at and receipt.get("hard_deadline") == target.hard_deadline
+        and type(sequence) is int and 1 <= sequence < target.max_cycles
+        and receipt.get("next_sequence") == sequence+1
+        and receipt.get("previous_approval_id") == cycle_config(target,sequence).capacity_approval_id
+        and receipt.get("next_approval_id") == cycle_config(target,sequence+1).capacity_approval_id
         and repo.clock()+300 < target.stop_claiming_at, "preparation_recovery_receipt_identity_mismatch")
     with repo.transaction() as conn:
         repo._lock_capacity(conn)
@@ -267,6 +272,14 @@ def verify(repo, target, receipt, *, release_leader=False):
         require(leader and leader["leader_id"] == receipt.get("fenced_leader_id")
             and leader["fence"] == receipt.get("fence"), "preparation_recovery_leader_changed")
         ids = sorted(receipt["restored_job_hashes"])
+        markers = list(conn.execute(select(scaler_receipts).where(scaler_receipts.c.operation == OPERATION,
+            scaler_receipts.c.facts["evidence_sha256"].as_string() == receipt["evidence_sha256"])).mappings())
+        link = conn.execute(select(capacity_cycles).where(
+            capacity_cycles.c.approval_id == receipt["previous_approval_id"])).mappings().first()
+        require(link and link["intent_id"] == receipt["intent_id"] and markers
+            and sorted(m["facts"]["job_id"] for m in markers) == ids
+            and sorted(j["job_id"] for j in receipt["jobs"]) == ids,
+            "preparation_recovery_receipt_job_set_changed")
         for jid in ids:
             job = repo._job(conn,jid,lock=True)
             marker = conn.execute(select(scaler_receipts).where(scaler_receipts.c.id == _receipt_id(receipt["intent_id"],jid),

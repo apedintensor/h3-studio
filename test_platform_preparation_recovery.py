@@ -204,6 +204,14 @@ class PreparationRecoveryTests(fixtures.OnDemandTests):
         with self.assertRaisesRegex(Conflict,"restored_job_changed"):
             verify(self.repo,self.target,receipt)
 
+    def test_recovery_receipt_cannot_skip_cycle_or_drop_an_original_job(self):
+        self.failed(second=True)
+        receipt=prepare(self.repo,self.config,self.target,self.proof,apply=True)
+        changed=copy.deepcopy(receipt);changed["next_sequence"]=3
+        with self.assertRaisesRegex(Conflict,"receipt_identity_mismatch"):verify(self.repo,self.target,changed)
+        changed=copy.deepcopy(receipt);del changed["restored_job_hashes"][self.job["id"]]
+        with self.assertRaisesRegex(Conflict,"receipt_job_set_changed"):verify(self.repo,self.target,changed)
+
     def test_budget_limit_rolls_back_all_jobs_and_dry_run_accounts_for_total(self):
         self.failed(second=True)
         amount=self.job["estimated_cost_microusd"]

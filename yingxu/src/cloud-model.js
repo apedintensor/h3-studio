@@ -13,7 +13,7 @@ export function capacityWaitMessage(job){
     capacity_inventory_check_failed:'暂时无法确认 GPU 库存，系统会重试查询。目前尚未确认有可用机器，请保留原任务。',
     capacity_rental_reconciliation:'GPU 租赁结果需要核对，当前尚未开始生成。为避免重复收费，已暂停再次租机；原任务保留，等待处理。',
     capacity_configuration_unavailable:'当前 GPU 执行配置暂不可用，需修复后才能继续。原任务保留，可取消等待。',
-    bootstrap_repair_required:'GPU 环境准备失败，正在修复；原任务已保留，无需重新提交。',
+    capacity_bootstrap_repair_required:'GPU 环境准备失败，正在修复；原任务已保留，无需重新提交。',
     capacity_budget_or_limit:'当前 GPU 预算或并发额度不足，暂时无法开机。原任务保留，不会自动提高预算。',
     capacity_gpu_starting:'正在准备 GPU、加载模型并检查运行条件，通过后自动执行原任务，无需再次提交。',
     capacity_gpu_busy:'GPU 正在处理队列中的任务，当前任务等待空闲执行位置，无需重新提交。',

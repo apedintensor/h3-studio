@@ -24,14 +24,29 @@ class PreparationHostTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(scaler, 'ROOT', self.root))
+        # CI intentionally runs as an unprivileged user. File ownership gates
+        # are covered by the release tests; this fixture tests recovery state.
+        self.stack.enter_context(patch.object(scaler, 'read_json',
+            side_effect=lambda filename, maximum=65536: json.loads(Path(filename).read_text())))
         self.config = on_demand_configuration()
+        self.config['capacity_approval_id'] = 'synthetic-approval'
         self.commit, self.old_commit = 'b'*40, 'a'*40
         self.state = {'version': 1, 'config_hash': scaler.fingerprint(self.config),
             'sequence': 3, 'created_at': self.config['created_at'], 'transfer_from': 'cycle-002'}
         self.receipt = {'version': 1, 'phase': 'staged', 'target_commit': self.commit,
             'old_commit': self.old_commit, 'config_hash': scaler.fingerprint(self.config),
             'supervisor': {'unit': 'sixnine-synthetic.service'},
-            'next_service_state': self.state, 'ledger': {'host_stage_confirmed': True}}
+            'next_service_state': self.state,
+            'old_service_state': {**self.state, 'sequence': 2},
+            'ledger': {'host_stage_confirmed': True, 'previous_sequence': 2, 'next_sequence': 3,
+                'previous_approval_id': 'synthetic-approval-002', 'next_approval_id': 'synthetic-approval-003',
+                'target_runtime_revision': self.commit, 'created_at': self.config['created_at'],
+                'hard_deadline': self.config['hard_deadline'],
+                'old_config_hash': scaler.fingerprint(self.config), 'target_config_hash': scaler.fingerprint(self.config),
+                'restored_job_hashes': {'synthetic-job': 'd'*64}, 'jobs': [{'job_id': 'synthetic-job'}]}}
+        proof = {'sequence': 2, 'job_ids': ['synthetic-job']}
+        self.receipt['proof_sha256'] = self.receipt['ledger']['evidence_sha256'] = scaler.fingerprint(proof)
+        scaler.atomic(recovery.path(recovery.PROOF), proof)
         scaler.atomic(recovery.path(recovery.RECEIPT), self.receipt)
         scaler.atomic(recovery.path(recovery.OLD), self.config)
         self.stack.enter_context(patch.object(recovery, 'runtime_json', return_value=self.state))
@@ -79,6 +94,15 @@ class PreparationHostTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             recovery.activate_resume(self.config, self.commit, {})
         self.assertEqual(scaler.read_json(recovery.path(recovery.RECEIPT))['phase'], 'staged')
+
+    def test_skipped_cycle_changed_approval_or_dropped_job_cannot_stage(self):
+        for change in ({'next_sequence': 4}, {'previous_approval_id': 'other'},
+                       {'restored_job_hashes': {}}, {'jobs': []}):
+            with self.subTest(change=change):
+                changed = copy.deepcopy(self.receipt)
+                changed['ledger'].update(change)
+                with self.assertRaises(release.ReleaseError):
+                    recovery.validate_ledger_shape(changed, self.config)
 
 
 if __name__ == '__main__':

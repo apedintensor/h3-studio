@@ -73,6 +73,28 @@ def retired(config, unit, old_commit):
             'process_count': 0, 'boot_children': 0, 'observed_at': time.time()}, host
 
 
+def validate_ledger_shape(receipt, config):
+    """Bind host state changes to every job and cycle of the protected proof."""
+    proof = scaler.read_json(path(PROOF))
+    ledger = receipt['ledger']
+    previous = ledger.get('previous_sequence')
+    release.require(type(previous) is int and 1 <= previous < config['max_cycles']
+        and previous == proof.get('sequence') == receipt['old_service_state'].get('sequence')
+        and ledger.get('next_sequence') == previous+1
+        and ledger.get('previous_approval_id') == config['capacity_approval_id']+'-'+str(previous).zfill(3)
+        and ledger.get('next_approval_id') == config['capacity_approval_id']+'-'+str(previous+1).zfill(3)
+        and ledger.get('target_runtime_revision') == receipt['target_commit']
+        and ledger.get('created_at') == config['created_at']
+        and ledger.get('hard_deadline') == config['hard_deadline']
+        and ledger.get('old_config_hash') == ledger.get('target_config_hash') == scaler.fingerprint(config)
+        and ledger.get('evidence_sha256') == receipt.get('proof_sha256') == scaler.fingerprint(proof),
+        'preparation_ledger_cycle_or_proof_changed')
+    ids = sorted(proof.get('job_ids', []))
+    release.require(ids and ids == sorted(ledger.get('restored_job_hashes', {}))
+        == sorted(row['job_id'] for row in ledger.get('jobs', [])),
+        'preparation_ledger_job_set_changed')
+
+
 def prepare(commit, unit):
     release.require(not path(RECEIPT).exists(), 'preparation_receipt_already_exists')
     config = scaler.protected_inputs(starting=False)
@@ -109,6 +131,7 @@ def prepare(commit, unit):
     release.require(ledger.get('phase') == 'jobs_restored', 'preparation_restore_unconfirmed')
     receipt.update(phase='jobs_restored', ledger=ledger)
     scaler.atomic(path(RECEIPT), receipt)
+    validate_ledger_shape(receipt, config)
     return {'phase': receipt['phase'], 'job_ids': sorted(ledger['restored_job_hashes'])}
 
 
@@ -118,6 +141,7 @@ def stage():
     config = scaler.protected_inputs(starting=False)
     release.require(scaler.fingerprint(config) == receipt['config_hash']
         and scaler.read_json(path(OLD)) == config, 'preparation_configuration_changed')
+    validate_ledger_shape(receipt, config)
     release.require(handoff.supervisor(receipt['supervisor']['unit'])['pid'] == 0,
                     'preparation_supervisor_restarted')
     _, _, environment = scaler.checked_release(receipt['old_commit'])
@@ -161,6 +185,7 @@ def verify_resume(config, commit, environment):
         and receipt.get('target_commit') == commit
         and receipt.get('config_hash') == scaler.fingerprint(config)
         and scaler.read_json(path(OLD)) == config, 'preparation_resume_identity_invalid')
+    validate_ledger_shape(receipt, config)
     release.require(handoff.supervisor(receipt['supervisor']['unit'])['pid'] == 0,
                     'preparation_old_supervisor_restarted')
     scaler.require_new_controller(environment)

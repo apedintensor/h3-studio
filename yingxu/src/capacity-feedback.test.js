@@ -8,6 +8,8 @@ test('capacity wait explains inventory, billing uncertainty and preparation sepa
   assert.match(jobMessage(waiting('capacity_inventory_check_failed')),/无法确认 GPU 库存/);
   assert.match(jobMessage(waiting('capacity_rental_reconciliation')),/暂停再次租机/);
   assert.match(jobMessage(waiting('capacity_gpu_starting')),/加载模型/);
+  assert.equal(jobMessage(waiting('capacity_bootstrap_repair_required')),'GPU 环境准备失败，正在修复；原任务已保留，无需重新提交。');
+  assert.equal(capacityWaitMessage(waiting('capacity_bootstrap_repair_required')),'GPU 环境准备失败，正在修复；原任务已保留，无需重新提交。');
   assert.match(jobMessage(waiting('capacity_budget_or_limit')),/不会自动提高预算/);
   assert.match(jobMessage(waiting('unrecognized')),/等待计算容量/);
   assert.equal(capacityWaitMessage({status:'succeeded',error_code:'capacity_no_matching_gpu'}),'');
