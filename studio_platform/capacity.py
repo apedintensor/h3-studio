@@ -12,7 +12,7 @@ from sqlalchemy import insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .autoscale import Demand, ScalePolicy, ScaleState, Slot, recommend
-from .repository import (BudgetExceeded, Conflict, NotFound, Scope, budget_accounts,
+from .repository import (BudgetExceeded, Conflict, NotFound, Scope, budget_accounts, budget_reservations,
     capacity_approvals, capacity_cycles, capacity_gate, capacity_waiters, canonical,
     documents, instance_intents, jobs, pool_limits, registered_workers, request_hash, attempts, scaler_receipts)
 from .scaler import LaunchSpec, _safe_id
@@ -186,6 +186,23 @@ def admit_waiter(repo, connection, scope, job, plan):
         intent_id=cycle["intent_id"] if cycle else None, state="waiting_capacity", created_at=repo.clock()))
 
 
+def proven_unadmitted_capacity_draft(connection, job):
+    """A locked, never-admitted draft is irrelevant to a rental rollover.
+
+    Callers hold the capacity gate and job lock. Labels alone cannot hide a
+    previous reservation, lease, waiter or inference; the draft remains untouched.
+    """
+    return bool(job["status"] in ("planned", "blocked") and job["attempt_no"] == 0
+        and job["current_attempt_id"] is None and job["lease_worker_id"] is None
+        and job["lease_expires_at"] is None
+        and not connection.execute(select(attempts.c.id).where(attempts.c.job_id == job["id"]).limit(1)).first()
+        and not connection.execute(select(capacity_waiters.c.job_id).where(
+            capacity_waiters.c.job_id == job["id"]).limit(1)).first()
+        and not connection.execute(select(budget_reservations.c.id).where(
+            budget_reservations.c.reference_type == "job",
+            budget_reservations.c.reference_id == job["id"]).limit(1)).first())
+
+
 def proven_unsubmitted_capacity_job(connection, job):
     """Never infer safe replay from a queued label; retain every old attempt."""
     if job["status"] not in ("queued", "waiting_capacity") or job["lease_worker_id"] is not None:
@@ -247,6 +264,10 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
         moved = []
         for jid in candidates:
             job = repo._job(conn, jid, lock=True)
+            if job["status"] in ("planned", "blocked"):
+                if not proven_unadmitted_capacity_draft(conn, job):
+                    raise Conflict("capacity_transfer_job_requires_reconciliation")
+                continue  # Never accept/modify a draft during GPU rollover.
             execution = job["execution_plan"]
             existing = conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == jid)).mappings().first()
             if execution.get("capacity_approval_id") == next_id and existing and existing["approval_id"] == next_id:

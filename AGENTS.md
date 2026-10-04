@@ -1,5 +1,9 @@
 # H3 Studio
 
+## 当前生产结果（2026-10-05 05:23 Sydney，本段优先）
+
+公网后端8c35fe7完整CI和受保护发布已通过；FL50/首尾帧4步/图视频音频REF4真实兼容性验证及两个原user/Agent任务均succeeded。API下载哈希、MP4解码/Range206、Agent网页候选回写已核验。按业务空闲约610秒自动销毁GPU，供应商精确GET404及租赁账本destroyed/settled；当前GPU0、sequence004 awaiting_jobs、admission_ready=true，CPU控制器仍active等下一确认任务，预检不租机。原US$50累计预算（已用5.741432、剩余44.258568）和今天18:45Sydney截止不变；不重跑已激活恢复/租赁/原任务，不重置期限。自动化gpu仍PAUSED。本地人物/地点/镜头媒体UX、来源登录、Agent删除引用与草稿轮转补丁已离线验收，新UX和最后两项补丁尚未生产发布，用户批准后批量上线；不得sync新UI混入8c35。首单本轮机器登记至用户attempt约48分钟，不能声称低延迟或全部原生上限已开放。最新报告/回执见`.platform-demand-live/OVERNIGHT-FIX-20261005.zh-CN.md`和`GPU-RECOVERY-HANDOFF.md`；下方旧状态仅历史。
+
 ## 本地媒体界面与生产 GPU 修复（2026-10-05，执行中）
 
 用户授权本批次修好公网快速创作/Agent API 的 GPU 链路；映序人物、地点、镜头的媒体上传与控件先在本地验收，明天用户批准后再发布，不混入本次后端上线。原 GPU 累计 US$50、按需单卡和业务空闲600秒关闭约束继续有效；不得重复租赁未知实例、重置预算或取消已接收任务。自动化gpu仍暂停。

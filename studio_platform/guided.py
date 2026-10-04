@@ -139,6 +139,10 @@ def delete_entity(project, entity_id, cascade):
         before, data = copy.deepcopy(entity["data"]), entity["data"]
         if isinstance(data.get("cast"), list):
             data["cast"] = [c for c in data["cast"] if (c if isinstance(c, str) else c["characterId"]) not in deleted]
+        if entity["type"] in {"scene", "shot"} and data.get("locationId") in deleted:
+            data["locationId"] = ""
+        if entity["type"] == "location" and isinstance(data.get("referenceAssetIds"), list):
+            data["referenceAssetIds"] = [ident for ident in data["referenceAssetIds"] if ident not in deleted]
         for look in data.get("looks", []):
             for slot, value in look.get("gallery", {}).items():
                 if value in deleted:

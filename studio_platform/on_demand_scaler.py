@@ -21,7 +21,8 @@ import uuid
 from sqlalchemy import select, update
 
 from .autoscale import ScalePolicy
-from .capacity import proven_unsubmitted_capacity_job, transfer_unsubmitted_capacity
+from .capacity import (proven_unadmitted_capacity_draft, proven_unsubmitted_capacity_job,
+    transfer_unsubmitted_capacity)
 from .lium_provider import LiumManifest, LiumProvider
 from .lium_runtime_aws import AwsLiumLoader
 from .production_scaler import (FiniteConfig, FiniteController, MODEL, RECIPE, ScalerError,
@@ -381,9 +382,17 @@ class OnDemandController:
         # Only provably never-submitted backlog may outlive a GPU rental.
         # A completed job with an unresolved paid attempt is included by the
         # finite status audit and fails this proof too.
-        with self.repo.engine.connect() as conn:
-            for jid in value["active_job_ids"]:
-                job = self.repo._job(conn, jid)
+        with self.repo.transaction() as conn:
+            # Serialize with admission/enqueue, then inspect locked jobs. Drafts
+            # do not keep a GPU alive, but their labels alone cannot prove that
+            # no earlier inference/lease still needs reconciliation.
+            self.repo._lock_capacity(conn)
+            for jid in sorted(value["active_job_ids"]):
+                job = self.repo._job(conn, jid, lock=True)
+                if job["status"] in ("planned", "blocked"):
+                    if not proven_unadmitted_capacity_draft(conn, job):
+                        return False
+                    continue
                 if not proven_unsubmitted_capacity_job(conn, job):
                     return False
         return True

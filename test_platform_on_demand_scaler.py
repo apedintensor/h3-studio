@@ -8,16 +8,18 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, insert, select, update
 
 from studio_platform.autoscale import ScalePolicy
 from studio_platform.capabilities import compile_request
+from studio_platform.capacity import transfer_unsubmitted_capacity
 from studio_platform.control import WorkerControl
 from studio_platform.execution_policy import ExecutionPolicies
-from studio_platform.on_demand_scaler import OnDemandConfig, OnDemandController, main, json_config, verified_service_receipt
+from studio_platform.on_demand_scaler import (OnDemandConfig, OnDemandController, ServiceCycle, cycle_config,
+    main, json_config, verified_service_receipt)
 from studio_platform.production_scaler import MODEL, RECIPE, ScalerError
 from studio_platform.queue import TaskQueue
-from studio_platform.repository import Scope, request_hash, instance_intents, attempts, capacity_waiters
+from studio_platform.repository import Conflict, Scope, request_hash, instance_intents, attempts, capacity_waiters, jobs
 from studio_platform.settings import Settings
 from test_platform_api import generation_request
 from test_platform_execution_policy import policy
@@ -269,6 +271,157 @@ class OnDemandTests(LedgerCase):
         self.assertEqual(self.repo.get_budget("finite-budget")["reserved_microusd"], 4_000_000)
         self.assertEqual(self.repo.get_budget("finite-budget")["limit_microusd"], before["limit_microusd"])
         self.assertEqual(self.repo.get_job(scope2, job2["id"])["status"], "queued")
+
+    def assert_idle_draft_allows_next_real_job(self, status):
+        scope, finished = self.start_job()
+        self.finish(scope, finished)
+        draft = self.repo.create_job(scope, finished["plan_id"], "unaccepted-"+status, initial_status=status)
+        original = self.repo.get_job(scope, draft["id"])
+        budget = self.repo.get_budget("finite-budget")
+        job_budget = self.repo.get_budget("job-budget")
+        config_hash = self.config.fingerprint()
+        self.tick()
+        for _ in range(40):
+            self.tick()
+        self.assertEqual(len(self.provider.destroys), 1)
+        self.assertEqual(self.controller.sequence, 2)
+        self.assertEqual(len(self.provider.creates), 1)  # No demand from a draft.
+        self.assertFalse(self.controller.stopping())
+        self.assertEqual(self.repo.get_job(scope, draft["id"]), original)
+        self.assertEqual(self.repo.get_budget("finite-budget"), budget)
+        self.assertEqual(self.repo.get_budget("job-budget"), job_budget)
+        self.assertEqual(self.controller.config.fingerprint(), config_hash)
+        next_scope, next_job = self.start_job("supervan", "after-"+status)
+        self.assertEqual(len(self.provider.creates), 2)
+        self.assertEqual(self.repo.get_job(next_scope, next_job["id"])["status"], "queued")
+        self.assertEqual(self.repo.get_job(scope, draft["id"]), original)
+        self.assertEqual(self.repo.get_budget("finite-budget")["limit_microusd"], budget["limit_microusd"])
+        self.assertEqual(self.controller.config.hard_deadline, self.config.hard_deadline)
+
+    def test_unaccepted_planned_draft_does_not_block_idle_cycle_or_next_job(self):
+        self.assert_idle_draft_allows_next_real_job("planned")
+
+    def test_unaccepted_blocked_draft_does_not_block_idle_cycle_or_next_job(self):
+        self.assert_idle_draft_allows_next_real_job("blocked")
+
+    def test_draft_label_cannot_hide_any_lease_current_attempt_or_attempt_history(self):
+        scope, finished = self.start_job()
+        self.finish(scope, finished)
+        worker = next(iter(self.controller.current.boots.values())).worker
+        draft = self.repo.create_job(scope, finished["plan_id"], "unsafe-draft", initial_status="planned")
+        # Keep the old cycle around after its real idle shutdown, so each proof
+        # checks an authoritative destroyed instance and retired child.
+        with self.repo.transaction() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == draft["id"]).values(lease_worker_id=worker))
+        self.tick()
+        for _ in range(40):
+            self.tick()
+        self.assertEqual(len(self.provider.destroys), 1)
+        self.assertEqual(self.controller.sequence, 1)
+        next_cycle = ServiceCycle(self.repo, self.settings, cycle_config(self.config, 2), provider=self.provider)
+        next_cycle.initialize()
+        previous_id = self.controller.current.config.capacity_approval_id
+        self.repo.set_capacity_approval_enabled(previous_id, enabled=False)
+        budget = self.repo.get_budget("finite-budget")
+        job_budget = self.repo.get_budget("job-budget")
+        attempt_id = "00000000-0000-0000-0000-000000000123"
+        cases = (
+            ("attempt-counter", {"attempt_no": 1}, None),
+            ("current-attempt", {"current_attempt_id": attempt_id}, None),
+            ("lease-worker", {"lease_worker_id": worker}, None),
+            ("expired-lease", {"lease_expires_at": self.now-1}, None),
+            ("historical-attempt", {}, {"status": "deferred", "upstream_stopped": 1}),
+            ("historical-submission", {}, {"status": "unknown", "submission_started_at": self.now,
+                "upstream_task_id": "original-paid-task", "upstream_stopped": 0}),
+            ("historical-waiter", {}, None),
+        )
+        for status in ("planned", "blocked"):
+            for name, overrides, history in cases:
+                with self.subTest(status=status, evidence=name):
+                    with self.repo.transaction() as conn:
+                        conn.execute(delete(attempts).where(attempts.c.job_id == draft["id"]))
+                        conn.execute(delete(capacity_waiters).where(capacity_waiters.c.job_id == draft["id"]))
+                        conn.execute(update(jobs).where(jobs.c.id == draft["id"]).values(
+                            **{"status": status, "attempt_no": 0, "current_attempt_id": None,
+                               "lease_worker_id": None, "lease_expires_at": None, **overrides}))
+                        if history:
+                            conn.execute(insert(attempts).values(id=attempt_id, job_id=draft["id"],
+                                number=1, fence=0, worker_id=worker, created_at=self.now, updated_at=self.now, **history))
+                        if name == "historical-waiter":
+                            old_waiter = conn.execute(select(capacity_waiters).where(
+                                capacity_waiters.c.job_id == finished["id"])).mappings().one()
+                            conn.execute(insert(capacity_waiters).values(**{**dict(old_waiter),
+                                "job_id": draft["id"], "state": "failed"}))
+                    value = self.controller.current.status()
+                    self.assertTrue(value["all_destroyed"])
+                    self.assertIn(draft["id"], value["active_job_ids"])
+                    self.assertFalse(self.controller._can_rotate(value))
+                    with self.assertRaisesRegex(Conflict, "capacity_transfer_job_requires_reconciliation"):
+                        transfer_unsubmitted_capacity(self.repo, previous_id, next_cycle.config.capacity_approval_id,
+                            allowed_owners=self.config.allowed_owners, children_done_confirmed=True)
+                    self.assertEqual(self.controller.sequence, 1)
+                    self.assertEqual(len(self.provider.creates), 1)
+                    self.assertEqual(self.repo.get_budget("finite-budget"), budget)
+                    self.assertEqual(self.repo.get_budget("job-budget"), job_budget)
+
+    def test_terminal_job_with_unresolved_submission_still_blocks_rotation(self):
+        scope, finished = self.start_job()
+        self.finish(scope, finished)
+        worker = next(iter(self.controller.current.boots.values())).worker
+        draft = self.repo.create_job(scope, finished["plan_id"], "hold-cycle-for-audit", initial_status="planned")
+        with self.repo.transaction() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == draft["id"]).values(lease_worker_id=worker))
+        self.tick()
+        for _ in range(40):
+            self.tick()
+        self.assertEqual(len(self.provider.destroys), 1)
+        with self.repo.transaction() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == draft["id"]).values(lease_worker_id=None))
+            conn.execute(update(jobs).where(jobs.c.id == finished["id"]).values(status="failed"))
+            conn.execute(update(attempts).where(attempts.c.job_id == finished["id"]).values(
+                status="unknown", upstream_stopped=0))
+        value = self.controller.current.status()
+        self.assertTrue(value["all_destroyed"])
+        self.assertIn(finished["id"], value["active_job_ids"])
+        self.assertFalse(self.controller._can_rotate(value))
+        self.assertEqual(self.controller.sequence, 1)
+        self.assertEqual(len(self.provider.creates), 1)
+
+    def test_warm_admitted_job_cannot_hide_reservation_with_a_draft_label(self):
+        first = self.start_job()
+        self.finish(*first)
+        scope, accepted = self.submit("supervan", "accepted-on-warm-gpu")
+        self.assertEqual(accepted["status"], "queued")
+        # Warm admission reserves budget without a cold waiter or attempt.
+        with self.repo.transaction() as conn:
+            self.assertIsNone(conn.execute(select(capacity_waiters.c.job_id).where(
+                capacity_waiters.c.job_id == accepted["id"])).first())
+            self.assertIsNone(conn.execute(select(attempts.c.id).where(
+                attempts.c.job_id == accepted["id"])).first())
+            conn.execute(update(jobs).where(jobs.c.id == accepted["id"]).values(status="planned"))
+        budget = self.repo.get_budget("job-budget")
+        self.assertGreater(budget["reserved_microusd"], 0)
+        self.tick()
+        for _ in range(40):
+            self.tick()
+        self.assertEqual(len(self.provider.destroys), 1)
+        self.assertEqual(self.controller.sequence, 1)
+        next_cycle = ServiceCycle(self.repo, self.settings, cycle_config(self.config, 2), provider=self.provider)
+        next_cycle.initialize()
+        previous_id = self.controller.current.config.capacity_approval_id
+        self.repo.set_capacity_approval_enabled(previous_id, enabled=False)
+        for status in ("planned", "blocked"):
+            with self.subTest(status=status):
+                with self.repo.transaction() as conn:
+                    conn.execute(update(jobs).where(jobs.c.id == accepted["id"]).values(status=status))
+                value = self.controller.current.status()
+                self.assertFalse(self.controller._can_rotate(value))
+                with self.assertRaisesRegex(Conflict, "capacity_transfer_job_requires_reconciliation"):
+                    transfer_unsubmitted_capacity(self.repo, previous_id, next_cycle.config.capacity_approval_id,
+                        allowed_owners=self.config.allowed_owners, children_done_confirmed=True)
+                self.assertEqual(self.repo.get_job(scope, accepted["id"])["status"], status)
+                self.assertEqual(self.repo.get_budget("job-budget"), budget)
+                self.assertEqual(len(self.provider.creates), 1)
 
     def test_unknown_creation_does_not_rotate_or_rerent(self):
         self.provider.uncertain = self.provider.unknown = True
