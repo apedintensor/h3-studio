@@ -119,11 +119,16 @@ class RenderTests(unittest.TestCase):
 
     def test_source_too_short_fails_before_submission(self):
         job = self.job(shots=[{"shot_id": "one", "source_id": "red", "frames": 72}])
-        with mock.patch("subprocess.Popen", wraps=subprocess.Popen) as process:
+        with mock.patch.object(media, "run_media_process", wraps=media.run_media_process) as process, \
+                mock.patch.object(self.backend, "_run_process", side_effect=AssertionError("transcode must not start")) as encoder:
             with self.assertRaisesRegex(BackendError, "video_too_short"):
                 self.backend.prepare(job, "short", self.store, lambda: None)
-        # ffprobe is permitted; no transcode was submitted.
+        # Probe through the actual bounded launcher is permitted. Its OS argv
+        # is an absolute executable on Windows and a Python exec wrapper on
+        # Linux, so assert the tool contract rather than the old bare argv.
+        self.assertGreater(process.call_count, 0)
         self.assertTrue(all(call.args[0][0] == "ffprobe" for call in process.call_args_list))
+        encoder.assert_not_called()
         self.assertEqual(self.backend.reconcile("short").state, "unknown")
 
     def test_nonzero_source_frames_use_blue_middle_of_real_30fps_clip(self):

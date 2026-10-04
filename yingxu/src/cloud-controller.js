@@ -8,11 +8,20 @@ import {burnCaptionStatus} from './caption-model.js';
 
 const clone=value=>structuredClone(value),uid=()=>crypto.randomUUID();
 const identity=result=>result?.username||result?.user?.username||result?.user||result?.account?.username;
-export function createCloudController({store=defaultStore,client,storage=globalThis.localStorage,readFile=getFile,mediaHandlers=setCloudMediaHandlers}={}){
-  let state={account:null,auth:null,capabilities:null,projects:[],projectsLoaded:false,nextProjectOffset:100,moreProjects:false,plans:{},preflightErrors:{},batchChecking:null,renderPlans:{},renderOptions:{},renderPending:{},jobs:[],activity:null,activityError:'',nextJobOffset:100,moreJobs:false,batches:[],batchesLoaded:false,nextBatchOffset:10,moreBatches:false,assets:[],usage:null,assetError:'',batchPending:null,busy:false,error:'',message:'',conflict:null,draftOffer:null,unknown:{}},epoch=0,stopped=false,polling=false,operation=false,detailCursor=0,sessionCheck=null;
+export function createCloudController({store=defaultStore,client,storage=globalThis.localStorage,workspaceStorage,readFile=getFile,mediaHandlers=setCloudMediaHandlers}={}){
+  if(workspaceStorage===undefined){try{workspaceStorage=globalThis.sessionStorage;}catch{workspaceStorage=null;}}
+  let state={account:null,auth:null,capabilities:null,projects:[],projectsLoaded:false,nextProjectOffset:100,moreProjects:false,plans:{},preflightErrors:{},batchChecking:null,renderPlans:{},renderOptions:{},renderPending:{},jobs:[],activity:null,activityError:'',nextJobOffset:100,moreJobs:false,batches:[],batchesLoaded:false,nextBatchOffset:10,moreBatches:false,assets:[],usage:null,assetError:'',batchPending:null,busy:false,error:'',message:'',conflict:null,draftOffer:null,resumeOffer:null,resumeError:'',unknown:{}},epoch=0,stopped=false,polling=false,operation=false,detailCursor=0,sessionCheck=null;
   const listeners=new Set(),emit=patch=>{state={...state,...patch};for(const cb of listeners)cb();};
   const api=client||createCloudClient({onUnauthorized:()=>expire()});
   const current=()=>store.getState(),context=()=>({epoch,workspaceEpoch:current().workspaceEpoch,projectId:current().project.id,account:state.account});
+  // Per-tab navigation memory only: never store private titles, project bodies
+  // or authentication here. A fresh /me check must precede any resume offer.
+  const visitKey='yingxu-workspace-visit-v1';
+  const rememberVisit=value=>{try{workspaceStorage?.setItem(visitKey,JSON.stringify(value));}catch{/* Draft persistence is independent; navigation memory is optional. */}};
+  function offerResume(){
+    if(!state.account||current().workspace.mode!=='local')return;
+    try{const visit=JSON.parse(workspaceStorage?.getItem(visitKey)||'null');if(visit?.mode==='cloud'&&visit.account===state.account&&typeof visit.projectId==='string'&&visit.projectId.length>0&&visit.projectId.length<=160)emit({resumeOffer:{projectId:visit.projectId}});}catch{/* Ignore malformed navigation memory; never infer an owner. */}
+  }
   const guard=ctx=>{if(ctx.epoch!==epoch||ctx.workspaceEpoch!==current().workspaceEpoch||ctx.projectId!==current().project.id||ctx.account!==state.account)throw Error('账户或项目已经切换；迟到的响应没有写入当前作品。');};
   const requireCloud=()=>{if(!state.account||current().workspace.mode!=='cloud'||current().workspace.account!==state.account)throw Error('请先登录并打开一个云项目。');};
   const intent=(kind,scope)=>{if(!storage)throw Error('浏览器无法保存提交标识；为避免重复提交，请先恢复存储。');const key=`yingxu-cloud-intent-v1:${state.account}:${kind}:${scope}`;let value=storage.getItem(key);if(!value){value=uid();storage.setItem(key,value);}return value;};
@@ -30,7 +39,7 @@ export function createCloudController({store=defaultStore,client,storage=globalT
   function installMedia(){api.setAccount?.(state.account);mediaHandlers({maxBytes:state.capabilities?.upload_max_bytes,read:state.account?async fileId=>{const match=/^cloud_(asset|artifact)_([A-Za-z0-9_-]+)$/.exec(fileId);if(!match)throw Error('云素材标识无效。');const ctx=context(),blob=await api.download(`/v1/${match[1]}s/${match[2]}/content`);guard(ctx);return blob;}:null,upload:state.account&&current().workspace.mode==='cloud'?upload:null});}
   function replaceIdentity(account,message=''){
     epoch++;api.reset?.();store.leaveCloudProject();
-    emit({...emptyProjectList,account,capabilities:null,assets:[],usage:null,assetError:'',plans:{},preflightErrors:{},batchChecking:null,renderPlans:{},renderOptions:{},renderPending:{},jobs:[],activity:null,activityError:'',nextJobOffset:100,moreJobs:false,batches:[],batchesLoaded:false,nextBatchOffset:10,moreBatches:false,batchPending:null,conflict:null,draftOffer:null,unknown:{},error:'',message});installMedia();
+    emit({...emptyProjectList,account,capabilities:null,assets:[],usage:null,assetError:'',plans:{},preflightErrors:{},batchChecking:null,renderPlans:{},renderOptions:{},renderPending:{},jobs:[],activity:null,activityError:'',nextJobOffset:100,moreJobs:false,batches:[],batchesLoaded:false,nextBatchOffset:10,moreBatches:false,batchPending:null,conflict:null,draftOffer:null,resumeOffer:null,resumeError:'',unknown:{},error:'',message});installMedia();
   }
   function expire(){replaceIdentity(null);emit({error:'云登录已失效或身份已改变。原本机作品已恢复，云草稿仍按原账户保留，请重新核对登录。'});}
   async function recheckSession({loadLists=false}={}){
@@ -43,6 +52,7 @@ export function createCloudController({store=defaultStore,client,storage=globalT
         const changed=state.account!==me||current().workspace.mode==='cloud'&&current().workspace.account!==me;
         if(changed){replaceIdentity(me,'登录身份已重新核对。原本机作品已恢复；请打开当前账户的云项目。');observedEpoch=epoch;}
         if(loadLists||changed){await reloadProjects();if(observedEpoch===epoch)await reloadCapabilities();}
+        if(observedEpoch===epoch)offerResume();
       }catch(error){if(observedEpoch!==epoch)return;if(error.status===401){if(state.account||current().workspace.mode==='cloud')expire();}else emit({error:'账户状态暂未核对：'+error.message});}
       finally{sessionCheck=null;}
     })();return sessionCheck;
@@ -64,6 +74,7 @@ export function createCloudController({store=defaultStore,client,storage=globalT
     if(draft?.dirty&&!restoreDraft&&!discardDraft){emit({draftOffer:{record,draft}});return false;}
     if(restoreDraft&&draft?.serverVersion!==record.version){emit({draftOffer:{record,draft},conflict:{id,remote:record,draft}});throw Error('本机云草稿基于较旧版本。请下载草稿或保存副本；未覆盖云端。');}
     epoch++;api.reset?.();if(!store.enterCloudProject(record.project,{account:me,version:record.version,restoreDraft}))throw Error(current().notice);
+    rememberVisit({mode:'cloud',account:me,projectId:record.id});emit({resumeOffer:null,resumeError:''});
     const pending=readPending(),renderPending=readRenderPending();emit({preflightErrors:{},batchChecking:null,renderPlans:Object.fromEntries(Object.entries(renderPending).map(([id,value])=>[id,value.plan])),renderOptions:{},renderPending,assets:[],usage:null,assetError:'',plans:Object.fromEntries(Object.entries(pending).map(([id,value])=>[id,value.plan])),jobs:[],activity:null,activityError:'',nextJobOffset:100,moreJobs:false,batches:[],batchesLoaded:false,nextBatchOffset:10,moreBatches:false,batchPending:readBatchPending(),conflict:null,draftOffer:null,unknown:pending,message:restoreDraft?'已恢复尚未同步的云草稿。':'云项目已打开。'});installMedia();await refreshJobs();return true;}
   async function save(){requireCloud();const ctx=context(),project=store.exportProject(),version=current().workspace.serverVersion;
     try{const record=checkedProjectRecord(await api.saveProject(project.id,project,version));guard(ctx);store.markCloudSaved(record.version,project);emit({conflict:null,message:'项目版本已保存。'});return record;}
@@ -157,9 +168,11 @@ export function createCloudController({store=defaultStore,client,storage=globalT
   return {subscribe(fn){listeners.add(fn);return()=>listeners.delete(fn);},getState:()=>state,
     async initialize(){const observedEpoch=epoch;try{const auth=await api.authConfig();if(observedEpoch!==epoch)return;emit({auth});await recheckSession({loadLists:true});}catch(error){if(observedEpoch===epoch)emit({error:error.message});}},
     recheckSession:()=>recheckSession(),
-    login:(username,password)=>action(async()=>{const observedEpoch=epoch,result=await api.login(username,password);if(observedEpoch!==epoch)throw Error('登录期间会话已经改变，请重新核对。');const me=identity(result);if(typeof me!=='string')throw Error('登录响应缺少账户身份。');replaceIdentity(me);announceSession();await reloadProjects();await reloadCapabilities();}),
-    logout:()=>action(async()=>{await api.logout();replaceIdentity(null,'已退出。云草稿仍按原账户保留，本机作品已恢复。');announceSession();}),
-    leave(){epoch++;api.reset?.();store.leaveCloudProject();emit({assets:[],usage:null,assetError:'',plans:{},preflightErrors:{},batchChecking:null,renderPlans:{},renderOptions:{},renderPending:{},jobs:[],activity:null,activityError:'',nextJobOffset:100,moreJobs:false,batches:[],batchesLoaded:false,nextBatchOffset:10,moreBatches:false,batchPending:null,conflict:null,draftOffer:null});installMedia();},
+    login:(username,password)=>action(async()=>{const observedEpoch=epoch,result=await api.login(username,password);if(observedEpoch!==epoch)throw Error('登录期间会话已经改变，请重新核对。');const me=identity(result);if(typeof me!=='string')throw Error('登录响应缺少账户身份。');replaceIdentity(me);announceSession();await reloadProjects();await reloadCapabilities();offerResume();}),
+    logout:()=>action(async()=>{await api.logout();rememberVisit({mode:'local'});replaceIdentity(null,'已退出。云草稿仍按原账户保留，本机作品已恢复。');announceSession();}),
+    leave(){epoch++;api.reset?.();store.leaveCloudProject();rememberVisit({mode:'local'});emit({assets:[],usage:null,assetError:'',plans:{},preflightErrors:{},batchChecking:null,renderPlans:{},renderOptions:{},renderPending:{},jobs:[],activity:null,activityError:'',nextJobOffset:100,moreJobs:false,batches:[],batchesLoaded:false,nextBatchOffset:10,moreBatches:false,batchPending:null,conflict:null,draftOffer:null,resumeOffer:null,resumeError:''});installMedia();},
+    resume:()=>action(async()=>{const ctx=accountContext(),offer=state.resumeOffer;if(!offer||current().workspace.mode!=='local')throw Error('请重新核对当前账户与上次作品。');try{const done=await open(offer.projectId);emit({resumeError:''});return done;}catch(error){guardAccount(ctx);if([403,404].includes(error.status)){rememberVisit({mode:'local'});emit({resumeOffer:null,resumeError:'上次云作品已不存在，或当前账户无权读取。当前本机作品和已有草稿均未改变。'});}else emit({resumeError:'上次云作品暂时无法读取。可稍后重试或从云项目列表打开；当前本机作品未改变。'});throw error;}}),
+    dismissResume(){rememberVisit({mode:'local'});emit({resumeOffer:null,resumeError:'',draftOffer:null});},
     list:()=>action(reloadProjects),loadMoreProjects:()=>action(loadMoreProjects),reloadCapabilities:()=>action(reloadCapabilities),open:(id,options)=>action(()=>open(id,options)),save:()=>action(save),
     create:(title,{copy=false}={})=>action(async()=>{if(!state.account)throw Error('先登录云工作室。');const ctx=accountContext(),project=copy?copyForCloud(store.exportProject()):blankCloudProject(title);if(copy&&title)project.title=title;const record=checkedProjectRecord(await api.createProject(project,intent('create',project.id)));guardAccount(ctx);await reloadProjects();guardAccount(ctx);return open(record.id);}),
     createQuick:title=>action(async()=>{if(!state.account)throw Error('先登录云工作室。');const ctx=accountContext(),project=freestyleProject(title||'快速创作 · '+new Date().toLocaleDateString());const record=checkedProjectRecord(await api.createProject(project,intent('create',project.id)));guardAccount(ctx);await reloadProjects();guardAccount(ctx);return open(record.id);}),

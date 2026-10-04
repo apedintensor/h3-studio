@@ -18,9 +18,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from .assets import AssetService, AssetNotFound
+from .upload_route import AssetUploadRoute
 from .auth import Auth, AuthenticationError, LoginLimited
 from .capabilities import VERSION, capabilities, compile_request
-from .media import MediaError
+from .media import MediaError, MediaBusy
 from .project_validation import validate_project
 from .repository import Repository, Scope, NotFound, Conflict, BudgetExceeded, plans, artifacts, jobs
 from .settings import Settings
@@ -147,6 +148,11 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     @app.exception_handler(ValueError)
     async def invalid(_request, error):
         return JSONResponse({"detail": str(error)}, status_code=422)
+
+    @app.exception_handler(MediaBusy)
+    async def media_busy(_request, _error):
+        return JSONResponse({"detail": "素材处理繁忙；原件已保留，请在素材列表恢复同一素材"},
+                            status_code=503, headers={"Retry-After": "5", "Cache-Control": "no-store"})
 
     @app.exception_handler(StorageError)
     async def storage_error(_request, _error):
@@ -324,11 +330,13 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         return project_response(repo.put_document(project_scope(principal), "project", project_id, project,
             expected_version=body["expected_version"]))
 
-    @app.post("/v1/assets", status_code=201)
     def upload_asset(request: Request, file: UploadFile = File(...), client_project_id: str = Form(...), client_asset_id: str | None = Form(None)):
         principal = request.state.principal
         authorized_project(principal, client_project_id, "assets:write")
         return asset_service.upload(principal.owner, client_project_id, file.file, file.filename or "file", client_asset_id=client_asset_id)
+
+    app.router.add_api_route("/v1/assets", upload_asset, methods=["POST"],
+        status_code=201, route_class_override=AssetUploadRoute)
 
     @app.get("/v1/assets")
     def list_assets(request: Request, client_project_id: str):

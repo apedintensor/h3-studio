@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -19,6 +20,7 @@ from .storage import (IntegrityError, LocalObjectStore, ObjectAlreadyExists, Obj
 from .storage_asset_journal import AssetUploadJournal, AssetConflict, AssetQuotaExceeded, validate_client_asset_id
 from .storage_multipart import MultipartJournal, MultipartOutcomeUnknown, MultipartUploadManager
 from .storage_schema import create_storage_schema
+from .asset_operation import asset_operation_lock
 
 MIB = 1024 * 1024
 metadata = MetaData()
@@ -71,7 +73,8 @@ class AssetService:
         if not root.is_absolute():
             raise ValueError("素材数据根必须为绝对路径")
         self.temp_dir, self.staging_dir = root / "processing", root / "asset-staging"
-        for directory in (self.temp_dir, self.staging_dir):
+        self.operation_dir = root / "asset-operation-locks"
+        for directory in (self.temp_dir, self.staging_dir, self.operation_dir):
             _check_ancestors(directory)
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         create_storage_schema(engine, metadata)
@@ -125,6 +128,19 @@ class AssetService:
         self.journal.release(receipt, retained)
 
     def upload(self, owner, project_id, source, filename, *, client_asset_id=None, parent_id=None, selection=None):
+        ident = uuid.uuid4().hex
+        with self._operation(ident):
+            return self._upload(ident, owner, project_id, source, filename,
+                client_asset_id=client_asset_id, parent_id=parent_id, selection=selection)
+
+    @contextmanager
+    def _operation(self, ident):
+        with asset_operation_lock(self.operation_dir, ident) as acquired:
+            if not acquired:
+                raise AssetConflict("素材操作仍在运行；不会接管或释放其收据")
+            yield
+
+    def _upload(self, ident, owner, project_id, source, filename, *, client_asset_id=None, parent_id=None, selection=None):
         _part(owner)
         if client_asset_id is not None:
             validate_client_asset_id(client_asset_id)
@@ -132,7 +148,6 @@ class AssetService:
         suffix = Path(display_name).suffix.lower()
         if suffix not in media.EXTENSIONS:
             raise media.MediaError("仅支持PNG/JPG/WEBP、MP4/MOV、WAV/MP3/FLAC")
-        ident = uuid.uuid4().hex
         asset = {"id": ident, "asset_id": ident, "client_asset_id": client_asset_id,
             "project_id": project_id, "file_name": display_name, "kind": media.EXTENSIONS[suffix],
             "mime": media.MIMES[suffix], "content_type": media.MIMES[suffix], "created_at": time.time(),
@@ -141,6 +156,9 @@ class AssetService:
         receipt["suffix"] = suffix
         receipt["storage_binding"] = self.storage_binding
         try:
+            # A kill during receiving must still identify the exact original
+            # storage/staging contract; an old unbound receipt is never guessed.
+            self.journal.save(receipt)
             directory = self._stage(receipt)
             directory.mkdir(mode=0o700)
             with (directory / "receiving").open("xb") as target:
@@ -165,7 +183,7 @@ class AssetService:
                 self.journal.save(receipt)
                 self._release(receipt)
                 return self.public(existing["asset"])
-            return self._run(receipt)
+            return self._run_locked(receipt)
         except Exception:
             if receipt["busy"]:
                 receipt["asset"].update(status="failed", error="素材接收未完成；已保留收到的文件")
@@ -263,22 +281,39 @@ class AssetService:
         self.journal.save(receipt)
 
     def _run(self, receipt, *, interrupted=False):
+        with self._operation(receipt["id"]):
+            return self._run_locked(receipt, interrupted=interrupted)
+
+    def _run_locked(self, receipt, *, interrupted=False):
         try:
             receipt["asset"].update(status="validating")
             receipt["asset"].pop("error", None)
             self.journal.save(receipt)
-            if receipt.get("derivation"):
-                self._prepare_derivation(receipt)
-            self._prepare(receipt)
+            if not receipt.get("prepared"):
+                with media.PROCESSING_ADMISSION.acquire(receipt["asset"]["kind"]):
+                    if receipt.get("derivation"):
+                        self._prepare_derivation(receipt)
+                    self._prepare(receipt)
             for role in ("original", "model"):
                 if role in receipt["objects"]:
                     self._write_object(receipt, role, interrupted=interrupted)
             receipt["asset"]["status"] = "ready"
             self.journal.save(receipt)
-        except Exception:
+        except Exception as error:
             uncertain = any(s["phase"] in {"putting", "put_unknown", "verifying", "multipart"} for s in receipt["objects"].values())
-            receipt["asset"].update(status="storage_unknown" if uncertain else "failed",
-                error="素材保存待核对，已保留原件，请恢复同一素材" if uncertain else "素材校验未完成，已保留原件")
+            if uncertain:
+                detail = "素材保存待核对，已保留原件，请恢复同一素材"
+            elif isinstance(error, media.MediaBusy):
+                detail = "素材处理繁忙；原件已保留，请恢复同一素材"
+            elif isinstance(error, media.MediaError):
+                # Our media layer uses bounded static diagnostics, never raw
+                # decoder output. Keep the actionable reason after a refresh.
+                detail = str(error)[:240]
+                if "原素材" not in detail and "原件" not in detail:
+                    detail += "；已保留原件"
+            else:
+                detail = "素材校验未完成，已保留原件"
+            receipt["asset"].update(status="storage_unknown" if uncertain else "failed", error=detail)
             self.journal.save(receipt)
             self._release(receipt)
             raise
@@ -288,17 +323,72 @@ class AssetService:
     def resume(self, owner, asset_id):
         return self.reconcile(owner, asset_id)
 
-    def reconcile(self, owner, asset_id, *, interrupted=False):
+    def reconcile(self, owner, asset_id, *, interrupted=False, expected_version=None):
+        # The local lock is taken before receipt claim and held through release.
+        # An operator assertion never overrides a still-running local operation.
         asset = self.get(owner, asset_id)
-        if asset["status"] == "ready":
+        if asset["status"] == "ready" and not interrupted and expected_version is None:
+            return self.public(asset)
+        with self._operation(asset_id):
+            return self._reconcile_locked(owner, asset_id, interrupted=interrupted,
+                expected_version=expected_version)
+
+    def _reconcile_locked(self, owner, asset_id, *, interrupted=False, expected_version=None):
+        asset = self.get(owner, asset_id)
+        if asset["status"] == "ready" and not interrupted and expected_version is None:
             return self.public(asset)
         receipt = self.journal.get(owner, asset_id)
+        if expected_version is not None and (type(expected_version) is not int or expected_version < 0
+                or receipt["version"] != expected_version):
+            raise AssetConflict("素材收据版本已变化；请重新只读核对")
         if receipt.get("storage_binding") != self.storage_binding:
             raise AssetConflict("素材上传属于另一存储位置或身份，未自动切换供应商")
         if not receipt.get("accepted_input") or not (receipt.get("size_bytes") or receipt.get("derivation")):
             raise AssetConflict("文件未完整接收，需要重新选择文件上传")
+        if asset["status"] == "ready":
+            if receipt["busy"]:
+                if not interrupted:
+                    return self.public(asset)
+                if not receipt.get("prepared") or "original" not in receipt["objects"]:
+                    raise AssetConflict("就绪素材收据证据不完整；未释放预留")
+                for role, spec in receipt["objects"].items():
+                    actual = asset.get(role, {})
+                    if (role not in {"original", "model"} or spec.get("phase") != "verified"
+                            or any(actual.get(k) != spec.get(k) for k in ("key", "size_bytes", "sha256", "content_type"))):
+                        raise AssetConflict("就绪素材与已验证对象证据不一致；未释放预留")
+                    self._verify_stored(spec)
+                # Ready was saved before the independent quota-release commit.
+                # Reconcile bytes and release once; never generate or write keys.
+                self._release(receipt)
+            return self.public(asset)
         self.journal.claim(receipt, interrupted=interrupted)
-        return self._run(receipt, interrupted=interrupted)
+        return self._run_locked(receipt, interrupted=interrupted)
+
+    def settle_incomplete(self, owner, asset_id, *, expected_version, writers_stopped=False):
+        """Operator-only: account for retained partial bytes; never make ready.
+
+        Shared local lock blocks actual live operations. An explicit assertion
+        remains necessary for old code/other hosts not sharing this local lock.
+        """
+        if writers_stopped is not True:
+            raise AssetConflict("必须先确认所有原写入者已停止")
+        self.get(owner, asset_id)
+        with self._operation(asset_id):
+            receipt = self.journal.get(owner, asset_id)
+            if (type(expected_version) is not int or expected_version < 0
+                    or receipt["version"] != expected_version):
+                raise AssetConflict("素材收据版本已变化；请重新只读核对")
+            if (receipt.get("storage_binding") != self.storage_binding
+                    or receipt.get("suffix") not in media.EXTENSIONS):
+                raise AssetConflict("不完整旧收据没有匹配的存储身份；未猜测或释放预留")
+            if (receipt.get("accepted_input") or receipt.get("prepared") or receipt.get("derivation")
+                    or receipt["objects"] or receipt["asset"]["status"] == "ready"):
+                raise AssetConflict("此收据不是单纯未完整接收；请核对原对象或使用完整素材恢复")
+            if receipt["busy"]:
+                receipt["asset"].update(status="failed", error="原文件接收未完成；旧写入者已停止，已保留收到的字节，请重新选择文件上传")
+                self.journal.save(receipt)
+                self._release(receipt)
+            return self.public(receipt["asset"])
 
     def get(self, owner, asset_id, project_id=None):
         clauses = [asset_table.c.id == asset_id, asset_table.c.tenant == self.tenant, asset_table.c.owner == owner]
@@ -324,6 +414,11 @@ class AssetService:
                 "original": record["original"], "parent_id": record.get("parent_id"), "selection": record.get("selection")}
 
     def derive(self, owner, asset_id, start, end):
+        ident = uuid.uuid4().hex
+        with self._operation(ident):
+            return self._derive(ident, owner, asset_id, start, end)
+
+    def _derive(self, ident, owner, asset_id, start, end):
         parent = self.get(owner, asset_id)
         if parent["status"] != "ready":
             raise media.MediaError("原素材尚未就绪")
@@ -336,7 +431,6 @@ class AssetService:
             raise media.MediaError("选段须在原素材范围内，且长度为2–15秒")
         # Reserve the same durable capacity/concurrency slot as uploads before
         # downloading or invoking FFmpeg. The receipt also survives API restart.
-        ident = uuid.uuid4().hex
         suffix = ".mp4" if info["kind"] == "video" else ".wav"
         asset = {"id": ident, "asset_id": ident, "client_asset_id": None,
             "project_id": parent["project_id"], "file_name": "trimmed"+suffix,
@@ -348,7 +442,7 @@ class AssetService:
             derivation={"input_name": "derivation-input"+Path(parent["file_name"]).suffix.lower(),
                         "original": dict(parent["original"]), "metadata": dict(info), "phase": "planned"})
         self.journal.save(receipt)
-        return self._run(receipt)
+        return self._run_locked(receipt)
 
     def _prepare_derivation(self, receipt):
         spec = receipt["derivation"]

@@ -7,6 +7,7 @@ import secrets
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -101,6 +102,29 @@ class ApiTests(unittest.TestCase):
         self.app.state.auth.register_client("activity-scope-test", token, "superdan", ["story-one"], ["projects:read"])
         headers = {"Authorization": "Bearer "+token}
         self.assertEqual(self.client.get("/v1/activity-summary", params={"client_project_id": "story-one"}, headers=headers).status_code, 404)
+
+    def test_cpu_media_busy_returns_retry_and_same_asset_can_resume(self):
+        from studio_platform import media
+        self.setup_project()
+        gate = media.ProcessingAdmission(wait_seconds=0)
+        with mock.patch.object(media, "PROCESSING_ADMISSION", gate), gate.acquire("video"):
+            response = self.client.post("/v1/assets", data={"client_project_id": "story-one", "client_asset_id": "busy-original"},
+                files={"file": ("reference.png", png(), "image/png")})
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.headers.get("Retry-After"), "5")
+        self.assertIn("恢复同一素材", response.json()["detail"])
+        items = self.app.state.assets.list("superdan", "story-one")
+        self.assertEqual(len(items), 1)
+        asset_id = items[0]["id"]
+        self.assertEqual(items[0]["status"], "failed")
+        self.login("supervan")
+        self.assertEqual(self.client.post(f"/v1/assets/{asset_id}/resume").status_code, 404)
+        self.login("superdan")
+        resumed = self.client.post(f"/v1/assets/{asset_id}/resume")
+        self.assertEqual(resumed.status_code, 200, resumed.text)
+        self.assertEqual(resumed.json()["id"], asset_id)
+        self.assertEqual(resumed.json()["status"], "ready")
+        self.assertEqual(len(self.app.state.assets.list("superdan", "story-one")), 1)
 
     def test_auth_required_and_bad_host_origin(self):
         self.assertEqual(self.client.get("/v1/projects").status_code, 401)

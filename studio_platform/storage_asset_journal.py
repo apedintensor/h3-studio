@@ -242,7 +242,7 @@ class AssetUploadJournal:
 
     def claim(self, receipt, *, interrupted=False):
         if receipt["busy"] and not interrupted:
-            raise AssetConflict("素材正在处理；请稍后刷新，不要重复上传")
+            raise AssetConflict("素材可能仍在处理，请先等待；若服务重启后状态持续不变，请联系管理员恢复同一素材，不要反复上传")
         # Operator-only: caller must actually fence/stop the old worker. Never
         # infer this from a timer or expose interrupted directly to API clients.
         active_delta = 0 if receipt["busy"] else 1

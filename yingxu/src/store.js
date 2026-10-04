@@ -178,6 +178,7 @@ export function createStore({storage,now=()=>Date.now(),seed=legacySeed}={}){
   return {
     getState:()=>state,
     getRecoveryRaw:()=>recoveryRaw,
+    getPersistenceRisk:()=>({current:state.saveState.startsWith('保存失败'),otherCloudDrafts:[...volatileCloudDrafts.keys()].filter(key=>state.workspace.mode!=='cloud'||key!==cloudKey(state.workspace.account,state.project.id)).length}),
     checkpoint(){const saved=persist()&&!volatileCloudDrafts.size;if(!saved)state={...state,notice:'当前或先前账户仍有未落盘草稿，已阻止刷新。请用原账户恢复后备份，保留本页面。'};emit();return saved;},
     getCloudDraft(account,id){const key=cloudKey(account,id);if(volatileCloudDrafts.has(key))return clone(volatileCloudDrafts.get(key));try{const raw=storage?.getItem(key);if(!raw)return null;const draft=JSON.parse(raw),valid=validateProject(draft.project);return valid.ok?{...draft,project:valid.project}:null;}catch{return null;}},
     enterCloudProject(project,{account,version,restoreDraft=false}={}){

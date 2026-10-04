@@ -22,7 +22,7 @@
 | 列出项目 | GET `/v1/projects?limit=100&offset=0` | limit 1–100；授权过滤发生在SQL分页之前 |
 | 读文稿 | GET `/v1/projects/{project_id}` | v4文稿、服务端version与更新时间 |
 | 创建/保存文稿 | POST `/v1/projects`；PUT `/v1/projects/{project_id}` | 仅网页登录；PUT携带expected_version，冲突不会覆盖 |
-| 上传素材 | POST `/v1/assets` | multipart file、client_project_id、可选稳定client_asset_id；实际解码/校验 |
+| 上传素材 | POST `/v1/assets` | multipart中恰好一个file、一个client_project_id、可选一个稳定client_asset_id；拒绝重复/未知字段，实际解码/校验 |
 | 读素材列表/状态 | GET `/v1/assets?client_project_id=...`；GET `/v1/assets/{id}` | 只在ready后可用于计划 |
 | 创建音视频选段 | POST `/v1/assets/{id}/derivatives` | JSON start/end秒；保留原件，不在生成请求里偷偷裁剪 |
 | 恢复已接收素材处理 | POST `/v1/assets/{id}/resume` | 同一asset；不等于浏览器断线按字节续传 |
@@ -38,6 +38,8 @@
 | 下载结果/素材 | GET或HEAD `/v1/artifacts/{id}/content`、`/v1/assets/{id}/content` | `?download=1`附件；Local支持Range；始终鉴权 |
 
 Swagger/OpenAPI由服务生成，访问仍需本账户身份。表中的模型支持是H3版本化配方的控制契约，当前未接通的Engy/Boyesir、图像生成、音乐生成、Marble不会因为有下拉框就自动可用。
+
+上传文件完整接收后，若CPU预处理名额等待30秒仍不可用，接口返回503和`Retry-After: 5`。原件及同一asset收据保留，素材列表会显示繁忙原因；客户端应查询原client_asset_id对应的素材并调用其`/resume`，不要创建另一个上传ID。恢复仍会鉴权且可能继续繁忙，不会自动创建付费生成。多轨原件不改写；模型参考副本仅采用首个受检真实视频轨和首个音轨，metadata.notes会说明这一选择。
 
 ## H3请求与确认
 

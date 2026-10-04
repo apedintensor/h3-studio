@@ -57,6 +57,10 @@ inventory.json
 !studio_platform/source_snapshot.py
 !studio_platform/http_limits.py
 !studio_platform/media.py
+!studio_platform/media_process.py
+!studio_platform/upload_route.py
+!studio_platform/asset_operation.py
+!studio_platform/asset_recovery.py
 !studio_platform/assets.py
 !studio_platform/batches.py
 !studio_platform/manage.py
@@ -95,9 +99,11 @@ inventory.json
 !ARCHITECTURE.zh-CN.md
 !ITERATIONS.zh-CN.md
 !DELIVERY-REPORT.zh-CN.md
+!START-HERE.zh-CN.md
 !OPERATIONS.zh-CN.md
 !API-USAGE.zh-CN.md
 !BACKUP-RECOVERY.zh-CN.md
+!ASSET-RECOVERY.zh-CN.md
 !LIUM-PROVIDER-CONTRACT.md
 !COLD-START-CONTRACT.zh-CN.md
 !API-PROVIDER-COMPATIBILITY.zh-CN.md
@@ -115,6 +121,7 @@ inventory.json
 !tools/build_platform_release.py
 !tools/check_platform_bundle.py
 !tools/backup_platform.py
+!tools/recover_platform_assets.py
 !tools/check_lightsail_plan.py
 !tools/stress_platform.py
 !deploy/platform/
