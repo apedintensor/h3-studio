@@ -347,6 +347,29 @@ class LiumProviderTests(unittest.TestCase):
             self.assertEqual(fact.state, "destroyed")
             self.assertIsNone(fact.actual_cost_microusd)
 
+    def test_live_statement_naive_utc_and_fractional_seconds_are_supported(self):
+        data = statement()
+        data.update(created_at=stamp(100).removesuffix("+00:00"),
+            removed_at=stamp(900.25).removesuffix("+00:00"), billed_seconds=800.25)
+        self.api.statements[POD] = data
+        fact = self.provider().reconcile(TAG, POD)
+        self.assertEqual((fact.state, fact.actual_cost_microusd), ("destroyed", 123457))
+
+    def test_bad_fractional_billing_keeps_removed_fact_but_money_pending(self):
+        for seconds in ("NaN", "-0.1", True, "9000000", None):
+            data = statement(); data["billed_seconds"] = seconds
+            self.api.statements[POD] = data
+            with self.subTest(seconds=seconds):
+                fact = self.provider().reconcile(TAG, POD)
+                self.assertEqual(fact.state, "destroyed")
+                self.assertIsNone(fact.actual_cost_microusd)
+
+    def test_mixed_timezone_statement_cannot_prove_removed(self):
+        data = statement(); data["created_at"] = stamp(100).removesuffix("+00:00")
+        self.api.statements[POD] = data
+        with self.assertRaises(LiumError):
+            self.provider().reconcile(TAG, POD)
+
     def test_statement_tag_id_removed_time_mismatch_cannot_release_or_settle(self):
         for change in ({"pod_id": OTHER}, {"pod_name": "sixnine-"+OTHER}, {"removed_at": stamp(2000)},
                        {"created_at": stamp(950)}, {"removed_at": "no-time"}):

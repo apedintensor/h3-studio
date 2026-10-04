@@ -112,6 +112,35 @@ class ComposeOverlayTests(unittest.TestCase):
                 with self.assertRaises(release.ReleaseError):
                     acceptance.validate(value, deployment_directory=DEPLOY, compose_version=self.version)
 
+    def test_observed_compose_2382_omitted_false_requires_exact_trusted_version(self):
+        # Observed in GitHub run 37178897092: the worker and app's added
+        # policy mount serialize explicit false as {}, just like base binds.
+        legacy = copy.deepcopy(self.config)
+        for service in legacy['services'].values():
+            for mount in service.get('volumes', []):
+                if mount.get('type') == 'bind':
+                    mount['bind'] = {}
+        before = copy.deepcopy(legacy)
+        for version in ('2.38.2', 'v2.38.2'):
+            self.assertTrue(acceptance.validate(legacy, deployment_directory=DEPLOY, compose_version=version))
+        self.assertEqual(legacy, before)
+        for version in (None, '2.38.1', '2.39.0', '5.6.0'):
+            with self.subTest(version=version), self.assertRaises((release.ReleaseError, validator.ConfigurationError)):
+                acceptance.validate(legacy, deployment_directory=DEPLOY, compose_version=version)
+
+    def test_legacy_normalization_never_accepts_enabled_or_missing_bind_options(self):
+        for name in ('gpu-worker', 'app'):
+            for options in ({'create_host_path': True}, None, {'create_host_path': False, 'propagation': 'rshared'}):
+                changed = copy.deepcopy(self.config)
+                mount = next(item for item in changed['services'][name]['volumes']
+                    if item['target'] == acceptance.POLICY_TARGET)
+                if options is None:
+                    mount.pop('bind', None)
+                else:
+                    mount['bind'] = options
+                with self.subTest(service=name, options=options), self.assertRaises(release.ReleaseError):
+                    acceptance.validate(changed, deployment_directory=DEPLOY, compose_version='2.38.2')
+
     def test_app_base_safety_is_not_bypassed_by_overlay(self):
         for field, value in [('SIXNINE_AUTH_MODE', 'local-test'), ('SIXNINE_RENDER_ENABLED', '1'),
                              ('SIXNINE_CLOUD_CREATION_ENABLED', '1')]:

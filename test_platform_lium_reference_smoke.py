@@ -110,6 +110,26 @@ class ReferenceTests(unittest.TestCase):
         self.assertEqual(self.tick()["state"], "reference_qualification_failed")
         self.assertEqual(self.backend.submits, 1)
 
+    def test_full_profile_has_separate_receipt_and_does_not_reuse_small_smoke(self):
+        self.backend.outcome = Outcome("succeeded", "task-ref")
+        self.assertEqual(self.tick()["state"], "qualified")
+        requests = []
+        verify = lambda paths, request: requests.append(request) or {"outputs": {}}
+        full = ReferenceSmoke(self.backend, lambda: 1000, self.save, verify, profile="full50_768p_5s")
+        result = full.tick(self.directory, self.bootstrap)
+        self.assertEqual(result["state"], "qualified")
+        self.assertEqual(self.backend.submits, 2)
+        self.assertEqual((requests[0]["steps"], requests[0]["resolution"], requests[0]["duration"]), (50, "768P", 5))
+        self.assertTrue((self.directory/"reference-smoke/state.json").exists())
+        self.assertTrue((self.directory/"reference-full-smoke/state.json").exists())
+        full.tick(self.directory, self.bootstrap)
+        self.assertEqual(self.backend.submits, 2)
+
+    def test_unapproved_profile_is_rejected_without_io(self):
+        with self.assertRaisesRegex(ValueError, "unsupported_reference"):
+            ReferenceSmoke(self.backend, lambda: 1000, self.save, self.verifier, profile="arbitrary")
+        self.assertEqual(self.backend.submits, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

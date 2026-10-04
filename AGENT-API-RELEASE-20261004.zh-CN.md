@@ -42,7 +42,7 @@ Agent Skill：仓库 `skills/sixnine-yingxu/`，网站授权下载 `/v1/agent-sk
 
 正式站点运行 AWS 新加坡 EC2 `i-03d81d2d153b5e2fd`，2 vCPU / 4 GiB，PostgreSQL、API、Caddy；数据在加密 EBS 上。只有 HTTPS/HTTP 公开；管理使用 SSM，没有公网 SSH/数据库/ComfyUI 端口。凭据在 AWS Secrets Manager，容器读 `/run` secret 文件。
 
-常规发布为明确选择已批准 commit 的 GitHub workflow：独立 OIDC 身份只能调用固定 SSM Document，不能执行任意 shell、自批 manifest、读取密码或租 GPU。主机独立核对 manifest SHA。GPU 验收期间常规 CD 被阻止，避免发布误停仍在生成的 worker。该 CD 的实际运行结果待本轮完成后补充，不能仅凭配置存在声称通过。
+常规发布为明确选择已批准 commit 的 GitHub workflow：独立 OIDC 身份只能调用固定 SSM Document，不能执行任意 shell、自批 manifest、读取密码或租 GPU。主机独立核对 manifest SHA。GPU 验收期间常规 CD 被阻止，避免发布误停仍在生成的 worker。2026-10-04 05:04 UTC，GitHub workflow `37178771109` 的 `deploy-approved-aws` 成功：OIDC → 固定 SSM Document → 主机批准摘要 → 已批准版本 `4b8b5e9` 的部署及健康检查全部实际执行，SSM 收据 `65ab78c9-2cfb-4bfb-8e6a-e20c7c7f7f69`。这不是每次 push 自动无审批替换生产。
 
 本轮没有把用户素材迁到 S3/R2/Hippius。S3 当前存的是发布包；保留 EBS 和代码回滚不等于异地数据库/素材备份。
 

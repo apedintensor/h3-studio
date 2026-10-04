@@ -13,18 +13,23 @@ from .worker import SubmissionRejected
 
 
 class ReferenceSmoke:
-    def __init__(self, backend, clock, save, verify):
+    def __init__(self, backend, clock, save, verify, *, profile="smoke"):
+        if profile not in {"smoke", "full50_768p_5s"}:
+            raise ValueError("unsupported_reference_qualification_profile")
+        self.profile = profile
         self.backend, self.clock, self.save, self.verify = backend, clock, save, verify
 
     def tick(self, directory, bootstrap):
         from .lium_bootstrap import BootError
         from comfy_workflow import build_workflow
         directory = Path(directory)
-        target = directory/"reference-smoke"
+        full = self.profile == "full50_768p_5s"
+        target = directory/("reference-full-smoke" if full else "reference-smoke")
         target.mkdir(exist_ok=True)
         receipt = target/"state.json"
-        tag = "ref-"+bootstrap["tag"]
-        identity = {"bootstrap": bootstrap["identity"], "fl_outputs": bootstrap["evidence"]["outputs"]}
+        tag = ("ref-full-" if full else "ref-")+bootstrap["tag"]
+        identity = {"bootstrap": bootstrap["identity"], "fl_outputs": bootstrap["evidence"]["outputs"],
+            "qualification_profile": self.profile}
         state = json.loads(receipt.read_text()) if receipt.exists() else {"identity": identity, "tag": tag, "phase": "pending"}
         if state.get("identity") != identity:
             raise BootError("reference_qualification_identity_conflict")
@@ -33,7 +38,8 @@ class ReferenceSmoke:
         if state["phase"] == "failed":
             return {"state": "reference_qualification_failed"}
         request = {"mode": "ref", "prompt": "A red ceramic teapot on a wooden table, matching the reference motion and gentle ambient sound.",
-            "duration": 4, "resolution": "480P", "aspect_ratio": "16:9", "steps": 4, "seed": "23456",
+            "duration": 5 if full else 4, "resolution": "768P" if full else "480P", "aspect_ratio": "16:9",
+            "steps": 50 if full else 4, "seed": "23456",
             "generate_audio": True, "video_decode": "tiled", "encoder_device": "cpu", "_job_id": tag,
             "inputs": {"images": ["own-image"], "videos": ["fl-video"], "audios": ["fl-audio"]},
             "video_audio": {"fl-video": True}, "guides": [{"media_id": "own-image", "time_seconds": 1, "use_audio": False}]}
@@ -108,7 +114,8 @@ class ReferenceSmoke:
         paths = self.backend.fetch({"request": {"request": request}}, tag, task, target, lambda: None)
         evidence = self.verify(paths, request)
         evidence.update(scope="single_host_ref2va_image_video_audio_and_image_guide_smoke_not_all_controls",
-            input_evidence=state["input_evidence"], elapsed_wall_seconds=self.clock()-state["submission_started"], completed_at=self.clock())
+            qualification_profile=self.profile, input_evidence=state["input_evidence"],
+            elapsed_wall_seconds=self.clock()-state["submission_started"], completed_at=self.clock())
         state.update(phase="qualified", evidence=evidence)
         self.save(receipt, state)
         return {"state": "qualified", "evidence": evidence}

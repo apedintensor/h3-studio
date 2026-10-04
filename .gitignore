@@ -162,6 +162,7 @@ inventory.json
 !studio_platform/guided.py
 !studio_platform/guided_schema.py
 !deploy/platform/verify_public_api.py
+!deploy/platform/verify_public_generation.py
 !studio_platform/lium_bootstrap.py
 !studio_platform/lium_reference_smoke.py
 !bootstrap_cloud.py

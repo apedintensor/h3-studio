@@ -78,6 +78,15 @@ def overlay(image):
 def validate(config, *, deployment_directory, compose_version):
     """Remove only the exact reviewed delta, then apply unchanged CPU policy."""
     config = copy.deepcopy(config)
+    # CI's trusted Compose 2.38.2 serializes explicit false as bind:{}.
+    # Match the unchanged base validator's exact-version exception. Newer
+    # Compose can interpret omission as TRUE, so never generalize this rule.
+    if compose_version in ('2.38.2', 'v2.38.2'):
+        for name in (SERVICE, 'app'):
+            service = config.get('services', {}).get(name, {})
+            for mount in service.get('volumes', []):
+                if isinstance(mount, dict) and mount.get('type') == 'bind' and mount.get('bind') == {}:
+                    mount['bind'] = {'create_host_path': False}
     service = config.get('services', {}).pop(SERVICE, None)
     # Compose emits byte limits as strings and Go-normalized duration text.
     # Accept only exact equivalent values, never omit resource checks.

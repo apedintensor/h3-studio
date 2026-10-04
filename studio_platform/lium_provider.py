@@ -71,13 +71,15 @@ def _microusd(value):
     return money(int((_decimal(value) * 1_000_000).to_integral_value(rounding=ROUND_CEILING)))
 
 
-def _timestamp(value):
+def _timestamp(value, *, assume_utc=False):
     if not isinstance(value, str) or len(value) > 80:
         raise LiumError("lium_invalid_statement_time")
     try:
         result = datetime.fromisoformat(value.replace("Z", "+00:00"))
         if result.tzinfo is None:
-            raise ValueError
+            if not assume_utc:
+                raise ValueError
+            result = result.replace(tzinfo=timezone.utc)
         stamp = result.timestamp()
         if not math.isfinite(stamp):
             raise ValueError
@@ -316,7 +318,19 @@ class LiumProvider:
             raise LiumError("lium_statement_identity_conflict")
         if statement.get("removed") is not True:
             return None
-        removed_at, created_at = _timestamp(statement.get("removed_at")), _timestamp(statement.get("created_at"))
+        # The live Lium statement uses paired timezone-less UTC ISO values,
+        # just like the pod lifetime endpoint. Never interpret them in the
+        # controller machine's local timezone or accept mixed formats.
+        try:
+            parsed = [datetime.fromisoformat(statement[k].replace("Z", "+00:00"))
+                for k in ("created_at", "removed_at")]
+            if (parsed[0].tzinfo is None) != (parsed[1].tzinfo is None):
+                raise ValueError
+            naive = parsed[0].tzinfo is None
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise LiumError("lium_invalid_statement_time") from None
+        removed_at = _timestamp(statement.get("removed_at"), assume_utc=naive)
+        created_at = _timestamp(statement.get("created_at"), assume_utc=naive)
         if not created_at <= removed_at <= self.clock()+30:
             raise LiumError("lium_invalid_statement_time")
         # Absence of final money does not prevent a verified physical removal.
@@ -324,10 +338,11 @@ class LiumProvider:
         actual = None
         try:
             actual = _microusd(statement["total"])
-            if type(statement.get("billed_seconds")) is not int or statement["billed_seconds"] < 0:
+            seconds = _decimal(statement.get("billed_seconds"))
+            if seconds > Decimal(str(removed_at-created_at+60)):
                 actual = None
         except (KeyError, LiumError):
-            pass
+            actual = None
         return ProviderFact("destroyed", pod_id, actual_cost_microusd=actual)
 
     def _manifest(self, launch):
