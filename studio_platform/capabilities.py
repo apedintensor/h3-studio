@@ -65,6 +65,13 @@ def capabilities(settings):
                     "minimum_aspect_ratio": .4, "maximum_aspect_ratio": 2.5,
                     "description": "自定义宽高须为32的倍数，总面积不超过768×1344，宽高比0.4–2.5"},
                 "source": {"comfyui_revision": COMFY_COMMIT}} for key, mode in RECIPES.items()]
+    for recipe in recipes:
+        recipe["execution_support"] = {
+            "status": "disabled" if offline else "simulation" if settings.execution_backend == "mock" else "unavailable",
+            "reason": "生成执行尚未开启，作品与素材可以继续编辑。" if offline else
+                "当前为模拟流程，不代表真实模型生成。" if settings.execution_backend == "mock" else
+                "当前执行范围尚未确认；模型支持的输入不代表已在此云端开放。",
+            "capacity_checked": False, "preflight_required": True}
     if settings.generation_enabled and settings.execution_backend == "comfy-worker":
         # Public operational defaults are separate from model defaults. Never
         # serialize the operator policy (budget identities/pool bindings), and
@@ -75,15 +82,38 @@ def capabilities(settings):
         except ValueError:
             policy = None
         now = time.time()
-        if (policy and policy["enabled"] and policy["qualification"]["status"] == "accepted"
+        if (policy and policy["enabled"] and policy["qualification"]["status"] in {"accepted", "runtime_required"}
                 and policy["qualification"]["verified_at"] <= now < policy["qualification"]["expires_at"]
-                and now < policy["reservation"]["expires_at"]):
+                and now + policy["reservation"]["expected_runtime_s"] <
+                    min(policy["qualification"]["expires_at"], policy["reservation"]["expires_at"])):
             envelope = policy["envelope"]["controls"]
             preset = {field: value for field, value in (("encoder_device", "cpu"), ("video_decode", "tiled"))
                 if envelope[field] == [value]}
-            if preset:
-                for recipe in recipes:
-                    if recipe["id"] in policy["recipe_ids"]:
+            available = [recipe["label"] for recipe in recipes if recipe["id"] in policy["recipe_ids"]]
+            runtime_required = policy["qualification"]["status"] == "runtime_required"
+            for recipe in recipes:
+                qualified = recipe["id"] in policy["recipe_ids"]
+                recipe["execution_support"] = {
+                    "status": ("runtime_required" if runtime_required else "qualified") if qualified else "not_qualified",
+                    "reason": ("可提交，GPU启动后先验证当前模式；验证通过后才执行原任务。仍需预检账户额度与容量窗口。" if runtime_required else
+                        "此模式已有受限的执行范围；符合范围后仍需预检账户额度与实际计算容量。") if qualified else
+                        "此生成方式尚未在当前云端开放。当前仅开放：" + "、".join(available) + "。素材和设置可以继续保存。",
+                    "capacity_checked": False, "preflight_required": True,
+                    "runtime_verification_required": runtime_required,
+                    "available_recipe_ids": list(policy["recipe_ids"]),
+                    "expires_at": min(policy["qualification"]["expires_at"], policy["reservation"]["expires_at"])
+                        - policy["reservation"]["expected_runtime_s"]}
+                if qualified:
+                    # This allowlisted envelope contains input/control limits,
+                    # never account, worker, approval or budget identities.
+                    recipe["execution_support"]["constraints"] = copy.deepcopy(policy["envelope"])
+                    if "input_limits" in policy["envelope"]:
+                        recipe["execution_support"]["input_limit_semantics"] = {
+                            "counts": "unique reference and guide assets per kind; first/last frames have separate slots",
+                            "pixels": "every image/video asset, including first/last frames and guides",
+                            "duration": "total distinct assets per kind; both source selections and normalized copies must fit",
+                            "metadata": "server-inspected model input metadata; client-provided media labels are not evidence"}
+                    if preset:
                         recipe["deployment_preset"] = {
                             "label": "当前云端显存预设", "controls": dict(preset),
                             "applies_to": "unset_controls_only", "source": "current_operator_execution_policy",

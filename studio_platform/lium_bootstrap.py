@@ -331,19 +331,10 @@ class BootController:
             result = self._smoke(directory, receipt, state)
             if result["state"] != "qualified":
                 return result
-            if "h3-base-ref2va-v1" in self.config.recipe_ids:
-                if state["phase"] in {"fleet_starting", "fleet_started"} and state.get("fleet_recipe_ids", ["h3-base-fl2va-v1"]) != list(self.config.recipe_ids):
-                    raise BootError("fleet_recipe_change_requires_explicit_drain_and_new_configuration")
-                if state["phase"] in {"fleet_starting", "fleet_started"}:
-                    reference_receipt = directory/"reference-smoke"/"state.json"
-                    if (not reference_receipt.exists()
-                            or json.loads(reference_receipt.read_text()).get("phase") != "qualified"):
-                        raise BootError("fleet_reference_evidence_missing_requires_reconciliation")
-                from .lium_reference_smoke import ReferenceSmoke
-                reference = ReferenceSmoke(self.backend, self.repo.clock, self._save, self.verify_smoke).tick(directory, state)
-                if reference["state"] != "qualified":
-                    return reference
-                result["reference_evidence"] = reference["evidence"]
+            additional = self._additional_qualification(directory, state)
+            if additional["state"] != "qualified":
+                return additional
+            result.update({k: v for k, v in additional.items() if k != "state"})
             if not self.config.fleet_enabled:
                 return result
             if self.fleet is None:
@@ -371,6 +362,20 @@ class BootController:
             attention = any(child.get("state") == "exited" for child in fleet_status.get("children", []))
             return {"state": "fleet_attention_required" if attention else "fleet_running", "fleet": fleet_status, "generation_verified": True,
                 "qualification_scope": "single_host_fl2va_4s_480p_audio_smoke_only"}
+
+    def _additional_qualification(self, directory, state):
+        """Historical base smoke remains unchanged; production overrides this."""
+        if "h3-base-ref2va-v1" not in self.config.recipe_ids:
+            return {"state": "qualified"}
+        if state["phase"] in {"fleet_starting", "fleet_started"}:
+            if state.get("fleet_recipe_ids", ["h3-base-fl2va-v1"]) != list(self.config.recipe_ids):
+                raise BootError("fleet_recipe_change_requires_explicit_drain_and_new_configuration")
+            receipt = directory/"reference-smoke"/"state.json"
+            if not receipt.exists() or json.loads(receipt.read_text()).get("phase") != "qualified":
+                raise BootError("fleet_reference_evidence_missing_requires_reconciliation")
+        from .lium_reference_smoke import ReferenceSmoke
+        result = ReferenceSmoke(self.backend, self.repo.clock, self._save, self.verify_smoke).tick(directory, state)
+        return {"state": "qualified", "reference_evidence": result["evidence"]} if result["state"] == "qualified" else result
 
     def _validate_report(self, report, manifest):
         if (report.get("model_revision") != MODEL_REVISION or report.get("comfyui_revision") != COMFY_REVISION

@@ -98,6 +98,68 @@ class CapacityTests(LedgerCase):
             self.assertEqual(ColdStartCoordinator(self.repo).tick("leader", "nonexistent"), {"state": "disabled"})
         self.assertEqual(self.provider.creates, [])
 
+    def test_cold_plan_expires_before_boot_plus_runtime_cannot_fit_and_confirmation_rechecks(self):
+        self.scale_policy = replace(self.scale_policy, cold_start_s=400, hard_deadline=self.now+1000)
+        self.approve(expires_at=self.now+1000)
+        result = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertTrue(result.execution["enabled"])
+        self.assertEqual(result.expires_at, self.now+300)
+        plan = self.repo.create_plan(self.scope, self.compiled, result.execution,
+            expires_at=result.expires_at, estimated_cost_microusd=result.cost)
+        self.now += 300
+        blocked = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertFalse(blocked.execution["enabled"])
+        self.assertIn("剩余运行窗口不足以启动并完成", " ".join(blocked.execution["blockers"]))
+        self.assertNotIn("无有效的独立冷启动审批", " ".join(blocked.execution["blockers"]))
+        with self.assertRaises(Conflict):
+            self.policies.ensure_current(plan, self.scope)
+        self.assertEqual(self.provider.creates, [])
+        self.assertEqual(self.repo.get_budget("owner:superdan")["reserved_microusd"], 0)
+
+    def test_quote_or_qualification_expiry_limits_cold_admission_but_ready_worker_needs_no_boot(self):
+        initial = self.now
+        self.value["qualification"]["expires_at"] = initial+1400
+        self.value["reservation"]["expires_at"] = initial+1100
+        self.write()
+        self.scale_policy = replace(self.scale_policy, cold_start_s=600, hard_deadline=initial+1600)
+        self.approve(expires_at=initial+1000)
+        result = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertEqual(result.expires_at, initial+100)
+        # No live worker: even an approved policy cannot start at this boundary.
+        self.now = initial+100
+        self.assertFalse(self.policies.evaluate(self.compiled, self.scope, self.fingerprint).execution["enabled"])
+        control = WorkerControl(self.repo)
+        control.register(WorkerSpec("already-ready", "cold-pool", "test-only", "already-started", ("ready-gpu",),
+            tuple(self.value["recipe_ids"]), MODEL, "cold-config"))
+        control.mark_ready("already-ready", upstream_idle_confirmed=True)
+        warm = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertTrue(warm.execution["enabled"], warm.execution["blockers"])
+        self.assertEqual(warm.execution["admission_state"], "queued")
+        self.assertNotIn("capacity_approval_id", warm.execution)
+        self.assertEqual(warm.expires_at, initial+800)
+
+    def test_starting_provider_without_qualified_worker_keeps_conservative_boot_window(self):
+        self.scale_policy = replace(self.scale_policy, cold_start_s=400, hard_deadline=self.now+1000)
+        self.approve(expires_at=self.now+1000)
+        job = self.waiting()
+        intent = self.start()
+        # Provider-confirmed TTL may be shorter than the approval's estimate.
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id == intent["id"])
+                .values(hard_deadline=self.now+650))
+        shortened = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertFalse(shortened.execution["enabled"])
+        self.assertIn("剩余运行窗口不足以启动并完成", " ".join(shortened.execution["blockers"]))
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id == intent["id"])
+                .values(hard_deadline=intent["hard_deadline"]))
+        self.now += 284  # reaches the same latest cold admission boundary
+        result = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertFalse(result.execution["enabled"])
+        self.assertIn("剩余运行窗口不足以启动并完成", " ".join(result.execution["blockers"]))
+        self.assertEqual(self.repo.get_job(self.scope, job["id"])["status"], "waiting_capacity")
+        self.assertEqual(len(self.provider.creates), 1)
+
     def test_approval_immutable_revocation_cannot_be_silently_reenabled_by_retry(self):
         approved = self.approve()
         self.repo.set_capacity_approval_enabled(approved["id"], enabled=False)

@@ -13,13 +13,18 @@ from .worker import SubmissionRejected
 
 
 class ReferenceSmoke:
-    def __init__(self, backend, clock, save, verify, *, profile="smoke"):
-        if profile not in {"smoke", "full50_768p_5s"}:
+    def __init__(self, backend, clock, save, verify, *, profile="smoke", can_submit=None, collection_context=None):
+        if profile not in {"smoke", "full50_768p_5s", "ref4-bounded-768p-5s-v1"}:
             raise ValueError("unsupported_reference_qualification_profile")
         self.profile = profile
         self.backend, self.clock, self.save, self.verify = backend, clock, save, verify
+        self.can_submit, self.collection_context = can_submit, collection_context
 
     def tick(self, directory, bootstrap):
+        if self.profile == "ref4-bounded-768p-5s-v1":
+            from .lium_multimodal_smoke import BoundedReferenceSmoke
+            return BoundedReferenceSmoke(self.backend, self.clock, self.save, self.verify,
+                can_submit=self.can_submit, collection_context=self.collection_context).tick(directory, bootstrap)
         from .lium_bootstrap import BootError
         from comfy_workflow import build_workflow
         directory = Path(directory)

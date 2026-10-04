@@ -213,3 +213,6 @@ inventory.json
 !studio_platform/on_demand_scaler.py
 !studio_platform/scaler_entry.py
 !ON-DEMAND-GPU.zh-CN.md
+!studio_platform/qualification_profiles.py
+!studio_platform/lium_multimodal_smoke.py
+!FREESTYLE-ADMISSION.zh-CN.md

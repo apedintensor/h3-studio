@@ -4,6 +4,7 @@ Same CPU container owns SSH tunnels and its fleet. This module has no provider
 credential reader, rent path, budget initialization or automatic child restart.
 """
 from dataclasses import replace
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,9 @@ from sqlalchemy import select, update
 from .control import WorkerControl
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
 from .lium_bootstrap import BootConfig, BootController, BootError, SSHHost
+from .lium_multimodal_smoke import FirstLastSmoke, BoundedReferenceSmoke
+from .lium_reference_smoke import ReferenceSmoke
+from .qualification_profiles import MULTIMODAL_PROFILE, STAGE_RUNTIME_S
 from .repository import Repository, instance_intents, registered_workers
 from .worker import ComfyBackend, SubmissionRejected, _slot_lock
 
@@ -31,7 +35,7 @@ class ProductionBoot(BootController):
         config = BootConfig(finite.work_dir/"boot", finite.source_dir, finite.ssh_key_file,
             finite.known_hosts_file, local_port, finite.configuration_id, enabled=True,
             smoke_enabled=True, fleet_enabled=True, trust_first_host_key=finite.trust_first_host_key,
-            minimum_remaining_s=finite.drain_margin_s)
+            minimum_remaining_s=finite.drain_margin_s, recipe_ids=finite.recipe_ids)
         super().__init__(repo, provider, config, ssh_factory=ssh_factory, backend_factory=backend_factory,
             verify_smoke=verify_smoke, fleet_factory=self._fleet)
 
@@ -72,6 +76,29 @@ class ProductionBoot(BootController):
                 hard_deadline=min(row["hard_deadline"], value["safe_deadline"])))
         return min(intent["hard_deadline"], value["safe_deadline"])
 
+    def _collection_backend(self, intent, state):
+        """Reconnect only an existing pinned runtime; never relaunch its setup."""
+        if self.backend is not None:
+            return
+        files, manifest = self._sources()
+        expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+            "configuration_id": self.config.configuration_id,
+            "sources": {name: hashlib.sha256(value).hexdigest() for name, value in files.items()}}
+        if state.get("identity") != expected or state.get("local_port") != self.config.local_port:
+            raise BootError("finite_collection_identity_conflict")
+        self.bound_intent, self.bound_instance = intent["id"], intent["provider_instance_id"]
+        if self.host is None:
+            coordinates = self.provider.ssh_connection(intent["id"], intent["provider_instance_id"])
+            self.host = self.ssh_factory(self.config, coordinates)
+        report = self.host.report()
+        if report.get("identity") != expected or report.get("state") != "ready":
+            raise BootError("finite_collection_runtime_unconfirmed")
+        self._validate_report(report, manifest)
+        self.host.open_tunnel(self.config.local_port)
+        endpoint = f"http://127.0.0.1:{self.config.local_port}"
+        from .lium_bootstrap import COMFY_REVISION
+        self.backend = self.backend_factory(endpoint=endpoint, enabled=True, allowed_origins=(endpoint,), comfy_revision=COMFY_REVISION)
+
     def tick(self, intent_id, *, stopping=False):
         from .production_scaler import verify_sources
         verify_sources(self.finite)
@@ -90,11 +117,21 @@ class ProductionBoot(BootController):
             if receipt.exists():
                 state = json.loads(receipt.read_text())
                 if state.get("smoke_submission_started") and state.get("phase") not in ("qualified", "qualification_failed", "fleet_starting", "fleet_started"):
-                    if self.backend is None:
-                        return {"state": "qualification_recovery_required"}
+                    self._collection_backend(intent, state)
                     result = self._smoke(receipt.parent, receipt, state)
                     if result["state"] != "qualified":
                         return result
+                for helper in self._multimodal_helpers():
+                    extra_receipt = receipt.parent/helper.name/"state.json"
+                    if not extra_receipt.exists():
+                        continue
+                    extra = json.loads(extra_receipt.read_text())
+                    if extra.get("submission_started") and extra.get("phase") not in ("qualified", "failed"):
+                        self._collection_backend(intent, state)
+                        helper.backend = self.backend
+                        result = helper.tick(receipt.parent, state)
+                        if result["state"] not in ("qualified", "qualification_failed"):
+                            return result
             if self.fleet:
                 self.fleet.tick()
                 self._retire_idle_children()
@@ -103,8 +140,69 @@ class ProductionBoot(BootController):
         # The base boot module remains compatible with its historical 4-step
         # smoke; only this subclass supplies the stronger immutable request.
         if result.get("generation_verified"):
-            result["qualification_scope"] = "single_host_fl2va_5s_768p_50steps_audio_not_all_controls"
+            result["qualification_scope"] = ("single_host_fl50_firstlast4_ref4_2048_inputs_compatibility_not_ref50_quality"
+                if self.finite.qualification_profile == MULTIMODAL_PROFILE else
+                "single_host_fl2va_5s_768p_50steps_audio_not_all_controls")
         return result
+
+    def _collection_context(self):
+        lock = self.finite.work_dir/"collection-lock"
+        lock.mkdir(exist_ok=True)
+        return _slot_lock(lock, "production-cpu-collection-v1")
+
+    def _stage_admission(self, stage):
+        root = self.finite.work_dir
+        flags = [root/"drain.flag", root/"rollover.flag"]
+        if root.parent.name == "cycles":
+            flags.append(root.parent.parent/"drain.flag")
+        if self._stopping or any(path.exists() for path in flags):
+            self.request_drain()
+            return "qualification_not_started_draining"
+        remaining = STAGE_RUNTIME_S[stage]
+        if self.finite.qualification_profile == MULTIMODAL_PROFILE:
+            if stage == "fl50":
+                remaining += STAGE_RUNTIME_S["firstlast4"]+STAGE_RUNTIME_S["ref4"]
+            elif stage == "firstlast4":
+                remaining += STAGE_RUNTIME_S["ref4"]
+        with self.repo.engine.connect() as conn:
+            deadline = conn.execute(select(instance_intents.c.hard_deadline).where(
+                instance_intents.c.id == self.intent_id)).scalar_one()
+        if self.repo.clock()+remaining+self.finite.collection_margin_s >= min(deadline, self.finite.hard_deadline):
+            self.request_drain()
+            return "qualification_deadline_insufficient"
+        return None
+
+    def _multimodal_helpers(self):
+        if self.finite.qualification_profile != MULTIMODAL_PROFILE:
+            return ()
+        return (FirstLastSmoke(self.backend, self.repo.clock, self._save, self.verify_smoke,
+                    can_submit=lambda: self._stage_admission("firstlast4"), collection_context=self._collection_context),
+                BoundedReferenceSmoke(self.backend, self.repo.clock, self._save, self.verify_smoke,
+                    can_submit=lambda: self._stage_admission("ref4"), collection_context=self._collection_context))
+
+    def _additional_qualification(self, directory, state):
+        helpers = self._multimodal_helpers()
+        if not helpers:
+            return super()._additional_qualification(directory, state)
+        receipts = []
+        for helper in helpers:
+            receipt = directory/helper.name/"state.json"
+            if state["phase"] in ("fleet_starting", "fleet_started"):
+                if (state.get("fleet_recipe_ids") != list(self.config.recipe_ids) or not receipt.exists()
+                        or json.loads(receipt.read_text()).get("phase") != "qualified"):
+                    raise BootError("finite_multimodal_evidence_missing_requires_reconciliation")
+            # Both helper implementations bind request/profile/bootstrap identity
+            # even for existing receipts. No old small smoke can qualify this.
+            if isinstance(helper, BoundedReferenceSmoke):
+                result = ReferenceSmoke(self.backend, self.repo.clock, self._save, self.verify_smoke,
+                    profile=helper.name, can_submit=helper.can_submit,
+                    collection_context=self._collection_context).tick(directory, state)
+            else:
+                result = helper.tick(directory, state)
+            if result["state"] != "qualified":
+                return result
+            receipts.append(result["evidence"])
+        return {"state": "qualified", "multimodal_evidence": receipts}
 
     def _smoke(self, directory, receipt, state):
         from comfy_workflow import build_workflow
@@ -123,22 +221,20 @@ class ProductionBoot(BootController):
         if state["phase"] == "qualification_failed":
             return {"state": "qualification_failed"}
         if not state.get("smoke_submission_started"):
-            if self._stopping:
-                return {"state": "qualification_not_started_draining"}
+            blocked = self._stage_admission("fl50")
+            if blocked:
+                return {"state": blocked}
             # Qualification is itself real GPU work and does not pass through
             # WorkerControl's job deadline check. Twenty minutes is a bounded
             # conservative allowance for this exact 50-step envelope, not an
             # inference SLA; keep the configured collection margin in addition.
-            with self.repo.engine.connect() as conn:
-                deadline = conn.execute(select(instance_intents.c.hard_deadline).where(
-                    instance_intents.c.id == self.intent_id)).scalar_one()
-            if self.repo.clock()+1200+self.finite.collection_margin_s >= min(deadline, self.finite.hard_deadline):
-                self.request_drain()
-                return {"state": "qualification_deadline_insufficient"}
             queue = self.backend._json("GET", "/queue")
             if queue.get("queue_running") != [] or queue.get("queue_pending") != []:
                 return {"state": "qualification_upstream_busy"}
             graph = build_workflow(request, {}, {})
+            blocked = self._stage_admission("fl50")
+            if blocked:
+                return {"state": blocked}
             state.update(smoke_request_hash=digest, smoke_submission_started=self.repo.clock(), phase="smoke_submitting")
             self._save(receipt, state)
             try:
@@ -167,8 +263,24 @@ class ProductionBoot(BootController):
         with _slot_lock(lock, "production-cpu-collection-v1") as acquired:
             if not acquired:
                 return {"state": "qualification_collection_waiting"}
-            paths = self.backend.fetch({"request": {"request": request}}, state["tag"], task, directory, lambda: None)
-            evidence = self.verify_smoke(paths, request)
+            from .media import MediaError, MediaBusy
+            from .worker import BackendError
+            try:
+                paths = self.backend.fetch({"request": {"request": request}}, state["tag"], task, directory, lambda: None)
+            except BackendError as error:
+                if str(error) != "comfy_save_outputs_missing":
+                    raise
+                state.update(phase="qualification_failed", failure="completed_inference_outputs_missing")
+                self._save(receipt, state)
+                return {"state": "qualification_failed"}
+            try:
+                evidence = self.verify_smoke(paths, request)
+            except MediaBusy:
+                return {"state": "qualification_collection_waiting"}
+            except (BootError, BackendError, MediaError):
+                state.update(phase="qualification_failed", failure="collected_output_validation_failed")
+                self._save(receipt, state)
+                return {"state": "qualification_failed"}
         evidence.update(scope="single_host_fl2va_5s_768p_50steps_audio_not_all_controls",
             elapsed_wall_seconds=self.repo.clock()-state["smoke_submission_started"], completed_at=self.repo.clock())
         state.update(phase="qualified", evidence=evidence)
@@ -181,6 +293,12 @@ class ProductionBoot(BootController):
             state = json.loads(receipt.read_text())
             if state.get("smoke_submission_started") and state.get("phase") not in ("qualified", "qualification_failed", "fleet_starting", "fleet_started"):
                 raise BootError("finite_qualification_result_still_unresolved")
+            for helper in self._multimodal_helpers():
+                extra_receipt = receipt.parent/helper.name/"state.json"
+                if extra_receipt.exists():
+                    extra = json.loads(extra_receipt.read_text())
+                    if extra.get("submission_started") and extra.get("phase") not in ("qualified", "failed"):
+                        raise BootError("finite_qualification_result_still_unresolved")
         return super().idle_probe(tag, instance_id)
 
     def _retire_idle_children(self):
@@ -233,7 +351,8 @@ def run_child(config, intent_id, expected_hash, settings):
         worker_id = "lium-"+intent_id.replace("-", "")
         spec = fleet.slot(worker_id).spec
         if (len(fleet.slots) != 1 or spec.pool != config.pool or spec.configuration_id != config.configuration_id
-                or spec.instance_id != identity.get("instance_id")):
+                or spec.instance_id != identity.get("instance_id") or spec.model_id != config.launches[0]["model_id"]
+                or tuple(spec.recipe_ids) != config.recipe_ids or receipt.get("fleet_recipe_ids") != list(config.recipe_ids)):
             raise ScalerError("finite_child_identity_mismatch")
         with repo.engine.connect() as conn:
             row = conn.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()

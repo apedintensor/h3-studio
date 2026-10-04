@@ -52,6 +52,10 @@ class OnDemandConfig(FiniteConfig):
 
 def json_config(config):
     value = asdict(config)
+    if value.get("qualification_profile") == "fl50":
+        value.pop("qualification_profile")
+    if value.get("allowed_owners") is None:
+        value.pop("allowed_owners")
     for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[key] = str(value[key])
     return value
@@ -168,7 +172,7 @@ class ServiceCycle(FiniteController):
             return
         policy = read_policy(self.settings.execution_policy_file)
         self.repo.approve_capacity(c.capacity_approval_id, tenant_id=c.tenant, pool=c.pool,
-            model_id=MODEL, configuration_id=c.configuration_id, recipe_ids=[RECIPE],
+            model_id=MODEL, configuration_id=c.configuration_id, recipe_ids=list(c.recipe_ids),
             policy_hash=c.execution_policy_sha256, qualification_evidence_id=c.qualification_evidence_id,
             qualification_expires_at=policy["qualification"]["expires_at"],
             quote_expires_at=policy["reservation"]["expires_at"],

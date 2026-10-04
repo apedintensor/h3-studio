@@ -17,6 +17,7 @@ import string
 from .capabilities import MODEL, RECIPES
 from .control import WorkerControl
 from .repository import BudgetExceeded, NotFound, identifier, request_hash
+from .qualification_profiles import FL50_PROFILE, MULTIMODAL_PROFILE, MULTIMODAL_INPUT_LIMITS, PROFILE_RECIPES
 
 
 POLICY = "self-hosted-default"
@@ -24,6 +25,9 @@ FIELDS = {"id", "revision", "enabled", "model_id", "backend", "pool", "configura
           "recipe_ids", "qualification", "envelope", "reservation", "budget_accounts"}
 ENVELOPE = {"max_pixels", "max_duration_seconds", "max_steps", "max_reference_files",
             "max_guides", "allow_first_last", "allow_audio", "controls"}
+INPUT_LIMITS = {"max_images", "max_videos", "max_audios", "max_image_pixels", "max_video_pixels",
+                "max_video_duration_seconds", "max_audio_duration_seconds", "guide_kinds",
+                "guide_recipe_ids", "max_guide_time_seconds", "allow_video_audio"}
 
 
 def positive(value, maximum):
@@ -43,15 +47,19 @@ def validate_policy(value):
     if not isinstance(recipes, list) or not recipes or len(set(recipes)) != len(recipes) or any(r not in RECIPES for r in recipes):
         raise ValueError("Invalid execution policy recipes")
     qualification = value["qualification"]
-    if (not isinstance(qualification, dict) or set(qualification) != {"status", "evidence_id", "verified_at", "expires_at"}
-            or qualification["status"] not in {"unverified", "accepted"}
+    qualification_fields = {"status", "evidence_id", "verified_at", "expires_at"}
+    if (not isinstance(qualification, dict) or not qualification_fields <= set(qualification)
+            or set(qualification) - qualification_fields - {"profile"}
+            or qualification["status"] not in {"unverified", "accepted", "runtime_required"}
+            or "profile" in qualification and qualification["profile"] not in {FL50_PROFILE, MULTIMODAL_PROFILE}
+            or qualification["status"] == "runtime_required" and qualification.get("profile") != MULTIMODAL_PROFILE
             or not positive(qualification["verified_at"], 1e12)
             or not positive(qualification["expires_at"], 1e12)
             or qualification["verified_at"] >= qualification["expires_at"]):
         raise ValueError("Invalid execution qualification")
     identifier(qualification["evidence_id"])
     envelope = value["envelope"]
-    if not isinstance(envelope, dict) or set(envelope) != ENVELOPE:
+    if not isinstance(envelope, dict) or not ENVELOPE <= set(envelope) or set(envelope) - ENVELOPE - {"input_limits"}:
         raise ValueError("Invalid execution envelope")
     for field, maximum in (("max_pixels", 768*1344), ("max_duration_seconds", 16), ("max_steps", 1000)):
         if not positive(envelope[field], maximum):
@@ -61,6 +69,37 @@ def validate_policy(value):
             raise ValueError("Invalid execution input envelope")
     if any(type(envelope[field]) is not bool for field in ("allow_first_last", "allow_audio")):
         raise ValueError("Invalid execution feature envelope")
+    if "input_limits" in envelope:
+        limits = envelope["input_limits"]
+        if not isinstance(limits, dict) or set(limits) != INPUT_LIMITS:
+            raise ValueError("Explicit per-kind input limits required")
+        for field, maximum in (("max_images", 9), ("max_videos", 3), ("max_audios", 3)):
+            if type(limits[field]) is not int or not 0 <= limits[field] <= maximum:
+                raise ValueError("Invalid per-kind input count")
+        for field, maximum in (("max_image_pixels", 5760**2), ("max_video_pixels", 5760**2),
+                ("max_video_duration_seconds", 15), ("max_audio_duration_seconds", 15), ("max_guide_time_seconds", 15)):
+            if not positive(limits[field], maximum):
+                raise ValueError("Invalid per-kind input size or duration")
+        for field, allowed in (("guide_kinds", {"image", "video", "audio"}), ("guide_recipe_ids", set(recipes))):
+            options = limits[field]
+            if (not isinstance(options, list) or any(not isinstance(item, str) for item in options)
+                    or len(set(options)) != len(options) or not set(options) <= allowed):
+                raise ValueError("Invalid qualified guide scope")
+        if type(limits["allow_video_audio"]) is not bool:
+            raise ValueError("Invalid reference video audio feature")
+    if qualification.get("profile") == MULTIMODAL_PROFILE:
+        limits = envelope.get("input_limits")
+        if limits is None or not set(recipes) <= set(PROFILE_RECIPES[MULTIMODAL_PROFILE]):
+            raise ValueError("Runtime qualification requires its explicit input scope")
+        for field, maximum in MULTIMODAL_INPUT_LIMITS.items():
+            if isinstance(maximum, list):
+                outside = not set(limits[field]) <= set(maximum)
+            elif isinstance(maximum, bool):
+                outside = limits[field] and not maximum
+            else:
+                outside = limits[field] > maximum
+            if outside:
+                raise ValueError("Input limits exceed the selected qualification suite")
     # Every non-numeric generation family must be explicitly qualified. Numeric
     # decoder tiling/export parameters remain visible and are never overridden.
     controls = envelope["controls"]
@@ -89,6 +128,75 @@ def validate_policy(value):
         except (KeyError, IndexError):
             raise ValueError("Invalid budget account template") from None
     return value
+
+
+def input_envelope_blockers(compiled, limits):
+    """Check server-inspected metadata, never client labels or source filenames.
+
+    Per-kind counts include unique references and guide media. First/last frames
+    have their own two slots; their images still obey the image pixel bound and
+    the existing aggregate asset cap. Duration bounds apply to TOTAL distinct
+    media of each kind, checking both inspected source and normalized duration.
+    """
+    if limits is None:
+        return []
+    request, assets = compiled["request"], compiled["assets"]
+    inputs, guides = request["inputs"], request["guides"]
+    blockers = []
+    kinds = {"image": set(inputs["images"]), "video": set(inputs["videos"]), "audio": set(inputs["audios"])}
+    metadata = {}
+    for asset_id, asset in assets.items():
+        meta = asset.get("metadata") if isinstance(asset, dict) else None
+        if not isinstance(meta, dict) or meta.get("kind") not in kinds:
+            blockers.append("参考素材缺少服务端已核验的类型信息，暂不能确认执行范围")
+        else:
+            metadata[asset_id] = meta
+    if guides and compiled["recipe_id"] not in limits["guide_recipe_ids"]:
+        blockers.append("当前生成方式尚未开放时间锚点；可保留锚点或明确移除后重新预检")
+    for guide in guides:
+        meta = metadata.get(guide["media_id"], {})
+        kind = meta.get("kind")
+        if kind in kinds:
+            kinds[kind].add(guide["media_id"])
+        if kind not in limits["guide_kinds"]:
+            blockers.append("当前执行池仅接受以下时间锚点类型：" + " / ".join(limits["guide_kinds"]))
+        if guide["time_seconds"] > limits["max_guide_time_seconds"]:
+            blockers.append(f"时间锚点须位于 {limits['max_guide_time_seconds']:g} 秒以内")
+    names = {"image": "图片参考", "video": "视频参考", "audio": "独立音频参考"}
+    for kind, ids in kinds.items():
+        maximum = limits["max_" + {"image": "images", "video": "videos", "audio": "audios"}[kind]]
+        if len(ids) > maximum:
+            blockers.append(f"当前使用 {len(ids)} 份{names[kind]}（含同类锚点）；执行池最多接受 {maximum} 份")
+        if kind in {"video", "audio"}:
+            maximum = limits[f"max_{kind}_duration_seconds"]
+            durations, sources = [], []
+            for asset_id in ids:
+                meta = metadata.get(asset_id, {})
+                duration, source = meta.get("duration"), meta.get("source_duration", meta.get("duration"))
+                if not positive(duration, 86400) or not positive(source, 86400):
+                    blockers.append(f"{names[kind]}缺少服务端已核验的时长，暂不能确认执行范围")
+                    continue
+                durations.append(duration)
+                sources.append(source)
+            if max(sum(durations), sum(sources)) > maximum + 1e-6:
+                blockers.append(f"{names[kind]}总时长超过执行池的 {maximum:g} 秒上限（原选段与模型副本均需满足）")
+    for meta in metadata.values():
+        kind = meta["kind"]
+        if kind in {"image", "video"}:
+            width, height = meta.get("width"), meta.get("height")
+            if not positive(width, 5760) or not positive(height, 5760):
+                blockers.append(f"{names[kind]}缺少服务端已核验的尺寸，暂不能确认执行范围")
+            elif width * height > limits[f"max_{kind}_pixels"]:
+                label = "图片输入（含首尾帧与锚点）" if kind == "image" else names[kind]
+                blockers.append(f"{label} {width:g}×{height:g} 超过执行池的 {limits[f'max_{kind}_pixels']:g} 像素上限")
+    if not limits["allow_video_audio"]:
+        enabled = any(metadata.get(asset_id, {}).get("has_audio") and request["video_audio"].get(asset_id, True)
+            for asset_id in inputs["videos"])
+        enabled = enabled or any(metadata.get(guide["media_id"], {}).get("kind") == "video"
+            and metadata[guide["media_id"]].get("has_audio") and guide.get("use_audio") for guide in guides)
+        if enabled:
+            blockers.append("当前执行池尚未开放参考视频原声；请明确关闭原声或保留设置等待相符配置")
+    return list(dict.fromkeys(blockers))
 
 
 def read_policy(path):
@@ -169,7 +277,7 @@ class ExecutionPolicies:
         blockers = base["blockers"]
         if not policy["enabled"]:
             blockers.append("操作员已暂停此执行策略")
-        if qualification["status"] != "accepted" or not qualification["verified_at"] <= now < qualification["expires_at"]:
+        if qualification["status"] not in {"accepted", "runtime_required"} or not qualification["verified_at"] <= now < qualification["expires_at"]:
             blockers.append("此执行配置尚未验收或验收记录已过期")
         if quote["expires_at"] <= now:
             blockers.append("费用预留策略已过期，请等待更新")
@@ -183,16 +291,27 @@ class ExecutionPolicies:
             blockers.append("执行池未验收此模型或配方")
         request, output = compiled["request"], compiled["output_spec"]
         refs = len(set(a for a in compiled["assets"]))
-        if (output["width"]*output["height"] > envelope["max_pixels"]
-                or output["actual_duration"] > envelope["max_duration_seconds"]
-                or request["steps"] > envelope["max_steps"] or refs > envelope["max_reference_files"]
-                or len(request["guides"]) > envelope["max_guides"]
-                or request["generate_audio"] and not envelope["allow_audio"]
-                or (request["inputs"]["first_frame"] or request["inputs"]["last_frame"]) and not envelope["allow_first_last"]
-                or any(request[field] not in options for field, options in envelope["controls"].items())):
-            blockers.append("当前输入或控制项超出此执行池的验收范围；请保留配方等待相符配置")
-        capacity = self.control.pool_status(policy["pool"], model_id=policy["model_id"],
-            configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend)
+        if output["width"]*output["height"] > envelope["max_pixels"]:
+            blockers.append(f"当前画面 {output['width']}×{output['height']} 超出执行池的 {envelope['max_pixels']} 像素上限")
+        if output["actual_duration"] > envelope["max_duration_seconds"]:
+            blockers.append(f"当前采样时长 {output['actual_duration']:g} 秒超过执行池的 {envelope['max_duration_seconds']:g} 秒上限")
+        if request["steps"] > envelope["max_steps"]:
+            blockers.append(f"当前采样 {request['steps']} 步；执行池最多接受 {envelope['max_steps']:g} 步")
+        if refs > envelope["max_reference_files"]:
+            blockers.append(f"当前使用 {refs} 份参考文件；执行池最多接受 {envelope['max_reference_files']} 份，素材仍可保存")
+        if len(request["guides"]) > envelope["max_guides"]:
+            blockers.append(f"当前使用 {len(request['guides'])} 个时间锚点；执行池最多接受 {envelope['max_guides']} 个")
+        if request["generate_audio"] and not envelope["allow_audio"]:
+            blockers.append("当前执行池尚未开放声音生成，请保留设置或明确关闭生成声音")
+        if (request["inputs"]["first_frame"] or request["inputs"]["last_frame"]) and not envelope["allow_first_last"]:
+            blockers.append("当前执行池尚未开放首尾帧输入；现有图片会保留，可明确移除关联后使用纯文字生成")
+        blockers.extend(input_envelope_blockers(compiled, envelope.get("input_limits")))
+        labels = {"sampler_name": "采样器", "scheduler": "调度器", "video_decode": "视频 VAE 解码",
+            "audio_decode": "音频 VAE 解码", "encoder_device": "编码器设备", "ref_image_size": "参考图尺寸"}
+        for field, options in envelope["controls"].items():
+            if request[field] not in options:
+                blockers.append(f"{labels[field]}当前为 {request[field]}；执行池仅接受 {' / '.join(options)}")
+        capacity = {"ready": 0, "busy": 0}
         account_ids = [value.format(**scope.__dict__) for value in policy["budget_accounts"]]
         for account_id in account_ids:
             try:
@@ -207,17 +326,37 @@ class ExecutionPolicies:
             except (NotFound, BudgetExceeded, ValueError):
                 blockers.append("当前项目的生成预算未配置或可用预留额度不足")
                 break
-        approval = None
-        if capacity["ready"] + capacity["busy"] == 0:
+        approval, cold_latest_start = None, None
+        if not blockers:
+            capacity = self.control.pool_status(policy["pool"], model_id=policy["model_id"],
+                configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend)
+        if not blockers and capacity["ready"] + capacity["busy"] == 0:
             # Only an independently approved, current launch can admit a wait.
             # Empty approvals / gates=0 retain the original blocked behavior.
-            if not blockers:
-                approval = self.repo.find_capacity_approval(scope, pool=policy["pool"], model_id=policy["model_id"],
-                    configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], policy_hash=request_hash(policy))
-                if approval is not None and not self.capacity_approval_current(approval["payload"]):
-                    approval = None
+            approval = self.repo.find_capacity_approval(scope, pool=policy["pool"], model_id=policy["model_id"],
+                configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], policy_hash=request_hash(policy))
+            if approval is not None and not self.capacity_approval_current(approval["payload"]):
+                approval = None
             if approval is None:
                 blockers.append("暂无已登记且心跳有效的匹配工作机，也无有效的独立冷启动审批")
+            else:
+                # A provider starting/running record is not a qualified slot.
+                # Until a matching worker is ready, conservatively retain the
+                # full approved boot allowance rather than inventing progress.
+                # Warm ready/busy capacity above never pays this allowance.
+                scale = approval["payload"]["scale_policy"]
+                deadlines = [qualification["expires_at"], quote["expires_at"], approval["expires_at"], scale["hard_deadline"]]
+                from sqlalchemy import select
+                from .repository import capacity_cycles, instance_intents
+                with self.repo.engine.connect() as connection:
+                    actual_deadline = connection.execute(select(instance_intents.c.hard_deadline)
+                        .join(capacity_cycles, capacity_cycles.c.intent_id == instance_intents.c.id)
+                        .where(capacity_cycles.c.approval_id == approval["id"])).scalar_one_or_none()
+                if actual_deadline is not None:
+                    deadlines.append(actual_deadline)
+                cold_latest_start = min(deadlines) - scale["cold_start_s"] - quote["expected_runtime_s"]
+                if cold_latest_start <= now:
+                    blockers.append("剩余运行窗口不足以启动并完成本次生成，请等待服务续期后重新预检")
         quote_known = quote["expires_at"] > now
         base.update(pool=policy["pool"], configuration_id=policy["configuration_id"], policy_revision=policy["revision"],
             policy_hash=request_hash(policy), expected_runtime_s=quote["expected_runtime_s"], quote_known=quote_known,
@@ -229,12 +368,8 @@ class ExecutionPolicies:
             base.update(capacity_approval_id=approval["id"], capacity_approval_hash=approval["approval_hash"])
         expiry = min(now+900, latest_start) if not blockers else now+900
         if approval:
-            expiry = min(expiry, approval["expires_at"],
-                approval["payload"]["scale_policy"]["hard_deadline"]-quote["expected_runtime_s"])
-            if expiry <= now:
-                base.update(enabled=False, admission_state="blocked")
-                blockers.append("冷启动硬截止不足以完成此配方")
-                expiry = now+900
+            if not blockers:
+                expiry = min(expiry, cold_latest_start)
         estimate = {"currency": "USD", "cost_microusd": quote["cost_microusd"] if quote_known else None,
                     "source": quote["source_id"] if quote_known else "unknown", "kind": "budget_reservation",
                     "actual_charge_known": False, "description": "运营配置的预算预留额；实际费用另行核对，不代表最终账单"}
@@ -266,7 +401,7 @@ class ExecutionPolicies:
                 and policy["model_id"] == payload["model_id"] and policy["pool"] == payload["pool"]
                 and policy["configuration_id"] == payload["configuration_id"]
                 and set(payload["recipe_ids"]) <= set(policy["recipe_ids"])
-                and qualification["status"] == "accepted" and qualification["verified_at"] <= now < qualification["expires_at"]
+                and qualification["status"] in {"accepted", "runtime_required"} and qualification["verified_at"] <= now < qualification["expires_at"]
                 and qualification["evidence_id"] == payload["qualification_evidence_id"]
                 and qualification["expires_at"] == payload["qualification_expires_at"]
                 and now < quote["expires_at"] == payload["quote_expires_at"]
@@ -322,7 +457,7 @@ class ExecutionPolicies:
             qualification, quote = policy["qualification"], policy["reservation"]
             now = self.repo.clock()
             return bool(policy["enabled"] and execution.get("policy_hash") == request_hash(policy)
-                and qualification["status"] == "accepted"
+                and qualification["status"] in {"accepted", "runtime_required"}
                 and qualification["verified_at"] <= now < qualification["expires_at"]
                 and now < quote["expires_at"]
                 and now + quote["expected_runtime_s"] < min(qualification["expires_at"], quote["expires_at"])

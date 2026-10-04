@@ -35,7 +35,10 @@ from .settings import Settings
 from .worker import _slot_lock
 
 MODEL = "MiniMax-H3-Base-BF16"
-RECIPE = "h3-base-fl2va-v1"
+from .qualification_profiles import (FL_RECIPE, FL50_PROFILE, MULTIMODAL_PROFILE, PROFILE_RECIPES,
+    MULTIMODAL_INPUT_LIMITS, MIN_MULTIMODAL_JOB_RUNTIME_S)
+
+RECIPE = FL_RECIPE  # Compatibility for existing exact FL50 operator configs.
 IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,120}")
 HASH = re.compile(r"[0-9a-f]{64}")
 
@@ -96,8 +99,11 @@ class FiniteConfig:
     manifests: list[dict]
     interval_s: int = 15
     allowed_owners: list[str] | None = None
+    qualification_profile: str = FL50_PROFILE
 
     def __post_init__(self):
+        if not isinstance(self.qualification_profile, str) or self.qualification_profile not in PROFILE_RECIPES:
+            raise ScalerError("finite_qualification_profile_invalid")
         if (type(self.version) is not int or self.version != 1 or type(self.enabled) is not bool
                 or self.tenant != "sixnine" or self.owner not in ("superdan", "supervan")
                 or type(self.trust_first_host_key) is not bool):
@@ -163,6 +169,10 @@ class FiniteConfig:
         return Scope(self.tenant, self.owner, self.project_id)
 
     @property
+    def recipe_ids(self):
+        return PROFILE_RECIPES[self.qualification_profile]
+
+    @property
     def stop_claiming_at(self):
         return self.hard_deadline-self.drain_margin_s
 
@@ -172,6 +182,8 @@ class FiniteConfig:
         # is an explicit opt-in and must be part of its new immutable identity.
         if self.allowed_owners is None:
             value.pop("allowed_owners")
+        if self.qualification_profile == FL50_PROFILE:
+            value.pop("qualification_profile")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
@@ -247,14 +259,14 @@ def validate_settings(config, settings, *, require_policy=True):
 def verify_policy(config, settings):
     policy = read_policy(settings.execution_policy_file)
     if (not policy or request_hash(policy) != config.execution_policy_sha256 or policy["pool"] != config.pool
-            or policy["configuration_id"] != config.configuration_id or policy["recipe_ids"] != [RECIPE]
-            or policy["qualification"]["status"] != "accepted"
+            or policy["configuration_id"] != config.configuration_id or policy["recipe_ids"] != list(config.recipe_ids)
+            or policy["qualification"]["status"] != ("runtime_required" if config.qualification_profile == MULTIMODAL_PROFILE else "accepted")
             or policy["qualification"]["evidence_id"] != config.qualification_evidence_id
             or policy["qualification"]["expires_at"] > config.hard_deadline
             or policy["reservation"]["expires_at"] > config.hard_deadline):
         raise ScalerError("finite_policy_identity_mismatch")
-    # Fixed, actually exercised FL2VA envelope; a 4-step boot smoke is not a
-    # 50-step qualification and this runner never enables reference controls.
+    # An explicit profile selects the entire qualification suite; no recipe or
+    # input family is enabled just because the underlying model supports it.
     envelope = policy["envelope"]
     controls = {"sampler_name": ["res_multistep"], "scheduler": ["auto"], "video_decode": ["tiled"],
                 "audio_decode": ["normal"], "encoder_device": ["cpu"], "ref_image_size": ["max"]}
@@ -262,9 +274,28 @@ def verify_policy(config, settings):
     # The policy compares native duration; six excludes the next integer
     # requested duration (six seconds is 148 / 24fps) without rejecting five.
     if (envelope["max_pixels"] > 1344*768 or envelope["max_duration_seconds"] > 6 or envelope["max_steps"] > 50
-            or envelope["max_reference_files"] != 0 or envelope["max_guides"] != 0 or envelope["allow_first_last"]
             or envelope["controls"] != controls):
         raise ScalerError("finite_policy_outside_qualified_fl50_envelope")
+    if config.qualification_profile == FL50_PROFILE:
+        if envelope["max_reference_files"] != 0 or envelope["max_guides"] != 0 or envelope["allow_first_last"]:
+            raise ScalerError("finite_policy_outside_qualified_fl50_envelope")
+    else:
+        limits = envelope.get("input_limits")
+        if (policy["qualification"].get("profile") != MULTIMODAL_PROFILE
+                or not isinstance(limits, dict) or set(limits) != set(MULTIMODAL_INPUT_LIMITS)
+                or envelope["max_reference_files"] > 3 or envelope["max_guides"] > 1
+                or policy["reservation"]["expected_runtime_s"] < MIN_MULTIMODAL_JOB_RUNTIME_S):
+            raise ScalerError("finite_policy_outside_qualified_multimodal_envelope")
+        for field, maximum in MULTIMODAL_INPUT_LIMITS.items():
+            actual = limits[field]
+            if isinstance(maximum, list):
+                valid = isinstance(actual, list) and set(actual) <= set(maximum)
+            elif type(maximum) is bool:
+                valid = type(actual) is bool and (not actual or maximum)
+            else:
+                valid = type(actual) in (int, float) and math.isfinite(actual) and 0 <= actual <= maximum
+            if not valid:
+                raise ScalerError("finite_policy_outside_qualified_multimodal_envelope")
     return policy
 
 
@@ -333,7 +364,7 @@ class FiniteController:
     def approval_current(self, payload):
         c = self.config
         return bool(not self.stopping() and payload["tenant_id"] == c.tenant and payload["pool"] == c.pool
-            and payload["configuration_id"] == c.configuration_id and payload["recipe_ids"] == [RECIPE]
+            and payload["configuration_id"] == c.configuration_id and payload["recipe_ids"] == list(c.recipe_ids)
             and payload["policy_hash"] == c.execution_policy_sha256
             and payload["budget_scope"] == asdict(c.scope)
             and sorted(payload["budget_account_ids"]) == sorted(c.budget_account_ids)
@@ -423,7 +454,7 @@ class FiniteController:
                 jobs.c.execution_plan["policy_hash"].as_string() == c.execution_policy_sha256,
                 jobs.c.execution_plan["backend"].as_string() == "comfy-worker",
                 jobs.c.execution_plan["enabled"].as_string() == ("true" if self.repo.engine.dialect.name == "postgresql" else 1),
-                jobs.c.request["recipe_id"].as_string() == RECIPE,
+                jobs.c.request["recipe_id"].as_string().in_(c.recipe_ids),
                 jobs.c.request["request"]["model"].as_string() == MODEL
                 ).order_by(jobs.c.created_at, jobs.c.id).limit(4097)).mappings())
             workers = list(conn.execute(select(registered_workers).where(registered_workers.c.pool == c.pool)).mappings())
@@ -465,6 +496,8 @@ class FiniteController:
 
     def request_drain(self):
         (self.config.work_dir/"drain.flag").touch()
+        for boot in self.boots.values():
+            boot.request_drain()
 
     def _drain_intents(self, rows):
         for row in rows:

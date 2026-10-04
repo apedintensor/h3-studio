@@ -5,13 +5,15 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from studio_platform.api import create_app
 from studio_platform.capabilities import MODEL, compile_request
 from studio_platform.control import WorkerControl, WorkerSpec
-from studio_platform.execution_policy import ExecutionPolicies, read_policy
+from studio_platform.execution_policy import ExecutionPolicies, read_policy, validate_policy
+from studio_platform.qualification_profiles import MULTIMODAL_PROFILE, MULTIMODAL_INPUT_LIMITS
 from studio_platform.repository import Repository, Scope, Conflict
 from studio_platform.settings import Settings
 from test_platform_api import project, generation_request
@@ -28,6 +30,19 @@ def policy(now):
                 "audio_decode": ["normal"], "encoder_device": ["default", "cpu"], "ref_image_size": ["max", "match"]}},
         "reservation": {"cost_microusd": 500000, "expected_runtime_s": 300, "expires_at": now+3600, "source_id": "synthetic-quote"},
         "budget_accounts": ["test-tenant:{tenant_id}", "test-owner:{tenant_id}:{owner_id}"]}
+
+
+def synthetic_input_limits():
+    return copy.deepcopy(MULTIMODAL_INPUT_LIMITS)
+
+
+def synthetic_assets():
+    # Shape-compatible inspected metadata only; no media/GPU performance claim.
+    return {"image": {"metadata": {"kind": "image", "width": 2048, "height": 2048}},
+        "last": {"metadata": {"kind": "image", "width": 2048, "height": 2048}},
+        "video": {"metadata": {"kind": "video", "width": 832, "height": 480,
+            "duration": 107/24, "source_duration": 4.45, "fps": 24, "frame_count": 107, "has_audio": True}},
+        "audio": {"metadata": {"kind": "audio", "duration": 4.45, "source_duration": 4.45}}}
 
 
 class ExecutionPolicyTests(unittest.TestCase):
@@ -91,6 +106,186 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.value["qualification"]["expires_at"] = self.repo.clock()-1
         self.write()
         self.assertTrue(all("deployment_preset" not in r for r in capabilities(self.settings)["recipes"]))
+
+    def test_public_execution_scope_distinguishes_unqualified_recipe_from_model_support(self):
+        from studio_platform.capabilities import capabilities
+        self.value["recipe_ids"] = ["h3-base-fl2va-v1"]
+        self.value["envelope"].update(max_reference_files=0, max_guides=0, allow_first_last=False)
+        self.write()
+        result = capabilities(self.settings)
+        by_id = {recipe["id"]: recipe for recipe in result["recipes"]}
+        live = by_id["h3-base-fl2va-v1"]["execution_support"]
+        self.assertEqual(live["status"], "qualified")
+        self.assertFalse(live["capacity_checked"])
+        self.assertTrue(live["preflight_required"])
+        self.assertEqual(live["constraints"]["max_reference_files"], 0)
+        self.assertFalse(live["constraints"]["allow_first_last"])
+        unsupported = by_id["h3-base-ref2va-v1"]
+        self.assertTrue(unsupported["implemented"])
+        self.assertEqual(unsupported["execution_support"]["status"], "not_qualified")
+        self.assertNotIn("constraints", unsupported["execution_support"])
+        serialized = json.dumps(result)
+        for private in ("synthetic-pool", "synthetic-config", "test-owner", "budget_accounts", "synthetic-test-only"):
+            self.assertNotIn(private, serialized)
+
+    def test_wrong_recipe_or_controls_do_not_report_unchecked_missing_capacity(self):
+        self.value["recipe_ids"] = ["h3-base-fl2va-v1"]
+        self.value["envelope"]["controls"].update(encoder_device=["cpu"], video_decode=["tiled"])
+        self.write()
+        with patch.object(self.control.__class__, "pool_status", side_effect=AssertionError("range must pass before capacity")), \
+                patch.object(self.repo, "find_capacity_approval", side_effect=AssertionError("no approval lookup for unsupported request")):
+            blocked = self.evaluate()
+            text = " ".join(blocked.execution["blockers"])
+            self.assertIn("编码器设备当前为 default", text)
+            self.assertIn("视频 VAE 解码当前为 normal", text)
+            self.assertNotIn("冷启动审批", text)
+            other = copy.deepcopy(self.compiled)
+            other["recipe_id"] = "h3-base-ref2va-v1"
+            other["request"].update(encoder_device="cpu", video_decode="tiled")
+            mismatch = self.policies.evaluate(other, self.scope, self.fingerprint)
+            self.assertIn("执行池未验收此模型或配方", mismatch.execution["blockers"])
+            self.assertFalse(any("冷启动审批" in value for value in mismatch.execution["blockers"]))
+
+    def test_optional_input_limits_are_complete_strict_and_do_not_change_old_policies(self):
+        self.assertIs(validate_policy(self.value), self.value)
+        self.value["envelope"]["input_limits"] = synthetic_input_limits()
+        self.assertIs(validate_policy(self.value), self.value)
+        for field, value in (("max_images", True), ("max_videos", 4), ("max_audio_duration_seconds", float("nan")),
+                ("guide_kinds", ["image", "image"]), ("guide_recipe_ids", ["other-recipe"]), ("allow_video_audio", 1)):
+            broken = copy.deepcopy(self.value)
+            broken["envelope"]["input_limits"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                validate_policy(broken)
+        for change in ("missing", "unknown"):
+            broken = copy.deepcopy(self.value)
+            if change == "missing":
+                broken["envelope"]["input_limits"].pop("max_videos")
+            else:
+                broken["envelope"]["input_limits"]["max_video"] = 1
+            with self.assertRaises(ValueError):
+                validate_policy(broken)
+
+    def test_qualified_multimodal_shape_and_two_first_last_images_pass_without_broadening_recipe(self):
+        from studio_platform.capabilities import capabilities
+        self.value["envelope"].update(input_limits=synthetic_input_limits(), max_reference_files=3, max_guides=1)
+        self.write()
+        assets = synthetic_assets()
+        for recipe, inputs in (("h3-base-ref2va-v1", {"images": ["image"], "videos": ["video"], "audios": ["audio"],
+                    "guides": [{"media_id": "image", "time_seconds": 1}]}),
+                ("h3-base-fl2va-v1", {"first_frame": "image", "last_frame": "last"})):
+            compiled, fingerprint = compile_request(generation_request(recipe_id=recipe, inputs=inputs), assets.__getitem__)
+            result = self.policies.evaluate(compiled, self.scope, fingerprint)
+            self.assertTrue(result.execution["enabled"], result.execution["blockers"])
+        published = capabilities(self.settings)["recipes"][0]["execution_support"]["constraints"]
+        self.assertEqual(published["input_limits"], synthetic_input_limits())
+
+    def test_aggregate_three_assets_does_not_admit_three_videos_or_unverified_metadata(self):
+        self.value["envelope"].update(input_limits=synthetic_input_limits(), max_reference_files=3, max_guides=1)
+        self.write()
+        assets = synthetic_assets()
+        assets["video-two"] = copy.deepcopy(assets["video"])
+        assets["video-three"] = copy.deepcopy(assets["video"])
+        compiled, fingerprint = compile_request(generation_request(recipe_id="h3-base-ref2va-v1",
+            inputs={"videos": ["video", "video-two", "video-three"]}), assets.__getitem__)
+        with patch.object(self.control.__class__, "pool_status", side_effect=AssertionError("must reject before capacity")):
+            result = self.policies.evaluate(compiled, self.scope, fingerprint)
+        self.assertIn("3 份视频参考", " ".join(result.execution["blockers"]))
+        self.assertIn("总时长", " ".join(result.execution["blockers"]))
+        self.assertNotIn("冷启动审批", " ".join(result.execution["blockers"]))
+        compiled, fingerprint = compile_request(generation_request(inputs={"first_frame": "image"}), assets.__getitem__)
+        compiled["assets"]["image"]["metadata"].pop("width")
+        self.assertIn("已核验的尺寸", " ".join(self.policies.evaluate(compiled, self.scope, fingerprint).execution["blockers"]))
+
+    def test_per_kind_bounds_cover_source_normalized_pixels_and_guide_recipe_without_mutation(self):
+        self.value["envelope"].update(input_limits=synthetic_input_limits(), max_reference_files=3, max_guides=1)
+        self.write()
+        assets = synthetic_assets()
+        compiled, fingerprint = compile_request(generation_request(recipe_id="h3-base-ref2va-v1",
+            inputs={"videos": ["video"], "audios": ["audio"], "images": ["image"]}), assets.__getitem__)
+        changes = [("video", "width", 1024, "像素上限"), ("image", "height", 4096, "含首尾帧"),
+            ("video", "source_duration", 4.6, "总时长"), ("video", "duration", 4.6, "总时长"),
+            ("audio", "duration", 4.46, "总时长"), ("audio", "source_duration", None, "已核验的时长")]
+        for asset, field, value, expected in changes:
+            changed = copy.deepcopy(compiled)
+            changed["assets"][asset]["metadata"][field] = value
+            snapshot = copy.deepcopy(changed)
+            blocked = self.policies.evaluate(changed, self.scope, fingerprint)
+            self.assertIn(expected, " ".join(blocked.execution["blockers"]))
+            self.assertEqual(snapshot, changed)
+        compiled, fingerprint = compile_request(generation_request(inputs={"first_frame": "image", "last_frame": "last",
+            "guides": [{"media_id": "image", "time_seconds": 1}]}), assets.__getitem__)
+        self.assertIn("当前生成方式尚未开放时间锚点", " ".join(self.policies.evaluate(compiled, self.scope, fingerprint).execution["blockers"]))
+
+    def test_guide_kind_and_video_audio_consent_are_checked_independently(self):
+        limits = synthetic_input_limits()
+        limits["allow_video_audio"] = False
+        self.value["envelope"].update(input_limits=limits, max_reference_files=3, max_guides=1)
+        self.write()
+        assets = synthetic_assets()
+        body = generation_request(recipe_id="h3-base-ref2va-v1", inputs={"videos": ["video"],
+            "guides": [{"media_id": "video", "time_seconds": 0, "use_audio": True}]})
+        compiled, fingerprint = compile_request(body, assets.__getitem__)
+        blocked = self.policies.evaluate(compiled, self.scope, fingerprint)
+        self.assertIn("时间锚点类型", " ".join(blocked.execution["blockers"]))
+        self.assertIn("参考视频原声", " ".join(blocked.execution["blockers"]))
+        body["inputs"] = {"videos": [{"asset_id": "video", "include_audio": False}]}
+        compiled, fingerprint = compile_request(body, assets.__getitem__)
+        self.assertTrue(self.policies.evaluate(compiled, self.scope, fingerprint).execution["enabled"])
+
+    def test_runtime_required_is_bound_to_explicit_new_suite_and_never_reported_as_verified(self):
+        from studio_platform.capabilities import capabilities
+        from studio_platform.repository import request_hash
+        self.value["qualification"].update(status="runtime_required", profile=MULTIMODAL_PROFILE)
+        self.value["envelope"]["input_limits"] = synthetic_input_limits()
+        self.write()
+        result = capabilities(self.settings)
+        for recipe in result["recipes"]:
+            support = recipe["execution_support"]
+            self.assertEqual(support["status"], "runtime_required")
+            self.assertTrue(support["runtime_verification_required"])
+            self.assertFalse(support["capacity_checked"])
+            self.assertIn("GPU启动后先验证", support["reason"])
+            self.assertEqual(support["constraints"]["input_limits"]["max_image_pixels"], 2048*2048)
+        # A synthetic already-ready slot is the only capacity in this unit test;
+        # the production boot suite owns registration after real inference.
+        admitted = self.evaluate()
+        self.assertTrue(admitted.execution["enabled"])
+        plan = self.repo.create_plan(self.scope, self.compiled, admitted.execution,
+            expires_at=admitted.expires_at, estimated_cost_microusd=admitted.cost)
+        job = self.repo.create_job(self.scope, plan["id"], "runtime-authorized",
+            budget_account_ids=admitted.execution["budget_account_ids"])
+        self.assertTrue(self.policies.activation_allowed(job))
+        approval = dict(policy_hash=request_hash(self.value), model_id=self.value["model_id"], pool=self.value["pool"],
+            configuration_id=self.value["configuration_id"], recipe_ids=self.value["recipe_ids"],
+            qualification_evidence_id=self.value["qualification"]["evidence_id"],
+            qualification_expires_at=self.value["qualification"]["expires_at"],
+            quote_expires_at=self.value["reservation"]["expires_at"], expires_at=self.repo.clock()+100)
+        self.assertTrue(self.policies.capacity_approval_current(approval))
+        self.value["qualification"]["status"] = "unverified"
+        self.write()
+        self.assertFalse(self.policies.activation_allowed(job))
+        self.assertFalse(self.policies.capacity_approval_current(approval))
+
+    def test_runtime_required_without_explicit_suite_or_beyond_its_bounds_fails_closed(self):
+        baseline = copy.deepcopy(self.value)
+        baseline["qualification"].update(status="runtime_required", profile=MULTIMODAL_PROFILE)
+        baseline["envelope"]["input_limits"] = synthetic_input_limits()
+        for change in ("missing-profile", "unknown-profile", "legacy-profile", "missing-limits", "oversized-image", "fl-guide"):
+            broken = copy.deepcopy(baseline)
+            if change == "missing-profile":
+                broken["qualification"].pop("profile")
+            elif change == "unknown-profile":
+                broken["qualification"]["profile"] = "unqualified-runtime"
+            elif change == "legacy-profile":
+                broken["qualification"]["profile"] = "fl50"
+            elif change == "missing-limits":
+                broken["envelope"].pop("input_limits")
+            elif change == "oversized-image":
+                broken["envelope"]["input_limits"]["max_image_pixels"] = 2048*2048+1
+            else:
+                broken["envelope"]["input_limits"]["guide_recipe_ids"].append("h3-base-fl2va-v1")
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                validate_policy(broken)
 
     def test_missing_invalid_or_disabled_policy_never_falls_back(self):
         self.path.unlink()

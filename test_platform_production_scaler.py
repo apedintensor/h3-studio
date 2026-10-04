@@ -61,6 +61,8 @@ def as_json(config):
     value = asdict(config)
     if value["allowed_owners"] is None:
         value.pop("allowed_owners")
+    if value["qualification_profile"] == "fl50":
+        value.pop("qualification_profile")
     for field in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[field] = str(value[field])
     return value
@@ -123,6 +125,37 @@ class FakeBoot:
 
 
 class FiniteTests(LedgerCase):
+    def test_multimodal_policy_requires_explicit_runtime_profile_and_exact_recipe_set(self):
+        from studio_platform.qualification_profiles import MULTIMODAL_PROFILE, MULTIMODAL_INPUT_LIMITS
+        value = json.loads(json.dumps(self.value))
+        config = replace(self.config, qualification_profile=MULTIMODAL_PROFILE)
+        value["recipe_ids"] = list(config.recipe_ids)
+        value["qualification"].update(status="runtime_required", profile=MULTIMODAL_PROFILE)
+        value["reservation"]["expected_runtime_s"] = 1800
+        value["envelope"].update(max_reference_files=3, max_guides=1, allow_first_last=True,
+                                 input_limits=dict(MULTIMODAL_INPUT_LIMITS))
+        def verify(changed, configuration=config):
+            self.path.write_text(json.dumps(changed))
+            return verify_policy(replace(configuration, execution_policy_sha256=request_hash(changed)), self.settings)
+        self.assertEqual(verify(value), value)
+        with self.assertRaises(Exception):
+            verify(value, self.config)
+        for field, replacement in (("status", "accepted"), ("profile", "different")):
+            bad = json.loads(json.dumps(value)); bad["qualification"][field] = replacement
+            with self.subTest(field=field), self.assertRaises(Exception):
+                verify(bad)
+        bad = json.loads(json.dumps(value)); bad["recipe_ids"] = [RECIPE]
+        with self.assertRaises(Exception):
+            verify(bad)
+        for key, replacement in (("max_image_pixels", 2048*2048+1), ("max_videos", 2),
+                                  ("guide_recipe_ids", [RECIPE]), ("max_video_duration_seconds", 5)):
+            bad = json.loads(json.dumps(value)); bad["envelope"]["input_limits"][key] = replacement
+            with self.subTest(limit=key), self.assertRaises(Exception):
+                verify(bad)
+        bad = json.loads(json.dumps(value)); bad["reservation"]["expected_runtime_s"] = 300
+        with self.assertRaises(Exception):
+            verify(bad)
+
     def setUp(self):
         super().setUp()
         self.scope = Scope("sixnine", "superdan", "story-one")
@@ -466,6 +499,130 @@ class ConfigAndCredentialTests(unittest.TestCase):
 
 
 class ProductionBootTests(LedgerCase):
+    def multimodal(self):
+        from studio_platform.qualification_profiles import MULTIMODAL_PROFILE
+        from studio_platform.lium_multimodal_smoke import FirstLastSmoke, BoundedReferenceSmoke
+        self.config = replace(self.config, qualification_profile=MULTIMODAL_PROFILE)
+        self.boot.finite = self.config
+        self.boot.config = replace(self.boot.config, recipe_ids=self.config.recipe_ids)
+        self.stage_outcomes = {FirstLastSmoke.name: Outcome("running", "firstlast-task"),
+                               BoundedReferenceSmoke.name: Outcome("running", "reference-task")}
+        self.backend.poll = lambda tag, task: next((v for k, v in self.stage_outcomes.items() if tag.startswith(k)), Outcome("succeeded", task))
+        def api(method, path, **kwargs):
+            if path == "/queue":
+                return self.backend.queue
+            return {"name": kwargs["files"]["image"][0], "subfolder": "sixnine-qualification", "type": "input"}
+        self.backend._json = api
+        def fetch(job, tag, task, directory, heartbeat):
+            self.backend.fetches += 1
+            paths = {"video": directory/"raw.mp4", "audio": directory/"raw.flac"}
+            for kind, path in paths.items():
+                path.write_bytes(("synthetic-"+kind).encode())
+            return paths
+        self.backend.fetch = fetch
+        self.boot.verify_smoke = lambda paths, request: {"request": request, "outputs": {
+            kind: {"filename": p.name, "size_bytes": p.stat().st_size, "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+            for kind, p in paths.items()}}
+        self.enterContext(patch("studio_platform.lium_multimodal_smoke.inspect", side_effect=lambda p, kind:
+            {"kind": kind, "width": 2048 if kind == "image" else 832, "height": 2048 if kind == "image" else 480,
+             "duration": 107/24 if kind == "video" else 4.45 if kind == "audio" else None, "has_audio": kind != "image"}))
+        self.enterContext(patch("studio_platform.lium_multimodal_smoke.probe", return_value={"streams": [
+            {"codec_type": "video", "avg_frame_rate": "24/1", "nb_frames": "107"}]}))
+        self.enterContext(patch("studio_platform.lium_multimodal_smoke.ffmpeg", side_effect=lambda args: Path(args[-1]).write_bytes(b"synthetic-normalized")))
+        return FirstLastSmoke.name, BoundedReferenceSmoke.name
+
+    def test_multimodal_registers_both_recipes_only_after_all_three_qualifications(self):
+        first, ref = self.multimodal()
+        result = self.boot.tick(self.intent["id"])
+        self.assertEqual((result["state"], result["qualification_stage"]), ("qualification_running", first))
+        self.assertIsNone(self.boot.fleet)
+        self.assertEqual(self.backend.submissions, 2)
+        self.stage_outcomes[first] = Outcome("succeeded", "firstlast-task")
+        result = self.boot.tick(self.intent["id"])
+        self.assertEqual(result["qualification_stage"], ref)
+        self.assertIsNone(self.boot.fleet)
+        self.assertEqual(self.backend.submissions, 3)
+        self.stage_outcomes[ref] = Outcome("succeeded", "reference-task")
+        process = SimpleNamespace(pid=4242, poll=lambda: None, send_signal=lambda _: None)
+        with patch.object(self.boot, "_popen_impl", return_value=process):
+            self.assertEqual(self.boot.tick(self.intent["id"])["state"], "fleet_running")
+        self.assertEqual(self.boot.fleet.config.slots[0].spec.recipe_ids, self.config.recipe_ids)
+        self.boot.tick(self.intent["id"])
+        self.assertEqual(self.backend.submissions, 3)
+        receipt = self.boot.config.work_dir/self.intent["id"]/first/"state.json"
+        value = json.loads(receipt.read_text()); value["phase"] = "pending"
+        receipt.write_text(json.dumps(value))
+        with self.assertRaisesRegex(Exception, "multimodal_evidence_missing"):
+            self.boot.tick(self.intent["id"])
+        self.assertEqual(self.backend.submissions, 3)
+
+    def test_multimodal_drain_collects_firstlast_without_starting_reference_or_worker(self):
+        first, ref = self.multimodal()
+        self.boot.tick(self.intent["id"])
+        self.boot.request_drain()
+        with self.assertRaisesRegex(Exception, "still_unresolved"):
+            self.boot.idle_probe(self.intent["id"], self.intent["provider_instance_id"])
+        self.stage_outcomes[first] = Outcome("succeeded", "firstlast-task")
+        self.assertEqual(self.boot.tick(self.intent["id"], stopping=True)["state"], "draining")
+        self.assertFalse((self.boot.config.work_dir/self.intent["id"]/ref/"state.json").exists())
+        self.assertIsNone(self.boot.fleet)
+        self.assertEqual(self.backend.submissions, 2)
+        self.assertTrue(self.boot.idle_probe(self.intent["id"], self.intent["provider_instance_id"]).idle)
+
+    def test_multimodal_restarted_draining_controller_reconnects_only_to_collect_ref(self):
+        first, ref = self.multimodal()
+        self.stage_outcomes[first] = Outcome("succeeded", "firstlast-task")
+        self.boot.tick(self.intent["id"])
+        self.assertEqual(self.backend.submissions, 3)
+        self.stage_outcomes[ref] = Outcome("succeeded", "reference-task")
+        recovered = ProductionBoot(self.repo, self.provider, self.config, self.intent, 19300,
+            config_path=Path(self.temp.name)/"config.json", ssh_factory=lambda *a: self.host,
+            backend_factory=lambda **kw: self.backend, verify_smoke=self.boot.verify_smoke)
+        self.assertEqual(recovered.tick(self.intent["id"], stopping=True)["state"], "draining")
+        self.assertIsNone(recovered.fleet)
+        self.assertEqual((self.backend.submissions, self.host.starts, self.host.uploads), (3, 1, 1))
+        self.assertTrue(recovered.idle_probe(self.intent["id"], self.intent["provider_instance_id"]).idle)
+
+    def test_multimodal_suite_reserves_time_before_first_post_and_fails_closed(self):
+        first, ref = self.multimodal()
+        with self.repo.transaction() as conn:
+            from studio_platform.repository import instance_intents
+            conn.execute(update(instance_intents).where(instance_intents.c.id == self.intent["id"]).values(hard_deadline=self.now+2800))
+        self.assertEqual(self.boot.tick(self.intent["id"])["state"], "qualification_deadline_insufficient")
+        self.assertEqual(self.backend.submissions, 0)
+        self.assertIsNone(self.boot.fleet)
+
+    def test_multimodal_firstlast_failure_prevents_reference_and_registration(self):
+        first, ref = self.multimodal()
+        self.stage_outcomes[first] = Outcome("failed", "firstlast-task")
+        self.assertEqual(self.boot.tick(self.intent["id"])["state"], "qualification_failed")
+        self.assertIsNone(self.boot.fleet)
+        self.assertFalse((self.boot.config.work_dir/self.intent["id"]/ref/"state.json").exists())
+        self.assertEqual(self.backend.submissions, 2)
+
+    def test_external_drain_during_upload_stops_next_inference_post(self):
+        self.multimodal()
+        original = self.backend._json
+        def api(method, path, **kwargs):
+            value = original(method, path, **kwargs)
+            if path == "/upload/image":
+                (self.config.work_dir/"drain.flag").touch()
+            return value
+        self.backend._json = api
+        result = self.boot.tick(self.intent["id"])
+        self.assertEqual(result["state"], "qualification_not_started_draining")
+        self.assertEqual(self.backend.submissions, 1)  # Only previously accepted FL.
+        self.assertIsNone(self.boot.fleet)
+
+    def test_fl_collected_output_validation_failure_is_terminal(self):
+        from studio_platform.lium_bootstrap import BootError
+        self.backend.outcome = Outcome("succeeded", "task-test")
+        self.boot.verify_smoke = lambda *args: (_ for _ in ()).throw(BootError("qualification_media_shape_mismatch"))
+        self.assertEqual(self.boot.tick(self.intent["id"])["state"], "qualification_failed")
+        self.assertEqual(self.boot.tick(self.intent["id"])["state"], "qualification_failed")
+        self.assertEqual(self.backend.submissions, 1)
+        self.assertIsNone(self.boot.fleet)
+
     def setUp(self):
         super().setUp()
         self.config = configuration(Path(self.temp.name), self.now)

@@ -34,6 +34,81 @@ class HeartbeatBoot(FakeBoot):
 
 
 class OnDemandTests(LedgerCase):
+    def test_multimodal_one_use_approval_uses_both_recipes_without_renting_before_user_job(self):
+        from studio_platform.qualification_profiles import MULTIMODAL_PROFILE, MULTIMODAL_INPUT_LIMITS
+        value = json.loads(json.dumps(self.value))
+        value["recipe_ids"] = [RECIPE, "h3-base-ref2va-v1"]
+        value["qualification"].update(status="runtime_required", profile=MULTIMODAL_PROFILE)
+        value["reservation"]["expected_runtime_s"] = 1800
+        value["envelope"].update(max_reference_files=3, max_guides=1, allow_first_last=True,
+                                 input_limits=dict(MULTIMODAL_INPUT_LIMITS))
+        self.path.write_text(json.dumps(value))
+        config = replace(self.config, qualification_profile=MULTIMODAL_PROFILE,
+            execution_policy_sha256=request_hash(value), work_dir=self.root/"multimodal-service",
+            capacity_approval_id="multimodal-approval", cycle_id="multimodal-service")
+        # A separately approved empty pool avoids mutating the active old policy.
+        config = replace(config, pool="multimodal-pool")
+        value["pool"] = config.pool
+        self.path.write_text(json.dumps(value))
+        config = replace(config, execution_policy_sha256=request_hash(value))
+        self.repo.configure_pool(config.pool, max_instances=1, max_physical_gpus=1)
+        controller = OnDemandController(self.repo, self.settings, config, provider=self.provider, boot_factory=HeartbeatBoot)
+        controller.initialize()
+        from studio_platform.repository import capacity_approvals
+        with self.repo.engine.connect() as conn:
+            approval = conn.execute(select(capacity_approvals).where(
+                capacity_approvals.c.id == controller.current.config.capacity_approval_id)).mappings().one()
+        self.assertEqual(approval["payload"]["recipe_ids"], list(config.recipe_ids))
+        controller.tick()
+        self.assertEqual(self.provider.creates, [])
+        scope = Scope("sixnine", "supervan", "reference-story")
+        request = generation_request()
+        request["recipe_id"] = "h3-base-ref2va-v1"
+        request["inputs"] = {"images": ["image"]}
+        request["controls"].update(duration=5, steps=50, resolution="768P", video_decode="tiled", encoder_device="cpu")
+        compiled, fingerprint = compile_request(request, lambda _: {"metadata": {
+            "kind": "image", "width": 2048, "height": 2048, "duration": None, "has_audio": False}})
+        admission = ExecutionPolicies(self.settings, self.repo).evaluate(compiled, scope, fingerprint)
+        self.assertTrue(admission.execution["enabled"], admission.execution)
+        plan = self.repo.create_plan(scope, compiled, admission.execution, expires_at=admission.expires_at,
+            estimated_cost_microusd=admission.cost)
+        job = self.repo.create_job(scope, plan["id"], "reference-job", initial_status=admission.execution["admission_state"],
+            budget_account_ids=admission.execution["budget_account_ids"])
+        # Demand SQL sees Ref2VA queued work too; no paid submission involved.
+        with self.repo.transaction() as conn:
+            from studio_platform.repository import jobs
+            conn.execute(update(jobs).where(jobs.c.id == job["id"]).values(status="queued"))
+        demands, _ = controller.current._observations([])
+        self.assertEqual([d.job_id for d in demands], [job["id"]])
+
+    def test_qualification_failure_fails_waiter_and_never_starts_another_cycle(self):
+        class RejectBoot(HeartbeatBoot):
+            def tick(self, *args, **kwargs):
+                if kwargs.get("stopping"):
+                    return super().tick(*args, **kwargs)
+                return {"state": "qualification_failed"}
+        self.controller.boot_factory = RejectBoot
+        self.controller.current.boot_factory = RejectBoot
+        scope, job = self.submit()
+        for _ in range(7):
+            self.tick()
+        self.assertTrue(self.controller.stopping())
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(self.controller.sequence, 1)
+        self.assertEqual(self.repo.get_job(scope, job["id"])["status"], "failed")
+        self.assertEqual(self.repo.get_budget("job-budget")["reserved_microusd"], 0)
+
+    def test_default_and_multimodal_json_roundtrip_preserve_exact_fingerprint(self):
+        from studio_platform.on_demand_scaler import read_config
+        from studio_platform.qualification_profiles import MULTIMODAL_PROFILE
+        for config in (self.config, replace(self.config, qualification_profile=MULTIMODAL_PROFILE)):
+            raw = json_config(config)
+            self.assertEqual(request_hash(raw), config.fingerprint())
+            path = self.root/"roundtrip.json"
+            path.write_text(json.dumps(raw))
+            path.chmod(0o600)
+            self.assertEqual(read_config(path).fingerprint(), config.fingerprint())
+
     def setUp(self):
         super().setUp()
         self.root = Path(self.temp.name)
