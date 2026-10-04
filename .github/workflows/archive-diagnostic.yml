@@ -30,7 +30,10 @@ jobs:
           with tarfile.open(directory/'image.tar.gz','r|gz') as archive:
               for member in archive:
                   if member.isfile() and member.size<20000:
-                      print(member.name,json.load(archive.extractfile(member)))
+                      try:
+                          print(member.name,json.load(archive.extractfile(member)))
+                      except (ValueError,UnicodeError):
+                          print(member.name,'non-JSON layer')
           try:
               release.validate_image_archive(directory/'image.tar.gz',release.manifest(directory,sys.argv[1]))
               print('Archive validated')
