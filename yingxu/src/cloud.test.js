@@ -206,3 +206,35 @@ test('project activity read rejects late same-project workspace and account resp
  h.store.enterCloudProject(before,{account:'superdan',version:1});finish({items:[{id:'private'}]});await rejected;assert.deepEqual(h.store.exportProject(),before);
  const pending2=h.controller.readProjectActivity(),rejected2=assert.rejects(pending2,/账户或项目已经切换/);await h.controller.logout();finish({items:[{id:'private'}]});await rejected2;h.controller.destroy();
 });
+
+const automaticRecipe={...recipe,controls:{...schema,encoder_device:{type:'string',enum:['default','cpu'],default:'default'},video_decode:{type:'string',enum:['normal','tiled'],default:'normal'}},deployment_preset:{applies_to:'unset_controls_only',controls:{encoder_device:'cpu',video_decode:'tiled'}},execution_support:{constraints:{controls:{encoder_device:['cpu'],video_decode:['tiled']}}}};
+test('preflight refreshes disabled cached service and persists pool settings without changing creative inputs',async()=>{
+ const h=await harness({capabilities:async()=>({...capabilities,execution_enabled:false,recipes:[automaticRecipe]})}).start();
+ h.store.updateEntity(h.shot,{data:{h3:{controls:{encoder_device:'default',video_decode:'normal',duration:4,resolution:'512P',seed:'42'}}}});
+ h.api.capabilities=async()=>({...capabilities,recipes:[automaticRecipe]});
+ await h.controller.prepare(h.shot);
+ assert.equal(h.controller.getState().capabilities.execution_enabled,true);
+ const saved=h.remote.get(h.store.getState().project.id).project.entities.find(e=>e.id===h.shot).data.h3.controls;
+ assert.deepEqual(saved,{encoder_device:'cpu',video_decode:'tiled',duration:4,resolution:'512P',seed:'42'});
+ assert.equal(h.calls.find(c=>c[0]==='plan')[1].controls.video_decode,'tiled');
+ assert.equal(h.calls.some(c=>c[0]==='submit'),false);
+ await h.controller.submit(h.shot);assert.equal(h.jobs.length,1);h.controller.destroy();
+});
+test('failed capability refresh preserves draft and makes no plan or paid submission',async()=>{
+ const h=await harness().start(),before=h.store.exportProject();h.api.capabilities=async()=>{throw Error('offline');};
+ await assert.rejects(h.controller.prepare(h.shot),/offline/);
+ assert.equal(h.controller.getState().capabilities,null);assert.match(h.controller.getState().capabilityError,/暂未核对/);
+ assert.deepEqual(h.store.exportProject(),before);assert.equal(h.calls.length,0);h.controller.destroy();
+});
+test('submit rechecks service disabled after successful preflight without making a job',async()=>{
+ const h=await harness().start();await h.controller.prepare(h.shot);
+ h.api.capabilities=async()=>({...capabilities,execution_enabled:false});
+ await assert.rejects(h.controller.submit(h.shot),/未启用/);assert.equal(h.jobs.length,0);h.controller.destroy();
+});
+test('automatic operational settings require matching single-choice execution evidence',()=>{
+ const saved={encoder_device:'default',video_decode:'normal',duration:9};
+ const multiple={...automaticRecipe,execution_support:{constraints:{controls:{encoder_device:['cpu','default'],video_decode:['normal','tiled']}}}};
+ assert.equal(controlsForRecipe(multiple,saved).video_decode,'normal');
+ assert.equal(controlsForRecipe(automaticRecipe,saved).duration,9);
+ assert.equal(controlsForRecipe({...automaticRecipe,deployment_preset:{...automaticRecipe.deployment_preset,controls:{encoder_device:'other',video_decode:'other'}}},saved).video_decode,'normal');
+});

@@ -44,6 +44,16 @@ export function shotSnapshot(project,shotId){
   const scene=project.entities.find(e=>e.id===shot.parentId),{references}=referenceSpecs(project,shotId);
   return {id:shot.id,version:shot.version,description:shot.description,prompt:shot.data.prompt||'',seconds:shot.data.seconds??5,h3:shot.data.h3||{},cast:shot.data.cast||[],scene:{id:scene?.id||null,script:scene?.data.script||'',cast:scene?.data.cast||[]},references:references.map(r=>({key:r.key,assetId:r.entity.id,fileId:r.entity.data.fileId,cloudAssetId:r.entity.data.cloudAssetId||null,version:r.entity.version})),guides:(shot.data.h3?.guides||[]).map(g=>{const e=project.entities.find(e=>e.id===g.media_id);return {id:g.media_id,fileId:e?.data.fileId||null,cloudAssetId:e?.data.cloudAssetId||null,version:e?.version||null};}),links:project.links.filter(l=>l.target===shot.id)};
 }
+// Only operational settings with one advertised executable choice are automatic.
+// Never change creative controls or infer a pool requirement from model defaults.
+export function executionPresetControls(recipe){
+  const preset=recipe?.deployment_preset,required=recipe?.execution_support?.constraints?.controls||{};
+  if(preset?.applies_to!=='unset_controls_only')return {};
+  return Object.fromEntries(['encoder_device','video_decode'].filter(field=>{
+    const value=preset.controls?.[field],allowed=required[field],schema=recipe.controls?.[field];
+    return schema?.available!==false&&schema?.enum?.includes(value)&&Array.isArray(allowed)&&allowed.length===1&&allowed[0]===value;
+  }).map(field=>[field,preset.controls[field]]));
+}
 export function controlsForRecipe(recipe,saved={},seconds=5){
   const result={};for(const [field,schema]of Object.entries(recipe?.controls||{})){
     if(schema.available===false||['guides','video_audio'].includes(field))continue;
@@ -51,7 +61,7 @@ export function controlsForRecipe(recipe,saved={},seconds=5){
     else if(!Object.hasOwn(saved,field)&&recipe?.deployment_preset?.applies_to==='unset_controls_only'&&['encoder_device','video_decode'].includes(field)&&schema.enum?.includes(recipe.deployment_preset.controls?.[field]))result[field]=recipe.deployment_preset.controls[field];
     else if(field==='duration')result[field]=seconds;
     else if(Object.hasOwn(schema,'default'))result[field]=schema.default;
-  }return result;
+  }return {...result,...executionPresetControls(recipe)};
 }
 export function validateControlValues(recipe,controls){
   const issues=[];for(const [field,value]of Object.entries(controls)){

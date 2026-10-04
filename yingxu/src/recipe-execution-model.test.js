@@ -15,7 +15,7 @@ test('implemented model and enabled channel do not masquerade as qualified recip
 test('selected inputs and explicit controls get specific warnings without changing or deleting them',()=>{
   const selected={...shot,data:{seconds:12,h3:{controls:{encoder_device:'default',video_decode:'normal',steps:60},guides:[{media_id:'image',time_seconds:1}]}}},
     p={entities:[selected,{id:'image',type:'image',title:'首帧',data:{fileId:'asset'}}],links:[{id:'frame',source:'image',target:'shot',role:'firstFrame'}]},before=structuredClone(p),status=recipeExecutionStatus(recipe,{project:p,shot:selected});
-  assert.equal(status.kind,'outside');assert.match(status.issues.join(' '),/12 秒/);assert.match(status.issues.join(' '),/60 步/);assert.match(status.issues.join(' '),/首尾帧/);assert.match(status.issues.join(' '),/时间锚点/);assert.match(status.issues.join(' '),/编码器设备当前为 default/);assert.match(status.issues.join(' '),/视频 VAE 解码当前为 normal/);assert.deepEqual(p,before);
+  assert.equal(status.kind,'outside');assert.match(status.issues.join(' '),/12 秒/);assert.match(status.issues.join(' '),/60 步/);assert.match(status.issues.join(' '),/首尾帧/);assert.match(status.issues.join(' '),/时间锚点/);assert.doesNotMatch(status.issues.join(' '),/编码器设备当前为 default|视频 VAE 解码当前为 normal/);assert.deepEqual(p,before);
 });
 test('expired qualification is unavailable rather than a promise based on old capabilities',()=>{
   const result=recipeExecutionStatus({...recipe,execution_support:{...recipe.execution_support,expires_at:100}},{now:100000});assert.equal(result.kind,'unavailable');assert.match(result.title,/过期/);
