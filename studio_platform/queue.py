@@ -53,8 +53,10 @@ class TaskQueue:
         """Claim one task; returns Claim or None. Collection reuses its original attempt.
 
         Per-pool row locking serializes short scheduling transactions on PostgreSQL.
-        This favors an owner with no active generation, then rotates by estimated
-        cumulative work. Tasks already running are never preempted.
+        Eligible tasks waiting at least 15 minutes are FIFO before newer work.
+        Newer work favors less occupied owners, then estimated cumulative work.
+        Aging is a priority, not a start-time guarantee or permission to release
+        held attempts, budgets or physical slots. Running work is not preempted.
         """
         identifier(worker_id)
         identifier(pool)
@@ -92,11 +94,11 @@ class TaskQueue:
             def priority(job):
                 key = self._owner_key(job)
                 age = max(0, repo.clock() - job["created_at"])
-                # Under equally occupied owners, a task waiting >=15min outranks
-                # cumulative work so a stream of short/new tasks cannot starve it.
-                return (active.get(key, 0), 0 if age >= 900 else 1,
-                        job["created_at"] if age >= 900 else usage.get(key, 0),
-                        job["created_at"], job["id"])
+                # An unresolved held/running attempt must not make this owner's
+                # separate eligible work lose forever to a stream of fresh work.
+                if age >= 900:
+                    return (0, job["created_at"], job["id"])
+                return (1, active.get(key, 0), usage.get(key, 0), job["created_at"], job["id"])
             job = None
             for candidate in sorted(candidates, key=priority):
                 selected = repo._job(connection, candidate["id"], lock=True)

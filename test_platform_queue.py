@@ -96,6 +96,63 @@ class QueueTests(LedgerCase):
         self.assertNotEqual(self.queue._owner_key({"tenant_id": "a:b", "owner_id": "c"}),
                             self.queue._owner_key({"tenant_id": "a", "owner_id": "b:c"}))
 
+    def _assert_aged_owner_job_precedes_fresh_without_changing_existing_attempt(self, *, held):
+        from sqlalchemy import update
+        from studio_platform.repository import jobs
+        existing = self.running()
+        if held:
+            # A restored/administratively held attempt keeps its upstream and
+            # reservation evidence; it is never itself a generation candidate.
+            with self.repo.transaction() as connection:
+                connection.execute(update(jobs).where(jobs.c.id == existing.job["id"]).values(
+                    status="recovery_hold", lease_worker_id=None, lease_expires_at=None,
+                    fence=existing.lease.fence + 1))
+        waiting = self.job()
+        self.now += 900
+        self.job(scope=self.other, cost=0)
+        before_job = self.repo.get_job(self.scope, existing.job["id"])
+        before_attempt = self.queue.get_attempt(self.scope, existing.job["id"])
+        before_budget = self.repo.get_budget("owner-budget")
+        claimed = self.queue.claim("another-free-slot", "test-pool")
+        self.assertEqual(claimed.job["id"], waiting["id"])
+        self.assertEqual(self.repo.get_job(self.scope, existing.job["id"]), before_job)
+        self.assertEqual(self.queue.get_attempt(self.scope, existing.job["id"]), before_attempt)
+        self.assertEqual(self.repo.get_budget("owner-budget"), before_budget)
+        self.assertEqual(before_budget["reserved_microusd"], 200_000)
+
+    def test_aged_job_precedes_fresh_owner_despite_recovery_hold(self):
+        self._assert_aged_owner_job_precedes_fresh_without_changing_existing_attempt(held=True)
+
+    def test_aged_job_precedes_fresh_owner_despite_running_attempt(self):
+        self._assert_aged_owner_job_precedes_fresh_without_changing_existing_attempt(held=False)
+
+    def test_fresh_job_just_below_aging_threshold_keeps_owner_fairness(self):
+        self.running()
+        self.job()
+        self.now += 899.999
+        fresh = self.job(scope=self.other, cost=0)
+        claimed = self.queue.claim("another-free-slot", "test-pool")
+        self.assertEqual(claimed.job["id"], fresh["id"])
+
+    def test_fresh_jobs_with_equal_occupancy_prefer_less_historical_work(self):
+        previous = self.running()
+        self.queue.fail(previous.lease, "test-finished", actual_cost_microusd=0, upstream_stopped=True)
+        self.job()
+        self.now += 1
+        fresh = self.job(scope=self.other, cost=0)
+        claimed = self.queue.claim("free-slot", "test-pool")
+        self.assertEqual(claimed.job["id"], fresh["id"])
+
+    def test_aged_jobs_are_fifo_then_id_even_with_different_owner_occupancy(self):
+        self.running()
+        oldest = self.job()
+        self.now += 1
+        tied = [self.job(scope=self.other, cost=0), self.job()]
+        self.now += 900
+        expected = [oldest["id"], *sorted(job["id"] for job in tied)]
+        claimed = [self.queue.claim("free-slot-"+str(i), "test-pool").job["id"] for i in range(3)]
+        self.assertEqual(claimed, expected)
+
     def test_expired_pre_submit_can_requeue_old_worker_fenced(self):
         job = self.job()
         first = self.queue.claim("worker-a", "test-pool", lease_seconds=10)
