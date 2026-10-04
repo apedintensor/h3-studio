@@ -33,6 +33,8 @@ id deploy >/dev/null 2>&1 || useradd --system --gid deploy --no-create-home --sh
 install -d -o root -g root -m 0755 /srv/sixnine /srv/sixnine/releases /srv/sixnine/approved-releases /opt/sixnine-release
 install -d -o root -g deploy -m 2770 /srv/sixnine/incoming
 install -d -o 10001 -g 10001 -m 0700 /srv/sixnine/platform-data /srv/sixnine/upload-spool
+install -d -o root -g root -m 0755 /srv/sixnine/frontend /srv/sixnine/frontend/assets /srv/sixnine/frontend/releases
+install -d -o root -g root -m 0700 /srv/sixnine/approved-frontends
 install -d -o 70 -g 70 -m 0700 /srv/sixnine/postgres
 install -d -o root -g root -m 0700 /opt/sixnine-release/docker-config /run/sixnine-secrets
 cat > /etc/tmpfiles.d/sixnine.conf <<'EOF'

@@ -13,7 +13,7 @@ def require_no_gpu_acceptance(root):
         if marker.exists() or marker.is_symlink():
             release.regular(marker, root_owned=True, maximum=16384)
             value = json.loads(marker.read_text())
-            release.require(isinstance(value, dict) and value.get('version') == 1
+            release.require(isinstance(value, dict) and type(value.get('version')) is int and value['version'] in (1, 2)
                             and value.get('active') is False, 'gpu_acceptance_requires_explicit_safe_restore')
     # Also catch a service started before its marker was introduced. Never
     # interrupt an uncertain acceptance worker through a routine app release.
@@ -40,7 +40,9 @@ def deploy(commit, *, root=release.ROOT):
         release.require(isinstance(current, str) and bool(release.SHA.fullmatch(current)),
                         'first_release_requires_independent_operator_bootstrap')
         release.require(state.get('pending') in (None, commit), 'another_release_requires_reconciliation')
-        require_no_gpu_acceptance(root)
+        # Legacy/unknown lifecycles still block before downloading. A v2
+        # execution pin is rechecked against the approved target in apply_locked.
+        release.gpu_deployment_context(root)
         fetch_release_s3.fetch(commit, root=root)
         # Both download and apply stay under the same host lock. The root
         # approval file is checked again while copying the incoming bundle.

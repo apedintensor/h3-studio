@@ -7,24 +7,86 @@ on:
   workflow_dispatch:
     inputs:
       deploy:
-        description: Build and publish the tested main release bundle
+        description: Prepare and publish a tested artifact (does not deploy it)
         type: boolean
         default: false
+      release_kind:
+        description: Artifact to prepare; frontend does not rebuild the API or controller
+        type: choice
+        options: [platform, frontend]
+        default: platform
       approved_commit:
-        description: Deploy an exact commit whose manifest was independently approved on the host
+        description: Deploy an exact platform commit independently approved on the host
+        type: string
+        default: ''
+      approved_frontend_commit:
+        description: Deploy an exact frontend commit independently approved and API-compatible on the host
         type: string
         default: ''
       resume_command:
-        description: Optional existing SSM command ID to resume without resubmission
+        description: Resume an existing SSM command without resubmission (one approved deployment only)
         type: string
         default: ''
 
 permissions:
   contents: read
 
+# Never filter the workflow itself by changed paths: the stable `test` check
+# must report a result for every push/PR, including an explicitly allowed doc edit.
+# Publishing and deployment are manual and never share cancellation with checks.
 jobs:
-  test:
-    if: github.event_name != 'workflow_dispatch' || inputs.approved_commit == ''
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      python: ${{ steps.scope.outputs.python }}
+      postgres: ${{ steps.scope.outputs.postgres }}
+      frontend: ${{ steps.scope.outputs.frontend }}
+      containers: ${{ steps.scope.outputs.containers }}
+      legacy: ${{ steps.scope.outputs.legacy }}
+      frontend_tools: ${{ steps.scope.outputs.frontend_tools }}
+      category: ${{ steps.scope.outputs.category }}
+      action: ${{ steps.scope.outputs.action }}
+      tested_sha: ${{ steps.scope.outputs.tested_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check classification safety without dependencies or network
+        run: python -m unittest test_ci_changes -v
+      - name: Select checks from the complete local diff and validate dispatch inputs
+        id: scope
+        run: python tools/ci_changes.py
+
+  python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fontconfig fonts-noto-cjk
+      - run: python -m pip install -r requirements.lock.txt
+      - name: Complete offline suite (temporary data, no model inference)
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+
+  postgres:
+    needs: changes
+    if: needs.changes.outputs.postgres == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
@@ -54,41 +116,144 @@ jobs:
           node-version: '22'
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg fontconfig fonts-noto-cjk
       - run: python -m pip install -r requirements.lock.txt
-      - name: Offline tests (temporary data, no model inference)
-        run: python -m unittest discover -s . -p 'test_*.py' -v
-      - name: PostgreSQL concurrency and complete API contract (local CI service)
+      - name: PostgreSQL concurrency and API contracts (isolated CI service)
         env:
           PLATFORM_TEST_DATABASE_URL: postgresql+psycopg://sixnine_test:sixnine-ci-test-only@127.0.0.1:5432/sixnine_test
         run: python -m unittest test_platform_repository test_platform_queue test_platform_autoscale test_platform_control test_platform_worker test_platform_drain_safe_runner test_platform_production_scaler test_platform_on_demand_scaler test_platform_fleet test_platform_scaler test_platform_api test_platform_execution_policy test_platform_batches test_platform_storage_multipart test_platform_artifact_writer test_platform_diagnostics test_platform_capacity test_platform_capacity_api test_platform_guided test_platform_generation_draft test_platform_project_activity test_platform_capacity_cli test_platform_reliability test_platform_request_admission test_platform_admission_review test_platform_generated_audio test_platform_caption_plans test_platform_render_plans test_platform_render_backend test_platform_lium_provider test_platform_boyesir_backend test_platform_backup_postgres test_platform_upload_route test_platform_asset_recovery -v
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: yingxu/package-lock.json
       - name: Verify source-only Yingxu release snapshot
         run: python tools/sync_yingxu_source.py --verify-snapshot
-      - run: node --check web/app.js
-      - run: bash -n deploy/release.sh
-      - name: Check deployment config without secrets
+      - run: npm ci --ignore-scripts
+        working-directory: yingxu
+      - name: Frontend behavior tests
+        run: npm test
+        working-directory: yingxu
+      - name: Compile exact tested frontend at the site root
+        run: npm run build -- --base / --outDir ../yingxu-dist
+        working-directory: yingxu
+      - name: Package frontend candidate (publication waits for every required gate)
+        if: needs.changes.outputs.action == 'prepare-frontend'
+        run: |
+          python tools/build_frontend_release.py "$GITHUB_SHA" yingxu-dist frontend-release
+          python tools/check_frontend_bundle.py "$GITHUB_SHA" frontend-release
+      - uses: actions/upload-artifact@v4
+        if: needs.changes.outputs.action == 'prepare-frontend'
+        with:
+          name: sixnine-frontend-${{ github.sha }}
+          path: frontend-release/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  frontend-tools:
+    needs: changes
+    if: needs.changes.outputs.frontend_tools == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - run: python -m pip install -r requirements.lock.txt
+      - name: Frontend packaging, compatibility and host boundary tests only
+        run: python -m unittest test_yingxu_snapshot test_frontend_release test_frontend_deploy test_release_contract test_platform_frontend -v
+
+  containers:
+    needs: changes
+    if: needs.changes.outputs.containers == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - uses: actions/setup-node@v4
+        if: needs.changes.outputs.legacy == 'true'
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements.lock.txt
+      - name: Verify source-only Yingxu release snapshot
+        run: python tools/sync_yingxu_source.py --verify-snapshot
+      - name: Check legacy browser and deployment config without secrets
+        if: needs.changes.outputs.legacy == 'true'
         env:
           H3_IMAGE: h3-studio:test
           H3_RELEASE: test
           H3_DOMAIN: studio.example.test
-        run: docker compose -f deploy/compose.yaml config --quiet
-      - name: Build CPU runtime and test it with synthetic accounts
         run: |
-          docker build --label org.opencontainers.image.revision="$GITHUB_SHA" -t "h3-studio:$GITHUB_SHA" .
-          python tools/check_container.py "h3-studio:$GITHUB_SHA"
-      - name: Build unified platform and test unprivileged Linux runtime without network
+          node --check web/app.js
+          bash -n deploy/release.sh
+          docker compose -f deploy/compose.yaml config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - name: Build cached legacy CPU runtime
+        if: needs.changes.outputs.legacy == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: linux/amd64
+          provenance: false
+          tags: h3-studio:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=sixnine-legacy-linux-amd64
+          cache-to: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'type=gha,mode=max,scope=sixnine-legacy-linux-amd64' || '' }}
+      - name: Test the exact legacy image with synthetic accounts
+        if: needs.changes.outputs.legacy == 'true'
+        run: python tools/check_container.py "h3-studio:$GITHUB_SHA"
+      - name: Build cached unified platform runtime
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.platform
+          load: true
+          platforms: linux/amd64
+          provenance: false
+          tags: sixnine-platform:${{ github.sha }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=sixnine-platform-linux-amd64
+          cache-to: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && 'type=gha,mode=max,scope=sixnine-platform-linux-amd64' || '' }}
+      - name: Test exact unprivileged Linux image without network
         run: |
-          docker build -f Dockerfile.platform --label org.opencontainers.image.revision="$GITHUB_SHA" -t "sixnine-platform:$GITHUB_SHA" .
           docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
             --memory 1g --cpus 2 --tmpfs /data:size=268435456,uid=10001,gid=10001,mode=0700 \
             --tmpfs /tmp:size=134217728,mode=1777 \
             --mount "type=bind,source=$PWD/tools/check_platform_container.py,target=/check_platform_container.py,readonly" \
             "sixnine-platform:$GITHUB_SHA" python /check_platform_container.py
-      - name: Package the tested platform image and exact deployment manifest
-        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
+      - name: Package platform candidate (publication waits for every required gate)
+        if: needs.changes.outputs.action == 'prepare-platform'
         run: |
           python tools/build_platform_release.py "$GITHUB_SHA" platform-release
           python tools/check_platform_bundle.py "$GITHUB_SHA" platform-release
       - uses: actions/upload-artifact@v4
-        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
+        if: needs.changes.outputs.action == 'prepare-platform'
         with:
           name: sixnine-platform-${{ github.sha }}
           path: platform-release/
@@ -96,68 +261,40 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  deploy:
-    # A fixed egress runner/private route must be provisioned separately. The
-    # default hosted runner's changing IP cannot reach the host's admin /32.
-    if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/main' && vars.SIXNINE_DEPLOY_RUNNER != ''
-    needs: test
-    runs-on: ${{ vars.SIXNINE_DEPLOY_RUNNER }}
-    timeout-minutes: 30
-    environment: production
-    concurrency:
-      group: sixnine-platform-production
-      cancel-in-progress: false
+  test:
+    # Preserve the existing required-check identity. Only explicitly unselected
+    # gates may be skipped; failures, cancellations and accidental skips fail it.
+    if: always()
+    needs: [changes, python, postgres, frontend, frontend-tools, containers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: sixnine-platform-${{ github.sha }}
-          path: platform-release
-      - name: Send tested CPU bundle to the installed host controller
+      - name: Require every selected gate to succeed
         env:
-          DEPLOY_HOST: ${{ vars.LIGHTSAIL_HOST }}
-          DEPLOY_USER: ${{ vars.LIGHTSAIL_SSH_USER }}
-          SSH_PRIVATE_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.LIGHTSAIL_KNOWN_HOSTS }}
-          RELEASE_COMMIT: ${{ github.sha }}
-        shell: bash
+          RESULTS: ${{ toJSON(needs) }}
         run: |
-          set -euo pipefail
-          [[ "$DEPLOY_HOST" =~ ^[a-zA-Z0-9.-]+$ ]] && [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
-          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
-          test -n "$SSH_PRIVATE_KEY" && test -n "$SSH_KNOWN_HOSTS"
-          umask 077
-          identity_dir="$(mktemp -d "$RUNNER_TEMP/sixnine-deploy.XXXXXXXX")"
-          printf 'DEPLOY_IDENTITY_DIR=%s\n' "$identity_dir" >> "$GITHUB_ENV"
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$identity_dir/key"
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$identity_dir/known_hosts"
-          unset SSH_PRIVATE_KEY SSH_KNOWN_HOSTS
-          remote="$DEPLOY_USER@$DEPLOY_HOST"
-          target="/srv/sixnine/incoming/$RELEASE_COMMIT"
-          opts=(-i "$identity_dir/key" -o "UserKnownHostsFile=$identity_dir/known_hosts" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes)
-          ssh "${opts[@]}" "$remote" "mkdir -p '$target'"
-          scp "${opts[@]}" platform-release/image.tar.gz platform-release/release-manifest.json \
-            platform-release/compose.yaml platform-release/Caddyfile platform-release/init_database.py \
-            platform-release/check_config.py "$remote:$target/"
-          # Controller and its validator are installed separately as root-owned
-          # code. Never sudo a script from the deploy user's incoming directory.
-          ssh "${opts[@]}" "$remote" "sudo -n /opt/sixnine-release/release.py '$RELEASE_COMMIT'"
-      - name: Remove temporary deployment identity from the runner
-        if: always()
-        shell: bash
-        run: |
-          if [[ -n "${DEPLOY_IDENTITY_DIR:-}" && "$DEPLOY_IDENTITY_DIR" == "$RUNNER_TEMP"/sixnine-deploy.* ]]; then
-            rm -f -- "$DEPLOY_IDENTITY_DIR/key" "$DEPLOY_IDENTITY_DIR/known_hosts"
-            rmdir -- "$DEPLOY_IDENTITY_DIR"
-          fi
+          python - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          if results['changes']['result'] != 'success':
+              raise SystemExit('CI classification or dispatch validation failed')
+          flags = results['changes']['outputs']
+          for job, flag in [('python', 'python'), ('postgres', 'postgres'), ('frontend', 'frontend'),
+                            ('frontend-tools', 'frontend_tools'), ('containers', 'containers')]:
+              selected = flags.get(flag)
+              if selected not in ('true', 'false'):
+                  raise SystemExit('CI selection output missing: ' + flag)
+              expected = 'success' if selected == 'true' else 'skipped'
+              if results[job]['result'] != expected:
+                  raise SystemExit('Required CI result mismatch: ' + job)
+          print('Every selected check passed; no publication or deployment authorized by this check')
+          PY
 
   publish-aws:
-    # Main can publish tested immutable objects. This role cannot approve or
-    # execute a host release, access passwords, change IAM or rent compute.
-    if: github.ref == 'refs/heads/main' && vars.SIXNINE_AWS_PUBLISH_ROLE != '' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
-    needs: test
+    # Publication cannot approve/execute a host release, read passwords or rent
+    # compute. Push/PR events never assume a publication identity.
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.changes.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.changes.outputs.action == 'prepare-platform' && vars.SIXNINE_AWS_PUBLISH_ROLE != '' }}
+    needs: [changes, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -173,6 +310,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
       - uses: actions/download-artifact@v4
         with:
           name: sixnine-platform-${{ github.sha }}
@@ -184,13 +323,50 @@ jobs:
           aws-region: ap-southeast-1
           allowed-account-ids: '829135631045'
       - run: python -m pip install -r requirements.lock.txt
-      - name: Publish validated bundle (host approval remains independent)
+      - name: Publish validated platform bundle (host approval remains independent)
         env:
           RELEASE_COMMIT: ${{ github.sha }}
         run: python tools/publish_aws_release.py "$RELEASE_COMMIT" platform-release
 
+  publish-frontend-aws:
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.changes.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.changes.outputs.action == 'prepare-frontend' && vars.SIXNINE_AWS_PUBLISH_ROLE != '' }}
+    needs: [changes, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: sixnine-release-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - uses: actions/download-artifact@v4
+        with:
+          name: sixnine-frontend-${{ github.sha }}
+          path: frontend-release
+      - name: Assume release-only identity with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
+        with:
+          role-to-assume: ${{ vars.SIXNINE_AWS_PUBLISH_ROLE }}
+          aws-region: ap-southeast-1
+          allowed-account-ids: '829135631045'
+      - run: python -m pip install -r requirements.lock.txt
+      - name: Publish validated frontend bundle (host approval and API match still required)
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python tools/publish_frontend_release.py "$RELEASE_COMMIT" frontend-release
+
   deploy-approved-aws:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.approved_commit != '' && vars.SIXNINE_AWS_DEPLOY_ROLE != ''
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.changes.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.changes.outputs.action == 'deploy-platform' && vars.SIXNINE_AWS_DEPLOY_ROLE != '' }}
+    needs: [changes, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     permissions:
@@ -206,6 +382,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
       - name: Assume fixed-document deployment identity
         uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
         with:
@@ -213,13 +391,53 @@ jobs:
           aws-region: ap-southeast-1
           allowed-account-ids: '829135631045'
       - run: python -m pip install -r requirements.lock.txt
-      - name: Deploy previously tested and independently approved release
+      - name: Deploy previously tested and independently approved platform release
         env:
           APPROVED_COMMIT: ${{ inputs.approved_commit }}
           RESUME_COMMAND: ${{ inputs.resume_command }}
         shell: bash
         run: |
           args=("$APPROVED_COMMIT")
+          if [[ -n "$RESUME_COMMAND" ]]; then
+            args+=(--resume-command "$RESUME_COMMAND")
+          fi
+          python tools/deploy_aws_release.py "${args[@]}"
+
+  deploy-approved-frontend-aws:
+    if: ${{ !cancelled() && needs.test.result == 'success' && needs.changes.result == 'success' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.changes.outputs.action == 'deploy-frontend' && vars.SIXNINE_AWS_DEPLOY_ROLE != '' }}
+    needs: [changes, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      # Same host lock as complete platform deployment; never race the two.
+      group: sixnine-production-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.lock.txt
+      - name: Assume fixed-document deployment identity
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
+        with:
+          role-to-assume: ${{ vars.SIXNINE_AWS_DEPLOY_ROLE }}
+          aws-region: ap-southeast-1
+          allowed-account-ids: '829135631045'
+      - run: python -m pip install -r requirements.lock.txt
+      - name: Deploy approved frontend with matching deployed API compatibility
+        env:
+          APPROVED_COMMIT: ${{ inputs.approved_frontend_commit }}
+          RESUME_COMMAND: ${{ inputs.resume_command }}
+        shell: bash
+        run: |
+          args=("$APPROVED_COMMIT" --frontend)
           if [[ -n "$RESUME_COMMAND" ]]; then
             args+=(--resume-command "$RESUME_COMMAND")
           fi

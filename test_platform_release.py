@@ -76,6 +76,20 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(release.ReleaseError):
             release.manifest(self.incoming, COMMIT)
 
+    def test_optional_contracts_are_strict_and_legacy_manifest_remains_readable(self):
+        self.value['contracts'] = {'version': 1, 'api_compatibility': 'c'*64,
+            'worker_compatibility': 'd'*64, 'frontend_contract': 'sixnine-web-v1'}
+        self.manifest()
+        self.assertEqual(release.manifest(self.incoming, COMMIT)['contracts'], self.value['contracts'])
+        for key, bad in [('version', True), ('api_compatibility', 'short'),
+                         ('worker_compatibility', '0'*63), ('frontend_contract', 'unknown')]:
+            old = self.value['contracts'][key]
+            self.value['contracts'][key] = bad
+            self.manifest()
+            with self.assertRaises(release.ReleaseError):
+                release.manifest(self.incoming, COMMIT)
+            self.value['contracts'][key] = old
+
     def test_tamper_rejected_before_publishing_release(self):
         (self.incoming / "compose.yaml").write_text("TAMPERED", encoding="utf-8")
         with self.assertRaises(release.ReleaseError):
@@ -168,7 +182,9 @@ class ReleaseTests(unittest.TestCase):
     def test_ci_uses_platform_and_installed_controller(self):
         text = (DIRECTORY.parents[1] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         self.assertIn('build_platform_release.py "$GITHUB_SHA"', text)
-        self.assertIn("sudo -n /opt/sixnine-release/release.py", text)
+        self.assertIn('tools/deploy_aws_release.py', text)
+        self.assertIn('approved_commit', text)
+        self.assertNotIn('sudo -n /opt/sixnine-release/release.py', text)
         self.assertNotIn("sudo -n bash '$target/", text)
 
     def test_compose_serialization_version_comes_only_from_trusted_docker(self):
@@ -345,6 +361,7 @@ class ApplyReleaseTests(unittest.TestCase):
             "wait_ready": lambda *args, **kwargs: None,
             "verify_running_app": lambda *args: None,
             "wait_proxy_stable": lambda *args: None,
+            "gpu_deployment_context": lambda *args: None,
         }
         for name, replacement in changes.items():
             patched = patch.object(release, name, replacement)
@@ -413,6 +430,37 @@ class ApplyReleaseTests(unittest.TestCase):
                 release.apply_locked(self.root, COMMIT)
         self.assertEqual(self.state(), before)
         self.assertFalse(any(call[0] == "load" or "up" in call[1] for call in self.calls))
+
+    def test_compatible_app_release_and_rollback_do_not_restart_database_or_controller(self):
+        contracts = {'version': 1, 'api_compatibility': '1'*64,
+            'worker_compatibility': '2'*64, 'frontend_contract': 'sixnine-web-v1'}
+        self.expected['contracts'] = contracts
+        context = {'admission': 'open', 'contracts': contracts}
+        for fail in (False, True):
+            self.calls.clear()
+            self.state({'current': self.old, 'previous': self.older, 'status': 'app_ready'})
+            with patch.object(release, 'gpu_deployment_context', return_value=context), \
+                    patch.object(release, 'approved_application_configuration'), \
+                    patch.object(release, 'application_compose', side_effect=lambda d, e, *a, **kw:
+                        self.calls.append(('application', a, kw['gpu_context']))), \
+                    patch.object(release, 'wait_proxy_stable', side_effect=[release.ReleaseError('synthetic'), None] if fail else None):
+                if fail:
+                    with self.assertRaises(release.ReleaseError):
+                        release.apply_locked(self.root, COMMIT)
+                else:
+                    release.apply_locked(self.root, COMMIT)
+            operations = [call for call in self.calls if call[0] != 'load']
+            self.assertTrue(all('db' not in call[1] and 'db-init' not in call[1]
+                and 'gpu-controller' not in call[1] for call in operations))
+            applications = [call for call in self.calls if call[0] == 'application']
+            self.assertEqual(len(applications), 2 if fail else 1)
+            self.assertTrue(all(call[2] is context for call in applications))
+
+    def test_same_release_retry_does_not_retire_external_frontend(self):
+        self.state({'current': COMMIT, 'previous': self.old, 'status': 'app_ready'})
+        with patch.object(release, 'retire_frontend_pointer') as retire:
+            release.apply_locked(self.root, COMMIT)
+        retire.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 # H3 Studio
 
+## 初期迭代节奏（用户确认，2026-10-04）
+
+先完成一批相关修改，再统一测试、验收、发布；不为每个小改动或中间版本单独推 main 跑完整 CI/CD。开发中仅做必要的语法/构建、受影响关键路径检查和本地页面预览；已通过且未受新改动影响的检查不重复。批次完成后按最终范围回归，权限、数据、调度及计费改动须通过关键检查后才能上线。完整规则见父目录 AGENTS.md。该工作约定不代表 CI/发布架构已解耦，不绕过现有生产任务、预算与部署保护。
+
 ## 当前授权与部署进展（2026-10-04，本段优先于下方历史状态）
 
 快速创作 Agent 接入：`POST /v1/projects` 的 `workspace:freestyle` 创建单镜草稿，`shot.configure_generation` 维护网页同一份分区输入与控制；优先使用镜头 `generation-draft` 和保存草稿的 `generation-plans`，原始 H3 plan 入口不会保存网页配置。快速页具备连接 AI、深链接和创作动态，保留远端修改/本地草稿冲突保护。接口契约与验收见 `FREESTYLE-AGENT.zh-CN.md`；实际生产回执见 `.platform-demand-live/QUICK-AGENT-RESULT.zh-CN.md`。不得用 API/模拟测试代替真实推理证据，不因版本升级重置预算或按需服务原窗口。中央 `sixnine` profile 尚未登记；用户网站 Key 仅在运行进程使用，不创建项目凭据副本。

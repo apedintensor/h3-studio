@@ -218,3 +218,17 @@ inventory.json
 !studio_platform/qualification_profiles.py
 !studio_platform/lium_multimodal_smoke.py
 !FREESTYLE-ADMISSION.zh-CN.md
+
+# Independently released UI, API and pinned GPU lifecycle.
+!studio_platform/frontend.py
+!tools/release_contract.py
+!tools/ci_changes.py
+!tools/ci_change_scope.py
+!tools/build_frontend_release.py
+!tools/check_frontend_bundle.py
+!tools/publish_frontend_release.py
+!deploy/platform/frontend_bundle.py
+!deploy/platform/frontend_release.py
+!deploy/platform/deploy_frontend.py
+!deploy/platform/ec2/ssm-frontend-document.json
+!DEVELOPMENT-RELEASE.zh-CN.md

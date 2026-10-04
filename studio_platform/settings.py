@@ -58,6 +58,7 @@ class Settings:
     storage_endpoint: str = ""
     storage_region: str = ""
     frontend_dir: Path | None = None
+    frontend_release_dir: Path | None = None
     execution_policy_file: Path | None = None
     render_enabled: bool = False
 
@@ -65,6 +66,9 @@ class Settings:
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
         if self.frontend_dir is not None:
             object.__setattr__(self, "frontend_dir", Path(self.frontend_dir).resolve())
+        if self.frontend_release_dir is not None:
+            from .frontend import validate_release_directory
+            object.__setattr__(self, "frontend_release_dir", validate_release_directory(self.frontend_release_dir))
         if self.execution_policy_file is not None and not Path(self.execution_policy_file).is_absolute():
             raise ValueError("Execution policy path must be absolute")
         if not self.database_url:
@@ -115,6 +119,7 @@ class Settings:
             storage_endpoint=os.environ.get("SIXNINE_STORAGE_ENDPOINT", ""),
             storage_region=os.environ.get("SIXNINE_STORAGE_REGION", ""),
             frontend_dir=Path(os.environ["SIXNINE_FRONTEND_DIR"]) if os.environ.get("SIXNINE_FRONTEND_DIR") else None,
+            frontend_release_dir=Path(os.environ["SIXNINE_FRONTEND_RELEASE_DIR"]) if os.environ.get("SIXNINE_FRONTEND_RELEASE_DIR") else None,
             execution_policy_file=Path(os.environ["SIXNINE_EXECUTION_POLICY_FILE"]) if os.environ.get("SIXNINE_EXECUTION_POLICY_FILE") else None,
             render_enabled=os.environ.get("SIXNINE_RENDER_ENABLED", "0") == "1",
         )

@@ -16,9 +16,12 @@ COMMIT = re.compile(r'[0-9a-f]{40}\Z')
 COMMAND_ID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\Z')
 
 
-def deploy(commit, *, resume_command=None, timeout=1900, api=None, clock=time.monotonic, sleep=time.sleep):
+def deploy(commit, *, resume_command=None, frontend=False, timeout=1900, api=None, clock=time.monotonic, sleep=time.sleep):
     if not COMMIT.fullmatch(commit) or resume_command is not None and not COMMAND_ID.fullmatch(resume_command):
         raise ValueError('Exact commit and valid optional command ID required')
+    document = 'Sixnine-DeployApprovedFrontend' if frontend else DOCUMENT
+    plugin = 'deployApprovedFrontend' if frontend else 'deployApprovedCommit'
+    receipt_state = 'approved_frontend_release_healthy' if frontend else 'approved_application_release_healthy'
     api = api or boto3.client('ssm', region_name=REGION, endpoint_url='https://ssm.ap-southeast-1.amazonaws.com',
         config=Config(connect_timeout=10, read_timeout=30, retries={'mode': 'standard', 'total_max_attempts': 1}))
     command_id = resume_command
@@ -26,7 +29,7 @@ def deploy(commit, *, resume_command=None, timeout=1900, api=None, clock=time.mo
         # SendCommand has no idempotency token. Do not retry a lost response
         # automatically: the same approved commit is idempotent at the host.
         try:
-            response = api.send_command(InstanceIds=[INSTANCE], DocumentName=DOCUMENT, DocumentVersion='1',
+            response = api.send_command(InstanceIds=[INSTANCE], DocumentName=document, DocumentVersion='1',
                 Parameters={'Commit': [commit]}, TimeoutSeconds=120, MaxConcurrency='1', MaxErrors='0',
                 Comment='Deploy independently approved Sixnine commit '+commit)
             command_id = response['Command']['CommandId']
@@ -39,7 +42,7 @@ def deploy(commit, *, resume_command=None, timeout=1900, api=None, clock=time.mo
     while clock() < deadline:
         try:
             invocation = api.get_command_invocation(CommandId=command_id, InstanceId=INSTANCE,
-                                                    PluginName='deployApprovedCommit')
+                                                    PluginName=plugin)
         except ClientError as error:
             if error.response.get('Error', {}).get('Code') != 'InvocationDoesNotExist':
                 raise RuntimeError('Command status unavailable; resume the same command ID') from None
@@ -49,13 +52,13 @@ def deploy(commit, *, resume_command=None, timeout=1900, api=None, clock=time.mo
         if status == 'Success':
             # Never print arbitrary SSM stdout/stderr. Validate the fixed receipt
             # so --resume-command cannot claim success for another commit/task.
-            if invocation.get('DocumentName') != DOCUMENT or invocation.get('DocumentVersion') != '1':
+            if invocation.get('DocumentName') != document or invocation.get('DocumentVersion') != '1':
                 raise RuntimeError('Command is not the reviewed deployment document version')
             try:
                 receipt = json.loads(invocation.get('StandardOutputContent', ''))
             except ValueError:
                 raise RuntimeError('Deployment success receipt invalid') from None
-            if receipt != {'state': 'approved_application_release_healthy', 'commit': commit}:
+            if receipt != {'state': receipt_state, 'commit': commit}:
                 raise RuntimeError('Deployment success receipt does not match this commit')
             result = {'state': 'deployment_completed', 'commit': commit, 'command_id': command_id}
             print(json.dumps(result))
@@ -72,9 +75,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('commit')
     parser.add_argument('--resume-command')
+    parser.add_argument('--frontend', action='store_true', help='Deploy approved static frontend without restarting services')
     args = parser.parse_args(argv)
     try:
-        deploy(args.commit, resume_command=args.resume_command)
+        deploy(args.commit, resume_command=args.resume_command, frontend=args.frontend)
         return 0
     except (ValueError, RuntimeError) as error:
         print(str(error), file=sys.stderr)

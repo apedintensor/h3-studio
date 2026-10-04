@@ -64,14 +64,27 @@ def manifest(directory, commit):
         value = json.loads((directory / "release-manifest.json").read_text(encoding="utf-8"))
     except (ValueError, UnicodeError):
         raise ReleaseError("invalid_release_manifest") from None
-    require(isinstance(value, dict) and set(value) == {"commit", "image", "image_id", "files"}
+    require(isinstance(value, dict) and set(value) in ({"commit", "image", "image_id", "files"},
+            {"commit", "image", "image_id", "files", "contracts"})
             and value["commit"] == commit and value["image"] == "sixnine-platform:"+commit
             and isinstance(value["image_id"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value["image_id"])
             and isinstance(value["files"], dict) and set(value["files"]) == FILES, "invalid_release_manifest")
+    if "contracts" in value:
+        validate_contracts(value["contracts"])
     for name, expected in value["files"].items():
         require(isinstance(expected, str) and bool(DIGEST.fullmatch(expected)), "invalid_release_checksum")
         regular(directory / name, maximum=2*1024**3 if name == "image.tar.gz" else 1024**2)
         require(checksum(directory / name) == expected, "release_checksum_mismatch")
+    return value
+
+
+def validate_contracts(value):
+    require(isinstance(value, dict) and set(value) == {
+        "version", "api_compatibility", "worker_compatibility", "frontend_contract"}
+        and type(value["version"]) is int and value["version"] == 1
+        and all(isinstance(value[key], str) and DIGEST.fullmatch(value[key])
+                for key in ("api_compatibility", "worker_compatibility"))
+        and value["frontend_contract"] == "sixnine-web-v1", "invalid_release_contracts")
     return value
 
 
@@ -277,6 +290,212 @@ def approved_configuration(directory, environment):
     return config
 
 
+def _protected_json(path, *, maximum=65536):
+    regular(path, root_owned=True, maximum=maximum)
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, "duplicate_host_record_field")
+            value[key] = item
+        return value
+    value = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique)
+    require(isinstance(value, dict), "invalid_host_record")
+    return value
+
+
+def canonical_hash(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+def protected_directory(path):
+    info = path.lstat()
+    require(stat.S_ISDIR(info.st_mode) and not path.is_symlink()
+        and (os.name == "nt" or info.st_uid == 0 and not info.st_mode & 0o022), "host_directory_not_protected")
+
+
+def app_admission_overlay(root):
+    policy = (root / "gpu-scaler" / "operator" / "execution-policy.json").as_posix()
+    target = "/control-config/execution-policy.json"
+    health = "import json,urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8845/healthz',timeout=5)); assert h['auth_ready'] and h['generation_enabled'] and not h['render_enabled'] and not h['cloud_creation_enabled'] and h['execution_backend']=='comfy-worker'"
+    return {"services": {"app": {"environment": {"SIXNINE_GENERATION_ENABLED": "1",
+        "SIXNINE_EXECUTION_BACKEND": "comfy-worker", "SIXNINE_EXECUTION_POLICY_FILE": target},
+        "volumes": [{"type": "bind", "source": policy, "target": target,
+            "read_only": True, "bind": {"create_host_path": False}}],
+        "healthcheck": {"test": ["CMD", "python", "-c", health]}}}}
+
+
+def gpu_deployment_context(root, target_manifest=None):
+    """Validate a pinned v2 controller without changing its lifecycle or ledger.
+
+    Caller holds release.lock. Old/unknown barriers remain strict; compatibility
+    permits an app replacement, never a controller restart or policy change.
+    """
+    context = None
+    for folder in ("gpu-acceptance", "gpu-scaler"):
+        path = root / folder / "active.json"
+        if not path.exists() and not path.is_symlink():
+            continue
+        protected_directory(root / folder)
+        value = _protected_json(path, maximum=16384)
+        require(type(value.get("active")) is bool and type(value.get("version")) is int
+            and value["version"] in (1, 2), "gpu_acceptance_requires_explicit_safe_restore")
+        if not value["active"]:
+            continue
+        require(folder == "gpu-scaler" and value["version"] == 2,
+            "gpu_acceptance_requires_explicit_safe_restore")
+        required = {"version", "active", "commit", "image_id", "contracts", "cycle_id", "config_hash",
+                    "container_name", "admission", "updated_at"}
+        require(set(value) == required and isinstance(value["commit"], str) and SHA.fullmatch(value["commit"])
+            and isinstance(value["image_id"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value["image_id"])
+            and isinstance(value["config_hash"], str) and DIGEST.fullmatch(value["config_hash"])
+            and value["admission"] in ("open", "closed"), "gpu_execution_pin_invalid")
+        validate_contracts(value["contracts"])
+        for parent in (root / folder / "operator", root / folder / "public-source"):
+            protected_directory(parent)
+        config = _protected_json(root / folder / "operator" / "scaler.json")
+        policy = _protected_json(root / folder / "operator" / "execution-policy.json")
+        require(value["config_hash"] == canonical_hash(config)
+            and value["cycle_id"] == config.get("cycle_id")
+            and isinstance(value["cycle_id"], str)
+            and value["container_name"] == "sixnine-finite-"+hashlib.sha256(value["cycle_id"].encode()).hexdigest()[:20]
+            and config.get("execution_policy_sha256") == canonical_hash(policy), "gpu_execution_config_changed")
+        sources = config.get("source_sha256")
+        require(isinstance(sources, dict) and set(sources) == {"bootstrap_cloud.py", "model_manifest.json"},
+            "gpu_execution_sources_invalid")
+        for filename, digest in sources.items():
+            source = root / folder / "public-source" / filename
+            regular(source, root_owned=True, maximum=2*1024**2)
+            require(isinstance(digest, str) and DIGEST.fullmatch(digest) and checksum(source) == digest,
+                "gpu_execution_sources_changed")
+        directory = root / "releases" / value["commit"]
+        approved_manifest(root, directory, value["commit"])
+        expected = manifest(directory, value["commit"])
+        require(expected.get("contracts") == value["contracts"], "gpu_execution_contract_changed")
+        identities = validate_image_archive(directory / "image.tar.gz", expected)
+        require(value["image_id"] in identities, "gpu_execution_image_unapproved")
+        if target_manifest is not None:
+            contracts = validate_contracts(target_manifest.get("contracts"))
+            require(contracts["worker_compatibility"] == value["contracts"]["worker_compatibility"]
+                and contracts["frontend_contract"] == value["contracts"]["frontend_contract"],
+                "gpu_runtime_change_requires_drain")
+            require(all(target_manifest.get("files", {}).get(name) == expected.get("files", {}).get(name)
+                and isinstance(expected.get("files", {}).get(name), str)
+                for name in ("compose.yaml", "Caddyfile", "init_database.py", "check_config.py")),
+                "gpu_host_configuration_change_requires_drain")
+        overlay_path = root / folder / "app-admission.json"
+        require(_protected_json(overlay_path) == app_admission_overlay(root), "gpu_app_admission_overlay_changed")
+        context = {**value, "root": root, "overlay_path": overlay_path}
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
+                   "DOCKER_CONFIG": "/opt/sixnine-release/docker-config"}
+    for service in ("gpu-worker", "gpu-controller"):
+        raw = command(["ps", "--quiet", "--filter", "label=com.docker.compose.project=sixnine-platform",
+                       "--filter", "label=com.docker.compose.service="+service], environment=environment, timeout=20).decode().strip()
+        if context is None or service != "gpu-controller":
+            require(not raw, "gpu_acceptance_worker_still_running")
+            continue
+        # A lost/exited/unknown controller is not evidence that admission is safe.
+        require(bool(re.fullmatch(r"[0-9a-f]{12,64}", raw)), "gpu_controller_not_uniquely_running")
+        values = json.loads(command(["inspect", raw], environment=environment, timeout=20))
+        require(isinstance(values, list) and len(values) == 1, "gpu_controller_identity_unknown")
+        observed = values[0]
+        labels = observed.get("Config", {}).get("Labels", {})
+        state = observed.get("State", {})
+        require(observed.get("Name") == "/"+context["container_name"] and observed.get("Image") == context["image_id"]
+            and labels.get("com.docker.compose.project") == "sixnine-platform"
+            and labels.get("com.docker.compose.service") == "gpu-controller"
+            and labels.get("com.sixnine.finite.config-hash") == context["config_hash"]
+            and state.get("Running") is True and state.get("Restarting") is False and state.get("OOMKilled") is False,
+            "gpu_controller_identity_mismatch")
+    return context
+
+
+def application_compose(directory, environment, *arguments, gpu_context=None, timeout=180):
+    if gpu_context is None or gpu_context["admission"] == "closed":
+        return compose(directory, environment, *arguments, timeout=timeout)
+    return command(["compose", "--project-directory", str(directory), "-f", str(directory / "compose.yaml"),
+        "-f", str(gpu_context["overlay_path"]), *arguments], environment=environment, timeout=timeout)
+
+
+def approved_application_configuration(directory, environment, *, gpu_context=None):
+    if gpu_context is None or gpu_context["admission"] == "closed":
+        return approved_configuration(directory, environment)
+    import copy
+    version = command(["compose", "version", "--short"], environment=environment).decode("ascii").strip()
+    original = json.loads(application_compose(directory, environment, "config", "--format", "json", gpu_context=gpu_context))
+    config = copy.deepcopy(original)
+    app = config.get("services", {}).get("app", {})
+    expected = app_admission_overlay(gpu_context["root"])["services"]["app"]
+    env = app.get("environment", {})
+    require(all(env.get(k) == v for k, v in expected["environment"].items()), "gpu_app_admission_settings_invalid")
+    env.pop("SIXNINE_EXECUTION_POLICY_FILE")
+    env.update(SIXNINE_GENERATION_ENABLED="0", SIXNINE_EXECUTION_BACKEND="disabled")
+    mounts = app.get("volumes", [])
+    if version in ("2.38.2", "v2.38.2"):
+        for mount in mounts:
+            if mount.get("type") == "bind" and mount.get("bind") == {}:
+                mount["bind"] = {"create_host_path": False}
+    require(mounts.count(expected["volumes"][0]) == 1, "gpu_app_policy_mount_invalid")
+    mounts.remove(expected["volumes"][0])
+    require(app.get("healthcheck", {}).get("test") == expected["healthcheck"]["test"], "gpu_app_health_invalid")
+    app["healthcheck"]["test"][3] = "import json,urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8845/healthz',timeout=5)); assert h['auth_ready'] and not h['generation_enabled'] and not h['render_enabled'] and not h['cloud_creation_enabled'] and h['execution_backend']=='disabled'"
+    validate(config, deployment_directory=directory, compose_version=version)
+    require(app["image"] == environment["SIXNINE_IMAGE"]
+        and config["services"]["db"]["image"] == environment["SIXNINE_POSTGRES_IMAGE"]
+        and config["services"]["caddy"]["image"] == environment["SIXNINE_CADDY_IMAGE"], "release_images_differ_from_trusted_site_config")
+    return original
+
+
+def current_application(root=ROOT):
+    state = _protected_json(root / "release-state.json", maximum=16384)
+    commit = state.get("current")
+    require(isinstance(commit, str) and SHA.fullmatch(commit) and state.get("pending") is None
+        and state.get("status") in ("app_ready", "rolled_back_app_only"), "current_application_requires_reconciliation")
+    directory = root / "releases" / commit
+    approved_manifest(root, directory, commit)
+    expected = manifest(directory, commit)
+    environment = deployment_environment(root / "site.env", commit)
+    approved_configuration(directory, environment)
+    identities = validate_image_archive(directory / "image.tar.gz", expected)
+    images = json.loads(command(["image", "inspect", environment["SIXNINE_IMAGE"]], environment=environment))
+    require(isinstance(images, list) and len(images) == 1 and images[0].get("Id") in identities,
+        "current_application_image_unapproved")
+    return commit, directory, environment
+
+
+def restore_current_cpu_locked(root=ROOT):
+    """Caller holds release.lock; never reuse a controller's old app directory."""
+    commit, directory, environment = current_application(root)
+    application_compose(directory, environment, "up", "-d", "--no-deps", "app")
+    wait_ready(directory, environment)
+    expected = manifest(directory, commit)
+    expected = {**expected, "archive_image_ids": validate_image_archive(directory / "image.tar.gz", expected)}
+    verify_running_app(directory, environment, expected)
+    return commit
+
+
+def retire_frontend_pointer(root):
+    """A new API image starts with its own UI; keep external assets for rollback.
+
+    Only a root-owned pointer is renamed. No release directory or asset is
+    removed, and same-commit retries never enter this path.
+    """
+    directory = root / "frontend"
+    if not directory.exists() and not directory.is_symlink():
+        return
+    info = directory.lstat()
+    require(stat.S_ISDIR(info.st_mode) and not directory.is_symlink()
+        and (os.name == "nt" or info.st_uid == 0 and not info.st_mode & 0o022), "frontend_directory_not_protected")
+    source, previous = directory / "current.json", directory / "previous-platform-pointer.json"
+    if not source.exists() and not source.is_symlink():
+        return
+    regular(source, root_owned=True, maximum=16384)
+    if previous.exists() or previous.is_symlink():
+        regular(previous, root_owned=True, maximum=16384)
+    source.replace(previous)
+    sync_directory(directory)
+
+
 def sync_directory(path):
     if os.name == "posix":
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -412,7 +631,6 @@ def apply_locked(root, commit):
     directory = prepare_bundle(root, commit)
     approved_manifest(root, directory, commit)
     environment = deployment_environment(root / "site.env", commit)
-    approved_configuration(directory, environment)
     state, previous = {}, None
     state_file = root / "release-state.json"
     if state_file.exists():
@@ -427,6 +645,10 @@ def apply_locked(root, commit):
         require(state.get("dependencies") == dependencies, "dependency_change_requires_separate_maintenance")
     state = {**state, "dependencies": dependencies}
     expected = manifest(directory, commit)
+    # This guard belongs to the shared apply path, not just the CD wrapper:
+    # a direct root release must not bypass an active lifecycle's contract.
+    gpu_context = gpu_deployment_context(root, expected)
+    approved_application_configuration(directory, environment, gpu_context=gpu_context)
     if previous == commit and state.get("status") in {"app_ready", "rolled_back_app_only"}:
         # A lost SSH response must not turn previous into a self-reference.
         identities = validate_image_archive(directory / "image.tar.gz", expected)
@@ -441,12 +663,15 @@ def apply_locked(root, commit):
                       "status": "deploying", "updated_at": time.time()})
     try:
         expected = load_approved_image(root, directory, commit, environment)
-        compose(directory, environment, "up", "-d", "db")
-        compose(directory, environment, "run", "--rm", "db-init")
-        compose(directory, environment, "up", "-d", "--no-deps", "app")
+        if gpu_context is None:
+            compose(directory, environment, "up", "-d", "db")
+            compose(directory, environment, "run", "--rm", "db-init")
+        retire_frontend_pointer(root)
+        application_compose(directory, environment, "up", "-d", "--no-deps", "app", gpu_context=gpu_context)
         wait_ready(directory, environment)
         verify_running_app(directory, environment, expected)
-        compose(directory, environment, "up", "-d", "--no-deps", "caddy")
+        if gpu_context is None:
+            compose(directory, environment, "up", "-d", "--no-deps", "caddy")
         wait_proxy_stable(directory, environment)
         write_state(root, {"current": commit, "previous": fallback, "dependencies": dependencies,
                           "updated_at": time.time(), "status": "app_ready"})
@@ -456,11 +681,16 @@ def apply_locked(root, commit):
                 old_directory = root / "releases" / fallback
                 old_environment = deployment_environment(root / "site.env", fallback)
                 old_expected = load_approved_image(root, old_directory, fallback, old_environment)
-                approved_configuration(old_directory, old_environment)
-                compose(old_directory, old_environment, "up", "-d", "--no-deps", "app")
+                if gpu_context is not None:
+                    old_contracts = validate_contracts(old_expected.get("contracts"))
+                    require(old_contracts["worker_compatibility"] == gpu_context["contracts"]["worker_compatibility"],
+                        "gpu_rollback_contract_requires_reconciliation")
+                approved_application_configuration(old_directory, old_environment, gpu_context=gpu_context)
+                application_compose(old_directory, old_environment, "up", "-d", "--no-deps", "app", gpu_context=gpu_context)
                 wait_ready(old_directory, old_environment)
                 verify_running_app(old_directory, old_environment, old_expected)
-                compose(old_directory, old_environment, "up", "-d", "--no-deps", "caddy")
+                if gpu_context is None:
+                    compose(old_directory, old_environment, "up", "-d", "--no-deps", "caddy")
                 wait_proxy_stable(old_directory, old_environment)
                 write_state(root, {"current": fallback, "previous": state.get("previous"), "failed_release": commit, "dependencies": dependencies,
                                   "updated_at": time.time(), "status": "rolled_back_app_only"})

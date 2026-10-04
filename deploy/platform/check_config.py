@@ -31,7 +31,7 @@ def validate(config, *, deployment_directory=None, compose_version=None):
     allowed_env = {
         "app": {"SIXNINE_DATA", "SIXNINE_DATABASE_URL_FILE", "SIXNINE_PUBLIC_ORIGIN", "SIXNINE_AUTH_MODE",
                 "SIXNINE_GENERATION_ENABLED", "SIXNINE_RENDER_ENABLED", "SIXNINE_EXECUTION_BACKEND", "SIXNINE_CLOUD_CREATION_ENABLED",
-                "SIXNINE_STORAGE_PROVIDER", "SIXNINE_FRONTEND_DIR"},
+                "SIXNINE_STORAGE_PROVIDER", "SIXNINE_FRONTEND_DIR", "SIXNINE_FRONTEND_RELEASE_DIR"},
         "db": {"POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD_FILE", "POSTGRES_INITDB_ARGS",
                "POSTGRES_HOST_AUTH_METHOD", "PGDATA"}, "db-init": set(), "caddy": set()}
     allowed_caps = {"app": set(), "db-init": set(), "caddy": {"NET_BIND_SERVICE"},
@@ -81,6 +81,11 @@ def validate(config, *, deployment_directory=None, compose_version=None):
                 "SIXNINE_STORAGE_PROVIDER": "local", "SIXNINE_PUBLIC_ORIGIN": "https://www.sixnine.art",
                 "SIXNINE_DATABASE_URL_FILE": "/run/secrets/app_database_url", "SIXNINE_DATA": "/data",
                 "SIXNINE_FRONTEND_DIR": "/app/yingxu-dist"}
+    # Only the exact legacy baseline or the complete reviewed frontend pair is
+    # accepted; this preserves rollback without permitting arbitrary mounts.
+    independent_frontend = "SIXNINE_FRONTEND_RELEASE_DIR" in app.get("environment", {})
+    if independent_frontend:
+        required["SIXNINE_FRONTEND_RELEASE_DIR"] = "/frontend"
     require(app.get("environment") == required, "App production safety settings differ")
     networks = config.get("networks", {})
     require(set(networks) == {"web", "database", "edge"}, "Unexpected network definition")
@@ -149,7 +154,8 @@ def validate(config, *, deployment_directory=None, compose_version=None):
             value["read_only"] = True
         return value
     for service_name, expected in {
-        "app": [bind("/srv/sixnine/platform-data", "/data"), bind("/srv/sixnine/upload-spool", "/tmp")],
+        "app": [bind("/srv/sixnine/platform-data", "/data"), bind("/srv/sixnine/upload-spool", "/tmp")]
+               + ([bind("/srv/sixnine/frontend", "/frontend", readonly=True)] if independent_frontend else []),
         "db": [bind("/srv/sixnine/postgres", "/var/lib/postgresql/data")],
         "db-init": [bind(deployment / "init_database.py", "/bootstrap/init_database.py", readonly=True)],
         "caddy": [bind(deployment / "Caddyfile", "/etc/caddy/Caddyfile", readonly=True),

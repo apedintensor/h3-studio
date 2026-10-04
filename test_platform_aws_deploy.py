@@ -127,6 +127,7 @@ class HostAndDocumentTests(unittest.TestCase):
             fake_fcntl = types.SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=mock.Mock())
             with mock.patch.dict(sys.modules, {'fcntl': fake_fcntl}), mock.patch.object(host.release, 'check_host'), \
                  mock.patch.object(host.release, 'regular'), mock.patch.object(host.fetch_release_s3, 'fetch') as fetch, \
+                 mock.patch.object(host.release, 'protected_directory'), \
                  mock.patch.object(host.release, 'apply_locked') as apply:
                 with self.assertRaisesRegex(host.release.ReleaseError, 'explicit_safe_restore'):
                     host.deploy(COMMIT, root=root)

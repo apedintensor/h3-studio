@@ -107,6 +107,7 @@ services:
       SIXNINE_CLOUD_CREATION_ENABLED: "0"
       SIXNINE_STORAGE_PROVIDER: local
       SIXNINE_FRONTEND_DIR: /app/yingxu-dist
+      SIXNINE_FRONTEND_RELEASE_DIR: /frontend
     # Trust only this Caddy container. Caddy overwrites the client-supplied XFF.
     command: [python, -m, uvicorn, "platform_app:app", --host, 0.0.0.0, --port, "8845", --workers, "1", --no-access-log, --proxy-headers, --forwarded-allow-ips, "172.29.69.2"]
     secrets: [app_database_url]
@@ -119,6 +120,11 @@ services:
       - type: bind
         source: /srv/sixnine/upload-spool
         target: /tmp
+        bind: {create_host_path: false}
+      - type: bind
+        source: /srv/sixnine/frontend
+        target: /frontend
+        read_only: true
         bind: {create_host_path: false}
     networks:
       database: {}

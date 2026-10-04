@@ -1,0 +1,48 @@
+# 开发、发布与 GPU 运行分开
+
+本项目处于初期迭代：先完成一批相关修改，再统一验收与发布。开发中只运行定位问题和关键边界所需检查；不为每个按钮单独推 main、跑全套 CI 或切换生产版本。源码事实与线上状态分开：上线回执在本地 `.platform-demand-live/`，本文描述代码契约。
+
+## 三条独立路径
+
+| 改动 | 检查与发布 | 对正在运行的服务 |
+| --- | --- | --- |
+| 文案、布局、前端交互 | Yingxu 行为测试、构建、快照及前端发布边界检查；独立静态包 | 原子切换 HTML 指针；API、数据库、GPU 控制器无需重启 |
+| 已确认与 worker 兼容的 API 展示/发现代码 | Python/API/数据库与镜像检查；批准平台包 | 只更新 app；控制器继续使用启动时固定镜像 |
+| 任务协议、准入、账户/数据结构、计费、调度或依赖 | 批次关键回归及完整发布门槛 | 不兼容时拒绝热更；等待任务和账单安全收尾后迁移 |
+
+`api.py`、schema、存储、编译和依赖均保守计入 worker 指纹。当前仅排除 `frontend.py`、`agent_discovery.py` 和分发 Skill 文件。不能把“有兼容热更路径”解释成所有 API 改动都能不排空更新，更不代表多副本 API 零停机：单 app 替换仍可能有短暂请求重试。
+
+## 日常批次
+
+1. 编辑 canonical 前端 `../video-studio-design/studio-app`；通过 `python tools/sync_yingxu_source.py --write` 同步发布快照。不要直接维护两份前端。
+2. 开发中按需预览、做语法及受影响关键路径检查；批次完成后再提交。
+3. push/PR 只检查，不发布。`test` 为稳定汇总检查。完整本地 Git diff 决定范围；新文件、删除、未知路径或缺少基线走全检查。不是按任意 `.md` 后缀跳过检查，公开 Skill 是运行资源。
+4. 准备发布：Actions 选择 `deploy=true`，`release_kind=frontend` 或 `platform`。这一步只产生/上传验证后的不可变包。
+5. 通过独立操作身份核对测试版本与 manifest 摘要，写入 host 对应批准目录，再 dispatch `approved_frontend_commit` 或 `approved_commit`。部署身份不能自批准或安装 root helper。
+
+平台准备会完整验收确切版本；前端准备只验收前端及发布边界，不运行全套 PostgreSQL 或重建 Python 镜像。不要同时为同一批次重复触发准备任务；已通过且未受修改影响的检查不反复执行。pip/npm 和 BuildKit 缓存用于加速依赖与镜像层，缓存命中不代替验证。
+
+## 前端版本与回滚
+
+- `tools/build_frontend_release.py COMMIT DIST DESTINATION` 生成 `frontend.tar.gz` 和 `frontend-manifest.json`；`check_frontend_bundle.py` 离线验证；`publish_frontend_release.py` 用 GitHub OIDC 条件写入已有 release bucket 的 `releases/COMMIT/frontend/`。
+- host `deploy_frontend.py` 只接受 40 位提交号，要求 `/srv/sixnine/approved-frontends/COMMIT.sha256` 独立批准。固定 SSM Document 为 `Sixnine-DeployApprovedFrontend`，不能执行任意命令。
+- host 校验当前 API 独立批准、实际镜像、`sixnine-web-v1` 和完整 `api_compatibility` 指纹。前端依赖尚未上线的后端代码时拒绝发布，不悄悄连接其他版本/API。
+- app 只读挂载 `/srv/sixnine/frontend` 到 `/frontend`。`current.json` 只选一个不可变 release index；共享 `assets` 只增不覆盖，已打开页面可继续加载旧文件。HTML 不缓存，带哈希静态文件长期缓存。
+- 成功切换后探测站内 HTML 版本；失败恢复旧指针。通过相同部署入口选回已批准且与当前 API 指纹相符的旧前端即可回滚。没有指针时使用镜像自带前端，损坏指针不会静默回退。
+- 完整平台更新前归档外置指针，使用新镜像配套 UI；平台失败回滚使用旧镜像配套 UI。外置资源与历史指针保留，后续可重新选择兼容前端。
+
+## GPU 生命周期
+
+新 v2 marker 固定 execution commit、镜像身份、worker 兼容指纹、配置、预算周期和控制器身份。API 发布前验证 pin 与真实运行容器，仅同 worker 契约及相同 host bundle 配置允许兼容更新。更新只操作 `app --no-deps`，不重建 db/db-init/caddy/controller。
+
+控制器发出控制命令仍使用固定 execution release；开启/关闭网站准入及最终恢复 CPU 则在 release lock 内重新读取当前 approved app。这样控制器结束不会把网站切回其启动时的旧镜像。预算、排队任务、租赁账本及原截止时间不随网站发布重置。
+
+旧 v1 运行中的 Python watcher 不会因磁盘文件更新而升级。首次接入需核对空池或等待安全收尾，再由新 helper 启动新 v2 周期。用户任务存在或账单不明时禁止使用“空池迁移”。保持最少 0 台 GPU，有确认任务才租赁，业务空闲 600 秒关机；本改造不改变原预算，也不进行生成验证。
+
+## 实现与复现
+
+关键模块：`tools/ci_changes.py`、`tools/release_contract.py`、`studio_platform/frontend.py`、`deploy/platform/frontend_bundle.py`、`frontend_release.py`、`deploy_frontend.py`、`release.py` 与 `gpu_scaler.py`。主机 helper 必须由独立操作身份安装，发布 bundle 不能替换 root 执行器。
+
+无网络边界检查：`python -m unittest test_ci_changes test_release_contract test_frontend_release test_frontend_deploy test_platform_frontend test_platform_release test_platform_gpu_release test_platform_gpu_scaler test_platform_aws_deploy`。GPU 测试使用模拟依赖，不代表真实推理验证。
+
+采用的官方依据：[GitHub workflow 路径过滤与触发规则](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)、[Docker GitHub Actions 构建缓存](https://docs.docker.com/build/cache/backends/gha/)、[Starlette 静态文件路径行为](https://www.starlette.io/staticfiles/)。

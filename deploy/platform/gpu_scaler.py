@@ -216,18 +216,49 @@ def container_name(config):
 
 
 def marker(commit, config, active):
-    atomic(ROOT/'active.json', {'version': 1, 'active': active, 'commit': commit,
+    value = {'version': 1, 'active': active, 'commit': commit,
         'cycle_id': config['cycle_id'], 'config_hash': fingerprint(config),
-        'container_name': container_name(config), 'updated_at': time.time()})
+        'container_name': container_name(config), 'updated_at': time.time()}
+    if not active:
+        previous = verify_marker(commit, config, allow_inactive=True)
+        if previous['version'] == 2:
+            value = {**previous, 'active': False, 'admission': 'closed', 'updated_at': time.time()}
+    else:
+        directory = release.ROOT/'releases'/commit
+        release.approved_manifest(release.ROOT, directory, commit)
+        expected = release.manifest(directory, commit)
+        if 'contracts' in expected:
+            contracts = release.validate_contracts(expected['contracts'])
+            environment = release.deployment_environment(release.ROOT/'site.env', commit)
+            identities = release.validate_image_archive(directory/'image.tar.gz', expected)
+            images = json.loads(release.command(['image', 'inspect', environment['SIXNINE_IMAGE']], environment=environment))
+            release.require(isinstance(images, list) and len(images) == 1 and images[0].get('Id') in identities,
+                'scaler_execution_image_unapproved')
+            value.update(version=2, image_id=images[0]['Id'], contracts=contracts, admission='closed')
+    atomic(ROOT/'active.json', value)
 
 
 def verify_marker(commit, config, *, allow_inactive=False):
     value = read_json(ROOT/'active.json', 16384)
-    release.require(value.get('version') == 1 and type(value.get('active')) is bool
+    release.require(type(value.get('version')) is int and value['version'] in (1, 2) and type(value.get('active')) is bool
         and (value['active'] or allow_inactive)
         and value.get('commit') == commit and value.get('cycle_id') == config['cycle_id']
         and value.get('config_hash') == fingerprint(config)
         and value.get('container_name') == container_name(config), 'scaler_active_identity_mismatch')
+    if value['version'] == 2:
+        release.validate_contracts(value.get('contracts'))
+        release.require(set(value) == {'version', 'active', 'commit', 'cycle_id', 'config_hash',
+            'container_name', 'updated_at', 'image_id', 'contracts', 'admission'}
+            and isinstance(value.get('image_id'), str) and re.fullmatch(r'sha256:[0-9a-f]{64}', value['image_id'])
+            and value.get('admission') in ('open', 'closed'), 'scaler_execution_pin_invalid')
+    return value
+
+
+def admission_marker(commit, config, admission):
+    release.require(admission in ('open', 'closed'), 'scaler_admission_state_invalid')
+    value = verify_marker(commit, config, allow_inactive=admission == 'closed')
+    if value['version'] == 2:
+        atomic(ROOT/'active.json', {**value, 'admission': admission, 'updated_at': time.time()})
 
 
 def require_new_controller(environment):
@@ -274,6 +305,11 @@ def inspect_controller(environment, config):
         and labels.get('com.docker.compose.project') == 'sixnine-platform'
         and labels.get('com.docker.compose.service') == SERVICE
         and labels.get('com.sixnine.finite.config-hash') == fingerprint(config), 'controller_container_identity_mismatch')
+    if (ROOT/'active.json').exists():
+        pin = read_json(ROOT/'active.json', 16384)
+        if pin.get('version') == 2:
+            verify_marker(pin.get('commit'), config, allow_inactive=True)
+            release.require(value.get('Image') == pin['image_id'], 'controller_execution_image_changed')
     return value.get('State', {})
 
 
@@ -309,8 +345,28 @@ def wait_until_ready(process, directory, environment, config, *, timeout=90,
 
 
 def close_admission(directory, environment):
-    release.compose(directory, environment, 'up', '-d', '--no-deps', 'app')
-    release.wait_ready(directory, environment)
+    # Caller holds release.lock. directory/environment belong to execution,
+    # not necessarily the latest approved website after compatible CD.
+    pin = read_json(ROOT/'active.json', 16384)
+    release.require(pin.get('commit') == directory.name, 'scaler_execution_release_mismatch')
+    if pin.get('version') == 2:
+        atomic(ROOT/'active.json', {**pin, 'admission': 'closed', 'updated_at': time.time()})
+    return release.restore_current_cpu_locked(release.ROOT)
+
+
+def enable_admission(directory, environment, config):
+    pin = verify_marker(directory.name, config)
+    if pin['version'] == 1:
+        # Legacy releases retain their strict no-CD barrier for the whole cycle.
+        compose(directory, environment, 'up', '-d', '--no-deps', 'app')
+        release.wait_ready(directory, environment)
+        return
+    admission_marker(directory.name, config, 'open')
+    current, app_directory, app_environment = release.current_application(release.ROOT)
+    context = release.gpu_deployment_context(release.ROOT, release.manifest(app_directory, current))
+    release.approved_application_configuration(app_directory, app_environment, gpu_context=context)
+    release.application_compose(app_directory, app_environment, 'up', '-d', '--no-deps', 'app', gpu_context=context)
+    release.wait_ready(app_directory, app_environment)
 
 
 def restore_cpu(directory, environment, config, *, timeout=240, clock=time.monotonic, sleep=time.sleep):
@@ -365,11 +421,15 @@ def launch(directory, environment, config, *, loader_factory=None, popen=subproc
         loader.close()
 
 
-def checked_release():
-    state = read_json(release.ROOT/'release-state.json', 16384)
-    commit = state.get('current')
-    release.require(isinstance(commit, str) and release.SHA.fullmatch(commit)
-        and state.get('status') == 'app_ready', 'healthy_approved_release_required')
+def checked_release(commit=None):
+    if commit is None:
+        state = read_json(release.ROOT/'release-state.json', 16384)
+        commit = state.get('current')
+        release.require(isinstance(commit, str) and release.SHA.fullmatch(commit)
+            and state.get('pending') is None and state.get('status') in ('app_ready', 'rolled_back_app_only'),
+            'healthy_approved_release_required')
+    else:
+        release.require(isinstance(commit, str) and release.SHA.fullmatch(commit), 'execution_release_invalid')
     directory = release.ROOT/'releases'/commit
     release.approved_manifest(release.ROOT, directory, commit)
     manifest = release.manifest(directory, commit)
@@ -384,7 +444,7 @@ def checked_release():
     return commit, directory, environment
 
 
-def wait_for_controller(process, directory, environment):
+def wait_for_controller(process, directory, environment, config=None):
     """A host TERM requests drain; it never proxies a kill to the container."""
     requested = [False]
     handlers = {}
@@ -400,6 +460,8 @@ def wait_for_controller(process, directory, environment):
                     import fcntl
                     with (release.ROOT/'release.lock').open('a') as lock:
                         fcntl.flock(lock, fcntl.LOCK_EX)
+                        if config is not None:
+                            verify_marker(directory.name, config, allow_inactive=True)
                         close_admission(directory, environment)
                         controller_control(directory, environment, '--request-drain')
                     requested[0] = False
@@ -422,20 +484,25 @@ def main(argv=None):
         print('Finite GPU deployment disabled; explicit root action required')
         return 0
     process = directory = environment = None
+    owns_barrier = False
     try:
         import fcntl
         release.require(args in (['start'], ['restore-cpu']), 'explicit_scaler_action_required')
         release.check_host(release.ROOT)
         with (release.ROOT/'release.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            commit, directory, environment = checked_release()
             config = protected_inputs(starting=args == ['start'])
             if args == ['start']:
+                commit, directory, environment = checked_release()
                 require_new_controller(environment)
                 atomic(ROOT/'overlay.json', overlay(environment['SIXNINE_IMAGE']))
+                atomic(ROOT/'app-admission.json', release.app_admission_overlay(release.ROOT))
             else:
+                pin = read_json(ROOT/'active.json', 16384)
+                commit, directory, environment = checked_release(pin.get('commit'))
                 verify_marker(commit, config, allow_inactive=True)
                 release.regular(ROOT/'overlay.json', root_owned=True, maximum=65536)
+                owns_barrier = True
             version = release.command(['compose', 'version', '--short'], environment=environment).decode().strip()
             validate(json.loads(compose(directory, environment, 'config', '--format', 'json')),
                 deployment_directory=directory, compose_version=version)
@@ -449,22 +516,22 @@ def main(argv=None):
                 and validation.get('provider_calls_enabled') is False
                 and validation.get('config_hash') == fingerprint(config), 'finite_configuration_validation_failed')
             marker(commit, config, True)
+            owns_barrier = True
             process = launch(directory, environment, config)
             if on_demand_config(config):
                 wait_until_ready(process, directory, environment, config)
-            compose(directory, environment, 'up', '-d', '--no-deps', 'app')
-            release.wait_ready(directory, environment)
+            enable_admission(directory, environment, config)
         # Caller runs this root helper under a persistent systemd unit. Release
         # lock is free during reconciliation so restore-cpu can close admission.
-        wait_for_controller(process, directory, environment)
+        wait_for_controller(process, directory, environment, config)
         with (release.ROOT/'release.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            close_admission(directory, environment)
-            release.require(process.returncode == 0, 'controller_uncertain_exit_barrier_retained')
             # A concurrent operator restore may already have set this exact
             # cycle inactive. Recheck the fresh proof; do not report failure or
             # accept another cycle merely because its marker is inactive.
             verify_marker(commit, config, allow_inactive=True)
+            close_admission(directory, environment)
+            release.require(process.returncode == 0, 'controller_uncertain_exit_barrier_retained')
             result = restore_cpu(directory, environment, config)
             marker(commit, config, False)
             print(json.dumps({'state': 'finite_cycle_complete_cpu_restored', **result}))
@@ -472,9 +539,12 @@ def main(argv=None):
     except Exception:
         # Fail closed for new work, but never stop/kill/remove an uncertain
         # controller. Its independent provider TTL and durable ledger remain.
-        if directory is not None and environment is not None:
+        if owns_barrier and directory is not None and environment is not None:
             try:
-                close_admission(directory, environment)
+                with (release.ROOT/'release.lock').open('a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    verify_marker(commit, config, allow_inactive=True)
+                    close_admission(directory, environment)
             except Exception:
                 pass
         print('Finite GPU operation incomplete; admission closure attempted, reconciliation barrier retained', file=sys.stderr)

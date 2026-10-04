@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "2.2",
+  "description": "Sixnine: activate only an independently approved frontend; never restart API or GPU",
+  "parameters": {
+    "Commit": {
+      "type": "String",
+      "description": "Exact 40-hex commit with root-owned frontend manifest approval",
+      "allowedPattern": "^[0-9a-f]{40}$",
+      "interpolationType": "ENV_VAR"
+    }
+  },
+  "mainSteps": [{
+    "action": "aws:runShellScript",
+    "name": "deployApprovedFrontend",
+    "precondition": {"StringEquals": ["platformType", "Linux"]},
+    "inputs": {
+      "timeoutSeconds": "300",
+      "runCommand": ["set -eu", "test -n \"${SSM_Commit:-}\"", "exec /usr/bin/python3 /opt/sixnine-release/deploy_frontend.py \"$SSM_Commit\""]
+    }
+  }]
+}

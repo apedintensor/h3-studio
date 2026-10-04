@@ -10,6 +10,8 @@ import re
 import shutil
 import subprocess
 
+from release_contract import build_contracts
+
 FILES = ("compose.yaml", "Caddyfile", "init_database.py", "check_config.py")
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,7 +41,8 @@ def build(commit, destination):
                 digest.update(chunk)
         checksums[name] = digest.hexdigest()
     (destination / "release-manifest.json").write_text(json.dumps(
-        {"commit": commit, "image": image, "image_id": inspected["Id"], "files": checksums}, indent=2)+"\n", encoding="utf-8")
+        {"commit": commit, "image": image, "image_id": inspected["Id"], "files": checksums,
+         "contracts": build_contracts(ROOT)}, indent=2)+"\n", encoding="utf-8")
     print("Reviewable release manifest SHA-256: "+hashlib.sha256((destination / "release-manifest.json").read_bytes()).hexdigest())
 
 

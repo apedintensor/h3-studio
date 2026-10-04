@@ -387,6 +387,7 @@ class FiniteControlTests(unittest.TestCase):
                 stack.enter_context(patch.object(scaler, 'launch', return_value=process))
                 stack.enter_context(patch.object(scaler, 'marker', side_effect=lambda c, x, a: events.append(('marker', a))))
                 stack.enter_context(patch.object(scaler, 'close_admission', side_effect=lambda *_: events.append('cpu')))
+                stack.enter_context(patch.object(scaler, 'enable_admission'))
                 stack.enter_context(patch.object(scaler, 'restore_cpu', side_effect=lambda *_: events.append('restored') or {'billing_pending': 0}))
                 stack.enter_context(patch('sys.stdout', new=io.StringIO()))
                 stack.enter_context(patch('sys.stderr', new=io.StringIO()))
@@ -407,7 +408,7 @@ class FiniteControlTests(unittest.TestCase):
             stack.enter_context(patch.object(scaler, 'checked_release', return_value=(
                 'a'*40, Path(tmp), {'SIXNINE_IMAGE': 'sixnine-platform:'+'a'*40})))
             stack.enter_context(patch.object(scaler, 'protected_inputs', return_value=config))
-            for name in ('require_new_controller', 'atomic', 'validate'):
+            for name in ('require_new_controller', 'atomic', 'validate', 'verify_marker'):
                 stack.enter_context(patch.object(scaler, name))
             compose = stack.enter_context(patch.object(scaler, 'compose', return_value=b'{}'))
             stack.enter_context(patch.object(scaler, 'controller_control', return_value={
@@ -426,6 +427,48 @@ class FiniteControlTests(unittest.TestCase):
         self.assertTrue(all('up' not in call.args for call in compose.call_args_list))
         process.kill.assert_not_called()
         process.terminate.assert_not_called()
+
+    def test_closing_old_controller_uses_current_app_and_marks_admission_closed(self):
+        config, commit = configuration(), 'a'*40
+        pin = {'version': 2, 'active': True, 'commit': commit, 'admission': 'open'}
+        with patch.object(scaler, 'read_json', return_value=pin), patch.object(scaler, 'atomic') as atomic, \
+                patch.object(release, 'restore_current_cpu_locked', return_value='b'*40) as restore, \
+                patch.object(release, 'compose') as compose:
+            scaler.close_admission(Path('/old-release')/commit, {'SIXNINE_IMAGE': commit})
+        restore.assert_called_once_with(release.ROOT)
+        compose.assert_not_called()
+        self.assertEqual(atomic.call_args.args[1]['admission'], 'closed')
+        self.assertEqual(atomic.call_args.args[1]['commit'], commit)
+
+    def test_wrong_execution_release_cannot_close_current_admission(self):
+        with patch.object(scaler, 'read_json', return_value={'commit': 'a'*40}), \
+                patch.object(release, 'restore_current_cpu_locked') as restore, \
+                self.assertRaisesRegex(release.ReleaseError, 'execution_release_mismatch'):
+            scaler.close_admission(Path('/release')/('b'*40), {})
+        restore.assert_not_called()
+
+    def test_new_marker_pins_approved_execution_image_and_contracts(self):
+        contracts = {'version': 1, 'api_compatibility': '1'*64,
+            'worker_compatibility': '2'*64, 'frontend_contract': 'sixnine-web-v1'}
+        image_id = 'sha256:'+'c'*64
+        with patch.object(release, 'approved_manifest'), \
+                patch.object(release, 'manifest', return_value={'contracts': contracts}), \
+                patch.object(release, 'deployment_environment', return_value={'SIXNINE_IMAGE': 'sixnine-platform:'+'a'*40}), \
+                patch.object(release, 'validate_image_archive', return_value={image_id}), \
+                patch.object(release, 'command', return_value=json.dumps([{'Id': image_id}]).encode()), \
+                patch.object(scaler, 'atomic') as atomic:
+            scaler.marker('a'*40, configuration(), True)
+        value = atomic.call_args.args[1]
+        self.assertEqual(value['version'], 2)
+        self.assertEqual(value['image_id'], image_id)
+        self.assertEqual(value['contracts'], contracts)
+        self.assertEqual(value['admission'], 'closed')
+        with patch.object(scaler, 'read_json', return_value=value), patch.object(scaler, 'atomic') as atomic:
+            scaler.marker('a'*40, configuration(), False)
+        closed = atomic.call_args.args[1]
+        self.assertFalse(closed['active'])
+        self.assertEqual(closed['image_id'], image_id)
+        self.assertEqual(closed['contracts'], contracts)
 
 
 if __name__ == '__main__':

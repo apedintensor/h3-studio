@@ -4,7 +4,9 @@ WORKDIR /build/yingxu
 COPY yingxu/package.json yingxu/package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY yingxu/ ./
-RUN npm test && npm run build -- --outDir /build/output
+# CI runs the frontend test suite independently. Local/full image builds still
+# compile from the verified source snapshot and serve assets at the site root.
+RUN npm run build -- --base / --outDir /build/output
 
 FROM python:3.12-slim-bookworm AS runtime-base
 ENV PYTHONDONTWRITEBYTECODE=1 \

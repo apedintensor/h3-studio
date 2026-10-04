@@ -11,8 +11,7 @@ from urllib.parse import quote, urlsplit
 import uuid
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
@@ -33,6 +32,7 @@ from .http_limits import (ADMISSION_SCOPE_KEY, BodyLimitMiddleware, UploadAdmiss
 from .execution_policy import ExecutionPolicies
 from .render_plans import RECIPE as RENDER_RECIPE, compile_render, validate_render_source
 from .agent_discovery import PUBLIC_PATHS as AGENT_PUBLIC_PATHS, DISCOVERY_LINK
+from .frontend import FRONTEND_CONTRACT, STATIC_CACHE_SCOPE_KEY, is_public_frontend
 
 COOKIE = "sixnine_session"
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -214,8 +214,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
             if request.headers.get("sec-fetch-site") == "cross-site":
                 return JSONResponse({"detail": "跨站写入请求被拒绝"}, status_code=403)
         public_paths = {"/healthz", "/api/auth/config", "/api/auth/login"}
-        public_frontend = (settings.frontend_dir is not None and request.method in {"GET", "HEAD"}
-            and (request.url.path in {"/", "/index.html", "/freestyle", "/freestyle/"} or request.url.path.startswith("/assets/")))
+        public_frontend = is_public_frontend(settings, request.method, request.url.path)
         public_discovery = request.method in {"GET", "HEAD"} and request.url.path in AGENT_PUBLIC_PATHS
         if request.url.path not in public_paths and not public_frontend and not public_discovery and not principal:
             return JSONResponse({"detail": "请先登录"}, status_code=401)
@@ -235,7 +234,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         if uploading:
             lease.release_when_finished(lambda: upload_admission.release(principal.owner))
         response = await call_next(request)
-        response.headers["Cache-Control"] = "no-store"
+        response.headers["Cache-Control"] = (request.scope.get(STATIC_CACHE_SCOPE_KEY, "no-store")
+            if response.status_code < 400 else "no-store")
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
         if request.url.path in {"/", "/index.html", "/for-agents", "/for-agents/"}:
@@ -251,6 +251,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         return {"status": "ok", "generation_enabled": settings.generation_enabled,
                 "execution_backend": settings.execution_backend, "auth_ready": auth.ready(),
                 "render_enabled": settings.render_enabled,
+                "frontend_contract": FRONTEND_CONTRACT,
                 "cloud_creation_enabled": False}
 
     @app.get("/api/auth/config")
@@ -679,16 +680,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     register_guided_routes(app)
     from .agent_discovery import register_routes as register_agent_discovery_routes
     register_agent_discovery_routes(app)
-    if settings.frontend_dir is not None:
-        if not (settings.frontend_dir / "index.html").is_file():
-            raise ValueError("Configured frontend build is missing; build the reviewed Yingxu source snapshot first")
-
-        @app.api_route("/freestyle", methods=["GET", "HEAD"], include_in_schema=False)
-        @app.api_route("/freestyle/", methods=["GET", "HEAD"], include_in_schema=False)
-        def freestyle():
-            return FileResponse(settings.frontend_dir / "index.html")
-
-        app.mount("/", StaticFiles(directory=settings.frontend_dir, html=True), name="yingxu")
+    from .frontend import register_routes as register_frontend_routes
+    register_frontend_routes(app)
     # Last-added middleware is outermost, including the authentication guard.
     app.add_middleware(RequestAdmissionMiddleware, admission=request_admission)
     return app
