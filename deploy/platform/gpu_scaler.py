@@ -488,17 +488,20 @@ def main(argv=None):
     owns_barrier = False
     try:
         import fcntl
-        release.require(args in (['start'], ['restore-cpu'], ['resume-handoff']), 'explicit_scaler_action_required')
+        release.require(args in (['start'], ['restore-cpu'], ['resume-handoff'], ['resume-preparation']), 'explicit_scaler_action_required')
         release.check_host(release.ROOT)
         with (release.ROOT/'release.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             config = protected_inputs(starting=args == ['start'])
-            if args in (['start'], ['resume-handoff']):
+            if args in (['start'], ['resume-handoff'], ['resume-preparation']):
                 commit, directory, environment = checked_release()
                 require_new_controller(environment)
                 if args == ['resume-handoff']:
                     import gpu_handoff
                     gpu_handoff.verify_resume(config, commit, environment)
+                if args == ['resume-preparation']:
+                    import gpu_preparation_recovery
+                    gpu_preparation_recovery.verify_resume(config, commit, environment)
                 atomic(ROOT/'overlay.json', overlay(environment['SIXNINE_IMAGE']))
                 atomic(ROOT/'app-admission.json', release.app_admission_overlay(release.ROOT))
             else:
@@ -521,6 +524,8 @@ def main(argv=None):
                 and validation.get('config_hash') == fingerprint(config), 'finite_configuration_validation_failed')
             if args == ['resume-handoff']:
                 gpu_handoff.activate_resume(config, commit, environment)
+            if args == ['resume-preparation']:
+                gpu_preparation_recovery.activate_resume(config, commit, environment)
             marker(commit, config, True)
             owns_barrier = True
             process = launch(directory, environment, config)

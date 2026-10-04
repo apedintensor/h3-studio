@@ -18,7 +18,7 @@ from sqlalchemy import select, update
 from .control import WorkerControl
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
 from .lium_bootstrap import BootConfig, BootController, BootError, SSHHost
-from .lium_provider import LiumManifest
+from .lium_provider import LiumManifest, InferenceIdleProof
 from .lium_multimodal_smoke import FirstLastSmoke, BoundedReferenceSmoke
 from .lium_reference_smoke import ReferenceSmoke
 from .qualification_profiles import MULTIMODAL_PROFILE, STAGE_RUNTIME_S
@@ -328,6 +328,43 @@ class ProductionBoot(BootController):
                     extra = json.loads(extra_receipt.read_text())
                     if extra.get("submission_started") and extra.get("phase") not in ("qualified", "failed"):
                         raise BootError("finite_qualification_result_still_unresolved")
+            # A preparation failure has no Comfy backend to query. Require a
+            # fresh, identity-bound process/socket observation instead of
+            # treating the missing endpoint or a failed status as idle proof.
+            if self.backend is None and state.get("phase") == "bootstrap_failed":
+                if (tag != self.intent_id or self.fleet is not None
+                        or state.get("smoke_submission_started")
+                        or any((receipt.parent/helper.name/"state.json").exists()
+                               for helper in self._multimodal_helpers())):
+                    raise BootError("finite_preparation_idle_unconfirmed")
+                with self.repo.engine.connect() as conn:
+                    intent = dict(conn.execute(select(instance_intents).where(
+                        instance_intents.c.id == tag)).mappings().one())
+                    if (intent["provider_instance_id"] != instance_id
+                            or conn.execute(select(registered_workers.c.id).where(
+                                registered_workers.c.instance_id == instance_id)).first()):
+                        raise BootError("finite_preparation_idle_unconfirmed")
+                files, _ = self._sources()
+                identity = {"intent_id": tag, "instance_id": instance_id,
+                    "configuration_id": self.config.configuration_id,
+                    "sources": {k: hashlib.sha256(v).hexdigest() for k, v in files.items()}}
+                if state.get("identity") != identity:
+                    raise BootError("finite_preparation_idle_unconfirmed")
+                if self.host is None:
+                    coordinates = self.provider.ssh_connection(tag, instance_id)
+                    self.host = self.ssh_factory(self.config, coordinates)
+                report = self.host.preparation_idle_report()
+                now = self.repo.clock()
+                idle = (report.get("identity") == identity and report.get("state") == "failed"
+                    and report.get("process_visibility_complete") is True
+                    and type(report.get("bootstrap_process_count")) is int
+                    and report["bootstrap_process_count"] == 0
+                    and type(report.get("comfy_process_count")) is int
+                    and report["comfy_process_count"] == 0
+                    and report.get("comfy_port_listening") is False)
+                self.bound_intent, self.bound_instance = tag, instance_id
+                self.idle_since = (self.idle_since if self.idle_since is not None else now) if idle else None
+                return InferenceIdleProof(instance_id, now, self.idle_since or now, idle)
         return super().idle_probe(tag, instance_id)
 
     def _retire_idle_children(self):

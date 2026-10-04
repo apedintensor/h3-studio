@@ -780,6 +780,19 @@ class Repository:
     def request_cancel(self, scope, job_id):
         with self.transaction() as connection:
             job = self._job(connection, job_id, scope, lock=True)
+            if (job["status"] == "failed" and job["error_code"] == "capacity_approval_expired_or_revoked"
+                    and job["attempt_no"] == 0 and job["current_attempt_id"] is None):
+                # A later privileged preparation recovery must honour a user
+                # cancelling this failed, never-submitted request. Historical
+                # versions returned without leaving evidence in this window.
+                result = dict(job["result"] or {})
+                if result.get("recovery_cancel_requested") is not True:
+                    result["recovery_cancel_requested"] = True
+                    connection.execute(update(jobs).where(jobs.c.id == job_id).values(
+                        result=result, updated_at=self.clock()))
+                    self._emit(connection, "job.cancel_requested", job_id,
+                        {"job_id": job_id, "status": "failed", "upstream_stopped": True})
+                    return self._job(connection, job_id)
             if job["status"] in ("succeeded", "failed", "cancelled", "cancel_requested"):
                 return job
             if job["status"] == "recovery_hold":

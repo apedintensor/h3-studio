@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from .autoscale import ScalePolicy
 from .capacity import proven_unsubmitted_capacity_job, transfer_unsubmitted_capacity
@@ -26,7 +26,8 @@ from .lium_provider import LiumManifest, LiumProvider
 from .lium_runtime_aws import AwsLiumLoader
 from .production_scaler import (FiniteConfig, FiniteController, MODEL, RECIPE, ScalerError,
     save, stdin_loader, unique, validate_settings, verify_identity_files, verify_sources)
-from .repository import Repository, capacity_approvals, capacity_cycles, scaler_actions, scaler_leaders
+from .repository import (Repository, capacity_approvals, capacity_cycles, capacity_waiters,
+    jobs, registered_workers, scaler_actions, scaler_leaders)
 from .scaler import LaunchSpec
 from .settings import Settings
 from .worker import _slot_lock
@@ -131,6 +132,23 @@ def cycle_config(config, sequence):
 class ServiceCycle(FiniteController):
     """The existing finite controller scoped to one approved rental cycle."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scaler.unsubmitted_retirement_guard = self._preparation_retirement_allowed
+
+    def _preparation_retirement_allowed(self, conn, intent):
+        hold = self.preparation_hold()
+        if (not hold or intent["state"] != "draining" or hold["intent_id"] != intent["id"]
+                or hold["instance_id"] != intent["provider_instance_id"]):
+            return False
+        grant = conn.execute(select(capacity_approvals).where(
+            capacity_approvals.c.id == self.config.capacity_approval_id)).mappings().first()
+        pending = list(conn.execute(select(jobs).where(jobs.c.pool == self.config.pool,
+            jobs.c.status.not_in(("succeeded", "failed", "cancelled", "planned", "blocked"))).limit(4097)).mappings())
+        return bool(grant and grant["enabled"] == 0 and len(pending) <= 4096
+            and all(j["execution_plan"].get("capacity_approval_id") == grant["id"]
+                and proven_unsubmitted_capacity_job(conn, j) for j in pending))
+
     def _managed(self):
         with self.repo.engine.connect() as conn:
             intent_id = conn.execute(select(capacity_cycles.c.intent_id).where(
@@ -186,10 +204,77 @@ class ServiceCycle(FiniteController):
         (self.config.work_dir/"rollover.flag").touch()
         self.request_drain()
 
+    def preparation_hold(self):
+        path = self.config.work_dir/"preparation-hold.json"
+        if not path.exists():
+            return None
+        value = json.loads(path.read_text())
+        if (value.get("version") != 1 or value.get("config_hash") != self.config.fingerprint()
+                or value.get("sources") != self.config.source_sha256
+                or value.get("reason") != "bootstrap_repair_required"):
+            raise ScalerError("ondemand_preparation_hold_identity_mismatch")
+        return value
+
+    def _boot_failure(self, intent, state):
+        if state.get("state") != "bootstrap_failed":
+            return super()._boot_failure(intent, state)
+        # Only a retained, identity-bound failure BEFORE model qualification
+        # can hold backlog. A failed inference or lost submission stays under
+        # the existing reconciliation/shutdown contract.
+        path = self.config.work_dir/"boot"/intent["id"]/"bootstrap-state.json"
+        try:
+            evidence = json.loads(path.read_text())
+            expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+                "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+            boot = self.boots[intent["id"]]
+            if (evidence.get("identity") != expected or evidence.get("phase") != "bootstrap_failed"
+                    or evidence.get("smoke_submission_started") is not None or getattr(boot, "fleet", None) is not None
+                    or any((path.parent/name/"state.json").exists() for name in (
+                        "firstlast4-768p-5s-v1", "ref4-bounded-768p-5s-v1", "reference-smoke", "reference-full-smoke"))):
+                return super()._boot_failure(intent, state)
+            with self.repo.engine.connect() as conn:
+                pending = list(conn.execute(select(jobs).where(self.scope_filter(),
+                    jobs.c.status.not_in(("succeeded", "failed", "cancelled"))).limit(4097)).mappings())
+                if (len(pending) > 4096 or any(not proven_unsubmitted_capacity_job(conn, j) for j in pending)
+                        or conn.execute(select(registered_workers.c.id).where(
+                            registered_workers.c.pool == self.config.pool,
+                            registered_workers.c.state != "retired")).first()):
+                    return super()._boot_failure(intent, state)
+            save(self.config.work_dir/"preparation-hold.json", {"version": 1,
+                "config_hash": self.config.fingerprint(), "intent_id": intent["id"],
+                "instance_id": intent["provider_instance_id"], "sources": self.config.source_sha256,
+                "reason": "bootstrap_repair_required", "observed_at": self.repo.clock()})
+            self.cold.record_wait_reason(self.config.capacity_approval_id, "bootstrap_repair_required")
+            self.request_drain()  # Retire the failed GPU, not the user work.
+        except (OSError, ValueError, KeyError, TypeError):
+            super()._boot_failure(intent, state)
+
+    def _expire_held_waiters(self):
+        # A repair hold is bounded by the ORIGINAL accepted wait deadline.
+        # It does not create a new confirmation window or ignore cancellation.
+        with self.repo.transaction() as conn:
+            ids = list(conn.execute(select(capacity_waiters.c.job_id).where(
+                capacity_waiters.c.approval_id == self.config.capacity_approval_id,
+                capacity_waiters.c.state == "waiting_capacity",
+                capacity_waiters.c.deadline <= self.repo.clock()).order_by(capacity_waiters.c.job_id)).scalars())
+            for jid in ids:
+                job = self.repo._job(conn, jid, lock=True)
+                if job["status"] not in ("waiting_capacity", "queued") or not proven_unsubmitted_capacity_job(conn, job):
+                    continue
+                self.repo._settle(conn, "job", jid, 0)
+                conn.execute(update(jobs).where(jobs.c.id == jid).values(status="failed",
+                    error_code="capacity_wait_deadline_expired", fence=job["fence"]+1, updated_at=self.repo.clock()))
+                conn.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(state="failed"))
+                self.repo._emit(conn, "job.failed", jid, {"job_id": jid, "status": "failed",
+                    "error_code": "capacity_wait_deadline_expired"})
+
     def _close_unsubmitted(self):
-        if ((self.config.work_dir/"rollover.flag").exists()
+        if ((self.preparation_hold() or (self.config.work_dir/"rollover.flag").exists())
                 and getattr(self, "preserve_rollover", lambda: False)()):
             self.repo.set_capacity_approval_enabled(self.config.capacity_approval_id, enabled=False)
+            if self.preparation_hold():
+                self._expire_held_waiters()
+                self.cold.record_wait_reason(self.config.capacity_approval_id, "bootstrap_repair_required")
             return
         super()._close_unsubmitted()
 
@@ -307,7 +392,8 @@ class OnDemandController:
         # A failed qualification or explicit grant revocation ends the service.
         # Only our durable TTL-rollover marker authorizes preserving backlog
         # and opening a replacement cycle under the original service budget.
-        if self.current.stopping() and not (self.current.config.work_dir/"rollover.flag").exists():
+        if (self.current.stopping() and not self.current.preparation_hold()
+                and not (self.current.config.work_dir/"rollover.flag").exists()):
             self.request_drain()
         if self.stopping():
             self.current.request_drain()
@@ -317,12 +403,15 @@ class OnDemandController:
                    self.repo.clock() >= row["hard_deadline"]-self.config.drain_margin_s for row in rows):
                 self.current.request_rollover()
         value = self.current.tick()
-        if self.current.stopping() and not (self.current.config.work_dir/"rollover.flag").exists():
+        if (self.current.stopping() and not self.current.preparation_hold()
+                and not (self.current.config.work_dir/"rollover.flag").exists()):
             self.request_drain()
         if "instances" not in value:
             # A competing leader/lease must never become a shutdown exception.
             value = self.current.status(decision=value.get("phase", "not_leader"))
-        if self._can_rotate(value) and not self.stopping():
+        if self.current.preparation_hold() and not self.stopping():
+            self.current.cold.record_wait_reason(self.current.config.capacity_approval_id, "bootstrap_repair_required")
+        if self._can_rotate(value) and not self.stopping() and not self.current.preparation_hold():
             self.repo.set_capacity_approval_enabled(self.current.config.capacity_approval_id, enabled=False)
             # Keep unsettled invoice reservations. A cycle limit never resets spend.
             enough = self.current.remaining_budget() >= self.config.scale_policy["instance_reservation_microusd"]
@@ -365,6 +454,7 @@ class OnDemandController:
             "idle_shutdown_seconds": 600, "minimum_gpu_instances": 0,
             "admission_ready": admission_ready,
             "phase": "drained" if drained else "draining" if self.stopping() else
+                "awaiting_repair" if self.current.preparation_hold() else
                 ("waiting_capacity" if value["active_job_ids"] else "awaiting_jobs") if not value["instances"] else value["phase"],
             "drained": drained, "all_destroyed": all_destroyed,
             "billing_pending": sum(r["billing_status"] != "settled" for r in rows),
@@ -436,7 +526,8 @@ def main(argv=None):
                     if value.get("drained"):
                         return 0
                 except Exception:
-                    controller.request_drain()
+                    if not (controller.current and controller.current.preparation_hold()):
+                        controller.request_drain()
                     print(json.dumps({"phase": "observation_unconfirmed", "drained": False}), flush=True)
                 time.sleep(config.interval_s)
     except Exception:

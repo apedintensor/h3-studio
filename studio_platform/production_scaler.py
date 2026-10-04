@@ -545,6 +545,10 @@ class FiniteController:
             # repository then records cancel_requested/hold, never a false $0.
             self.repo.request_cancel(Scope(row["tenant_id"], row["owner_id"], row["project_id"]), row["id"])
 
+    def _boot_failure(self, intent, state):
+        """Finite runs stop; on-demand preparation recovery may preserve backlog."""
+        self.request_drain()
+
     def tick(self):
         c = self.config
         lease = self.scaler.acquire(c.pool, self.leader_id)
@@ -623,7 +627,7 @@ class FiniteController:
                 boot_status[intent] = self.boots[intent].tick(intent, stopping=stopping)
                 if boot_status[intent].get("state") in ("qualification_failed", "qualification_deadline_insufficient",
                         "bootstrap_failed", "fleet_recovery_required", "fleet_attention_required"):
-                    self.request_drain()
+                    self._boot_failure(row, boot_status[intent])
             except Exception:
                 boot_status[intent] = {"state": "boot_observation_unconfirmed"}
         reason = decision.get("reason")

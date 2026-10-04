@@ -63,7 +63,7 @@
     "src/client-admission.test.js": "02def6a10188bbe18a2ca31c605f663256ee72d7b3acbdb5d5a61c91222dcb31",
     "src/cloud-client.js": "e0e6a5a38603411b1c4141e8c38295fd5d929a9f97d4ea0751a6f68ccf75e32d",
     "src/cloud-controller.js": "8a92742a5beaa8786db060021ec4061d9d6aa4a64def97e60822879a2ee7184f",
-    "src/cloud-model.js": "50891b3a46f99c994146c5eeef77ce17ed84e96d6fa6b16d53fdb8c69c098539",
+    "src/cloud-model.js": "d2ee66ee407750b52d919de81b3a306afa953bd75e7b2a6571fea5df8cf1eaf5",
     "src/cloud-studio.css": "fa047216f9133bbb978042724e47f7a1a5cd2ac58e83e96a9e0a7cb8fe957980",
     "src/cloud.test.js": "f71c532d1081b33b01bf8d18faa36432a5148b0b2275d1ee4188ab29af8fb163",
     "src/creation-journey.css": "95effb9321c6029abedcdeb6c281a87e041c85f53f6afdf21a910774d4c59ea0",

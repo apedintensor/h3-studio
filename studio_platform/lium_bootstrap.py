@@ -30,6 +30,52 @@ REMOTE_ROOT = "/workspace/h3-studio"
 MODEL_REVISION = "e5eb578a89295337b8ff433a035929ce0279e0b6"
 COMFY_REVISION = "e9027f2b30f37bb3052714eb08fcf479542f4fc0"
 
+# These are literals emitted by the pinned bootstrap, not arbitrary exception
+# messages/classes from a remote machine. Unknown values are explicitly masked.
+BOOT_FAILURE_CODES = frozenset({"InternalSetupFailure", "SubprocessTimeout", "SubprocessFailed",
+    "CUDAUnavailable", "ExistingComfyDirectoryIsNotCheckout", "ExistingComfyCheckoutModified",
+    "ComfyRevisionMismatch", "RequiredComfyFlagMissing", "ImageTorchMissing", "ImageTorchChanged",
+    "XetRequiredForLargeWeights", "InsufficientCacheDiskSpace", "DownloadedFileSizeMismatch",
+    "ExistingModelPathConflict", "ModelDownloadFailed", "ExistingOwnedComfyNotReady",
+    "Port8188AlreadyInUse", "ComfyExitedBeforeReady", "ComfyStartupTimeout"})
+BOOT_FAILURE_TYPES = frozenset({"SetupError", "RuntimeError", "ValueError", "TypeError", "OSError",
+    "FileNotFoundError", "PermissionError", "ImportError", "ModuleNotFoundError", "TimeoutError",
+    "ConnectionError", "CalledProcessError", "TimeoutExpired", "HTTPError", "HTTPStatusError",
+    "ReadTimeout", "ConnectTimeout", "ConnectError", "SSLError", "HfHubHTTPError",
+    "LocalEntryNotFoundError", "EntryNotFoundError", "RepositoryNotFoundError", "RevisionNotFoundError",
+    "XetDownloadError", "XetError", "JSONDecodeError"})
+BOOT_PHASES = frozenset({"preflight", "clone_comfy", "fetch_comfy", "pin_comfy", "install_dependencies",
+    "download_preflight", "download_file", "weights_ready", "start_comfy", "comfy_ready", "failed", "download"})
+
+
+def _static(value, allowed, fallback):
+    return value if isinstance(value, str) and value in allowed else fallback
+
+
+def safe_bootstrap_diagnosis(value):
+    """Bounded static diagnosis only; never return logs, paths, URLs or details."""
+    value = value if isinstance(value, dict) else {}
+    diagnosis = {
+        "error_code": _static(value.get("error_code"), BOOT_FAILURE_CODES, "UnclassifiedBootstrapFailure"),
+        "error_type": _static(value.get("error_type"), BOOT_FAILURE_TYPES, "UnknownSetupError"),
+        "phase": _static(value.get("phase"), BOOT_PHASES, "unknown"),
+        "failure_phase": _static(value.get("failure_phase"), BOOT_PHASES - {"failed"}, "unknown")}
+    details = value.get("failure_details", [])
+    if isinstance(details, list):
+        bounded = []
+        for event in details[-5:]:
+            if not isinstance(event, dict):
+                continue
+            entry = {"phase": _static(event.get("phase"), BOOT_PHASES, "unknown")}
+            for name, allowed, fallback in (("error_code", BOOT_FAILURE_CODES, "UnclassifiedBootstrapFailure"),
+                                            ("error_type", BOOT_FAILURE_TYPES, "UnknownSetupError")):
+                if name in event:
+                    entry[name] = _static(event[name], allowed, fallback)
+            bounded.append(entry)
+        if bounded:
+            diagnosis["failure_details"] = bounded
+    return diagnosis
+
 
 class BootError(Conflict):
     pass
@@ -158,10 +204,73 @@ with (root/'sixnine-bootstrap.lock').open('a') as lock:
   with marker.open('x') as out:
    json.dump(expected,out);out.flush();os.fsync(out.fileno())
   with (root/'bootstrap-controller.log').open('ab') as log:
-   proc=subprocess.Popen([str(python),'-u',str(root/'bootstrap_cloud.py'),'--cache-dir','/workspace/hf-cache'],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+   # Lium image /workspace is its small overlay. The encrypted local volume
+   # lives below /root; bootstrap still checks remaining space before download.
+   proc=subprocess.Popen([str(python),'-u',str(root/'bootstrap_cloud.py'),'--cache-dir','/root/hf-cache'],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
   print(json.dumps({'state':'started','pid':proc.pid}))
 '''.replace("IDENTITY", repr(identity))
         return self.run(script)
+
+    def preparation_idle_report(self):
+        """Read-only proof for failed setup; never assumes absent files are idle.
+
+        Both complete process visibility and listener inspection are required.
+        Race/unreadable/malformed observations are inconclusive, and no command
+        lines, environment, socket addresses or error bodies leave the host.
+        """
+        script = '''import json,re,time,uuid
+from pathlib import Path
+root=Path('/workspace/h3-studio');proc=Path('/proc')
+result={'identity':{},'state':'unknown','process_visibility_complete':False,
+ 'bootstrap_process_count':None,'comfy_process_count':None,'comfy_port_listening':None}
+def read(name,maximum=16384):
+ p=root/name
+ if not p.is_file() or p.is_symlink() or p.stat().st_size>maximum: raise ValueError('unconfirmed')
+ value=json.loads(p.read_text())
+ if not isinstance(value,dict): raise ValueError('unconfirmed')
+ return value
+def pids():
+ return {entry.name for entry in proc.iterdir() if entry.name.isdecimal() and entry.is_dir()}
+try:
+ identity=read('sixnine-bootstrap-identity.json')
+ if set(identity)!={'intent_id','instance_id','configuration_id','sources'}: raise ValueError('unconfirmed')
+ for field in ('intent_id','instance_id'):
+  value=identity[field]
+  if not isinstance(value,str) or str(uuid.UUID(value))!=value: raise ValueError('unconfirmed')
+ if not isinstance(identity['configuration_id'],str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}',identity['configuration_id']): raise ValueError('unconfirmed')
+ sources=identity['sources']
+ if not isinstance(sources,dict) or set(sources)!={'bootstrap_cloud.py','model_manifest.json'} or not all(isinstance(v,str) and re.fullmatch(r'[0-9a-f]{64}',v) for v in sources.values()): raise ValueError('unconfirmed')
+ status=read('setup-status.json',4194304)
+ result['identity']=identity
+ result['state']=status.get('state') if status.get('state') in ('failed','preparing','weights_ready','ready') else 'unknown'
+ before=pids()
+ if not before: raise ValueError('unconfirmed')
+ bootstrap=comfy=0
+ for pid in sorted(before):
+  with (proc/pid/'cmdline').open('rb') as handle: raw=handle.read(1048577)
+  if len(raw)>1048576: raise ValueError('unconfirmed')
+  args=raw.split(b'\\0')
+  # Match argv paths, not substrings inside this inspection's python -c code.
+  bootstrap+=int(any(a==b'bootstrap_cloud.py' or a.endswith(b'/bootstrap_cloud.py') for a in args))
+  comfy+=int(any(a==b'ComfyUI/main.py' or a.endswith(b'/ComfyUI/main.py') for a in args))
+ listening=False
+ for name in ('tcp','tcp6'):
+  with (proc/'net'/name).open('r',encoding='ascii') as handle: rows=handle.read(4194305)
+  if len(rows)>4194304: raise ValueError('unconfirmed')
+  lines=rows.splitlines()
+  if not lines or 'local_address' not in lines[0] or 'st' not in lines[0].split(): raise ValueError('unconfirmed')
+  for line in lines[1:]:
+   fields=line.split()
+   if len(fields)<10 or not re.fullmatch(r'[0-9A-Fa-f]+:[0-9A-Fa-f]{4}',fields[1]) or not re.fullmatch(r'[0-9A-Fa-f]{2}',fields[3]): raise ValueError('unconfirmed')
+   listening=bool(listening or (int(fields[1].rsplit(':',1)[1],16)==8188 and fields[3].upper()=='0A'))
+ if pids()!=before: raise ValueError('unconfirmed')
+ result.update(process_visibility_complete=True,bootstrap_process_count=bootstrap,comfy_process_count=comfy,comfy_port_listening=listening)
+except Exception:
+ pass
+result['observed_at']=time.time()
+print(json.dumps(result))
+'''
+        return self.run(script, limit=16384)
 
     def report(self):
         script = '''import json,subprocess
@@ -171,13 +280,26 @@ def read(name):
  p=r/name
  return json.loads(p.read_text()) if p.exists() and p.stat().st_size<4194304 else {}
 s=read('setup-status.json');runtime=read('runtime-after.json')
-result={'identity':read('sixnine-bootstrap-identity.json'),'state':s.get('state'),'phase':s.get('phase'),'model_revision':s.get('model_revision'),'comfyui_revision':s.get('comfyui_revision'),'files':s.get('files',{}),'runtime':runtime}
+codes=SAFE_CODES;types=SAFE_TYPES;phases=SAFE_PHASES
+def static(value,allowed,fallback):
+ return value if isinstance(value,str) and value in allowed else fallback
+events=s.get('events',[]);events=events if isinstance(events,list) else []
+prior=next((e.get('phase') for e in reversed(events) if isinstance(e,dict) and e.get('phase') in phases and e.get('phase')!='failed'),'unknown')
+details=[]
+for event in events:
+ if not isinstance(event,dict) or event.get('state')!='failed': continue
+ entry={'phase':static(event.get('phase'),phases,'unknown')}
+ if 'error_code' in event: entry['error_code']=static(event.get('error_code'),codes,'UnclassifiedBootstrapFailure')
+ if 'error_type' in event: entry['error_type']=static(event.get('error_type'),types,'UnknownSetupError')
+ details.append(entry)
+result={'identity':read('sixnine-bootstrap-identity.json'),'state':s.get('state'),'phase':static(s.get('phase'),phases,'unknown'),'model_revision':s.get('model_revision'),'comfyui_revision':s.get('comfyui_revision'),'files':s.get('files',{}),'runtime':runtime,
+ 'error_code':static(s.get('error_code'),codes,'UnclassifiedBootstrapFailure'),'error_type':static(s.get('error_type'),types,'UnknownSetupError'),'failure_phase':prior,'failure_details':details[-5:]}
 if result['state']=='ready':
  result['actual_comfy_revision']=subprocess.check_output(['git','-C',str(r/'ComfyUI'),'rev-parse','HEAD'],text=True).strip()
  rows=subprocess.check_output(['nvidia-smi','--query-gpu=uuid,memory.total,name','--format=csv,noheader,nounits'],text=True).strip().splitlines()
  result['gpus']=[{'uuid':x.split(',')[0].strip(),'memory_mib':int(x.split(',')[1].strip()),'name':','.join(x.split(',')[2:]).strip()} for x in rows]
 print(json.dumps(result))
-'''
+'''.replace("SAFE_CODES", repr(sorted(BOOT_FAILURE_CODES))).replace("SAFE_TYPES", repr(sorted(BOOT_FAILURE_TYPES))).replace("SAFE_PHASES", repr(sorted(BOOT_PHASES)))
         return self.run(script)
 
     def open_tunnel(self, port):
@@ -242,6 +364,21 @@ class BootController:
             os.fsync(handle.fileno())
         temporary.replace(path)
 
+    def status(self, intent_id=None):
+        """CPU-only retained failure lookup, also usable after pod destruction."""
+        intent_id = intent_id or self.bound_intent
+        _uuid(intent_id)
+        path = self.config.work_dir/intent_id/"bootstrap-status.json"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 16384:
+            return {"state": "bootstrap_diagnosis_unavailable"}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"state": "bootstrap_diagnosis_unavailable"}
+        if not isinstance(value, dict) or value.get("state") != "bootstrap_failed":
+            return {"state": "bootstrap_diagnosis_unavailable"}
+        return {"state": "bootstrap_failed", **safe_bootstrap_diagnosis(value)}
+
     def _sources(self):
         files = {}
         for name, maximum in (("bootstrap_cloud.py", 512*1024), ("model_manifest.json", 64*1024)):
@@ -293,6 +430,10 @@ class BootController:
                 "created_at": self.repo.clock(), "local_port": self.config.local_port}
             if state.get("identity") != identity or state.get("local_port") != self.config.local_port:
                 raise BootError("bootstrap_receipt_identity_conflict")
+            if state["phase"] == "bootstrap_failed":
+                # A retained failed attempt is terminal. Changing a marker or
+                # restarting remote setup requires separate audited recovery.
+                return {"state": "bootstrap_failed", **safe_bootstrap_diagnosis(state.get("failure"))}
             if not self.host:
                 coordinates = self.provider.ssh_connection(intent_id, intent["provider_instance_id"])
                 self.host = self.ssh_factory(self.config, coordinates)
@@ -311,10 +452,16 @@ class BootController:
                 return {"state": "bootstrap_start_unknown"}
             if report.get("state") == "failed":
                 state["phase"] = "bootstrap_failed"
+                state["failure"] = safe_bootstrap_diagnosis(report)
                 self._save(receipt, state)
-                return {"state": "bootstrap_failed"}
+                result = {"state": "bootstrap_failed", **state["failure"]}
+                # Durable, small status survives future draining/aggregate
+                # status updates and contains no remote logs or media paths.
+                self._save(directory/"bootstrap-status.json", {**result, "intent_id": intent_id,
+                    "instance_id": intent["provider_instance_id"], "observed_at": self.repo.clock()})
+                return result
             if report.get("state") != "ready":
-                return {"state": "booting", "phase": report.get("phase")}
+                return {"state": "booting", "phase": _static(report.get("phase"), BOOT_PHASES, "unknown")}
             self._validate_report(report, manifest)
             state["hardware"] = {"gpu": report["gpus"][0], "runtime": report["runtime"],
                 "model_revision": MODEL_REVISION, "comfy_revision": COMFY_REVISION,
@@ -521,7 +668,7 @@ def main(argv=None):
         while not stop.is_set():
             value = controller.tick(args.intent_id)
             # Print a small non-secret progress state, never config/DB/SSH keys.
-            public = {k: value[k] for k in ("state", "phase", "generation_verified") if k in value}
+            public = {k: value[k] for k in ("state", "phase", "failure_phase", "error_code", "error_type", "generation_verified") if k in value}
             if public != last:
                 print(json.dumps(public), flush=True)
                 last = public

@@ -112,12 +112,13 @@ class LeaderLease:
 
 class ScaleCoordinator:
     def __init__(self, repository, *, provider=None, enabled=False, leader_seconds=60,
-                 min_observation_s=15):
+                 min_observation_s=15, unsubmitted_retirement_guard=None):
         if (type(enabled) is not bool or not math.isfinite(leader_seconds) or not 0 < leader_seconds <= 3600
             or not math.isfinite(min_observation_s) or not 0 < min_observation_s <= 3600):
             raise ValueError("invalid_scaler_settings")
         self.repo, self.provider, self.enabled = repository, provider or DisabledProvider(), enabled
         self.leader_seconds, self.min_observation_s = leader_seconds, min_observation_s
+        self.unsubmitted_retirement_guard = unsubmitted_retirement_guard or (lambda conn, intent: False)
 
     def acquire(self, pool, leader_id):
         """CAS leader; an expired lease grants a new fence, never frees capacity."""
@@ -312,7 +313,11 @@ class ScaleCoordinator:
             if row["state"] != "draining":
                 self.repo.update_instance(row["id"], "draining", connection=connection)
             if not ttl_due and pending is not None:
-                return
+                # Preparation recovery can retire a demonstrably unused GPU
+                # while keeping the original accepted backlog. Default deny;
+                # this does not replace the fresh idle/attempt/worker proof.
+                if self.unsubmitted_retirement_guard(connection, dict(row)) is not True:
+                    return
             if not idle or blocked or action["destroy_started_at"] is not None:
                 return
             self.repo.update_instance(row["id"], "destroying", connection=connection)

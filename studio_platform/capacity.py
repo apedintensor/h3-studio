@@ -28,6 +28,7 @@ CAPACITY_WAIT_CODES = {
     "gpu_starting": "capacity_gpu_starting",
     "gpu_busy": "capacity_gpu_busy",
     "searching": "capacity_searching_gpu",
+    "bootstrap_repair_required": "capacity_bootstrap_repair_required",
 }
 
 
@@ -261,7 +262,8 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
                     or job["request"].get("recipe_id") not in b["recipe_ids"]
                     or job["request"].get("request", {}).get("model") != b["model_id"]):
                 raise Conflict("capacity_transfer_job_requires_reconciliation")
-            deadline = min(new["expires_at"], b["quote_expires_at"], b["qualification_expires_at"],
+            deadline = min(existing["deadline"] if existing else float("inf"),
+                new["expires_at"], b["quote_expires_at"], b["qualification_expires_at"],
                 b["scale_policy"]["hard_deadline"]-job["expected_runtime_s"])
             if deadline <= repo.clock():
                 raise Conflict("capacity_transfer_deadline_expired")

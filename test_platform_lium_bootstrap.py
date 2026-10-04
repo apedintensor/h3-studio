@@ -4,11 +4,13 @@ import contextlib
 import io
 import json
 from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 
 import test_platform_repository as ledger
-from studio_platform.lium_bootstrap import BootConfig, BootController, BootError, COMFY_REVISION, MODEL_REVISION, main
+from studio_platform.lium_bootstrap import (BootConfig, BootController, BootError, COMFY_REVISION,
+    MODEL_REVISION, SSHHost, safe_bootstrap_diagnosis, main)
 from studio_platform.worker import Outcome
 
 
@@ -251,6 +253,144 @@ class BootTests(ledger.LedgerCase):
         self.backend.queue["queue_pending"] = []
         self.now += 10
         self.assertGreater(controller.idle_probe(self.intent["id"], POD).idle_since, first.idle_since)
+
+    def test_failed_setup_static_diagnosis_persists_after_restart_and_destroy(self):
+        self.host.state = "failed"
+        self.host.patch = {"phase": "failed", "failure_phase": "download_file", "error_code": "ModelDownloadFailed",
+            "error_type": "SetupError", "failure_details": [{"phase": "download_file", "error_type": "RuntimeError"}],
+            "log": "SECRET_LOG_SHOULD_NOT_BE_RETAINED", "url": "https://private.invalid/?sig=SECRET_SIGNATURE"}
+        controller = self.controller()
+        result = self.tick(controller)
+        self.assertEqual(result["error_code"], "ModelDownloadFailed")
+        self.assertEqual(result["failure_phase"], "download_file")
+        self.assertEqual(result["failure_details"], [{"phase": "download_file", "error_type": "RuntimeError"}])
+        folder = self.config.work_dir/self.intent["id"]
+        saved = json.loads((folder/"bootstrap-state.json").read_text())
+        self.assertEqual(saved["phase"], "bootstrap_failed")
+        self.assertEqual(saved["failure"], {k: v for k, v in result.items() if k != "state"})
+        self.host.state = "ready"  # A failed marker must not automatically recover.
+        other = self.controller()
+        self.assertEqual(self.tick(other), result)
+        self.assertEqual((self.host.starts, self.host.uploads), (1, 1))
+        self.assertIsNone(other.host)
+        self.repo.update_instance(self.intent["id"], "draining")
+        self.repo.update_instance(self.intent["id"], "destroying")
+        self.repo.update_instance(self.intent["id"], "destroyed", destruction_confirmed=True)
+        self.assertEqual(other.status(self.intent["id"]), result)
+        self.assertEqual(self.backend.submissions, 0)
+        raw = (folder/"bootstrap-state.json").read_text() + (folder/"bootstrap-status.json").read_text()
+        for denied in ("SECRET_LOG", "SECRET_SIGNATURE", "private.invalid"):
+            self.assertNotIn(denied, raw)
+
+    def test_untrusted_failure_fields_and_progress_phases_are_masked(self):
+        self.host.state = "failed"
+        self.host.patch = {"phase": "https://private.invalid/?sig=SECRET", "error_code": "SECRET_TOKEN",
+                           "error_type": "SECRET_PASSWORD", "failure_phase": {"secret": "SECRET"}}
+        result = self.tick(self.controller())
+        self.assertEqual(result["error_code"], "UnclassifiedBootstrapFailure")
+        self.assertEqual(result["error_type"], "UnknownSetupError")
+        self.assertEqual(result["phase"], "unknown")
+        self.assertEqual(result["failure_phase"], "unknown")
+        diagnosis = safe_bootstrap_diagnosis({"failure_details": [{"phase": "download_file", "error_type": "OSError",
+            "detail": "SECRET"}]*100})
+        self.assertEqual(len(diagnosis["failure_details"]), 5)
+        self.assertNotIn("SECRET", json.dumps(diagnosis))
+
+
+class SSHInspectionTests(unittest.TestCase):
+    """Execute the actual inspection scripts against temporary fake procfs."""
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)/"remote"
+        self.proc = Path(self.temp.name)/"proc"
+        self.root.mkdir(); self.proc.mkdir()
+        (self.proc/"net").mkdir()
+        self.identity = {"intent_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "instance_id": POD,
+            "configuration_id": "h3-test", "sources": {"bootstrap_cloud.py": "a"*64, "model_manifest.json": "b"*64}}
+        (self.root/"sixnine-bootstrap-identity.json").write_text(json.dumps(self.identity))
+        (self.root/"setup-status.json").write_text(json.dumps({"state": "failed", "phase": "failed",
+            "error_code": "ModelDownloadFailed", "error_type": "SetupError", "events": [
+                {"phase": "download_file", "state": "failed", "error_type": "RuntimeError",
+                 "url": "https://private.invalid/?sig=SECRET"}, {"phase": "failed", "error_code": "ModelDownloadFailed"}]}))
+        self.write_process("100", b"python3\0-c\0read-only inspection text bootstrap_cloud.py\0")
+        for name in ("tcp", "tcp6"):
+            (self.proc/"net"/name).write_text("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n")
+        self.host = SSHHost.__new__(SSHHost)
+
+    def write_process(self, pid, raw):
+        (self.proc/pid).mkdir(exist_ok=True)
+        (self.proc/pid/"cmdline").write_bytes(raw)
+
+    def execute(self, script, **kwargs):
+        script = script.replace("/workspace/h3-studio", self.root.as_posix()).replace("Path('/proc')", "Path("+repr(self.proc.as_posix())+")")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exec(compile(script, "<offline-remote-inspection>", "exec"), {})
+        return json.loads(output.getvalue())
+
+    def test_report_preserves_static_failure_stage_without_signed_url_or_log(self):
+        self.host.run = self.execute
+        result = self.host.report()
+        self.assertEqual(result["error_code"], "ModelDownloadFailed")
+        self.assertEqual(result["failure_phase"], "download_file")
+        self.assertEqual(result["failure_details"], [{"phase": "download_file", "error_type": "RuntimeError"}])
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_idle_proof_requires_complete_process_and_both_listener_scans(self):
+        self.host.run = self.execute
+        result = self.host.preparation_idle_report()
+        self.assertEqual(result["identity"], self.identity)
+        self.assertEqual(result["state"], "failed")
+        self.assertIs(result["process_visibility_complete"], True)
+        self.assertEqual(result["bootstrap_process_count"], 0)
+        self.assertEqual(result["comfy_process_count"], 0)
+        self.assertIs(result["comfy_port_listening"], False)
+        self.assertIsInstance(result["observed_at"], float)
+        # Do not match the literal filename in this script's python -c argument.
+        self.assertNotIn("cmdline", result)
+        (self.proc/"net"/"tcp6").unlink()
+        result = self.host.preparation_idle_report()
+        self.assertIs(result["process_visibility_complete"], False)
+        self.assertIsNone(result["bootstrap_process_count"])
+        self.assertIsNone(result["comfy_port_listening"])
+
+    def test_real_setup_comfy_or_listener_blocks_idle_without_retaining_args(self):
+        self.host.run = self.execute
+        self.write_process("101", b"python3\0-u\0/workspace/h3-studio/bootstrap_cloud.py\0--token=SECRET\0")
+        self.write_process("102", b"python3\0/workspace/h3-studio/ComfyUI/main.py\0")
+        (self.proc/"net"/"tcp").write_text((self.proc/"net"/"tcp").read_text()+
+            "0: 0100007F:1FFC 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 42\n")
+        result = self.host.preparation_idle_report()
+        self.assertIs(result["process_visibility_complete"], True)
+        self.assertEqual(result["bootstrap_process_count"], 1)
+        self.assertEqual(result["comfy_process_count"], 1)
+        self.assertIs(result["comfy_port_listening"], True)
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_unreadable_process_invalid_identity_or_malformed_socket_are_inconclusive(self):
+        self.host.run = self.execute
+        (self.proc/"100"/"cmdline").unlink()
+        self.assertIs(self.host.preparation_idle_report()["process_visibility_complete"], False)
+        self.write_process("100", b"python3\0")
+        (self.proc/"net"/"tcp6").write_text("garbage\n")
+        self.assertIs(self.host.preparation_idle_report()["process_visibility_complete"], False)
+        (self.root/"sixnine-bootstrap-identity.json").write_text(json.dumps({**self.identity, "sources": {"url": "SECRET"}}))
+        result = self.host.preparation_idle_report()
+        self.assertIs(result["process_visibility_complete"], False)
+        self.assertEqual(result["identity"], {})
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_start_uses_encrypted_local_volume_cache_and_retains_one_shot_marker(self):
+        scripts = []
+        self.host.run = lambda script, **kwargs: scripts.append(script) or {"state": "started"}
+        self.host.start(self.identity)
+        script = scripts[0]
+        self.assertIn("'--cache-dir','/root/hf-cache'", script)
+        self.assertNotIn("/workspace/hf-cache", script)
+        self.assertLess(script.index("with marker.open('x')"), script.index("subprocess.Popen"))
+        self.assertIn("'state':'already_reserved'", script)
+        compile(script, "<offline-start-syntax>", "exec")
 
 
 if __name__ == "__main__":

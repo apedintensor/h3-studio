@@ -202,7 +202,10 @@ inventory.json
 !deploy/platform/GPU-SCALER.zh-CN.md
 !test_platform_gpu_scaler.py
 !deploy/platform/gpu_handoff.py
+!deploy/platform/gpu_preparation_recovery.py
 !studio_platform/backlog_handoff.py
+!studio_platform/preparation_recovery.py
+!test_platform_preparation_recovery.py
 !test_platform_backlog_handoff.py
 !test_platform_gpu_acceptance.py
 !studio_platform/production_worker.py
