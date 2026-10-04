@@ -85,7 +85,10 @@ def validate_snapshot(snapshot):
     docker = snapshot["docker"]
     require(docker.get("os") == "linux" and type(docker.get("cpus")) is int and docker["cpus"] >= 2,
             "preflight_docker_requires_two_linux_cpus")
-    require(type(docker.get("memory_bytes")) is int and docker["memory_bytes"] >= 6*GIB,
+    # A nominal 4-GiB EC2 host reports less usable RAM after kernel reservation.
+    # Reviewed steady containers: app 2 GiB + PG 512 MiB + Caddy 128 MiB.
+    # No local generation/render worker is covered by this initial host profile.
+    require(type(docker.get("memory_bytes")) is int and docker["memory_bytes"] >= 3584*1024**2,
             "preflight_docker_memory_below_reviewed_floor")
     return {"state": "host_metadata_ready", "cpu_count": docker["cpus"],
             "secret_contents_checked": False, "services_started": False,

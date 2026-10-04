@@ -8,9 +8,13 @@
 
 网页使用HttpOnly会话Cookie；正式模式必须密码登录。`superdan`、`supervan`的项目、素材、任务和下载按服务端认证身份隔离。网页API客户端的fetch请求加`X-Expected-Account`，服务端发现Cookie实际账号改变会在操作前返回409、`code=account_context_changed`；前端应保存旧账号草稿并重新核对身份。响应头`X-Authenticated-Account`是非秘密账号名，可核对迟到响应。原生下载链接及video/audio媒体地址不携带自定义请求头，依靠Cookie及服务端owner授权；换账户时前端卸载旧媒体。
 
-机器客户端使用`Authorization: Bearer ...`，绑定一个owner、明确的项目ID列表及scopes。由操作员在受保护终端运行`python -m studio_platform.manage register-client --help`查看入口；token只通过隐藏交互输入、存储哈希，不作为命令参数或文档内容。它不是用户密码，也不是供应商API key。注册/轮换权限不开放给网页或CI部署身份。
+机器客户端使用 `Authorization: Bearer ...`。现在网页账户可在「Agent API」创建个人 API key：绑定当前 owner，明确选择现有项目列表，或「本人全部项目（包括未来新故事）」；用户与供应商的 API key 是不同身份。key 的值只在创建时返回一次，数据库只存 SHA256 与非秘密前缀/权限/时间元信息；列表不返回值，撤销立即阻止后续请求。有效期 1–365 天，默认 90 天，最多 50 个有效 key。生产密码更改、账户停用也会阻止旧个人 key；local-test 创建的 key 不能带到 password 模式使用。
 
-可授予：`projects:read`、`assets:read`、`assets:write`、`jobs:read`、`jobs:write`。机器客户端不能创建未授权项目、覆盖项目文稿或查询整个账户配额。先由创作者建立项目，再绑定该项目；不要为方便把superdan会话Cookie发给别的服务。机器token只存放在受信第三方服务端/BFF，不嵌入公开网页JavaScript或浏览器本地配置。
+可授予 `projects:read`、`projects:create`、`projects:write`、`assets:read`、`assets:write`、`jobs:read`、`jobs:write`。创建新故事必须同时有 `projects:create` 和全部本人项目范围；`projects:write` 可编辑授权文稿。所有下载与生成仍校验 owner、项目与各自 scope，不因选择全部项目跨到账户外。`GET/POST /v1/api-keys` 和 `DELETE /v1/api-keys/{id}` 仅允许网页登录会话，任何 Bearer key 都不能生成新 key、改权限或撤销 key。机器 key 不放进公开 JavaScript、localStorage、日志或 URL；使用受信任 Agent 运行环境/秘密库。
+
+正式密码模式还支持网页登录会话 `POST /v1/auth/password`，body 为 `old_password/new_password`。新密码至少12字符、最多72 UTF-8字节；验证旧密码，成功返回 `{changed:true,reauthenticate:true}` 并清Cookie，撤销本人旧会话与个人API key，随后重新登录/创建key。其他账户不受影响。旧密码尝试按账户限5次/5分钟；Bearer key不能调用，local-test不提供改密码。密码只在HTTPS请求和运行进程内传递，不写日志或文档。
+
+旧操作员 `python -m studio_platform.manage register-client --help` 静态客户端仍兼容：原有项目范围与五类只读/生成权限不变，不自动升级为创作权限。创建个人 key 不需要分享网页 Cookie 或操作员权限。上述存储用量接口仍不对机器身份开放。
 
 本项目供应商配置仍按中央 `C:/Users/danmo/Desktop/AI-Registry/API_USAGE.md` 加载。上述外部客户端token没有被本轮自动创建或导入中央profile；不要把资源ID当model ID或凭空写一个可用profile。
 
@@ -21,7 +25,14 @@
 | 查看模型控制与输入限制 | GET `/v1/capabilities` | 用准确recipe/model/能力版本，不假定所有执行池可用 |
 | 列出项目 | GET `/v1/projects?limit=100&offset=0` | limit 1–100；授权过滤发生在SQL分页之前 |
 | 读文稿 | GET `/v1/projects/{project_id}` | v4文稿、服务端version与更新时间 |
-| 创建/保存文稿 | POST `/v1/projects`；PUT `/v1/projects/{project_id}` | 仅网页登录；PUT携带expected_version，冲突不会覆盖 |
+| 创建/保存文稿 | POST `/v1/projects`；PUT `/v1/projects/{project_id}` | 创建接受 title/logline/id 或旧 project v4；机器创建需 projects:create+全部本人项目；保存需 projects:write+expected_version |
+| 原子创作操作 | POST `/v1/projects/{id}/actions` | expected_version + 1–200 actions；可带稳定 Idempotency-Key；失败整批回滚 |
+| 节点操作 | GET/POST `/v1/projects/{id}/entities`；PATCH/DELETE `/v1/projects/{id}/entities/{entity_id}` | GET可按type/parent_id筛选；POST entity、PATCH patch都带expected_version；DELETE用query expected_version、显式cascade |
+| 版本轻查询 | GET `/v1/projects/{id}/meta` | id/title/version/updated_at；发现新版本后显式读取，不盲目覆盖网页草稿 |
+| Agent说明 | GET `/v1/agent-guide`；GET `/v1/guided-schema` | 实际操作顺序、类型、scope及未实现能力 |
+| 导出文稿/镜头表 | GET `/v1/projects/{id}/export?format=json或csv` | 同账户/项目授权；JSON可导回v4；CSV转义公式起始符 |
+| 导出字幕 | GET `/v1/projects/{id}/chapters/{chapter_id}/subtitles.srt` | 当前时间线的字幕须经过显式确认 |
+| 个人API key | GET/POST `/v1/api-keys`；DELETE `/v1/api-keys/{id}` | 仅网页登录；创建响应{api_key,key}，list {api_keys,available_scopes}；不落明文 |
 | 上传素材 | POST `/v1/assets` | multipart中恰好一个file、一个client_project_id、可选一个稳定client_asset_id；拒绝重复/未知字段，实际解码/校验 |
 | 读素材列表/状态 | GET `/v1/assets?client_project_id=...`；GET `/v1/assets/{id}` | 只在ready后可用于计划 |
 | 创建音视频选段 | POST `/v1/assets/{id}/derivatives` | JSON start/end秒；保留原件，不在生成请求里偷偷裁剪 |
@@ -93,3 +104,48 @@ Swagger/OpenAPI由服务生成，访问仍需本账户身份。表中的模型�
 ## 验证范围
 
 本轮本地HTTP契约覆盖双用户、受限机器scope、分页、同名项目跨账号操作阻挡、版本冲突、幂等批次、私有Range/附件与哈希。SQLite和隔离PostgreSQL均有测试；CPU粗剪实际编码输出MP4/FLAC。真实H3新GPU池、公网域名、供应商API与云存储在线读写需要分别验收。
+
+## Agent 创作与网页回显（2026-10-04新增）
+
+以下为契约示例，不含凭据值。所有 `/v1` 请求均走同一已认证账户；不要在 body 传 owner。
+
+1. `POST /v1/projects`，JSON `{"title":"雨夜来信","logline":"一个送信人的故事"}`，带稳定 `Idempotency-Key`。返回 `id,version,updated_at,project`。相同 key/body 的重试复用同一故事；修改 body 后用新的 key。若传自己的 `id`，key 只在该项目与调用身份内幂等。
+2. 使用返回 id，`POST /v1/projects/{id}/actions`。响应仍是完整文稿 envelope；所有 action 都成功后版本才加一。409 要重新 GET、核对并重做基于新版本的操作，不能丢掉用户修改后盲重试。
+
+```json
+{
+  "expected_version": 1,
+  "actions": [
+    {"op":"entity.create","entity":{"id":"chapter-one","type":"chapter","title":"第一章"}},
+    {"op":"entity.create","entity":{"id":"scene-one","type":"scene","parentId":"chapter-one","title":"雨夜车站","data":{"script":"人物对白和场景说明"}}},
+    {"op":"entity.create","entity":{"id":"shot-one","type":"shot","parentId":"scene-one","title":"走入车站","data":{"seconds":5,"prompt":"缓慢推镜，人物走入雨夜车站"}}},
+    {"op":"journey.update","patch":{"brief":{"aspect":"16:9"},"sound":{"mode":"silent"}}}
+  ]
+}
+```
+
+实体支持 chapter/scene/shot/character/location/image/audio/video/note/generation。创建字段 `id,type,parentId,title,description,data,order,status`；id可省略由服务生成，章节的parentId为空、场戏指向章节、镜头指向场戏。角色、地点、素材等可位于项目或故事层级。`entity.update` 使用 `entity_id,patch`，不允许修改id/type/version；data仅合并一层，嵌套对象/数组是显式替换。例如修改`data.h3`需带要保留的H3设置；角色`data.looks`、场戏`data.cast`（characterId/lookId）、剧本`data.script`都沿用网页v4结构。更新自动增加实体version，项目同时增加服务端version。
+
+| op | 字段与作用 |
+|---|---|
+| entity.create/update/delete | entity；entity_id+patch；entity_id+cascade。含子级删除必须显式cascade=true；只删文稿节点，原文件/历史任务不会删除。 |
+| link.create/delete | link:{id?,source,target,role}；link_id。用途为identity/location/firstFrame/lastFrame/motion/audio/reference/dependency；类型、重复边、循环受验证。 |
+| project.update | patch:{title?,logline?} |
+| journey.update | patch合并流程顶层；brief/sound/角色审查/交付设定等嵌套值明确替换 |
+| layout.update | patch:{positions?,viewport?}，画布与引导工作台共享文稿 |
+| asset.attach | asset_id（上传收据）、entity_id?/title?/parent_id?；可带shot_id、role、select。需projects:write+assets:read，只接受同项目ready素材。 |
+| artifact.adopt | artifact_id、entity_id?/title?/parent_id?/shot_id?/select?。需projects:write+jobs:read，验证同账户同项目已完成任务；不接收任意下载URL。 |
+| shot.select | shot_id、entity_id（空值解除采用）；视频或图片候选，显式采用后网页和粗剪读取同一选择 |
+| shot.trim | shot_id/start/end秒；将选段绑定到当前已采用视频的确切文件身份，实际长度在render预检再核对 |
+| sound.set | chapter_id/tracks及可选mode（silent/dialogue/music/mixed）；音轨沿用网页assetId/fileId/shotId/offset/start/end/gain/muted结构 |
+| sound.generated | shot_id、gain?（0–1，默认0.7）；先加入同任务视频与独立FLAC并采用视频，建立跟随镜头/选段的同次生成声音绑定 |
+| captions.set | chapter_id/cues，每条{id,start,end,text}；清除原确认，保留可编辑正文 |
+| captions.confirm | chapter_id/reviewed:true；调用方明确核对本版字幕与时间线，服务端重建确认依据；后续改时间线后必须再确认 |
+
+已有网页功能中的声音、字幕、视频选段、角色造型、镜头和参考都可通过上述文稿编辑表达。H3生成仍需能力查询→预检→jobs确认；章节粗剪仍走render-plans→jobs，不因文稿action自动产生费用。
+
+上传外部 Agent 生成结果时，先 multipart 上传到该故事，再 `asset.attach`（必要时shot_id+select:true）。本站生成结果用 `artifact.adopt`；同次声音通过第二个audio artifact adopt后再`sound.generated`关联。网页读取的就是这些已提交文稿；正在编辑的网页会提示更新，用户显式加载并处理草稿，不静默覆盖。这里只提供同账户不同客户端协作，还没有跨账户团队成员/邀请机制。
+
+复制故事时可 GET/导出 JSON 改项目ID后 POST，章节和文稿可以复用；**媒体仍按原项目隔离**，需要上传到新项目并重新关联，不能复制cloudAssetId冒充新项目文件。尚无服务器端媒体ZIP打包接口；原始文件可通过已授权content/download端点逐个下载。自动LLM编剧、未配置图像/音乐/Marble生成不在本次实现范围，不能仅凭entity类型就声称可执行。
+
+验证：隔离临时数据库与假key，无外网/供应商调用；真实GPU/public部署另看交付记录。本次普通项目备份明确排除个人key认证表，编辑幂等收据属于业务数据；恢复后需重新配置身份/创建key。

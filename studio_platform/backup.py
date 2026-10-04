@@ -26,7 +26,7 @@ from sqlalchemy.engine import URL
 from .storage import LocalObjectStore, _check_ancestors, _no_links, _copy, _sync_directory, key_belongs_to
 
 MIB = 1024*1024
-AUTH_TABLES = frozenset({"platform_accounts", "platform_sessions", "platform_service_clients", "platform_login_limits"})
+AUTH_TABLES = frozenset({"platform_accounts", "platform_sessions", "platform_service_clients", "platform_login_limits", "platform_personal_api_keys"})
 
 
 class BackupError(Exception):
@@ -40,7 +40,8 @@ def _schemas():
     from .storage_multipart import _metadata as multipart
     from .artifact_writer import _schema as writer
     from .batches import metadata as batches
-    return (metadata, assets, quota, multipart, writer, batches)
+    from .guided import metadata as guided
+    return (metadata, assets, quota, multipart, writer, batches, guided)
 
 
 def _tables():

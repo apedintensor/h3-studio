@@ -157,3 +157,12 @@ inventory.json
 !yingxu/src/*.css
 !yingxu/src/*.json
 !yingxu/src/NOVICE-STORIES-AC.md
+
+# Reviewed Agent authoring API and distributable skill; never credential files.
+!studio_platform/guided.py
+!skills/
+!skills/sixnine-yingxu/
+!skills/sixnine-yingxu/SKILL.md
+!skills/sixnine-yingxu/scripts/
+!skills/sixnine-yingxu/scripts/sixnine.py
+!tools/publish_aws_release.py

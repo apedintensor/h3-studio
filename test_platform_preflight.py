@@ -31,7 +31,7 @@ def valid_host():
             "secrets": {"db_admin_password": info(mode=0o400, regular=True),
                         "app_database_url": info(gid=10001, mode=0o440, regular=True)},
             "secret_filesystems": dict.fromkeys(("secret-root", "db_admin_password", "app_database_url"), "tmpfs"),
-            "docker": {"os": "linux", "cpus": 2, "memory_bytes": 8*1024**3}}
+            "docker": {"os": "linux", "cpus": 2, "memory_bytes": 4*1024**3}}
 
 
 class PreflightTests(unittest.TestCase):
@@ -65,7 +65,7 @@ class PreflightTests(unittest.TestCase):
                  lambda s: s["directories"]["postgres"].update(uid=10001, gid=10001),
                  lambda s: s["directories"]["postgres"].update(uid=0, gid=0),
                  lambda s: s["docker"].update(cpus=1),
-                 lambda s: s["docker"].update(memory_bytes=4*1024**3),
+                 lambda s: s["docker"].update(memory_bytes=3584*1024**2-1),
                  lambda s: s["docker"].update(os="windows"),
                  lambda s: s["secret_filesystems"].update(app_database_url="ext4"),
                  lambda s: s.update(docker_config_empty=False)]

@@ -50,7 +50,7 @@ jobs:
       - name: PostgreSQL concurrency and complete API contract (local CI service)
         env:
           PLATFORM_TEST_DATABASE_URL: postgresql+psycopg://sixnine_test:sixnine-ci-test-only@127.0.0.1:5432/sixnine_test
-        run: python -m unittest test_platform_repository test_platform_queue test_platform_autoscale test_platform_control test_platform_worker test_platform_fleet test_platform_scaler test_platform_api test_platform_execution_policy test_platform_batches test_platform_storage_multipart test_platform_artifact_writer test_platform_diagnostics test_platform_capacity test_platform_capacity_api test_platform_capacity_cli test_platform_reliability test_platform_request_admission test_platform_admission_review test_platform_generated_audio test_platform_caption_plans test_platform_render_plans test_platform_render_backend test_platform_lium_provider test_platform_boyesir_backend test_platform_backup_postgres test_platform_upload_route test_platform_asset_recovery -v
+        run: python -m unittest test_platform_repository test_platform_queue test_platform_autoscale test_platform_control test_platform_worker test_platform_fleet test_platform_scaler test_platform_api test_platform_execution_policy test_platform_batches test_platform_storage_multipart test_platform_artifact_writer test_platform_diagnostics test_platform_capacity test_platform_capacity_api test_platform_guided test_platform_capacity_cli test_platform_reliability test_platform_request_admission test_platform_admission_review test_platform_generated_audio test_platform_caption_plans test_platform_render_plans test_platform_render_backend test_platform_lium_provider test_platform_boyesir_backend test_platform_backup_postgres test_platform_upload_route test_platform_asset_recovery -v
       - name: Verify source-only Yingxu release snapshot
         run: python tools/sync_yingxu_source.py --verify-snapshot
       - run: node --check web/app.js
@@ -74,12 +74,12 @@ jobs:
             --mount "type=bind,source=$PWD/tools/check_platform_container.py,target=/check_platform_container.py,readonly" \
             "sixnine-platform:$GITHUB_SHA" python /check_platform_container.py
       - name: Package the tested platform image and exact deployment manifest
-        if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
         run: |
           python tools/build_platform_release.py "$GITHUB_SHA" platform-release
           python tools/check_platform_bundle.py "$GITHUB_SHA" platform-release
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && inputs.deploy && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
         with:
           name: sixnine-platform-${{ github.sha }}
           path: platform-release/
@@ -143,3 +143,39 @@ jobs:
             rm -f -- "$DEPLOY_IDENTITY_DIR/key" "$DEPLOY_IDENTITY_DIR/known_hosts"
             rmdir -- "$DEPLOY_IDENTITY_DIR"
           fi
+
+  publish-aws:
+    # Main can publish tested immutable objects. This role cannot approve or
+    # execute a host release, access passwords, change IAM or rent compute.
+    if: github.ref == 'refs/heads/main' && vars.SIXNINE_AWS_PUBLISH_ROLE != '' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.deploy))
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: sixnine-release-publication
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: sixnine-platform-${{ github.sha }}
+          path: platform-release
+      - name: Assume release-only identity with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c
+        with:
+          role-to-assume: ${{ vars.SIXNINE_AWS_PUBLISH_ROLE }}
+          aws-region: ap-southeast-1
+          allowed-account-ids: '829135631045'
+      - run: python -m pip install -r requirements.lock.txt
+      - name: Publish validated bundle (host approval remains independent)
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: python tools/publish_aws_release.py "$RELEASE_COMMIT" platform-release

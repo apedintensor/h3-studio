@@ -41,8 +41,10 @@ def validate(config, *, deployment_directory=None, compose_version=None):
                      "tmpfs", "networks", "healthcheck", "logging", "depends_on", "user"}
     extra_fields = {"app": {"cpus", "init", "stop_grace_period"}, "db": {"shm_size", "stop_grace_period"},
                     "db-init": set(), "caddy": {"ports"}}
-    bounds = {"app": (3*1024**3, 256), "db": (1024**3, 256),
-              "db-init": (256*1024**2, 32), "caddy": (256*1024**2, 128)}
+    # Initial two-account control plane on a 4-GiB instance. Rendering/GPU
+    # workers stay disabled and must receive a separately tested resource budget.
+    bounds = {"app": (2*1024**3, 256), "db": (512*1024**2, 256),
+              "db-init": (256*1024**2, 32), "caddy": (128*1024**2, 128)}
     for name, service in services.items():
         require(set(service) <= common_fields | extra_fields[name], "Unreviewed container option is present")
         image = service.get("image", "")

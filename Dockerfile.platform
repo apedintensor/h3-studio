@@ -28,6 +28,7 @@ FROM runtime-base AS runtime
 ENV XDG_CACHE_HOME=/tmp/sixnine-font-cache
 COPY platform_app.py comfy_workflow.py comfy-object-info.json ./
 COPY studio_platform/ ./studio_platform/
+COPY skills/sixnine-yingxu/ ./skills/sixnine-yingxu/
 COPY --from=frontend /build/output/ ./yingxu-dist/
 USER 10001:10001
 # Public proxy is the only published service. This port stays on the app network.

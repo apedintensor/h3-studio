@@ -31,3 +31,8 @@
 !yingxu/src/*.jsx
 !yingxu/src/*.css
 !yingxu/src/*.json
+!skills/
+!skills/sixnine-yingxu/
+!skills/sixnine-yingxu/SKILL.md
+!skills/sixnine-yingxu/scripts/
+!skills/sixnine-yingxu/scripts/sixnine.py

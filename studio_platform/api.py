@@ -274,7 +274,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     def whoami(request: Request):
         principal = request.state.principal
         return {"username": principal.owner, "actor_id": principal.actor_id, "machine": principal.machine,
-                "authentication": settings.auth_mode}
+                "authentication": settings.auth_mode, "scopes": list(principal.scopes),
+                "all_projects": principal.all_projects, "project_ids": list(principal.project_ids)}
 
     @app.post("/api/auth/logout")
     def logout(request: Request):
@@ -298,7 +299,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     @app.get("/v1/projects")
     def list_projects(request: Request, limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000)):
         principal = request.state.principal
-        allowed = (principal.project_ids if "projects:read" in principal.scopes else ()) if principal.machine else None
+        allowed = ((None if principal.all_projects else principal.project_ids) if "projects:read" in principal.scopes else ()) if principal.machine else None
         values = repo.list_documents(project_scope(principal), "project", limit=limit, offset=offset,
                                      allowed_ids=allowed, summary=True)
         return {"projects": [{"id": v["document_id"], "title": v["payload"]["title"],
@@ -306,13 +307,23 @@ def create_app(settings: Settings, *, repository=None, storage=None):
                 for v in values if principal.allows(v["document_id"], "projects:read")]}
 
     @app.post("/v1/projects", status_code=201)
-    def create_project(request: Request, body: dict):
+    def create_project(request: Request, body: dict, idempotency_key: str | None = Header(None)):
         principal = request.state.principal
-        if principal.machine:
-            raise HTTPException(403, "服务身份不能创建新的授权项目")
-        project = validate_project(body.get("project"), settings.max_project_bytes)
-        value = repo.put_document(project_scope(principal), "project", project["id"], project, expected_version=0)
-        return project_response(value)
+        if principal.machine and not (principal.all_projects and "projects:create" in principal.scopes):
+            raise HTTPException(403, "创建故事需要projects:create及全部本人项目授权")
+        from .guided import empty_project
+        if "project" in body:
+            if set(body) != {"project"}:
+                raise HTTPException(422, "导入故事仅接受project字段")
+            project = body["project"]
+        else:
+            values = dict(body)
+            if idempotency_key and "id" not in values:
+                values["id"] = "project-"+uuid.uuid5(uuid.NAMESPACE_URL,
+                    f"{settings.tenant_id}:{principal.owner}:{principal.actor_id}:{idempotency_key}").hex
+            project = empty_project(values)
+        validate_project(project, settings.max_project_bytes)
+        return app.state.guided.mutate(principal, project["id"], project, idempotency_key, create=True)
 
     @app.get("/v1/projects/{project_id}")
     def get_project(project_id: str, request: Request):
@@ -321,9 +332,9 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     @app.put("/v1/projects/{project_id}")
     def save_project(project_id: str, request: Request, body: dict):
         principal = request.state.principal
-        if principal.machine:
-            raise HTTPException(403, "服务身份不能覆盖项目文稿")
-        authorized_project(principal, project_id)
+        if principal.machine and not principal.allows(project_id, "projects:write"):
+            raise HTTPException(403, "保存故事需要projects:write授权")
+        authorized_project(principal, project_id, "projects:write")
         project = validate_project(body.get("project"), settings.max_project_bytes)
         if project["id"] != project_id or type(body.get("expected_version")) is not int:
             raise HTTPException(422, "需要匹配的项目ID与版本")
@@ -556,7 +567,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         principal = request.state.principal
         if client_project_id:
             authorized_project(principal, client_project_id, "jobs:read")
-        allowed = (principal.project_ids if "jobs:read" in principal.scopes else ()) if principal.machine else None
+        allowed = ((None if principal.all_projects else principal.project_ids) if "jobs:read" in principal.scopes else ()) if principal.machine else None
         values = repo.list_jobs_for_owner(settings.tenant_id, principal.owner, project_id=client_project_id, project_ids=allowed,
                                          limit=limit, offset=offset, summary=True)
         visible = [v for v in values if principal.allows(v["project_id"], "jobs:read")]
@@ -612,6 +623,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     app.state.public_job = public_job
     from .batches import register_routes
     register_routes(app)
+    from .guided import register_routes as register_guided_routes
+    register_guided_routes(app)
     if settings.frontend_dir is not None:
         if not (settings.frontend_dir / "index.html").is_file():
             raise ValueError("Configured frontend build is missing; build the reviewed Yingxu source snapshot first")

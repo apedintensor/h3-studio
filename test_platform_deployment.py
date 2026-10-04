@@ -72,6 +72,19 @@ class DeploymentPolicyTests(unittest.TestCase):
     def test_rendered_compose_has_strict_production_policy(self):
         self.assertTrue(policy.validate(self.rendered, compose_version=self.compose_version))
 
+    def test_initial_four_gib_host_has_explicit_two_account_container_envelope(self):
+        services = self.rendered["services"]
+        expected = {"app": 2*1024**3, "db": 512*1024**2, "caddy": 128*1024**2,
+                    "db-init": 256*1024**2}
+        self.assertEqual({name: int(row["mem_limit"]) for name, row in services.items()}, expected)
+        self.assertEqual(sum(expected[name] for name in ("app", "db", "caddy")), 2688*1024**2)
+        self.assertEqual(services["app"]["environment"]["SIXNINE_RENDER_ENABLED"], "0")
+        for name, old_bytes in (("app", 3*1024**3), ("db", 1024**3), ("caddy", 256*1024**2)):
+            changed = copy.deepcopy(self.rendered)
+            changed["services"][name]["mem_limit"] = old_bytes
+            with self.assertRaises(policy.ConfigurationError):
+                policy.validate(changed, compose_version=self.compose_version)
+
     def test_insecure_configuration_changes_are_rejected(self):
         changes = [lambda c: c["services"]["app"]["environment"].update(SIXNINE_GENERATION_ENABLED="1"),
                    lambda c: c["services"]["app"]["environment"].update(SIXNINE_RENDER_ENABLED="1"),
