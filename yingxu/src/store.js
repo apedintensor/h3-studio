@@ -177,6 +177,7 @@ export function createStore({storage,now=()=>Date.now(),seed=legacySeed}={}){
   const replace=(p)=>{const valid=validateProject(p);if(!valid.ok){say(valid.error);return false;}if(protectedRaw&&recoveryRaw!==null&&!backup(recoveryRaw,'recovery'))return false;if(!backup())return false;protectedRaw=false;recoveryRaw=null;past.length=0;future.length=0;coalesce=null;state={...state,project:valid.project,workspaceEpoch:state.workspaceEpoch+1,selectedId:null,scopeId:null,notice:'旧项目已备份，当前项目已切换。'};persist();emit();return true;};
   return {
     getState:()=>state,
+    getLocalProjectSummary(){const project=state.workspace.mode==='local'?state.project:localWorkspace?.state.project;return project?{id:project.id,title:project.title}:null;},
     getRecoveryRaw:()=>recoveryRaw,
     getPersistenceRisk:()=>({current:state.saveState.startsWith('保存失败'),otherCloudDrafts:[...volatileCloudDrafts.keys()].filter(key=>state.workspace.mode!=='cloud'||key!==cloudKey(state.workspace.account,state.project.id)).length}),
     checkpoint(){const saved=persist()&&!volatileCloudDrafts.size;if(!saved)state={...state,notice:'当前或先前账户仍有未落盘草稿，已阻止刷新。请用原账户恢复后备份，保留本页面。'};emit();return saved;},
