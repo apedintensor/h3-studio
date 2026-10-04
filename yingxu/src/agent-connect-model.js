@@ -10,7 +10,7 @@ export function agentOrigin(value){
 }
 const identifier=value=>typeof value==='string'&&value.length>0&&value.length<=160&&!/[\x00-\x20\x7f\\]/.test(value)?value:null;
 
-export function agentHandoff({origin,account,workspace={},projectId,entityId,profile='edit'}={}){
+export function agentHandoff({origin,account,workspace={},projectId,entityId,profile='edit',view='/'}={}){
   const base=agentOrigin(origin),access=agentAccessProfiles[profile]||agentAccessProfiles.edit;
   const accountMatches=!!account&&workspace.account===account;
   const cloudProject=workspace.mode==='cloud'&&accountMatches&&identifier(projectId)?projectId:null;
@@ -20,13 +20,13 @@ export function agentHandoff({origin,account,workspace={},projectId,entityId,pro
   const params=new URLSearchParams();
   if(ready)params.set('project',cloudProject);
   if(selectedEntity)params.set('entity',selectedEntity);
-  const workUrl=base&&ready?`${base}/?${params.toString()}`:null;
+  const workUrl=base&&ready&&['/','/freestyle'].includes(view)?`${base}${view}?${params.toString()}`:null;
   const docsUrl=base?`${base}/for-agents`:null;
   const brief=base?[
     '请使用映序的公开 Skill 与 API，帮助我完成创作。',
     `先阅读：${base}/for-agents/SKILL.md`,
     `接口与流程：${base}/for-agents/guide.json`,
-    ...(workUrl?[`工作位置：${workUrl}`,selectedEntity?'本次先处理链接定位的内容；更改其他部分前与我确认。':'本次只处理链接中的故事。']:['暂未指定可同步的云故事。先介绍可用流程，等我登录并选择、保存云故事后再操作。']),
+    ...(workUrl?[`工作位置：${workUrl}`,selectedEntity?'本次先处理链接定位的内容；更改其他部分前与我确认。':view==='/freestyle'?'本次只处理链接中的快速创作，准备这个视频的提示词与参考素材。':'本次只处理链接中的故事。']:['暂未指定可同步的云故事。先介绍可用流程，等我登录并选择、保存云故事后再操作。']),
     `建议授权范围：${access.label}。实际权限以已配置的 API Key 为准。`,
     ...(access===agentAccessProfiles.read?['本次只允许读取与分析。不要保存修改、上传文件或提交生成任务。']:[]),
     '凭据只从我在本地安全配置的 SIXNINE_API_KEY 或已匹配的凭据加载器读取；不要向我索要聊天中的密钥，不要把密钥写进 URL、作品或日志。',

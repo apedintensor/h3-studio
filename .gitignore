@@ -53,6 +53,8 @@ inventory.json
 !studio_platform/settings.py
 !studio_platform/auth.py
 !studio_platform/capabilities.py
+!studio_platform/generation_draft.py
+!FREESTYLE-AGENT.zh-CN.md
 !studio_platform/project_validation.py
 !studio_platform/source_snapshot.py
 !studio_platform/http_limits.py

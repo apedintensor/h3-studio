@@ -55,6 +55,7 @@ def control_schema():
 
 
 def capabilities(settings):
+    from .media import EXTENSIONS
     offline = not settings.generation_enabled
     recipes = [{"id": key, "label": "H3 首尾帧 / 文生音视频" if mode == "fl" else "H3 全能参考",
                 "mode": mode, "model_id": MODEL, "implemented": True,
@@ -118,7 +119,15 @@ def capabilities(settings):
                             "label": "当前云端显存预设", "controls": dict(preset),
                             "applies_to": "unset_controls_only", "source": "current_operator_execution_policy",
                             "description": "当前执行池要求这些控制值。新镜头的未设置项采用此预设；已有明确选择保留。API调用请显式传入，最终以预检为准。"}
+    upload_geometry = {"min_side": 256, "max_side": 5760, "min_aspect_ratio": .4, "max_aspect_ratio": 2.5}
     return {"capabilities_version": VERSION, "recipes": recipes,
+            "upload_constraints": {"max_bytes": settings.max_upload_bytes,
+                "allowed_extensions": dict(EXTENSIONS),
+                "image": {**upload_geometry, "single_frame_only": True},
+                "video": {**upload_geometry, "min_source_duration_seconds": .1, "max_source_duration_seconds": 3600},
+                "audio": {"min_source_duration_seconds": .1, "max_source_duration_seconds": 3600},
+                "scope": "upload_inspection_only",
+                "description": "上传校验与模型输入、执行池范围分别检查。上传成功不代表可直接生成；视频/音频可能需要明确选择2–15秒片段。实际执行还须通过配方与execution_support范围及生成预检。"},
             "execution_enabled": settings.generation_enabled,
             "execution_backend": settings.execution_backend,
             "simulation": settings.execution_backend == "mock",

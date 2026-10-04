@@ -18,11 +18,56 @@ SKILL_FILES = ("SKILL.md", "scripts/sixnine.py")
 MAX_SKILL_BYTES = 512 * 1024
 
 
+def quick_examples():
+    """Static placeholders only; contract tests execute the draft-only examples."""
+    return {
+        "create_quick_project": {"method": "POST", "path": "/v1/projects",
+            "headers": {"Idempotency-Key": "quick-create-001"},
+            "body": {"title": "一束光中的叶子", "workspace": "freestyle"},
+            "read_response": {"project_id": "id", "project_version": "version", "shot_id": "project.journey.reviewShotId"}},
+        "upload_quick_reference": {"method": "POST", "path": "/v1/assets",
+            "multipart": {"client_project_id": "{project_id}", "client_asset_id": "quick-input-001", "file": "{local_file}"},
+            "require": "Read capabilities.upload_constraints first; use the returned asset_id only after status=ready. A timed-out/503 upload may already exist: match the original client_asset_id and resume that receipt. A validation-failed receipt is not fixed by repeatedly resuming; do not silently alter the original."},
+        "configure_quick_text": {"method": "POST", "path": "/v1/projects/{project_id}/actions",
+            "headers": {"Idempotency-Key": "quick-configure-001"},
+            "body": {"expected_version": 1, "actions": [{"op": "shot.configure_generation", "shot_id": "{shot_id}",
+                "recipe_id": "h3-base-fl2va-v1", "prompt": "A green leaf moves gently in warm sunlight, with a slow camera push-in.",
+                "controls": {"duration": 5, "resolution": "768P", "aspect_ratio": "16:9", "steps": 50,
+                    "seed": "42", "generate_audio": True, "encoder_device": "cpu", "video_decode": "tiled"}}]},
+            "notice": "These illustrative controls must be checked against current capabilities, execution_support and deployment_preset. Supply the actual current project version; this action only saves a draft."},
+        "configure_quick_references": {"method": "POST", "path": "/v1/projects/{project_id}/actions",
+            "headers": {"Idempotency-Key": "quick-references-001"},
+            "body": {"expected_version": 1, "actions": [{"op": "shot.configure_generation", "shot_id": "{shot_id}",
+                "recipe_id": "h3-base-ref2va-v1", "inputs": {
+                    "images": [{"asset_id": "{image_receipt_id}", "purpose": "reference"}],
+                    "videos": [{"asset_id": "{video_receipt_id}", "purpose": "motion", "include_audio": False,
+                        "source_range": {"start": 0, "end": 4}}],
+                    "audios": [{"asset_id": "{audio_receipt_id}", "purpose": "audio", "source_range": {"start": 0, "end": 4}}],
+                    "first_frame": None, "last_frame": None, "guides": []}}]},
+            "notice": "Reference slots are independent. Include only user-intended ready uploads; selections above illustrate explicitly authorized 0..4 second ranges, not automatic cropping."},
+        "read_quick_draft": {"method": "GET", "path": "/v1/projects/{project_id}/shots/{shot_id}/generation-draft"},
+        "plan_quick_draft": {"method": "POST", "path": "/v1/projects/{project_id}/shots/{shot_id}/generation-plans",
+            "body": {"expected_version": 1},
+            "notice": "Replace expected_version with the generation-draft response project_version. Optional capabilities_version must be the current /v1/capabilities version. No paid job is submitted."},
+        "submit_ready_plan": {"method": "POST", "path": "/v1/jobs",
+            "headers": {"Idempotency-Key": "quick-generation-001"}, "body": {"plan_id": "{plan_id}"},
+            "require": "Only a ready current plan within the user's generation authorization and budget; persist this exact body/key before sending. An uncertain outcome must keep both."},
+        "adopt_quick_candidate": {"method": "POST", "path": "/v1/projects/{project_id}/actions",
+            "headers": {"Idempotency-Key": "quick-candidate-001"}, "body": {"expected_version": 1, "actions": [
+                {"op": "artifact.adopt", "artifact_id": "{video_artifact_id}", "shot_id": "{shot_id}", "select": False}]},
+            "require": "Successful same-project artifact, actual current project version; adds a candidate without changing the chosen take. Adopt an actual returned FLAC separately when present."},
+        "select_quick_candidate": {"method": "POST", "path": "/v1/projects/{project_id}/actions",
+            "headers": {"Idempotency-Key": "quick-select-001"}, "body": {"expected_version": 1, "actions": [
+                {"op": "shot.select", "shot_id": "{shot_id}", "entity_id": "{adopted_entity_id}"}]},
+            "require": "Only when choosing this take is intended. Use the adopted document entity ID, not the artifact receipt ID."},
+    }
+
+
 def public_guide():
     """Relative URLs deliberately keep discovery and credentials on one origin."""
     return {
-        "name": "Sixnine / 映序", "version": 1, "api_version": "v1",
-        "description": "Create stories, chapters, characters, scenes and shots; attach references, plan generation and adopt results into the same document visible on the website.",
+        "name": "Sixnine / 映序", "version": 2, "api_version": "v1",
+        "description": "Create one quick H3 clip or edit a multi-chapter story; save the same prompt, separate references and controls visible on the website, plan generation and adopt results without replacing prior takes.",
         "discovery_is_authorization": False,
         "runtime_state": "Not advertised by this static guide. Authenticate, read capabilities, and inspect an actual plan's execution, blockers and estimate. Disabled generation is not a successful generation.",
         "public_resources": {"html": "/for-agents", "text": "/llms.txt", "manifest": "/for-agents/guide.json",
@@ -31,7 +76,7 @@ def public_guide():
             "type": "Bearer", "header": "Authorization", "credential_environment": "SIXNINE_API_KEY",
             "provisioning": "The account owner signs in to the website and creates a scoped Agent API Key; the agent cannot create its own key. Select the intended stories, scopes and expiry.",
             "storage": "Use the key only in process memory or an existing encrypted api_registry service sixnine profile whose base_url matches this origin. Do not put credentials in URLs, prompts, chat, project files or logs.",
-            "origin_policy": "Use the origin supplied by the user. HTTPS is required except loopback. Never follow authenticated redirects or send this credential to a model provider.",
+            "origin_policy": "Use the origin supplied by the user. HTTPS is required except loopback. Never forward credentials through redirects. Only the download helper can follow one signed public HTTPS storage hop using a separate credential-free client with a pinned public IP.",
             "scopes": {
                 "read_story": ["projects:read"],
                 "edit_existing_story": ["projects:read", "projects:write"],
@@ -46,21 +91,24 @@ def public_guide():
             "capabilities": "/v1/capabilities", "projects": "/v1/projects",
             "project": "/v1/projects/{project_id}", "actions": "/v1/projects/{project_id}/actions",
             "activity": "/v1/projects/{project_id}/activity", "assets": "/v1/assets",
+            "generation_draft": "/v1/projects/{project_id}/shots/{shot_id}/generation-draft",
+            "saved_generation_plans": "/v1/projects/{project_id}/shots/{shot_id}/generation-plans",
             "generation_plans": "/v1/generation-plans", "render_plans": "/v1/render-plans",
             "jobs": "/v1/jobs", "job": "/v1/jobs/{job_id}", "artifacts": "/v1/jobs/{job_id}/artifacts",
         },
         "workflow": [
             {"step": "Discover", "action": "Read the public skill; no key is needed to learn the contract. A shared URL alone does not authorize editing or spending."},
             {"step": "Connect", "action": "Use an owner-issued scoped key, then GET the authenticated guide, guided schema and capabilities. Use OpenAPI for exact endpoint bodies."},
-            {"step": "Choose a story", "action": "GET /v1/projects; select the user's existing story or POST /v1/projects with title/logline and a stable Idempotency-Key within granted scope."},
+            {"step": "Choose a workflow", "action": "For one clip, POST /v1/projects with title and workspace=freestyle; use the returned project.journey.reviewShotId. For chapters, use the story examples or select an existing project. Creating a quick draft does not submit generation."},
             {"step": "Edit", "action": "Read the current project/version, then POST atomic guided actions with expected_version. On 409 read again and reconcile; preserve unrelated edits."},
-            {"step": "Prepare media", "action": "Upload media into the same story, wait for ready, and asset.attach it. Derive roles, recipes, model IDs and input limits from the authenticated contract."},
-            {"step": "Plan and submit", "action": "Plan for the current shot/version; inspect output shape, blockers and estimate. Within the user's generation authorization and budget, POST the accepted plan_id to jobs with one durable Idempotency-Key."},
+            {"step": "Prepare media", "action": "Upload into the same project, wait for ready, then shot.configure_generation saves prompt, controls and separate receipt-ID input slots. It maintains web associations; asset.attach remains available for general library editing. Preserve originals and explicit selections."},
+            {"step": "Plan and submit", "action": "Read the saved generation-draft and its project_version, then POST that shot's generation-plans with expected_version. Inspect effective settings, output shape, blockers and estimate; only then, within user authorization/budget, POST a ready plan_id to jobs using one durable Idempotency-Key."},
             {"step": "Observe", "action": "Poll the original job with bounded backoff and Retry-After. A timeout or submission_unknown is unresolved; reconcile the original receipt, never resubmit with a new key."},
             {"step": "Review and adopt", "action": "Verify successful artifacts, adopt video/audio into the intended shot using guided actions, and GET the document again. Preserve existing takes until an explicit selection change."},
             {"step": "Return to the website", "action": "Return the story/entity link, job ID and actual outcome. The user can inspect activity, open the affected section, adjust inputs and request a new take; unsaved browser drafts require an explicit reload decision."},
         ],
         "examples": {
+            **quick_examples(),
             "create_story": {"method": "POST", "path": "/v1/projects", "headers": {"Idempotency-Key": "story-request-001"},
                 "body": {"title": "雨中的来信", "logline": "一次意外重逢改变了归途。"}},
             "create_chapter_scene_shot": {"method": "POST", "path": "/v1/projects/{project_id}/actions",
@@ -71,12 +119,32 @@ def public_guide():
                         "data": {"seconds": 5, "prompt": "A traveller waits at a quiet station in the rain."}}},
                 ]}},
         },
+        "quick_creation": {
+            "workspace": "freestyle", "template_shot_id": "project.journey.reviewShotId",
+            "example_sequence": ["create_quick_project", "configure_quick_text", "read_quick_draft", "plan_quick_draft",
+                "submit_ready_plan", "adopt_quick_candidate"],
+            "reference_variant": "Upload each intended input, then configure_quick_references before reading/planning. Include only the user's actual references; input counts and ranges are constrained by live capabilities.",
+            "placeholder_rules": "Replace {project_id}/{shot_id}/receipt placeholders with actual returned IDs; replace every numeric example expected_version with the current project version. Generate fresh stable keys per logical write, but keep exact keys/bodies for unknown-outcome retries.",
+            "draft_response": ["project_id", "shot_id", "project_version", "shot_version", "draft", "issues", "web_url"],
+            "partial_update_rules": "shot.configure_generation preserves omitted fields and input slots; controls merge by field; [] clears list slots; null clears first/last frame. Same-reference source_range omission preserves the selection; null clears it. Recipe-only changes preserve references; inspect saved inputs and preflight errors (mode incompatibilities may return HTTP 422), not only generation-draft issues.",
+            "input_identity": "All configure_generation input IDs are upload receipt IDs, including guide media_id. The server maps them into web entities. Adopted result selection uses entity IDs.",
+            "upload_validation": {
+                "source": "/v1/capabilities upload_constraints; actual decoding is authoritative",
+                "extensions": {"image": [".png", ".jpg", ".jpeg", ".webp"], "video": [".mp4", ".mov"], "audio": [".wav", ".mp3", ".flac"]},
+                "image_and_video_dimensions": "Each side 256..5760 pixels; width/height ratio 0.4..2.5. A 320x180 video fails because 180 < 256. Images must be static and actual formats must match extensions.",
+                "duration_layers": "Audio/video uploads accept 0.1..3600 seconds; model reference selections are 2..15 seconds with separate aggregate limits. Deployed execution_support may be much stricter. A ready upload is not proof of model/deployment compatibility.",
+                "failure": "Read the original receipt after 422/failed. Retrying resume cannot repair invalid dimensions/format; preserve the source and get an explicit correction instead of silently resizing, cropping or changing upload IDs.",
+            },
+            "preflight_vs_submit": "Saved-draft preflight may materialize explicitly selected audio/video derivatives and needs assets:write for that work, but never submits a GPU job. POST /v1/jobs is the separate paid confirmation boundary.",
+            "web_consistency": "Prefer saved-draft endpoints; direct POST /v1/generation-plans does not update the webpage's prompt/controls/reference slots.",
+        },
         "iteration": {
             "draft_edit": "Patch only the requested entity, read its current nested data first, and use the current expected_version. Nested data objects replace their whole value.",
             "new_take": "A deliberate regeneration is a new plan for the same shot using its latest version and a new logical request key. Keep previous candidates. Do not confuse regeneration with retrying an unknown submission.",
             "activity": "GET the project activity feed for committed browser/API edits; GET project jobs for asynchronous generation. The feed is authenticated, and older edits need not have historical events.",
         },
         "web_links": {"story": "/?project={project_id}", "entity": "/?project={project_id}&entity={entity_id}",
+            "quick": "/freestyle?project={project_id}&entity={shot_id}",
             "activity": "/?project={project_id}&panel=activity",
             "notice": "URL-encode IDs and use the same origin. These navigation links contain no credential and grant no access; the user must sign in to the authorized account."},
         "exports": ["/v1/projects/{project_id}/export?format=json", "/v1/projects/{project_id}/export?format=csv",
@@ -122,13 +190,16 @@ def skill_bundle():
 def llms_text():
     return """# Sixnine / 映序 — Agent integration
 
-> Use the authenticated API to create and edit stories, chapters, characters, scenes and shots; upload references; plan H3 generation and adopt results into the same web document.
+> Use the authenticated API for one quick H3 clip or a multi-chapter story. Save the same prompt, separate media inputs and controls the user can edit on the website; plan generation and adopt candidates.
 
 ## Start here
 - [Agent onboarding](/for-agents): Public HTML; no JavaScript or login is needed to read it.
 - [Machine-readable guide](/for-agents/guide.json): Authentication, request examples and supported workflow.
 - [Skill instructions](/for-agents/SKILL.md): How to work safely on the user's story.
 - [Skill download](/for-agents/skill.zip): Only SKILL.md and scripts/sixnine.py; the helper requires Python and httpx.
+
+## Quick creation
+For one clip, POST /v1/projects with title and workspace=freestyle. Use project.journey.reviewShotId, upload intended references, and save with shot.configure_generation. GET the shot's generation-draft; POST its generation-plans with the returned project_version as expected_version. Only a ready plan within the user's authorization can be confirmed through POST /v1/jobs with a stable Idempotency-Key. The guide JSON contains exact examples and partial-update rules. Return /freestyle?project={project_id}&entity={shot_id}; the same draft and candidates remain editable. Creating/editing a draft does not generate video.
 
 ## Authorization and live capabilities
 A URL is a discovery link, not permission to edit or spend. The owner signs in and creates a scoped Agent API Key. Use process-only SIXNINE_API_KEY or an existing matching encrypted registry profile; never place credentials in chat, URLs or files. All /v1 resources and OpenAPI require authentication. Use only the origin supplied by the user and do not forward its credential to other origins.
@@ -145,20 +216,20 @@ Adopt successful artifacts into the target shot and verify the saved document. R
 def landing_html():
     guide = public_guide()
     steps = "".join(f'<li><strong>{html.escape(item["step"])}</strong><p>{html.escape(item["action"])}</p></li>' for item in guide["workflow"])
-    example = html.escape(json.dumps(guide["examples"]["create_chapter_scene_shot"], ensure_ascii=False, indent=2))
+    example = html.escape(json.dumps(guide["examples"]["create_quick_project"], ensure_ascii=False, indent=2))
     return '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>让 AI 和你一起创作 · 映序 Agent 接入</title><meta name="description" content="把映序交给 Codex：读取使用指南，授权指定故事，通过 API 创作，再回网页查看和调整。">
 <link rel="alternate" type="text/plain" href="/llms.txt"><link rel="alternate" type="application/json" href="/for-agents/guide.json">
 <style>body{margin:0;background:#f7f8f3;color:#1a3028;font:17px/1.7 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:40px 24px 72px}a{color:#245c42}nav{display:flex;gap:22px;flex-wrap:wrap}h1{font-size:clamp(32px,5vw,52px);line-height:1.2;margin:40px 0 20px}h2{margin-top:40px}p{max-width:78ch}.tag{font-size:13px;letter-spacing:.12em}.panel{background:white;border:1px solid #d3dfd1;border-radius:16px;padding:24px;margin:24px 0}.links{display:flex;gap:12px;flex-wrap:wrap}.links a{border:1px solid #afc4ac;border-radius:8px;padding:8px 14px;text-decoration:none}code,pre{font:14px/1.6 ui-monospace,monospace}pre{overflow:auto;background:#edf1e9;padding:20px;border-radius:10px}li{margin-bottom:18px}li p{margin:4px 0}small{color:#526556}</style></head><body><main>
 <nav><a href="/">← 回到映序</a><a href="/llms.txt">llms.txt</a><a href="/for-agents/guide.json">机器可读指南</a></nav>
 <p class="tag">FOR AI AGENTS · API V1</p><h1>让 AI 创作，<br>让你随时接手。</h1>
-<p>把这个网站链接发给 Codex 或其他支持 API 的 Agent。它能先读懂映序，再用你授权的账户创建故事、整理章节和分镜、提交生成任务，并把结果放回你在网页上看到的同一个故事。</p>
+<p>把这个网站链接发给 Codex 或其他支持 API 的 Agent。一个短片可以直接用快速创作：提示词、图片、动作视频、音频和设置都保存到同一份网页草稿。需要改编剧本时，也能整理故事、章节和分镜。</p>
 <div class="links"><a href="/for-agents/SKILL.md">阅读 Skill</a><a href="/for-agents/skill.zip">下载 Skill 包</a><a href="/">登录并创建 API Key</a></div>
 <section class="panel"><h2 style="margin-top:0">三步开始</h2><ol><li><strong>先把链接和创作要求给 Agent。</strong>这页、Skill 和机器指南公开可读，无需登录。</li><li><strong>登录网站，创建限定范围的 Agent API Key。</strong>选择它能操作的故事、权限和有效期；通过你的本地凭据管理器或进程环境交给 Agent。不要把 Key 贴进聊天或放进链接。</li><li><strong>回网站看结果，再继续调整。</strong>打开同一云故事，查看活动和任务；定位章节、角色或镜头，修改要求后只重做需要的部分。旧候选保留，选中哪一版由你决定。</li></ol>
 <small>分享链接只用于发现功能。写入需要账户授权；生成还取决于当前服务是否启用、输入是否合格和可用预算。此页不代表 GPU 已上线。</small></section>
-<h2>可直接发给 Agent 的任务示例</h2><p>“阅读这个网站的 /for-agents 使用指南。用我已配置的凭据，在我指定的故事里建立三章大纲与分镜，先保存草稿并返回能打开对应章节的链接。生成前检查可用能力、阻塞原因和费用；只有在我已经授权的范围内才提交生成。”</p>
+<h2>可直接发给 Agent 的任务示例</h2><p>“阅读这个网站的 /for-agents 使用指南。用我已配置的凭据，为这个广告想法创建一个快速视频草稿，把我的图片、动作视频和音频放到对应位置，返回网页让我继续修改。生成前核对可用能力、阻塞原因和费用；只有在我已经授权的范围内才提交。结果先放候选，不覆盖我已选择的版本。”</p><p>如果你在做短剧，可以要求 Agent 建立章节、角色和分镜；同一份故事也能在快速创作中单独调整某个镜头。</p>
 <h2>Agent 的调用顺序</h2><ol>''' + steps + '''</ol>
-<h2>一个最小编辑请求</h2><p>先创建或读取目标故事，把下面的 project_id 和 expected_version 换成真实返回值。认证头使用进程内凭据；示例不包含 Key。</p><pre>''' + example + '''</pre>
+<h2>创建一个快速草稿</h2><p>使用本人全部项目范围和 projects:create 权限。为每次新建保存唯一的幂等键；重试原请求沿用原键。返回的 project.journey.reviewShotId 是单镜头 ID。随后用 shot.configure_generation 保存生成设置；创建草稿不会启动 GPU。</p><pre>''' + example + '''</pre><p>完整的纯文字、参考素材、预检、提交和候选采用示例见<a href="/for-agents/guide.json">机器可读指南</a>。</p>
 <h2>真实边界</h2><p>网站公开说明与已授权 API 文档分开。认证后的 <code>/v1/agent-guide</code>、<code>/v1/guided-schema</code>、<code>/v1/capabilities</code> 和 <code>/openapi.json</code> 是调用依据。若生成计划返回阻塞，保留草稿并说明原因；不要把演示素材当成生成成功。</p>
 <p>目前没有自动 LLM 写作服务、未配置的图像/音乐/Marble 生成、团队成员共享权限或服务器媒体 ZIP。Agent 可以按你的要求写草稿并存入故事；已有 API Key 不会扩大这些能力。</p>
 <p><small>Skill 包只包含 SKILL.md 和 scripts/sixnine.py；辅助脚本需要 Python 与 httpx。你也可以直接使用同源 HTTP API，无需安装 Skill。下载不会自动安装或授权。</small></p></main></body></html>'''

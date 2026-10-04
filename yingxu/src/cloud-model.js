@@ -97,15 +97,25 @@ export function mergeJobCandidate(project,job,{snapshotHash,now=new Date().toISO
   if(job.recipe_id==='chapter-roughcut-v1')return {changed:!same,added:[],reason:'chapter-deliverable'};
   if(job.status!=='succeeded')return {changed:!same,added:[]};
   const shot=project.entities.find(e=>e.id===job.client_ref.shot_id),old=!!(shot&&(shot.version!==job.client_ref.shot_version||job.client_ref.source_hash&&snapshotHash&&job.client_ref.source_hash!==snapshotHash)),added=[];
+  let candidateChanged=false;
   for(const artifact of job.artifacts||[]){const isAudio=artifact.kind==='audio'&&['audio/flac','audio/x-flac'].includes(artifact.mime||artifact.content_type||artifact.metadata?.mime);if(!artifact.id||!['video','image'].includes(artifact.kind)&&!isAudio)continue;const id='result-'+artifact.id;
     if(isAudio&&audioSeen.has(artifact.id))continue;
     if(same&&!isAudio)continue;
     if(isAudio)audioSeen.add(artifact.id);
+    const attached=project.entities.find(e=>e.data?.cloudArtifactId===artifact.id);
+    if(attached){
+      // Guided artifact.adopt may choose its own entity ID. Keep that identity,
+      // selection and review data instead of manufacturing a duplicate result.
+      if(shot&&!isAudio&&attached.type===artifact.kind&&!shot.data.candidateIds?.includes(attached.id)){
+        shot.data.candidateIds=[...(shot.data.candidateIds||[]),attached.id];candidateChanged=true;
+      }
+      continue;
+    }
     if(project.entities.some(e=>e.id===id))continue;
     project.entities.push({id,type:artifact.kind,title:`${(shot?.title||'历史镜头').slice(0,120)} · ${job.simulation?'模拟 ':''}${old?'旧版 ':''}v${job.client_ref.shot_version} ${isAudio?'独立声音':'候选'}`,description:job.simulation?'模拟任务产物，不代表 H3 真实生成；未自动采用。':'实际任务结果；未自动采用。',parentId:null,order:project.entities.filter(e=>e.parentId===null).length,version:1,status:'draft',data:{fileId:'cloud_artifact_'+artifact.id,cloudArtifactId:artifact.id,cloudContentPath:artifact.content_url||null,fileName:artifact.filename||`${artifact.id}.${artifact.kind==='image'?'png':isAudio?'flac':'mp4'}`,mime:artifact.mime||artifact.content_type||(artifact.kind==='image'?'image/png':isAudio?'audio/flac':'video/mp4'),bytes:artifact.size_bytes||artifact.size||0,metadata:artifact.metadata||{},simulation:!!job.simulation,source:'generation',sourceJobId:job.id,sourceShotId:job.client_ref.shot_id,sourceShotVersion:job.client_ref.shot_version,sourceHash:job.client_ref.source_hash||null,oldVersion:old,missingFile:false,createdAt:now}});
     added.push(id);
     if(shot&&!isAudio){shot.data.candidateIds=[...new Set([...(shot.data.candidateIds||[]),id])];if(old)shot.status='review';}
   }
   const markerChanged=audioSeen.size!==importedAudio.length;if(audioSeen.size)project.jobs.find(j=>j.id===job.id).clientImportedAudioIds=[...audioSeen];
-  return {changed:!same||added.length>0||markerChanged,added,oldVersion:old,...(same&&!added.length&&!markerChanged?{reason:'unchanged'}:{})};
+  return {changed:!same||added.length>0||markerChanged||candidateChanged,added,oldVersion:old,...(same&&!added.length&&!markerChanged&&!candidateChanged?{reason:'unchanged'}:{})};
 }

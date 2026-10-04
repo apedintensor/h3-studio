@@ -1,6 +1,6 @@
 # 映序与 H3 的实际 v1 API
 
-这份文档对应 `studio_platform/api.py` 的实现。目标公网入口是 `https://www.sixnine.art/v1`；当前公网尚未部署。本机预览经 `http://localhost:8850/v1` 代理到8845，仅使用明确标注的CPU模拟与CPU粗剪。真实H3执行/云租赁默认关闭。
+这份文档说明 `studio_platform/api.py` 的代码契约。公网入口为 `https://www.sixnine.art/v1`；实际已发布版本、运行状态与验证范围须分别看发布回执、能力接口和当次预检，不能由文档推断 GPU 可用。本机预览可经 `http://localhost:8850/v1` 代理到8845；模拟模式与真实生成必须明确区分。
 
 映序网页直接使用这一套API与项目文稿。其他小说或制作服务可以作为受限服务客户端接入；不需要把ComfyUI暴露到公网，也不需要拥有GPU云账号或对象存储主密钥。
 
@@ -25,7 +25,7 @@
 | 查看模型控制与输入限制 | GET `/v1/capabilities` | 用准确recipe/model/能力版本，不假定所有执行池可用 |
 | 列出项目 | GET `/v1/projects?limit=100&offset=0` | limit 1–100；授权过滤发生在SQL分页之前 |
 | 读文稿 | GET `/v1/projects/{project_id}` | v4文稿、服务端version与更新时间 |
-| 创建/保存文稿 | POST `/v1/projects`；PUT `/v1/projects/{project_id}` | 创建接受 title/logline/id 或旧 project v4；机器创建需 projects:create+全部本人项目；保存需 projects:write+expected_version |
+| 创建/保存文稿 | POST `/v1/projects`；PUT `/v1/projects/{project_id}` | 创建接受 title/logline/id、可选 workspace=freestyle 或旧 project v4；机器创建需 projects:create+全部本人项目；保存需 projects:write+expected_version |
 | 原子创作操作 | POST `/v1/projects/{id}/actions` | expected_version + 1–200 actions；可带稳定 Idempotency-Key；失败整批回滚 |
 | 节点操作 | GET/POST `/v1/projects/{id}/entities`；PATCH/DELETE `/v1/projects/{id}/entities/{entity_id}` | GET可按type/parent_id筛选；POST entity、PATCH patch都带expected_version；DELETE用query expected_version、显式cascade |
 | 版本轻查询 | GET `/v1/projects/{id}/meta` | id/title/version/updated_at；发现新版本后显式读取，不盲目覆盖网页草稿 |
@@ -38,6 +38,8 @@
 | 创建音视频选段 | POST `/v1/assets/{id}/derivatives` | JSON start/end秒；保留原件，不在生成请求里偷偷裁剪 |
 | 恢复已接收素材处理 | POST `/v1/assets/{id}/resume` | 同一asset；不等于浏览器断线按字节续传 |
 | 创建H3预检计划 | POST `/v1/generation-plans` | 输出实际参数/尺寸/片长、blockers、期限及预算性质 |
+| 读取网页同一生成草稿 | GET `/v1/projects/{p}/shots/{s}/generation-draft` | 返回 draft、issues、project_version、shot_version、web_url；不创建任务 |
+| 从已保存草稿预检 | POST `/v1/projects/{p}/shots/{s}/generation-plans` | expected_version为项目版本，可选capabilities_version；显式选段可生成派生素材，仍不提交GPU任务 |
 | 创建章节粗剪计划 | POST `/v1/render-plans` | 从服务端文稿编译已采用视频/音轨时间线 |
 | 确认任务 | POST `/v1/jobs` | body只有plan_id；必须带稳定Idempotency-Key |
 | 查任务/列表 | GET `/v1/jobs/{id}`；GET `/v1/jobs` | 可按client_project_id；limit 1–100，offset非负 |
@@ -51,6 +53,45 @@
 Swagger/OpenAPI由服务生成，访问仍需本账户身份。表中的模型支持是H3版本化配方的控制契约，当前未接通的Engy/Boyesir、图像生成、音乐生成、Marble不会因为有下拉框就自动可用。
 
 上传文件完整接收后，若CPU预处理名额等待30秒仍不可用，接口返回503和`Retry-After: 5`。原件及同一asset收据保留，素材列表会显示繁忙原因；客户端应查询原client_asset_id对应的素材并调用其`/resume`，不要创建另一个上传ID。恢复仍会鉴权且可能继续繁忙，不会自动创建付费生成。多轨原件不改写；模型参考副本仅采用首个受检真实视频轨和首个音轨，metadata.notes会说明这一选择。
+
+上传前读取 `/v1/capabilities` 的 `upload_constraints`。当前服务按 `studio_platform/media.py` 实际解码校验：静态图片扩展名为 `.png/.jpg/.jpeg/.webp`，视频为 `.mp4/.mov`，纯音频为 `.wav/.mp3/.flac`，实际格式必须匹配扩展名。图片和视频**每边 256–5760 像素，宽高比 0.4–2.5**；320×180 视频会因短边不足256而拒绝。音视频**上传原件**可为0.1–3600秒；**模型参考选段**需2–15秒，并满足同类总时长；**当前部署**的 `execution_support` 又可更严格。不要把上传通过当作当前GPU能够执行。HTTP422或内容验证失败的收据，应先查原收据与限制；反复 `/resume` 不能修复错误尺寸或格式，也不能通过换上传ID解决。保留原件，经明确要求修正源素材，不自动缩放、裁剪或转码。
+
+## Agent 快速创作：一次视频，与网页共用草稿
+
+网站 `/for-agents/guide.json` 的 `quick_creation`、`examples` 给出可发现的完整示例；`/for-agents/SKILL.md` 说明安全调用与恢复规则。只想生成一个视频时，不必让用户建立章节：
+
+1. 带稳定 `Idempotency-Key` 创建 `POST /v1/projects {"title":"我的短片","workspace":"freestyle"}`。返回普通项目 envelope；`project.journey.reviewShotId` 是自动建立的镜头。仅新建草稿，不启动生成。
+2. 如有参考，上传到该项目，并等待原收据 `status=ready`。每次逻辑上传保存稳定 `client_asset_id`；不确定结果时按它查原收据并恢复，不换 ID 重传。
+3. 读取当前项目版本，向 `/v1/projects/{p}/actions` 提交下面的配置动作。这里只保存草稿，服务端会维护网页中对应输入分区、提示词与控制值。
+
+```json
+{
+  "expected_version": 1,
+  "actions": [{
+    "op": "shot.configure_generation",
+    "shot_id": "returned-shot-id",
+    "recipe_id": "h3-base-fl2va-v1",
+    "prompt": "阳光中一片叶子轻轻晃动，镜头缓慢推近。",
+    "controls": {"duration": 5, "seed": "42"},
+    "inputs": {"first_frame": {"asset_id": "ready-image-receipt"}}
+  }]
+}
+```
+
+替换实际 ID 和当前 `expected_version`，为这次逻辑编辑保存独立幂等键。`controls` 合并字段，省略字段和输入槽位会保留原值；列表 `[]` 清空，首尾帧 `null` 清空。只换配方不会悄悄删除不兼容的参考，需核对保存输入及随后预检错误；模式不兼容可能在预检返回HTTP422，不保证已出现在草稿 `issues`。完整结构以 `/v1/guided-schema` 为准。
+
+`inputs` 分成 `images/videos/audios/first_frame/last_frame/guides`，全部使用同项目**上传收据 ID**，包括 guide 的 `media_id`；无需手拼网页实体 ID。普通列表项为 `{asset_id,purpose?}`，视频另有 `include_audio`。音视频或锚点可以显式传 `source_range:{start,end}` 秒；同一关联省略此字段保留选段，`null` 清除选段。不要为了通过限制擅自剪短或静音。
+
+4. GET `/v1/projects/{p}/shots/{s}/generation-draft`，核对 `draft/ issues/ project_version`；读取 `/v1/capabilities` 的实时约束及仅对未设置字段生效的 `deployment_preset`。随后 POST 同路径的 `/generation-plans`，body 为 `{"expected_version":当前project_version}`，可加当前 `capabilities_version`。服务端从已保存文稿编译，不需要手算 source_hash 或 shot_version。存在明确选段时可能创建派生素材，需要 `assets:write`，不代表已经生成视频。
+5. 检查计划实际参数、阻塞、费用与期限；仅在用户已经授权的范围内，用单独持久幂等键 POST `/v1/jobs {"plan_id":"..."}`。未知结果继续原计划/原键；不另建任务“重试”。
+6. 查原 job，成功后取 artifact 清单并核对下载 SHA256。用 `artifact.adopt` 加入候选（`select:false`）；只有明确要采用时才 `shot.select`，传采用后文稿的**实体 ID**。音频仅以实际清单为准，不凭音频开关承诺一定存在 FLAC。
+7. 返回 `https://www.sixnine.art/freestyle?project={p}&entity={s}`。用户仍需登录有权限的账户；可看到同一份草稿、输入、控制与结果候选，再局部修改重做。其他章节和旧候选保留。
+
+直接调用通用 `/v1/generation-plans` 仍受支持，但它不把请求 prompt/controls 自动写回网页。需要“Agent 做了什么，网页就能继续改什么”时，应使用上述保存草稿路径。
+
+随 Skill 提供的 helper 支持 `request`（含 PATCH）、`upload`、`resume-upload`、`poll` 和 `download`。`resume-upload --project P --asset-id 原client_asset_id` 只定位并恢复原收据，不重传文件；`poll --job ID --max-wait 600` 只做有界 GET，遵守 Retry-After，`waiting` 表示需要稍后继续原任务，绝不自动重新生成或采用。输出文件拒绝覆盖；网络错误后已有部分下载可以保留检查，改输出文件名重新下载同一个 artifact。
+
+只有专用 `download` 可以接收可信同源 content 响应的一次 307 签名 HTTPS 跳转：目标须为公网443端口，DNS全部结果经核验，连接固定到核验后的 IP，TLS仍验证原主机名；使用不含 Authorization/Cookie/Referer 的独立客户端，拒绝二次跳转。通用 request 继续拒绝重定向，签名URL不输出到日志或收据。辅助脚本的成功退出不表示任务成功，必须读返回状态。
 
 ## H3请求与确认
 

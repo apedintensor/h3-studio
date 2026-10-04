@@ -4,6 +4,16 @@ import {agentHandoff,agentKeySuggestion,agentOrigin} from './agent-connect-model
 
 const ready={origin:'https://www.sixnine.art/?api_key=do-not-copy#private',account:'owner',workspace:{mode:'cloud',account:'owner',serverVersion:3,dirty:false},projectId:'story-1',entityId:'shot-2'};
 
+test('quick handoff returns to the same saved shot in freestyle with the same scoped key suggestion',()=>{
+  const value=agentHandoff({...ready,view:'/freestyle'});
+  assert.equal(value.workUrl,'https://www.sixnine.art/freestyle?project=story-1&entity=shot-2');
+  assert.match(value.brief,/\/freestyle\?project=story-1&entity=shot-2/);
+  assert.deepEqual(agentKeySuggestion(value.cloudProject).projectIds,['story-1']);
+  assert.equal(agentHandoff({...ready,view:'https://other.example/'}).workUrl,null);
+  assert.equal(agentHandoff({...ready,view:'/freestyle?token=private'}).workUrl,null);
+  assert.equal(agentHandoff({...ready,view:'/freestyle',workspace:{...ready.workspace,dirty:true}}).workUrl,null);
+});
+
 test('handoff links point to the saved cloud scope and never carry page query or private document content',()=>{
   const value=agentHandoff({...ready,projectTitle:'Private title',project:{script:'Private script'},api_key:'synthetic-secret'});
   assert.equal(value.workUrl,'https://www.sixnine.art/?project=story-1&entity=shot-2');

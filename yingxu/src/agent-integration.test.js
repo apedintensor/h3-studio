@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {createCloudClient} from './cloud-client.js';
 import {createCloudController} from './cloud-controller.js';
 import {createStore} from './store.js';
-import {blankCloudProject} from './cloud-model.js';
+import {blankCloudProject,freestyleProject} from './cloud-model.js';
+import {freestyleLinkState} from './agent-navigation.js';
 
 async function fixture(){
   const data=new Map(),storage={getItem:k=>data.get(k)||null,setItem:(k,v)=>data.set(k,v)};
@@ -26,6 +27,24 @@ test('late version read after leaving the story cannot expose an old project not
 test('opening the checked remote version clears the stale update notice',async()=>{
   const h=await fixture();h.record.version=2;h.record.project.title='Agent revised story';await h.controller.checkRemoteVersion();await h.controller.open(h.record.id);
   assert.equal(h.controller.getState().remoteUpdate,null);assert.equal(h.store.getState().project.title,'Agent revised story');assert.equal(h.store.getState().workspace.serverVersion,2);h.controller.destroy();
+});
+test('opening an Agent quick link selects its second shot and preserves the previous project dirty draft',async()=>{
+  const h=await fixture(),previousId=h.record.id;
+  h.store.updateProject({logline:'Keep my unsaved work'});
+  const quick=freestyleProject('Agent quick'),first=quick.entities.find(e=>e.type==='shot');
+  quick.entities.push({...structuredClone(first),id:'second-shot',title:'Agent target',order:1});
+  h.record.id=quick.id;h.record.project=quick;
+  assert.equal(freestyleLinkState(h.store.getState(),`?project=${quick.id}&entity=second-shot`,'superdan'),null);
+  assert.equal(await h.controller.open(quick.id),true);
+  assert.equal(freestyleLinkState(h.store.getState(),`?project=${quick.id}&entity=second-shot`,'superdan').target.shotId,'second-shot');
+  assert.equal(h.store.getCloudDraft('superdan',previousId).project.logline,'Keep my unsaved work');
+  h.store.updateEntity('second-shot',{data:{prompt:'Browser draft'}});
+  h.record.version=2;h.record.project.entities.find(e=>e.id==='second-shot').data.prompt='Agent newer edit';
+  await h.controller.checkRemoteVersion();assert.equal(h.controller.getState().remoteUpdate.version,2);
+  assert.equal(await h.controller.open(quick.id),false);
+  assert.equal(h.store.getState().project.entities.find(e=>e.id==='second-shot').data.prompt,'Browser draft');
+  assert.equal(h.controller.getState().draftOffer.record.version,2);
+  h.controller.destroy();
 });
 test('key creation is a single account-bound write and a late secret cannot return after account reset',async()=>{
   let resolve,calls=0,observed;const client=createCloudClient({fetcher:(path,options)=>{calls++;observed={path,options};return new Promise(r=>{resolve=r;});}});client.setAccount('superdan');

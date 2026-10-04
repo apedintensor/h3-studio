@@ -4,8 +4,31 @@ export function readAgentLink(search){
   const params=new URLSearchParams(search);
   if(!params.has('project'))return null;
   if(params.getAll('project').length!==1||!validId(params.get('project')))return null;
-  if(params.getAll('entity').length>1||params.has('entity')&&!validId(params.get('entity')))return null;
+  if(params.getAll('entity').length>1||params.has('entity')&&!validId(params.get('entity'))||params.getAll('panel').length>1)return null;
   return {projectId:params.get('project'),entityId:params.get('entity')||null,activity:params.get('panel')==='activity'};
+}
+export function agentLinkSearch({projectId,entityId,activity=false}={}){
+  if(!validId(projectId)||entityId!=null&&!validId(entityId))return '';
+  const params=new URLSearchParams({project:projectId});
+  if(entityId)params.set('entity',entityId);
+  if(activity)params.set('panel','activity');
+  return '?'+params.toString();
+}
+// A reference shared by multiple shots has no unambiguous single-shot destination.
+export function freestyleEntityTarget(project,id){
+  const entity=project.entities.find(e=>e.id===id);
+  if(!entity)return null;
+  if(entity.type==='shot')return {shotId:entity.id,entityId:entity.id};
+  if(['image','video','audio'].includes(entity.type)){
+    const shots=project.entities.filter(e=>e.type==='shot'&&(e.id===entity.data?.sourceShotId||e.data?.selectedAssetId===id||e.data?.candidateIds?.includes(id)||project.links.some(l=>l.source===id&&l.target===e.id)));
+    if(shots.length===1)return {shotId:shots[0].id,entityId:entity.id};
+  }
+  return {shotId:null,entityId:entity.id};
+}
+export function freestyleLinkState(state,search,account){
+  const target=readAgentLink(search);
+  if(!target||!account||state.workspace.mode!=='cloud'||state.workspace.account!==account||state.project.id!==target.projectId)return null;
+  return {activity:target.activity,target:target.entityId?freestyleEntityTarget(state.project,target.entityId):null};
 }
 export function locateEntity(project,id){
   const entity=project.entities.find(e=>e.id===id);

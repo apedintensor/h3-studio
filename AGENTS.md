@@ -2,6 +2,8 @@
 
 ## 当前授权与部署进展（2026-10-04，本段优先于下方历史状态）
 
+快速创作 Agent 接入：`POST /v1/projects` 的 `workspace:freestyle` 创建单镜草稿，`shot.configure_generation` 维护网页同一份分区输入与控制；优先使用镜头 `generation-draft` 和保存草稿的 `generation-plans`，原始 H3 plan 入口不会保存网页配置。快速页具备连接 AI、深链接和创作动态，保留远端修改/本地草稿冲突保护。接口契约与验收见 `FREESTYLE-AGENT.zh-CN.md`；实际生产回执见 `.platform-demand-live/QUICK-AGENT-RESULT.zh-CN.md`。不得用 API/模拟测试代替真实推理证据，不因版本升级重置预算或按需服务原窗口。中央 `sixnine` profile 尚未登记；用户网站 Key 仅在运行进程使用，不创建项目凭据副本。
+
 快速创作修复：方式选择移到素材区上方，接口按 `execution_support` 展示真实开放范围。可选 `fl50-firstlast4-ref4-v1` 仅允许受控排队；策略 `runtime_required` 不能写成已完成GPU实测。每台新GPU完成FL50及4步首尾帧/Ref兼容性检查后才注册工作机；仍由真实用户确认任务触发租赁，业务空闲600秒停机。控制与保守输入限制、验收边界见 `FREESTYLE-ADMISSION.zh-CN.md`；部署回执在 `.platform-demand-live/`，不能用本地代码存在代替线上状态。旧池有任何已接收任务都不得执行空池换版；预算与原窗口不得在升级时重置。
 
 最新用户调整：不保留常驻 GPU；只有真实用户确认生成任务后才允许启动，队列与生成/结果收集全部结束后连续空闲 600 秒才关闭。准备常驻时未发送租赁请求。两账户所有故事共用按需单卡池，新增/实验扩容不可打断已接收任务。GPU 累计 US$50 原预算仍有效，旧最终账单 US$3.490345，运行期不能自动充值或提高额度。按需实现与实际部署/验证状态分别见 `ON-DEMAND-GPU.zh-CN.md`，不能把离线测试写成新 GPU 线上实测。

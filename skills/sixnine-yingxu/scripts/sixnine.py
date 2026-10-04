@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
+import re
+import socket
 import sys
-from urllib.parse import urlsplit
+import time
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 
@@ -61,13 +67,137 @@ def write_json(result, destination=None):
 
 def check_response(response):
     if not 200 <= response.status_code < 300:
-        retry = response.headers.get("retry-after", "")
-        suffix = " (retry delay supplied by server)" if retry else ""
+        retry = retry_delay(response)
+        suffix = f" (Retry-After: {retry:g} seconds)" if retry is not None else ""
         raise ValueError(f"API returned HTTP {response.status_code}{suffix}; response details suppressed")
 
 
-def run(args, transport=None):
+def retry_delay(response):
+    value = response.headers.get("retry-after", "")
+    try:
+        if re.fullmatch(r"[0-9]{1,6}", value):
+            return float(value)
+        moment = parsedate_to_datetime(value)
+        if moment.tzinfo is None:
+            return None
+        return max(0.0, (moment - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def identity(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value):
+        raise ValueError("Use an exact project, asset or job ID")
+    return value
+
+
+def signed_download_target(location, resolver=None):
+    """Validate and pin a public HTTPS destination without revealing its bearer URL."""
+    try:
+        if not isinstance(location, str) or len(location) > 16384 or "\\" in location or any(ord(c) < 33 for c in location):
+            raise ValueError()
+        parsed = urlsplit(location)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                or parsed.fragment or parsed.port not in (None, 443) or "%" in parsed.hostname):
+            raise ValueError()
+        # These are download grants, not general external redirect navigation.
+        query = parse_qs(parsed.query)
+        if not any(query.get(name) for name in ("X-Amz-Signature", "X-Goog-Signature", "Signature", "sig")):
+            raise ValueError()
+        host = parsed.hostname.encode("idna").decode("ascii")
+        addresses = (resolver or socket.getaddrinfo)(host, 443, type=socket.SOCK_STREAM)
+        ips = [ipaddress.ip_address(record[4][0]) for record in addresses]
+        if not ips or any(not ip.is_global or ip.is_multicast or (getattr(ip, "ipv4_mapped", None) is not None
+                                              and not ip.ipv4_mapped.is_global) for ip in ips):
+            raise ValueError()
+        # Connecting to this IP prevents a second DNS lookup / rebinding; Host and
+        # TLS SNI still name the original storage host for signature and cert checks.
+        url = httpx.URL(location).copy_with(host=str(ips[0]))
+        host_header = "[" + host + "]" if ":" in host else host
+        return url, host_header, host
+    except Exception:
+        raise ValueError("Storage redirect rejected: require one signed HTTPS URL on public port 443") from None
+
+
+def save_download(response, args):
+    check_response(response)
+    digest, size = hashlib.sha256(), 0
+    with Path(args.output).open("xb") as output:
+        for chunk in response.iter_bytes():
+            size += len(chunk)
+            if size > args.max_bytes:
+                raise ValueError("Download limit exceeded; partial file retained for inspection")
+            digest.update(chunk)
+            output.write(chunk)
+    actual = digest.hexdigest()
+    if args.sha256 and actual != args.sha256.lower():
+        raise ValueError("SHA-256 mismatch; do not adopt the downloaded file")
+    return {"bytes": size, "sha256": actual, "verified": bool(args.sha256)}
+
+
+def download(client, args, transport=None, resolver=None):
+    path = api_path(args.path)
+    if not re.fullmatch(r"/v1/(?:assets|artifacts)/[A-Za-z0-9_-]{1,160}/content", urlsplit(path).path):
+        raise ValueError("Download requires an authenticated asset or artifact content route")
+    if not isinstance(args.max_bytes, int) or args.max_bytes < 1 or args.max_bytes > 2 * 1024**3:
+        raise ValueError("Download byte limit must be between 1 and 2 GiB")
+    if args.sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}", args.sha256):
+        raise ValueError("Use the manifest's complete SHA-256")
+    with client.stream("GET", path) as response:
+        if response.status_code != 307:
+            return save_download(response, args)
+        target, host_header, server_name = signed_download_target(response.headers.get("location"), resolver)
+    # An entirely separate client carries no API credential, Cookie or Referer.
+    # Exactly one storage hop is permitted; a second redirect is an error.
+    try:
+        with httpx.Client(follow_redirects=False, trust_env=False, transport=transport,
+                          timeout=httpx.Timeout(300, connect=15)) as storage:
+            with storage.stream("GET", target, headers={"Host": host_header},
+                                extensions={"sni_hostname": server_name}) as response:
+                return save_download(response, args)
+    except (OSError, httpx.HTTPError):
+        raise ValueError("Storage download incomplete; signed URL details suppressed; retry the original content route") from None
+
+
+def resume_upload(client, args):
+    identity(args.project)
+    identity(args.asset_id)
+    response = client.get("/v1/assets", params={"client_project_id": args.project})
+    check_response(response)
+    matches = [asset for asset in response.json()["assets"] if asset.get("client_asset_id") == args.asset_id]
+    if len(matches) != 1:
+        raise ValueError("No unique original upload receipt found; reconcile the original upload before sending another file")
+    asset = matches[0]
+    if asset.get("status") != "ready":
+        response = client.post("/v1/assets/" + identity(asset.get("asset_id", asset.get("id"))) + "/resume")
+        check_response(response)
+        asset = response.json()
+    return asset
+
+
+def poll_job(client, args, clock=time.monotonic, sleep=time.sleep):
+    ident = identity(args.job)
+    if not 1 <= args.max_wait <= 3600 or not 2 <= args.interval <= 30:
+        raise ValueError("Poll max-wait must be 1..3600 seconds and interval 2..30 seconds")
+    deadline, last = clock() + args.max_wait, None
+    while clock() < deadline:
+        response = client.get("/v1/jobs/" + ident, timeout=min(30, deadline-clock()))
+        delay = max(args.interval, retry_delay(response) or 0)
+        if response.status_code not in (429, 503):
+            check_response(response)
+            last = response.json()
+            if last.get("status") in {"succeeded", "failed", "cancelled", "blocked", "submission_unknown", "recovery_hold"}:
+                return {"job": last, "poll_status": "stopped"}
+        if delay >= deadline-clock():
+            return {"job": last, "poll_status": "waiting", "retry_after_seconds": delay}
+        sleep(delay)
+    return {"job": last, "poll_status": "waiting"}
+
+
+def run(args, transport=None, *, resolver=None, clock=time.monotonic, sleep=time.sleep):
     args.base_url = origin(args.base_url)
+    if getattr(args, "output", None) and Path(args.output).exists():
+        raise FileExistsError("Output already exists; preserve the previous receipt or take")
     token = credential(args)
     headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
     if getattr(args, "idempotency_key", None):
@@ -83,32 +213,24 @@ def run(args, transport=None):
                 raise ValueError("JSON response exceeded the expected limit")
             write_json(response.json(), args.output)
         elif args.command == "upload":
+            identity(args.project)
+            identity(args.asset_id)
             path = Path(args.file)
             if not path.is_file() or path.stat().st_size > 512 * 1024 * 1024:
                 raise ValueError("Input must be an existing file of at most 512 MiB")
             with path.open("rb") as source:
                 response = client.post("/v1/assets", data={"client_project_id": args.project,
                     "client_asset_id": args.asset_id}, files={"file": (path.name, source)})
+            if response.status_code == 422:
+                raise ValueError("Upload returned HTTP 422. Check /v1/capabilities upload_constraints and the original receipt; do not upload a new ID blindly. Invalid media needs an explicit source correction, not repeated resume attempts. Server details suppressed.")
             check_response(response)
             write_json(response.json(), args.output)
+        elif args.command == "resume-upload":
+            write_json(resume_upload(client, args), args.output)
+        elif args.command == "poll":
+            write_json(poll_job(client, args, clock, sleep), args.output)
         elif args.command == "download":
-            path = api_path(args.path)
-            target = Path(args.output)
-            # Exclusive creation prevents overwriting a previous take or receipt.
-            with client.stream("GET", path) as response:
-                check_response(response)
-                digest, size = hashlib.sha256(), 0
-                with target.open("xb") as output:
-                    for chunk in response.iter_bytes():
-                        size += len(chunk)
-                        if size > args.max_bytes:
-                            raise ValueError("Download limit exceeded; partial file retained for inspection")
-                        digest.update(chunk)
-                        output.write(chunk)
-            actual = digest.hexdigest()
-            if args.sha256 and actual != args.sha256.lower():
-                raise ValueError("SHA-256 mismatch; do not adopt the downloaded file")
-            write_json({"bytes": size, "sha256": actual, "verified": bool(args.sha256)})
+            write_json(download(client, args, transport, resolver))
 
 
 def main():
@@ -118,7 +240,7 @@ def main():
     parser.add_argument("--profile")
     commands = parser.add_subparsers(dest="command", required=True)
     req = commands.add_parser("request")
-    req.add_argument("method", choices=["GET", "POST", "PUT", "DELETE"])
+    req.add_argument("method", choices=["GET", "POST", "PUT", "PATCH", "DELETE"])
     req.add_argument("path")
     req.add_argument("--json-file")
     req.add_argument("--idempotency-key")
@@ -128,6 +250,15 @@ def main():
     upload.add_argument("--asset-id", required=True)
     upload.add_argument("--file", required=True)
     upload.add_argument("--output")
+    resume = commands.add_parser("resume-upload", help="Find and resume the original accepted upload; never re-upload bytes")
+    resume.add_argument("--project", required=True)
+    resume.add_argument("--asset-id", required=True, help="Original stable client_asset_id, not the receipt ID")
+    resume.add_argument("--output")
+    poll = commands.add_parser("poll", help="Bounded GET-only polling; no submissions or automatic adoption")
+    poll.add_argument("--job", required=True)
+    poll.add_argument("--max-wait", type=float, default=600)
+    poll.add_argument("--interval", type=float, default=5)
+    poll.add_argument("--output")
     download = commands.add_parser("download")
     download.add_argument("path")
     download.add_argument("--output", required=True)

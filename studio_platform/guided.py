@@ -42,11 +42,22 @@ def now_iso():
 
 
 def empty_project(body):
-    if set(body) - {"id", "title", "logline"}:
-        raise ValueError("新故事仅接受id、title、logline；导入完整文稿请使用project字段")
-    return dict(schemaVersion=4, id=body.get("id", "project-"+uuid.uuid4().hex), title=body.get("title"),
+    if set(body) - {"id", "title", "logline", "workspace"}:
+        raise ValueError("新故事仅接受id、title、logline、workspace；导入完整文稿请使用project字段")
+    if "workspace" in body and body["workspace"] != "freestyle":
+        raise ValueError("workspace目前仅支持freestyle；普通故事省略该字段")
+    project = dict(schemaVersion=4, id=body.get("id", "project-"+uuid.uuid4().hex), title=body.get("title"),
         logline=body.get("logline", ""), entities=[], links=[], jobs=[], journey={"stage": 1},
         layout={"positions": {}, "viewport": {"x": 0, "y": 0, "zoom": 1}}, updatedAt=now_iso())
+    if body.get("workspace") == "freestyle":
+        parent = None
+        for kind, title in (("chapter", "快速创作"), ("scene", "单镜场景"), ("shot", "我的视频")):
+            ident = kind + "-" + uuid.uuid5(uuid.NAMESPACE_URL, str(project["id"])+":"+kind).hex
+            new_entity(project, {"id": ident, "type": kind, "title": title, "parentId": parent,
+                "data": {"seconds": 5, "prompt": ""} if kind == "shot" else {"script": ""} if kind == "scene" else {}})
+            parent = ident
+        project["journey"] = {"workspace": "freestyle", "stage": 4, "reviewShotId": parent}
+    return project
 
 
 def object_fields(value, allowed, message):
@@ -210,6 +221,10 @@ class Guided:
                 validate_action_fields(action)
                 if action.get("op") in {"asset.attach", "artifact.adopt"}:
                     resolved[index] = self.resolve(principal, project_id, action)
+                elif action.get("op") == "shot.configure_generation":
+                    from .generation_draft import prepare_patch
+                    resolved[index] = prepare_patch(action, lambda ident: self.resolve(principal, project_id,
+                        {"op": "asset.attach", "asset_id": ident}))
         try:
             with self.repo.transaction() as conn:
                 # The project row serializes concurrent edits. A unique receipt
@@ -310,6 +325,9 @@ class Guided:
             new_entity(project, action.get("entity"))
         elif op == "entity.update":
             update_entity(entity_by_id(project, action.get("entity_id")), action.get("patch"))
+        elif op == "shot.configure_generation":
+            from .generation_draft import configure
+            configure(project, action, resolved)
         elif op == "entity.delete":
             delete_entity(project, action.get("entity_id"), action.get("cascade", False))
         elif op == "link.create":
@@ -500,8 +518,11 @@ def register_routes(app):
 
     @app.get("/v1/agent-guide")
     def guide():
-        return {"version": 1, "schema_url": "/v1/guided-schema", "openapi_url": "/openapi.json", "skill_download_url": "/v1/agent-skill.zip",
+        from .agent_discovery import public_guide
+        return {"version": 2, "schema_url": "/v1/guided-schema", "openapi_url": "/openapi.json", "skill_download_url": "/v1/agent-skill.zip",
+            "quick_creation": public_guide()["quick_creation"], "examples_url": "/for-agents/guide.json",
             "steps": ["Browser account creates scoped API key; pass Bearer on API calls only",
+                "For one clip, create workspace=freestyle; use project.journey.reviewShotId, shot.configure_generation and the saved-draft generation-plans route. Exact examples: /for-agents/guide.json",
                 "POST /v1/projects with title/logline and stable Idempotency-Key; select returned project id",
                 "POST /v1/projects/{id}/actions with expected_version and atomic actions",
                 "POST /v1/assets multipart; asset.attach adds ready receipt to the same web document",

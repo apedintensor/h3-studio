@@ -450,6 +450,10 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         principal = request.state.principal
         project_id = body.get("client_ref", {}).get("project_id") if isinstance(body.get("client_ref"), dict) else None
         project = authorized_project(principal, project_id, "jobs:write")["payload"]
+        return plan_response(principal, body, project)
+
+    def plan_response(principal, body, project):
+        project_id = project["id"]
         compiled, fingerprint = compile_request(body, lambda asset_id: asset_service.model_snapshot(principal.owner, project_id, asset_id))
         ref = compiled["client_ref"]
         if not validate_source_ref(project, ref):
@@ -466,6 +470,51 @@ def create_app(settings: Settings, *, repository=None, storage=None):
                 "client_ref": ref, "expires_at": plan["expires_at"], "blockers": blockers,
                 "warnings": ["本地模拟：不调用模型，不代表H3速度或质量"] if simulation else [],
                 "estimate": admission.estimate, "execution": public_execution(execution), "simulation": simulation}
+
+    @app.get("/v1/projects/{project_id}/shots/{shot_id}/generation-draft")
+    def generation_draft(project_id: str, shot_id: str, request: Request):
+        from .generation_draft import read_draft, shot_entity
+        record = authorized_project(request.state.principal, project_id)
+        project = record["payload"]
+        draft, issues = read_draft(project, shot_id)
+        view = "/freestyle" if project.get("journey", {}).get("workspace") == "freestyle" else "/"
+        return {"project_id": project_id, "shot_id": shot_id, "project_version": record["version"],
+            "shot_version": shot_entity(project, shot_id)["version"], "draft": draft, "issues": issues,
+            "web_url": f"{view}?project={quote(project_id, safe='')}&entity={quote(shot_id, safe='')}"}
+
+    @app.post("/v1/projects/{project_id}/shots/{shot_id}/generation-plans", status_code=201)
+    def saved_generation_plan(project_id: str, shot_id: str, request: Request, body: dict):
+        from .generation_draft import fields, plan_body
+        principal = request.state.principal
+        fields(body, {"expected_version", "capabilities_version"}, "草稿预检")
+        if type(body.get("expected_version")) is not int or body["expected_version"] < 1:
+            raise ValueError("需要当前项目的expected_version")
+        if body.get("capabilities_version", VERSION) != VERSION:
+            raise ValueError("生成能力已变化，请刷新后重新预检")
+        authorized_project(principal, project_id, "projects:read")
+        record = authorized_project(principal, project_id, "jobs:write")
+        if record["version"] != body["expected_version"]:
+            raise Conflict("document_version_conflict")
+        def derive(ident, start, end):
+            authorized_project(principal, project_id, "assets:write")
+            asset_service.get(principal.owner, ident, project_id)
+            value = asset_service.derive(principal.owner, ident, start, end)
+            if value["status"] != "ready":
+                raise Conflict("asset_not_ready")
+            return value["asset_id"]
+        # Permission is required only if there are media receipts. The saved
+        # project contains no authority to access another owner's object.
+        from .generation_draft import read_draft
+        draft, _ = read_draft(record["payload"], shot_id)
+        if any(draft["inputs"].values()):
+            authorized_project(principal, project_id, "assets:read")
+        payload = plan_body(record["payload"], shot_id, capabilities(settings), derive)
+        # CPU derivation may take time; do not produce a plan from a now-stale
+        # snapshot or let concurrent edits be mistaken for the submitted draft.
+        latest = authorized_project(principal, project_id, "jobs:write")
+        if latest["version"] != body["expected_version"]:
+            raise Conflict("document_version_conflict")
+        return plan_response(principal, payload, latest["payload"])
 
     def resolve_render_source(principal, project_id, entity, kind):
         data = entity.get("data", {})

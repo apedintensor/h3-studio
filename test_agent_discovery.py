@@ -116,6 +116,66 @@ class AgentDiscoveryTests(unittest.TestCase):
         self.login("supervan")
         self.assertEqual(self.client.get("/v1/projects/"+row["id"]).status_code, 404)
 
+    def test_quick_examples_save_one_web_draft_preflight_and_never_submit_implicitly(self):
+        guide = self.client.get("/for-agents/guide.json").json()
+        self.assertEqual(guide["version"], 2)
+        self.assertEqual(guide["web_links"]["quick"], "/freestyle?project={project_id}&entity={shot_id}")
+        self.login()
+        issued = self.client.post("/v1/api-keys", json={"name": "Quick agent fixture",
+            "scopes": ["projects:read", "projects:create", "projects:write", "assets:read", "assets:write", "jobs:read", "jobs:write"],
+            "all_projects": True, "project_ids": [], "expires_in_days": 1})
+        issued.raise_for_status()
+        headers = {"Authorization": "Bearer "+issued.json()["api_key"]}
+        self.client.cookies.clear()
+        example = guide["examples"]["create_quick_project"]
+        created = self.client.request(example["method"], example["path"], json=example["body"], headers={**headers, **example["headers"]})
+        self.assertEqual(created.status_code, 201, created.text)
+        row = created.json()
+        shot_id = row["project"]["journey"]["reviewShotId"]
+        self.assertEqual(row["project"]["journey"]["workspace"], "freestyle")
+        self.assertEqual(len([e for e in row["project"]["entities"] if e["type"] == "shot"]), 1)
+        retry = self.client.request(example["method"], example["path"], json=example["body"], headers={**headers, **example["headers"]})
+        self.assertEqual(retry.json()["id"], row["id"])
+        example = guide["examples"]["configure_quick_text"]
+        body = copy.deepcopy(example["body"])
+        body["expected_version"] = row["version"]
+        body["actions"][0]["shot_id"] = shot_id
+        response = self.client.request(example["method"], example["path"].format(project_id=row["id"]), json=body,
+            headers={**headers, **example["headers"]})
+        self.assertEqual(response.status_code, 200, response.text)
+        current = response.json()
+        same = self.client.request(example["method"], example["path"].format(project_id=row["id"]), json=body,
+            headers={**headers, **example["headers"]})
+        self.assertEqual(same.json()["version"], current["version"])
+        shot = next(e for e in current["project"]["entities"] if e["id"] == shot_id)
+        self.assertEqual(shot["data"]["prompt"], body["actions"][0]["prompt"])
+        self.assertEqual(shot["data"]["h3"]["controls"]["seed"], "42")
+        example = guide["examples"]["read_quick_draft"]
+        draft = self.client.get(example["path"].format(project_id=row["id"], shot_id=shot_id), headers=headers)
+        self.assertEqual(draft.status_code, 200, draft.text)
+        draft = draft.json()
+        self.assertEqual(draft["project_version"], current["version"])
+        self.assertEqual(draft["draft"]["prompt"], shot["data"]["prompt"])
+        self.assertEqual(draft["web_url"], guide["web_links"]["quick"].format(project_id=row["id"], shot_id=shot_id))
+        example = guide["examples"]["plan_quick_draft"]
+        plan = self.client.post(example["path"].format(project_id=row["id"], shot_id=shot_id),
+            json={"expected_version": draft["project_version"]}, headers=headers)
+        self.assertEqual(plan.status_code, 201, plan.text)
+        self.assertEqual(plan.json()["status"], "blocked")
+        listed = self.client.get("/v1/jobs", params={"client_project_id": row["id"]}, headers=headers).json()
+        self.assertEqual(listed["jobs"], [])
+        self.login("supervan")
+        self.assertEqual(self.client.get(guide["authenticated_resources"]["generation_draft"].format(project_id=row["id"], shot_id=shot_id)).status_code, 404)
+
+    def test_authenticated_guide_reuses_public_quick_contract_without_public_private_data(self):
+        public = self.client.get("/for-agents/guide.json").json()
+        self.login()
+        private = self.client.get("/v1/agent-guide").json()
+        self.assertEqual(private["quick_creation"], public["quick_creation"])
+        self.assertIn("shot.configure_generation", self.client.get("/v1/guided-schema").json()["operation_schemas"])
+        self.assertIn("workspace=freestyle", self.client.get("/llms.txt").text)
+        self.assertIn("快速草稿", self.client.get("/for-agents").text)
+
 
 if __name__ == "__main__":
     unittest.main()
