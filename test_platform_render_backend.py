@@ -266,6 +266,30 @@ class RenderTests(unittest.TestCase):
         starts = [i for i, value in enumerate(values) if value > 1900 and (i == 0 or values[i-1] <= 1900)]
         self.assertEqual(starts, expected)
 
+    def test_short_clip_concat_has_exact_24fps_packet_timeline(self):
+        from fractions import Fraction
+        self.video("red", "red", seconds=1, audio=False)
+        self.video("blue", "blue", seconds=1, audio=False)
+        shots = [{"shot_id": f"shot-{index}", "source_id": "red" if index % 2 == 0 else "blue",
+                  "frames": count, "source_start_frame": 0}
+                 for index, count in enumerate((1, 2, 1, 1, 2, 1))]
+        result = self.execute(self.job(shots=shots, render_version=2), tag="short-grid")
+        info = media.probe(result["video"])
+        stream = next(s for s in info["streams"] if s["codec_type"] == "video")
+        self.assertEqual(Fraction(stream["avg_frame_rate"]), Fraction(24))
+        self.assertEqual(int(stream["nb_frames"]), 8)
+        self.assertAlmostEqual(float(stream["duration"]), 8/24, delta=1e-5)
+        # MP4 movie/header duration may still round to its millisecond scale.
+        # The actual video stream and each packet must retain the 24fps grid.
+        self.assertAlmostEqual(float(info["format"]["duration"]), 8/24, delta=.001)
+        packets = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_packets", "-show_entries", "packet=pts_time,duration_time", "-of", "json", str(result["video"])],
+            timeout=30))["packets"]
+        self.assertEqual(len(packets), 8)
+        for index, packet in enumerate(sorted(packets, key=lambda p: float(p["pts_time"]))):
+            self.assertAlmostEqual(float(packet["pts_time"]), index/24, delta=1e-5)
+            self.assertAlmostEqual(float(packet["duration_time"]), 1/24, delta=1e-5)
+
     def test_v2_short_flac_cannot_be_hidden_by_padding_even_if_header_probe_lies(self):
         self.video("clip", "red", seconds=2)
         self.marked_flac("voice", [3000]*31999)

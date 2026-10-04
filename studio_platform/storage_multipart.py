@@ -315,7 +315,20 @@ class MultipartUploadManager:
             return self._verify_object(owner_id, record)
         if record["status"] != "active" or len(record["parts"]) != record["part_count"]:
             raise MultipartConflict("Every part must be uploaded before completion")
-        remote = self._list_parts(record)
+        try:
+            remote = self._list_parts(record)
+        except ObjectNotFound:
+            # A concurrent winner can consume the MPU after our active snapshot
+            # was read. Recheck the same owner/provider-bound journal, not HEAD:
+            # only its completed state proves full byte verification occurred.
+            current = self._get(owner_id, session_id)
+            if current["version"] <= record["version"]:
+                raise  # No state transition explains the genuinely missing MPU.
+            if current["status"] == "completed":
+                return ObjectInfo(**current["object"])
+            # Completing, aborting and uncertain outcomes must stay recoverable;
+            # never reissue Complete or infer success from an object's presence.
+            raise MultipartConflict("Upload session changed; reload its current status") from None
         expected = set(range(1, record["part_count"] + 1))
         if set(remote) != expected:
             raise MultipartConflict("Remote parts differ; reconcile before completion")

@@ -5,7 +5,9 @@ are used. Nothing here touches a user's data, credentials or inference provider.
 """
 import io
 import hashlib
+import json
 import os
+from fractions import Fraction
 from pathlib import Path
 import secrets
 import subprocess
@@ -130,6 +132,45 @@ def check_roughcut(client, app, project, root):
             white = sum(r > 210 and g > 210 and b > 210 for r, g, b in area.get_flattened_data())
         expected = 6 <= frame_index < 18 or 30 <= frame_index < 42
         assert (white > 20) == expected, "Burned Chinese cue frame boundary mismatch"
+    # The runtime image can ship a different FFmpeg release from the CI host.
+    # Exercise sub-second concat through the real API using that exact binary.
+    project["entities"] = [e for e in project["entities"] if e["type"] != "shot"]
+    for index, frames in enumerate((1, 2, 1, 1, 2, 1)):
+        project["entities"].append(dict(id=f"tiny-{index}", type="shot", parentId="scene",
+            title=f"Tiny clip {index}", description="", version=1, order=index, status="draft",
+            data={"seconds": frames/24, "selectedAssetId": f"clip-{index % 2}"}))
+    project["journey"] = {"brief": {"aspect": "16:9"}, "sound": {"mode": "silent"}}
+    saved = client.put("/v1/projects/"+project["id"], json={"project": project, "expected_version": 2})
+    assert saved.status_code == 200, "Short-clip timeline could not be saved"
+    short_plan = client.post("/v1/render-plans", json={"client_ref": {"project_id": project["id"],
+        "chapter_id": "chapter"}, "resolution": "480P", "burn_subtitles": False})
+    assert short_plan.status_code == 201 and short_plan.json()["status"] == "ready"
+    short_job = client.post("/v1/jobs", json={"plan_id": short_plan.json()["plan_id"]},
+        headers={"Idempotency-Key": "container-six-short-clips"})
+    assert short_job.status_code == 202
+    deadline = time.monotonic()+90
+    while time.monotonic() < deadline:
+        runner.run_once("container-cpu", POOL)
+        short_done = client.get("/v1/jobs/"+short_job.json()["id"]).json()
+        if short_done["status"] == "succeeded":
+            break
+        assert short_done["status"] not in {"failed", "cancelled"}, "Short-clip CPU render failed"
+        time.sleep(.1)
+    assert short_done["status"] == "succeeded", "Short-clip render exceeded check deadline"
+    short_video = next(a for a in short_done["artifacts"] if a["kind"] == "video")
+    response = client.get(short_video["download_url"])
+    assert response.status_code == 200
+    assert hashlib.sha256(response.content).hexdigest() == short_video["sha256"]
+    short_path = root / "short-grid.mp4"
+    short_path.write_bytes(response.content)
+    info = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_streams", "-show_packets", "-of", "json", str(short_path)], timeout=20))
+    assert Fraction(info["streams"][0]["avg_frame_rate"]) == 24
+    packets = sorted(info["packets"], key=lambda p: float(p["pts_time"]))
+    assert len(packets) == 8
+    for index, packet in enumerate(packets):
+        assert abs(float(packet["pts_time"])-index/24) < .00001
+        assert abs(float(packet["duration_time"])-1/24) < .00001
     control.drain("container-cpu")
     return done
 
@@ -199,7 +240,7 @@ def main():
             assert client.get(artifact["download_url"]).status_code == 200
     forbidden = [".env", "cloud-state.json", "api-vault.dpapi", "cloud_control.py", "ssh-known-hosts"]
     assert not any((Path("/app")/name).exists() for name in forbidden)
-    print("PASS: unprivileged Linux image, frontend, secure sessions, private media/jobs, PNG normalization, two-clip CPU rough cut with explicit sound, burned Chinese caption pixels and exact cue frames, MP4/FLAC attachment checksums, Range, restart persistence; no network or GPU")
+    print("PASS: unprivileged Linux image, frontend, secure sessions, private media/jobs, PNG normalization, two-clip CPU rough cut with explicit sound, burned Chinese caption pixels and exact cue frames, six short clips with exact 24fps packet timestamps, MP4/FLAC attachment checksums, Range, restart persistence; no network or GPU")
 
 
 if __name__ == "__main__":

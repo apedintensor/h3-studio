@@ -4,14 +4,18 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import tempfile
 import traceback
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest import mock
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 from studio_platform.storage import (IntegrityError, ObjectNotFound, ObjectTooLarge,
                                     S3ObjectStore, UnsupportedStorageOperation)
@@ -104,6 +108,23 @@ class MultipartTests(OfflineTest):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.url = "sqlite:///" + (Path(self.temp.name) / "journal.db").as_posix()
+        postgres = os.environ.get("PLATFORM_TEST_DATABASE_URL")
+        if postgres:
+            parsed = make_url(postgres)
+            if parsed.host not in {"127.0.0.1", "localhost"} or parsed.database != "sixnine_test":
+                raise RuntimeError("Multipart tests only allow the explicit local sixnine_test database")
+            schema = "multipart_test_" + uuid.uuid4().hex
+            bootstrap = create_engine(parsed, echo=False, hide_parameters=True)
+            with bootstrap.begin() as conn:
+                conn.execute(text('CREATE SCHEMA "' + schema + '"'))
+            def drop_test_schema():
+                try:
+                    with bootstrap.begin() as conn:
+                        conn.execute(text('DROP SCHEMA "' + schema + '" CASCADE'))
+                finally:
+                    bootstrap.dispose()
+            self.addCleanup(drop_test_schema)
+            self.url = parsed.update_query_dict({"options": "-csearch_path=" + schema})
         self.engine = create_engine(self.url)
         self.addCleanup(self.engine.dispose)
         self.journal = MultipartJournal(self.engine)
@@ -342,6 +363,95 @@ class MultipartTests(OfflineTest):
         with ThreadPoolExecutor(max_workers=6) as pool:
             results = list(pool.map(complete, range(6)))
         self.assertTrue(any(result is not None for result in results))
+        self.assertEqual(self.count("complete"), 1)
+
+    def test_completion_with_stale_active_snapshot_returns_verified_result(self):
+        session = self.uploaded()
+        stale = self.restarted()
+        snapshot_read, completion_finished = Barrier(2, timeout=10), Barrier(2, timeout=10)
+        list_parts = stale._list_parts
+
+        def delayed_list(record):
+            # Force the losing caller to keep its active snapshot until the
+            # winner has verified the object and the provider has removed MPU.
+            self.assertEqual(record["status"], "active")
+            snapshot_read.wait()
+            completion_finished.wait()
+            return list_parts(record)
+
+        with mock.patch.object(stale, "_list_parts", side_effect=delayed_list):
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(stale.complete, "owner", session["id"])
+                snapshot_read.wait()
+                try:
+                    winner = self.manager.complete("owner", session["id"])
+                finally:
+                    completion_finished.wait()
+                self.assertEqual(pending.result(timeout=10), winner)
+        self.assertEqual(self.count("complete"), 1)
+        self.assertEqual(self.count("get"), 1)
+        self.assertEqual(self.manager.get("owner", session["id"])["status"], "completed")
+
+    def test_missing_upload_without_new_journal_version_remains_missing(self):
+        session = self.uploaded()
+        record = self.journal.get("owner", session["id"])
+        del self.fake.uploads[record["upload_id"]]
+        with self.assertRaises(ObjectNotFound):
+            self.manager.complete("owner", session["id"])
+        self.assertEqual(self.journal.get("owner", session["id"]), record)
+        self.assertEqual(self.count("complete"), 0)
+        self.assertEqual(self.count("get"), 0)
+
+    def test_stale_completion_cannot_turn_concurrent_abort_into_success(self):
+        session = self.uploaded()
+        stale = self.restarted()
+        list_parts = stale._list_parts
+        def abort_before_list(record):
+            self.manager.abort("owner", session["id"])
+            return list_parts(record)
+        with mock.patch.object(stale, "_list_parts", side_effect=abort_before_list):
+            with self.assertRaises(MultipartConflict):
+                stale.complete("owner", session["id"])
+        self.assertEqual(self.manager.get("owner", session["id"])["status"], "aborted")
+        self.assertEqual(self.count("complete"), 0)
+        self.assertEqual(self.count("get"), 0)
+
+    def test_stale_completion_preserves_inflight_and_unknown_outcomes(self):
+        for stage, error, status in (("crash", ProcessStopped, "completing"),
+                                     ("after", MultipartOutcomeUnknown, "completion_unknown")):
+            with self.subTest(stage=stage):
+                session = self.manager.begin("owner", "asset", "uncertain-" + stage,
+                    size_bytes=3, sha256=hashlib.sha256(b"abc").hexdigest(),
+                    filename="source.mp4", content_type="video/mp4")
+                self.manager.upload_part("owner", session["id"], 1, io.BytesIO(b"abc"))
+                stale = self.restarted()
+                list_parts = stale._list_parts
+                before = self.count("complete")
+                def interrupted_before_list(record):
+                    self.fake.failure = ("complete", stage)
+                    with self.assertRaises(error):
+                        self.manager.complete("owner", session["id"])
+                    return list_parts(record)
+                with mock.patch.object(stale, "_list_parts", side_effect=interrupted_before_list):
+                    with self.assertRaises(MultipartConflict):
+                        stale.complete("owner", session["id"])
+                self.assertEqual(self.manager.get("owner", session["id"])["status"], status)
+                self.assertEqual(self.count("complete"), before + 1)
+                self.assertEqual(self.count("get"), 0)
+
+    def test_missing_upload_reread_rechecks_provider_binding(self):
+        session = self.uploaded()
+        stale = self.restarted()
+        list_parts = stale._list_parts
+        def changed_binding_before_list(record):
+            self.manager.complete("owner", session["id"])
+            changed = self.journal.get("owner", session["id"])
+            changed["binding"] = "different-storage-binding"
+            self.journal.save("owner", changed)
+            return list_parts(record)
+        with mock.patch.object(stale, "_list_parts", side_effect=changed_binding_before_list):
+            with self.assertRaisesRegex(MultipartConflict, "different provider"):
+                stale.complete("owner", session["id"])
         self.assertEqual(self.count("complete"), 1)
 
     def test_crash_before_creation_intent_resumes_persisted_key(self):

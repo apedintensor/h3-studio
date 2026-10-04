@@ -538,7 +538,11 @@ class CPURenderBackend:
             _require(total_clip_bytes <= self.max_output_bytes, "render_combined_video_size_limit")
             clips.append(output)
         manifest = self._path(directory, "clips.txt")
-        manifest.write_text("".join("file '"+path.name+"'\n" for path in clips), encoding="ascii")
+        # MP4 format duration can be rounded to milliseconds (one 24fps frame
+        # becomes .042s). Concat must advance by the validated frame count,
+        # not accumulate those per-file header roundings across short shots.
+        manifest.write_text("".join("file '"+path.name+"'\n"
+            +f"duration {shot['frames']/24:.12f}\n" for path, shot in zip(clips, render["shots"])), encoding="ascii")
         joined = self._path(directory, "joined.mp4")
         self._run_process(["-protocol_whitelist", "file,pipe", "-f", "concat", "-safe", "1", "-i", manifest,
                            "-map", "0:v:0", "-c:v", "copy", "-an", "-fs", self.max_output_bytes+1, joined],
