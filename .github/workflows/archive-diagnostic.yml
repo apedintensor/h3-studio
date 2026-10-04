@@ -4,6 +4,25 @@ on:
 permissions:
   contents: read
 jobs:
+  compose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Inspect synthetic GPU overlay rendering (no daemon changes or credentials)
+        run: |
+          python - <<'PY'
+          import json
+          from test_platform_gpu_acceptance import ComposeOverlayTests, fixture_diagnostics
+          ComposeOverlayTests.setUpClass()
+          print(json.dumps(fixture_diagnostics(ComposeOverlayTests.config, ComposeOverlayTests.version), indent=2))
+          PY
+          python -m unittest test_platform_gpu_acceptance -v
   archive:
     runs-on: ubuntu-24.04
     timeout-minutes: 5

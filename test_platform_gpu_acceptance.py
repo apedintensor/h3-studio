@@ -33,6 +33,18 @@ EXPECTED = {'handoff_id': 'synthetic-handoff', 'worker_id': 'synthetic-worker', 
 CONTAINER = 'a'*64
 
 
+def fixture_diagnostics(config, version):
+    """Synthetic fixture only; never call this with a real runtime config."""
+    actual = config['services']['gpu-worker']
+    expected = acceptance.worker('sixnine-platform:'+'a'*40)
+    missing = '<missing>'
+    return {'compose_version': version, 'worker_fields': {key:
+        {'actual': actual.get(key, missing), 'expected': expected.get(key, missing)}
+        for key in sorted(set(actual)|set(expected)) if actual.get(key, missing) != expected.get(key, missing)},
+        'app_policy_mounts': [item for item in config['services']['app']['volumes']
+            if item.get('target') == acceptance.POLICY_TARGET]}
+
+
 def safe_status():
     return {'handoff_id': EXPECTED['handoff_id'], 'worker_ids': [EXPECTED['worker_id']],
         'hard_deadline': EXPECTED['hard_deadline'], 'observed_at': time.time(),
@@ -73,7 +85,12 @@ class ComposeOverlayTests(unittest.TestCase):
 
     def test_actual_compose_render_preserves_cpu_policy_with_exact_gpu_delta(self):
         before = copy.deepcopy(self.config)
-        self.assertTrue(acceptance.validate(self.config, deployment_directory=DEPLOY, compose_version=self.version))
+        try:
+            self.assertTrue(acceptance.validate(self.config, deployment_directory=DEPLOY, compose_version=self.version))
+        except (release.ReleaseError, validator.ConfigurationError):
+            # No secret file is read: this fixture uses fake image hashes and
+            # fixed secret-reference paths, so precise CI diagnostics are safe.
+            self.fail(json.dumps(fixture_diagnostics(self.config, self.version), sort_keys=True))
         self.assertEqual(self.config, before)
         for mount in self.config['services']['gpu-worker']['volumes']:
             self.assertTrue(mount['source'].startswith('/srv/sixnine/'))
