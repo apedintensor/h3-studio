@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import secrets
+import time
 
 from comfy_workflow import (COMFY_COMMIT, ASPECT_RATIOS, RESOLUTIONS, SAMPLER_NAMES,
                             SCHEDULER_NAMES, controls_metadata, native_output_spec,
@@ -64,6 +65,29 @@ def capabilities(settings):
                     "minimum_aspect_ratio": .4, "maximum_aspect_ratio": 2.5,
                     "description": "自定义宽高须为32的倍数，总面积不超过768×1344，宽高比0.4–2.5"},
                 "source": {"comfyui_revision": COMFY_COMMIT}} for key, mode in RECIPES.items()]
+    if settings.generation_enabled and settings.execution_backend == "comfy-worker":
+        # Public operational defaults are separate from model defaults. Never
+        # serialize the operator policy (budget identities/pool bindings), and
+        # never modify compile_request or a caller's explicitly chosen values.
+        from .execution_policy import read_policy
+        try:
+            policy = read_policy(settings.execution_policy_file)
+        except ValueError:
+            policy = None
+        now = time.time()
+        if (policy and policy["enabled"] and policy["qualification"]["status"] == "accepted"
+                and policy["qualification"]["verified_at"] <= now < policy["qualification"]["expires_at"]
+                and now < policy["reservation"]["expires_at"]):
+            envelope = policy["envelope"]["controls"]
+            preset = {field: value for field, value in (("encoder_device", "cpu"), ("video_decode", "tiled"))
+                if envelope[field] == [value]}
+            if preset:
+                for recipe in recipes:
+                    if recipe["id"] in policy["recipe_ids"]:
+                        recipe["deployment_preset"] = {
+                            "label": "当前云端显存预设", "controls": dict(preset),
+                            "applies_to": "unset_controls_only", "source": "current_operator_execution_policy",
+                            "description": "当前执行池要求这些控制值。新镜头的未设置项采用此预设；已有明确选择保留。API调用请显式传入，最终以预检为准。"}
     return {"capabilities_version": VERSION, "recipes": recipes,
             "execution_enabled": settings.generation_enabled,
             "execution_backend": settings.execution_backend,

@@ -71,6 +71,27 @@ class ExecutionPolicyTests(unittest.TestCase):
         self.assertEqual(self.compiled["request"]["seed"], "18446744073709551615")
         self.assertEqual(self.compiled["request"]["model"], MODEL)
 
+    def test_capabilities_explain_live_deployment_preset_without_changing_model_defaults(self):
+        from studio_platform.capabilities import capabilities, control_schema
+        self.value["envelope"]["controls"].update(encoder_device=["cpu"], video_decode=["tiled"])
+        self.write()
+        result = capabilities(self.settings)
+        for recipe in result["recipes"]:
+            self.assertEqual(recipe["deployment_preset"]["controls"], {"encoder_device": "cpu", "video_decode": "tiled"})
+            self.assertEqual(recipe["deployment_preset"]["applies_to"], "unset_controls_only")
+            self.assertEqual(recipe["controls"]["encoder_device"]["default"], "default")
+            self.assertEqual(recipe["controls"]["video_decode"]["default"], "normal")
+        self.assertNotIn("budget_accounts", json.dumps(result))
+        self.assertEqual(control_schema()["encoder_device"]["default"], "default")
+        self.assertFalse(self.evaluate().execution["enabled"])
+        request = generation_request()
+        request["controls"].update(result["recipes"][0]["deployment_preset"]["controls"])
+        compiled, fingerprint = compile_request(request, lambda _: None)
+        self.assertTrue(self.policies.evaluate(compiled, self.scope, fingerprint).execution["enabled"])
+        self.value["qualification"]["expires_at"] = self.repo.clock()-1
+        self.write()
+        self.assertTrue(all("deployment_preset" not in r for r in capabilities(self.settings)["recipes"]))
+
     def test_missing_invalid_or_disabled_policy_never_falls_back(self):
         self.path.unlink()
         self.assertFalse(self.evaluate().execution["enabled"])

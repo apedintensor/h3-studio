@@ -48,6 +48,7 @@ export function controlsForRecipe(recipe,saved={},seconds=5){
   const result={};for(const [field,schema]of Object.entries(recipe?.controls||{})){
     if(schema.available===false||['guides','video_audio'].includes(field))continue;
     if(Object.hasOwn(saved,field)&&saved[field]!==''&&saved[field]!==null)result[field]=saved[field];
+    else if(!Object.hasOwn(saved,field)&&recipe?.deployment_preset?.applies_to==='unset_controls_only'&&['encoder_device','video_decode'].includes(field)&&schema.enum?.includes(recipe.deployment_preset.controls?.[field]))result[field]=recipe.deployment_preset.controls[field];
     else if(field==='duration')result[field]=seconds;
     else if(Object.hasOwn(schema,'default'))result[field]=schema.default;
   }return result;
