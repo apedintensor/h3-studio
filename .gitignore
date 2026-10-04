@@ -172,6 +172,7 @@ inventory.json
 !deploy/platform/ec2/CD.zh-CN.md
 !tools/deploy_aws_release.py
 !studio_platform/lium_runtime_aws.py
+!studio_platform/lium_identity.py
 !LIUM-PRODUCTION-INTEGRATION.zh-CN.md
 !skills/
 !skills/sixnine-yingxu/
@@ -191,8 +192,18 @@ inventory.json
 !deploy/platform/ec2/sixnine-secrets.service
 !deploy/platform/ec2/README.zh-CN.md
 !deploy/platform/gpu_acceptance.py
+!deploy/platform/gpu_scaler.py
+!deploy/platform/verify_public_scaling.py
+!deploy/platform/GPU-SCALER.zh-CN.md
+!test_platform_gpu_scaler.py
 !test_platform_gpu_acceptance.py
 !studio_platform/production_worker.py
+!studio_platform/drain_safe_runner.py
+!studio_platform/production_scaler.py
+!studio_platform/production_scaler_boot.py
+!test_platform_production_scaler.py
+!PRODUCTION-SCALER.zh-CN.md
 !PRODUCTION-WORKER.zh-CN.md
 !deploy/platform/production-worker.example.json
 !AGENT-API-RELEASE-20261004.zh-CN.md
+!BACKEND-HANDOFF-20261004.zh-CN.md

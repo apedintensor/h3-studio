@@ -497,12 +497,14 @@ class WorkerRunner:
                 self.control.observe(worker_id, result["job_id"])
             return result
 
+    def _claim(self, worker_id, pool, *, purpose):
+        return (self.control or self.queue).claim(worker_id, pool, lease_seconds=900, purpose=purpose)
+
     def _run_once(self, worker_id, pool):
         self.queue.recover_expired(summary=True)
         claim, purpose = None, None
         for phase in ("collect", "reconcile", "generate"):
-            source = self.control or self.queue
-            claim = source.claim(worker_id, pool, lease_seconds=900, purpose=phase)
+            claim = self._claim(worker_id, pool, purpose=phase)
             if claim:
                 purpose = phase
                 break

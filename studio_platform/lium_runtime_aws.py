@@ -13,7 +13,7 @@ import json
 import re
 import threading
 
-from .lium_provider import BASE_URL, KEY_VARIABLE, PROFILE, SERVICE
+from .lium_identity import BASE_URL, KEY_VARIABLE, PROFILE, SERVICE
 
 
 REGION = "ap-southeast-1"

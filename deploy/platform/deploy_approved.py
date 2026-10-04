@@ -8,20 +8,22 @@ import release
 
 
 def require_no_gpu_acceptance(root):
-    marker = root/'gpu-acceptance'/'active.json'
-    if marker.exists() or marker.is_symlink():
-        release.regular(marker, root_owned=True, maximum=16384)
-        value = json.loads(marker.read_text())
-        release.require(isinstance(value, dict) and value.get('version') == 1
-                        and value.get('active') is False, 'gpu_acceptance_requires_explicit_safe_restore')
+    for folder in ('gpu-acceptance', 'gpu-scaler'):
+        marker = root/folder/'active.json'
+        if marker.exists() or marker.is_symlink():
+            release.regular(marker, root_owned=True, maximum=16384)
+            value = json.loads(marker.read_text())
+            release.require(isinstance(value, dict) and value.get('version') == 1
+                            and value.get('active') is False, 'gpu_acceptance_requires_explicit_safe_restore')
     # Also catch a service started before its marker was introduced. Never
     # interrupt an uncertain acceptance worker through a routine app release.
-    running = release.command(['ps', '--quiet',
-        '--filter', 'label=com.docker.compose.project=sixnine-platform',
-        '--filter', 'label=com.docker.compose.service=gpu-worker'],
-        environment={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
-                     'DOCKER_CONFIG': '/opt/sixnine-release/docker-config'}, timeout=20)
-    release.require(not running.strip(), 'gpu_acceptance_worker_still_running')
+    for service in ('gpu-worker', 'gpu-controller'):
+        running = release.command(['ps', '--quiet',
+            '--filter', 'label=com.docker.compose.project=sixnine-platform',
+            '--filter', 'label=com.docker.compose.service='+service],
+            environment={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
+                         'DOCKER_CONFIG': '/opt/sixnine-release/docker-config'}, timeout=20)
+        release.require(not running.strip(), 'gpu_acceptance_worker_still_running')
 
 
 def deploy(commit, *, root=release.ROOT):

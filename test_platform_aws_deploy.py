@@ -82,6 +82,24 @@ class RunnerTests(unittest.TestCase):
 
 
 class HostAndDocumentTests(unittest.TestCase):
+    def test_active_unknown_scaler_or_running_controller_blocks_cd(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root/'gpu-scaler'
+            folder.mkdir()
+            marker = folder/'active.json'
+            with mock.patch.object(host.release, 'regular'), mock.patch.object(host.release, 'command', return_value=b'') as command:
+                for value in ({'version': 1, 'active': True}, {'version': 1}, {}):
+                    marker.write_text(json.dumps(value))
+                    with self.assertRaisesRegex(host.release.ReleaseError, 'explicit_safe_restore'):
+                        host.require_no_gpu_acceptance(root)
+                command.assert_not_called()
+                marker.write_text(json.dumps({'version': 1, 'active': False}))
+                command.side_effect = [b'', b'controller-id']
+                with self.assertRaisesRegex(host.release.ReleaseError, 'worker_still_running'):
+                    host.require_no_gpu_acceptance(root)
+                self.assertIn('label=com.docker.compose.service=gpu-controller', command.call_args.args[0])
+
     def test_active_unknown_and_running_acceptance_block_routine_release(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

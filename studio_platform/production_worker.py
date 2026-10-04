@@ -18,17 +18,17 @@ import signal
 import stat
 import subprocess
 import sys
-import threading
 import time
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 
 from .control import WorkerControl, WorkerSpec
+from .drain_safe_runner import DrainSafeRunner
 from .fleet import FleetConfig, FleetSupervisor, SlotConfig, read_config as read_fleet, run_slot
 from .lium_bootstrap import SSHHost, COMFY_REVISION, MODEL_REVISION
 from .repository import Repository, attempts, jobs, registered_workers
 from .settings import Settings
-from .worker import ComfyBackend, WorkerRunner, _slot_lock
+from .worker import ComfyBackend, _slot_lock
 
 
 MODEL = "MiniMax-H3-Base-BF16"
@@ -230,51 +230,24 @@ def request_drain(repo, config):
         "worker_ids": [config.worker_id], "drained": False}
 
 
-class AcceptanceRunner(WorkerRunner):
+class AcceptanceRunner(DrainSafeRunner):
     """Stop NEW work at the deadline; keep collecting/reconciling old attempts."""
     def __init__(self, *args, acceptance, **kwargs):
         self.acceptance = acceptance
-        self._stop_new = threading.Event()
-        self._worker_id = None
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs,
+            stop_new=lambda: self.repo.clock() >= acceptance.stop_claiming_at
+                or (acceptance.work_dir/"drain.flag").exists(),
+            job_allowed=self._acceptance_job_allowed,
+            job_filter=and_(jobs.c.tenant_id == acceptance.tenant, jobs.c.owner_id == acceptance.owner,
+                jobs.c.pool == acceptance.pool,
+                jobs.c.execution_plan["configuration_id"].as_string() == acceptance.configuration_id),
+            collection_lock_dir=acceptance.work_dir/"collection-lock")
 
-    def drain(self):
-        self._stop_new.set()
-
-    def stopped(self):
-        return (self._stop_new.is_set() or self.repo.clock() >= self.acceptance.stop_claiming_at
-            or (self.acceptance.work_dir/"drain.flag").exists()
-            or self.stop_requested is not None and self.stop_requested() is True)
-
-    def _check_external_stop(self):
-        if self.stopped() and self._worker_id:
-            self.control.drain(self._worker_id)
-
-    def _submission_allowed(self, job):
+    def _acceptance_job_allowed(self, job):
         duration = job.get("expected_runtime_s")
         return bool(type(duration) in (int, float) and math.isfinite(duration) and duration > 0
             and self.repo.clock()+duration+self.acceptance.collection_margin_s < self.acceptance.hard_deadline
-            and not self.stopped() and job["tenant_id"] == self.acceptance.tenant
-            and job["owner_id"] == self.acceptance.owner and super()._submission_allowed(job))
-
-    def run_forever(self, worker_id, pool, *, poll_interval_s=1):
-        self._worker_id = worker_id
-        prior = {}
-        if threading.current_thread() is threading.main_thread():
-            for signum in (signal.SIGINT, signal.SIGTERM):
-                prior[signum] = signal.getsignal(signum)
-                signal.signal(signum, lambda *_: self.drain())
-        try:
-            while True:
-                self._check_external_stop()
-                if self.stopped() and self.control.get(worker_id)["current_job_id"] is None:
-                    break
-                self.run_once(worker_id, pool)
-                time.sleep(poll_interval_s)
-        finally:
-            self.control.drain(worker_id)
-            for signum, handler in prior.items():
-                signal.signal(signum, handler)
+            and job["tenant_id"] == self.acceptance.tenant and job["owner_id"] == self.acceptance.owner)
 
 
 class ProductionController:

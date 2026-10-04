@@ -2,15 +2,17 @@
 
 ## 当前授权与部署进展（2026-10-04，本段优先于下方历史状态）
 
+最新用户指令：先收尾后端，暂停进一步扩容实测，完成 front-facing / onboarding 后再继续。两台旧测试 GPU 在随后“留一个”的消息到达前均已销毁，未重租；网站仍运行，生成已关闭。新增有限 controller 代码默认禁用、尚未部署，交接见 `BACKEND-HANDOFF-20261004.zh-CN.md`。恢复租赁/实测前需要新的继续指令，不能据下方历史预算自动重开。
+
 用户已新授权：完成映序 Agent API、账户自助 API Key、部署公开网站，并实际验证多 GPU 队列与自动扩容。GPU 测试累计上限 US$50，不自动充值；其他设施初期预算目标低于 US$50/月。测试 GPU 完成后销毁，网站保留运行。历史关闭 GPU 指令不禁止此次已授权测试；不把测试额度视为无限持续租用授权。
 
-已创建新加坡 AWS EC2 CPU 控制主机 `i-03d81d2d153b5e2fd`，固定 IP `18.136.57.227`，六九域名 DNS 已切换；资源记录见 `deploy/platform/ec2/`。GitHub OIDC 仅可发布经测试的 S3 release bundle，主机仍须通过独立操作员通道批准确切 manifest SHA；准备就绪不代表已通过公网发布验收。密码与数据库凭据留 AWS Secrets Manager，站点容器通过 `/run` 文件读取；不得读出值到会话/日志。生产初始账号通过服务器内部安全管道建立。
+已创建新加坡 AWS EC2 CPU 控制主机 `i-03d81d2d153b5e2fd`，固定 IP `18.136.57.227`，六九域名 DNS 已切换；资源记录见 `deploy/platform/ec2/`。`https://www.sixnine.art` 的密码登录、账户隔离、PAT、故事编辑及结果回写已实际验收。GitHub OIDC 发布测试后的 S3 release bundle，独立部署身份通过固定 SSM Document 执行确切版本；主机仍须独立批准确切 manifest SHA。`fc91fc7` 的 CI/CD 均成功。密码与数据库凭据留 AWS Secrets Manager，站点容器通过 `/run` 文件读取；不得读出值到会话/日志。生产初始账号通过服务器内部安全管道建立。
 
-实际 GPU 测试由本轮独立控制器负责，状态见 `.platform-gpu-live`；检查持久账本与供应商状态后才能考虑租赁，不重复创建。单独测试环境成功不能写成生产服务器已连接，两个单卡任务并发也不等于单个任务使用张量并行。
+原 GPU 隔离测试控制器状态见 `.platform-gpu-live`：两台单卡 PRO6000 96GB 的 8 个 FL50 任务成功、Ref50 多模态输入成功；正式生产单机交接作业 `1816736a-49f2-4be4-89a3-0f1ad1e7bfb2` 已通过公网生成/下载/采用/会话一致验收，随后安全恢复 CPU 模式。原控制器负责该两台实例销毁；新生产有限扩容控制器须在旧周期全部销毁并完成持久账本核验后才可单独启动。两个单卡任务并发不等于单个任务张量并行；本轮未测 5090/B200。
 
 2026-10-04 十小时实现与本轮验收已完成：新的统一平台入口是 `platform_app.py` / `studio_platform/`，使用独立数据库与对象根，不覆盖旧 `data/`。映序 canonical 源码在 `../video-studio-design/studio-app`，`yingxu/` 是由 `tools/sync_yingxu_source.py` 产生的只读发布快照。当前架构见 `ARCHITECTURE.zh-CN.md`；新生产包在 `deploy/platform/`，旧 `deploy/` 只保留兼容。不能把下文初始“只有设计”的状态当作新代码未实现，也不能把本地代码/模拟验证当作公网或GPU已上线。
 
-新平台已实现 PostgreSQL/SQLite 持久任务、计划/预算、worker/fleet、受限私有存储、云项目/素材及CPU章节粗剪；运行证据见本轮验收记录。真实GPU默认关、云创建上限0、scaler默认dry-run；FakeProvider和模拟视频不是线上模型验收。Hippius只为实验adapter，不能替换缺少条件创建保证的AssetService。远端Linux中央凭据加载尚未完成，不复制DPAPI库或生成项目.env。
+新平台已实现 PostgreSQL/SQLite 持久任务、计划/预算、worker/fleet、受限私有存储、云项目/素材及CPU章节粗剪；运行证据见本轮验收记录。常规 CPU 发布默认关闭真实生成和云创建；有限 GPU 验收必须独立启用并阻止并行 CD。FakeProvider不算线上验收。Hippius只为实验adapter，不能替换缺少条件创建保证的AssetService。Linux使用已明确授权的AWS Secrets Manager `/sixnine/platform/lium` 固定版本作为同一 `lium/lium--rig-root` 的加密运行时来源；host复用 `AwsLiumLoader`，一次内存stdin交付controller，不复制DPAPI库、不建项目.env、不打印秘密。导入通过不等于新生产租赁已验收。
 
 `SIXNINE_RENDER_ENABLED` 单独控制CPU粗剪；不通过开启它恢复GPU。正式站点必须密码认证，`local-test`和mock仅隔离loopback测试使用。公网发布仅使用测试后的 `sixnine-platform:<commit>`；主机要求独立root批准manifest摘要，部署身份不得覆盖host controller或自批准。处理项目删除/模型迁移仍需先读中央HOUSEKEEPING并核实云账单与唯一资产。
 

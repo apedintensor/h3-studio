@@ -128,6 +128,14 @@ def require_new_acceptance(environment):
     release.require(not existing.strip(), 'existing_acceptance_worker_requires_reconciliation')
 
 
+def require_no_parallel_cycle():
+    # Share the exact CD barrier before any new acceptance service mutation.
+    # A finite controller and a single-handoff worker must never own the same
+    # production queue concurrently, even when started in the reverse order.
+    from deploy_approved import require_no_gpu_acceptance
+    require_no_gpu_acceptance(release.ROOT)
+
+
 def acceptance_marker(commit, active):
     """Root-owned cross-controller barrier; never infer completion from a TTL."""
     path = ROOT/'active.json'
@@ -244,6 +252,7 @@ def main(argv=None):
                 acceptance_marker(commit, False)
                 print('CPU-only application restored; GPU billing requires separate provider verification')
                 return 0
+            require_no_parallel_cycle()
             protected_inputs()
             require_new_acceptance(environment)
             policy = json.loads(POLICY_SOURCE.read_text())

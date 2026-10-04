@@ -26,12 +26,9 @@ import httpx
 
 from .repository import Conflict, money
 from .scaler import LaunchSpec, ProviderFact, _safe_id
+from .lium_identity import BASE_URL, KEY_VARIABLE, PROFILE, SERVICE
 
 
-SERVICE = "lium"
-PROFILE = "lium--rig-root"
-BASE_URL = "https://lium.io/api"
-KEY_VARIABLE = "LIUM_API_KEY"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_ROWS = 4096
 

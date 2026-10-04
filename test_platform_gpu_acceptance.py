@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -151,6 +152,18 @@ class ComposeOverlayTests(unittest.TestCase):
 
 
 class DrainTests(unittest.TestCase):
+    def test_start_shares_scaler_and_acceptance_barrier(self):
+        # The shared guard's real two-marker/two-service behavior is exercised
+        # in test_platform_aws_deploy. This binds the legacy start to it too.
+        from unittest.mock import Mock
+        guard = Mock(side_effect=release.ReleaseError('gpu_acceptance_requires_explicit_safe_restore'))
+        with patch.dict(sys.modules, {'deploy_approved': SimpleNamespace(require_no_gpu_acceptance=guard)}), \
+                patch.object(release, 'command') as command:
+            with self.assertRaisesRegex(release.ReleaseError, 'explicit_safe_restore'):
+                acceptance.require_no_parallel_cycle()
+        guard.assert_called_once_with(release.ROOT)
+        command.assert_not_called()
+
     def test_operator_marker_persists_explicit_state_without_worker_secrets(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(acceptance, 'ROOT', Path(directory)):
             for state in (True, False):

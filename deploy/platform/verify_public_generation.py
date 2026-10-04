@@ -257,7 +257,10 @@ def docker_decode(path, kind):
     release = trusted_release()
     assert release.ROOT == Path('/srv/sixnine') and release.DOCKER == '/usr/bin/docker'
     check_file(path)
-    assert path.parent == ROOT and path.name in ('generated.mp4', 'generated.flac')
+    scaling_parent = Path('/srv/sixnine/gpu-scaler/public-verification')
+    allowed_parent = path.parent == ROOT or (path.parent.parent == scaling_parent
+        and re.fullmatch(r'shot-[1-6]', path.parent.name))
+    assert allowed_parent and path.name in ('generated.mp4', 'generated.flac')
     release.regular(Path(release.DOCKER), root_owned=True)
     state_path = release.ROOT/'release-state.json'
     release.regular(state_path, root_owned=True, maximum=16384)
