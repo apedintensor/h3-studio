@@ -25,8 +25,9 @@ import uuid
 import httpx
 
 from .repository import Conflict, money
-from .scaler import LaunchSpec, ProviderFact, _safe_id
+from .scaler import CreationNotSubmitted, LaunchSpec, ProviderFact, _safe_id
 from .lium_identity import BASE_URL, KEY_VARIABLE, PROFILE, SERVICE
+from .rent_journal import RentJournal
 
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
@@ -35,6 +36,24 @@ MAX_ROWS = 4096
 
 class LiumError(Conflict):
     """Only static, non-secret error codes leave the adapter."""
+
+
+class LiumNotSubmitted(LiumError, CreationNotSubmitted):
+    """This invocation failed before the sole rent POST; not a HTTP rejection."""
+
+
+class LiumRentRejected(LiumError):
+    """A pinned 4xx code proves allocation was refused; never a timeout/5xx."""
+
+
+RENT_REFUSALS = {
+    "node_not_found": {404}, "template_not_found": {404},
+    "node_unavailable": {400}, "node_rent_in_progress": {400, 409},
+    "node_paused_by_provider": {409}, "provider_banned": {409},
+    "gpu_count_invalid": {400}, "gpu_split_not_allowed": {400},
+    "node_not_verified": {400}, "template_invalid": {400}, "ttl_invalid": {400},
+    "no_executor_matches_spec": {409},
+}
 
 
 def _uuid(value):
@@ -124,12 +143,23 @@ class LiumManifest:
     region: str = ""
     allow_preflight_only_price_cap: bool = False
     execution_slots: int = 1
+    compatible_gpu_names: tuple[str, ...] = ()
+    minimum_vram_mib: int = 0
+    allowed_countries: tuple[str, ...] = ()
+    server_side_selection: bool = False
+    minimum_ram_gib: int = 0
+    minimum_disk_gib: int = 0
+    require_docker_in_docker: bool = False
 
     def __post_init__(self):
         _safe_id(self.configuration_id), _safe_id(self.model_id)
         if self.region:
             _safe_id(self.region)
-        _uuid(self.executor_id), _uuid(self.template_id)
+        _uuid(self.template_id)
+        if self.executor_id:
+            _uuid(self.executor_id)
+        elif self.executor_id != "" or not self.compatible_gpu_names:
+            raise LiumError("lium_hardware_filter_required_without_executor")
         if type(self.gpu_count) is not int or not 1 <= self.gpu_count <= 128:
             raise LiumError("lium_invalid_gpu_count")
         if type(self.execution_slots) is not int or not 1 <= self.execution_slots <= self.gpu_count:
@@ -143,6 +173,24 @@ class LiumManifest:
                 or not math.isfinite(self.approved_until)):
             raise LiumError("lium_invalid_manifest")
         _public_key(self.user_public_key)
+        for key in ("compatible_gpu_names", "allowed_countries"):
+            value = getattr(self, key)
+            if (not isinstance(value, (list, tuple)) or len(value) > 32
+                    or any(not isinstance(v, str) or not v or len(v) > 128 for v in value)
+                    or len(set(value)) != len(value)):
+                raise LiumError("lium_invalid_hardware_selector")
+            object.__setattr__(self, key, tuple(value))
+        if (type(self.minimum_vram_mib) is not int or not 0 <= self.minimum_vram_mib <= 1_048_576
+                or bool(self.compatible_gpu_names) != bool(self.minimum_vram_mib)
+                or any(len(v) != 2 or not v.isascii() or not v.isupper() or not v.isalpha()
+                       for v in self.allowed_countries)):
+            raise LiumError("lium_invalid_hardware_selector")
+        if (type(self.server_side_selection) is not bool or type(self.require_docker_in_docker) is not bool
+                or type(self.minimum_ram_gib) is not int or not 0 <= self.minimum_ram_gib <= 65536
+                or type(self.minimum_disk_gib) is not int or not 0 <= self.minimum_disk_gib <= 1048576
+                or self.server_side_selection and (self.executor_id or len(self.compatible_gpu_names) != 1
+                                                    or len(self.allowed_countries) > 1)):
+            raise LiumError("lium_invalid_server_selector")
 
 
 @dataclass(frozen=True)
@@ -193,7 +241,7 @@ class LiumProvider:
     provider_id = SERVICE
 
     def __init__(self, *, enabled=False, manifests=(), loader=None, transport=None,
-                 idle_probe=None, clock=time.time, timeout_s=20, ttl_margin_s=60):
+                 idle_probe=None, clock=time.time, timeout_s=20, ttl_margin_s=60, journal_dir=None):
         if (type(enabled) is not bool or isinstance(timeout_s, bool) or not math.isfinite(timeout_s)
                 or not 0 < timeout_s <= 30 or isinstance(ttl_margin_s, bool)
                 or not math.isfinite(ttl_margin_s) or not 30 <= ttl_margin_s <= 300):
@@ -202,6 +250,8 @@ class LiumProvider:
         if (any(not isinstance(item, LiumManifest) for item in manifest_list)
                 or len({(item.configuration_id, item.executor_id, item.template_id) for item in manifest_list}) != len(manifest_list)):
             raise LiumError("lium_duplicate_or_invalid_manifest")
+        if journal_dir is None and any(item.server_side_selection for item in manifest_list):
+            raise LiumError("lium_server_selector_requires_durable_journal")
         self.enabled = enabled
         self._manifests = {(item.configuration_id, item.executor_id, item.template_id): item for item in manifest_list}
         self._loader = loader or _central_loader
@@ -211,6 +261,133 @@ class LiumProvider:
         self._initialization_lock, self._create_lock = threading.Lock(), threading.Lock()
         self._submitted_tags = set()
         self._destroy_submitted = set()
+        self._availability_cache = {}
+        self._journal = RentJournal(journal_dir) if journal_dir is not None else None
+
+    def _journal_write(self, tag, phase, **fields):
+        if self._journal is not None:
+            try:
+                self._journal.save(tag, phase, **fields)
+            except Exception:
+                raise LiumError("lium_rent_journal_unconfirmed") from None
+
+    def _journal_read(self, tag):
+        if self._journal is None:
+            return None
+        try:
+            return self._journal.read(tag)
+        except Exception:
+            raise LiumError("lium_rent_journal_unconfirmed") from None
+
+    def _select_offer(self, manifest):
+        # Selection is opt-in operator policy. Model, template, count, TTL and
+        # money reservation stay unchanged. Recheck inventory at actual create.
+        if manifest.server_side_selection:
+            try:
+                response = self._request("POST", "executors/rent-by-spec", rental=True,
+                    payload=self._spec_payload(manifest, "sixnine-preflight", dry_run=True))
+            except LiumRentRejected:
+                raise LiumError("lium_exact_offer_or_template_unavailable") from None
+            self._validate_spec_response(response, manifest, dry_run=True)
+            return _uuid(response["selected_executor"]["id"])
+        route = "executors?available=true" if manifest.compatible_gpu_names else "executors"
+        rows = self._rows(route)
+        candidates = []
+        for row in rows:
+            if not manifest.compatible_gpu_names and row.get("id") != manifest.executor_id:
+                continue
+            try:
+                identity = _uuid(row.get("id"))
+                price = _microusd(row.get("price_per_gpu"))
+                count = row.get("gpu_count")
+                if (type(count) is not int or count < manifest.gpu_count
+                        or price > manifest.max_price_per_gpu_hour_microusd):
+                    continue
+                free = row.get("available_gpu_count", count)
+                if type(free) is not int or free < manifest.gpu_count:
+                    continue
+                # Direct selection cannot infer splitting permission. Atomic
+                # rent-by-spec is required for a partial rental of a larger host.
+                if count != manifest.gpu_count:
+                    continue
+                minimum = row.get("min_gpu_count_for_rental", 1)
+                if type(minimum) is not int or minimum > manifest.gpu_count:
+                    continue
+                if manifest.allowed_countries and row.get("location", {}).get("country_code") not in manifest.allowed_countries:
+                    continue
+                if manifest.compatible_gpu_names:
+                    details = row["specs"]["gpu"]["details"]
+                    if not isinstance(details, list) or not details:
+                        continue
+                    if any(not isinstance(d, dict) or d.get("name") not in manifest.compatible_gpu_names
+                           or type(d.get("capacity")) is not int or d["capacity"] < manifest.minimum_vram_mib
+                           for d in details):
+                        continue
+                candidates.append((identity != manifest.executor_id, price, identity))
+            except (LiumError, KeyError, TypeError, AttributeError):
+                continue
+        if not candidates:
+            code = "lium_offer_outside_approved_limits" if any(r.get("id") == manifest.executor_id for r in rows) else "lium_exact_offer_or_template_unavailable"
+            raise LiumError(code)
+        selected = sorted(candidates)[0][2]
+        if sum(r.get("id") == selected for r in rows) != 1:
+            raise LiumError("lium_duplicate_offer_identity")
+        templates = [r for r in self._rows("templates") if r.get("id") == manifest.template_id]
+        if len(templates) != 1:
+            raise LiumError("lium_exact_offer_or_template_unavailable")
+        return selected
+
+    @staticmethod
+    def _spec_payload(manifest, name, *, dry_run, hours=None):
+        value = {"pod_name": name, "template_id": manifest.template_id,
+                 "gpu_count": manifest.gpu_count, "gpu_type": manifest.compatible_gpu_names[0],
+                 "min_vram_gb": manifest.minimum_vram_mib/1024,
+                 "max_price_per_gpu_hour": manifest.max_price_per_gpu_hour_microusd/1_000_000,
+                 "user_public_key": manifest.user_public_key, "dry_run": dry_run}
+        if hours is not None:
+            value["termination_hours"] = hours
+        if manifest.allowed_countries:
+            value["country"] = manifest.allowed_countries[0]
+        if manifest.minimum_ram_gib:
+            value["min_ram_gb"] = manifest.minimum_ram_gib
+        if manifest.minimum_disk_gib:
+            value["min_disk_gb"] = manifest.minimum_disk_gib
+        if manifest.require_docker_in_docker:
+            value["docker_in_docker"] = True
+        return value
+
+    @staticmethod
+    def _validate_spec_response(response, manifest, *, dry_run):
+        if (not isinstance(response, dict) or response.get("success") is not True
+                or response.get("dry_run") is not dry_run
+                or response.get("template_id") != manifest.template_id
+                or not isinstance(response.get("selected_executor"), dict)):
+            raise LiumError("lium_spec_response_unconfirmed")
+        _uuid(response["selected_executor"].get("id"))
+        if (_microusd(response.get("price_per_hour")) > manifest.gpu_count*manifest.max_price_per_gpu_hour_microusd
+                or dry_run and response.get("pod_id") is not None):
+            raise LiumError("lium_spec_response_outside_approved_limits")
+
+    def preflight_availability(self, launch):
+        """Read-only probe before ledger reservation; negatives retry after 60s.
+
+        Never settle an existing intent from inventory absence. Cache only this
+        read-only result, never rent responses or a selected offer for creation.
+        """
+        manifest = self._manifest(launch)
+        now = self.clock()
+        cached = self._availability_cache.get(manifest)
+        if cached and 0 <= now-cached[0] < 60:
+            return cached[1]
+        try:
+            self._select_offer(manifest)
+            reason = None
+        except LiumError as exc:
+            reason = ("provider_inventory_unavailable" if str(exc) in {
+                "lium_exact_offer_or_template_unavailable", "lium_offer_outside_approved_limits"
+            } else "provider_inventory_unconfirmed")
+        self._availability_cache[manifest] = (now, reason)
+        return reason
 
     def _http(self):
         if not self.enabled:
@@ -235,22 +412,29 @@ class LiumProvider:
         if self._client is not None:
             self._client.close()
 
-    def _request(self, method, route, *, payload=None, missing_ok=False):
+    def _request(self, method, route, *, payload=None, missing_ok=False, rental=False, request_id=None):
         # All routes are generated internally from validated UUIDs. Disable
         # redirects, proxies and retries; never propagate response body/errors.
         try:
-            with self._http().stream(method, route, json=payload) as response:
+            headers = {"X-Request-Id": _uuid(request_id)} if request_id else None
+            with self._http().stream(method, route, json=payload, headers=headers) as response:
                 if missing_ok and response.status_code == 404:
                     return None
-                if response.status_code < 200 or response.status_code >= 300:
-                    raise LiumError("lium_request_unconfirmed")
                 raw = bytearray()
                 for part in response.iter_bytes():
                     raw.extend(part)
                     if len(raw) > MAX_RESPONSE_BYTES:
                         raise LiumError("lium_response_too_large")
                 # Preserve money's JSON decimal spelling; avoid binary floats.
-                return json.loads(raw, parse_float=Decimal)
+                value = json.loads(raw, parse_float=Decimal)
+                if response.status_code < 200 or response.status_code >= 300:
+                    if (rental and isinstance(value, dict) and value.get("success") is False
+                            and all(value.get(k) is None for k in ("pod_id", "instance_id", "pod", "pods"))):
+                        code = (value.get("error") or {}).get("code") if isinstance(value.get("error"), dict) else value.get("code")
+                        if response.status_code in RENT_REFUSALS.get(code, set()):
+                            raise LiumRentRejected("lium_rent_rejected")
+                    raise LiumError("lium_request_unconfirmed")
+                return value
         except LiumError:
             raise
         except Exception:
@@ -360,6 +544,8 @@ class LiumProvider:
         arbitrary ssh command strings, URLs, secrets, and private targets are not
         returned or interpreted. This remains CPU-side operational metadata.
         """
+        if not self.execution_allowed(tag, instance_id):
+            raise LiumError("lium_rental_contract_requires_reconciliation")
         pod = self._exact_pod(tag, instance_id)
         if pod is None or str(pod.get("status", "")).upper() != "RUNNING":
             raise LiumError("lium_pod_not_running_for_bootstrap")
@@ -381,6 +567,12 @@ class LiumProvider:
         except (KeyError, TypeError, ValueError, LiumError):
             raise LiumError("lium_ssh_coordinates_unverified") from None
         return {"instance_id": _uuid(instance_id), "host": host, "port": port, "username": "root"}
+
+    def execution_allowed(self, tag, instance_id):
+        marker = self._journal_read(_uuid(tag))
+        if marker and "instance_id" in marker and marker["instance_id"] != _uuid(instance_id):
+            raise LiumError("lium_instance_identity_conflict")
+        return not marker or marker["phase"] != "quarantined"
 
     def lifetime(self, tag, instance_id, *, local_created_at, maximum_hours=4):
         """A conservative actual-pod deadline, never an extension of approval.
@@ -449,50 +641,84 @@ class LiumProvider:
             raise LiumError("lium_provider_disabled")
         tag = _uuid(tag)
         name = _pod_name(tag)
+        # Pure validation says nothing about a pre-existing resource bearing
+        # this tag. An expired manifest must not create a zero-charge marker.
         manifest = self._manifest(launch)
         now = self.clock()
         if (isinstance(hard_deadline, bool) or not isinstance(hard_deadline, (float, int))
                 or not math.isfinite(hard_deadline)):
             raise LiumError("lium_invalid_deadline")
-        # The minimum provider TTL is one hour. Floor the available window and
-        # include the bounded HTTP submission margin; never round TTL upward.
         hours = min(manifest.termination_hours, math.floor((hard_deadline-now-self._ttl_margin)/3600))
         if hours < 1:
             raise LiumError("lium_insufficient_provider_ttl_window")
         with self._create_lock:
-            if tag in self._submitted_tags:
+            if tag in self._submitted_tags or self._journal_read(tag) is not None:
                 raise LiumError("lium_creation_already_submitted_reconcile_only")
+            self._journal_write(tag, "checking")
+            # Any pre-existing exact tag retains reconciliation even when its
+            # payload is malformed. Never settle that resource at zero cost.
             existing = self._exact_pod(tag)
             if existing is not None:
                 return self._running_fact(tag, existing)
-            offers = [row for row in self._rows("executors") if row.get("id") == manifest.executor_id]
-            templates = [row for row in self._rows("templates") if row.get("id") == manifest.template_id]
-            if len(offers) != 1 or len(templates) != 1:
-                raise LiumError("lium_exact_offer_or_template_unavailable")
-            price = _microusd(offers[0].get("price_per_gpu"))
-            count = offers[0].get("gpu_count")
-            if (type(count) is not int or count < manifest.gpu_count
-                    or price > manifest.max_price_per_gpu_hour_microusd):
-                raise LiumError("lium_offer_outside_approved_limits")
+            try:
+                selected_offer = self._select_offer(manifest)
+            except LiumError as exc:
+                # Only this pre-POST block provides absence proof. In particular
+                # a rejected/timed-out POST must NEVER use this exception type.
+                self._journal_write(tag, "not_submitted")
+                raise LiumNotSubmitted(str(exc)) from None
             # Preflight may have consumed time. Recheck approval and absolute
             # deadline immediately before the single side-effecting request.
             now = self.clock()
             hours = min(hours, math.floor((hard_deadline-now-self._ttl_margin)/3600))
             if hours < 1 or manifest.approved_until <= now:
-                raise LiumError("lium_launch_approval_expired")
+                self._journal_write(tag, "not_submitted")
+                raise LiumNotSubmitted("lium_launch_approval_expired")
+            post_executor = None if manifest.server_side_selection else selected_offer
+            self._journal_write(tag, "post_started", executor_id=post_executor)
             self._submitted_tags.add(tag)
-            response = self._request("POST", f"executors/{manifest.executor_id}/rent", payload={
+            payload = {
                 "pod_name": name, "template_id": manifest.template_id,
                 "user_public_key": manifest.user_public_key, "gpu_count": manifest.gpu_count,
                 "termination_hours": hours,
-            })
+            }
+            route = f"executors/{selected_offer}/rent"
+            if manifest.server_side_selection:
+                route = "executors/rent-by-spec"
+                payload = self._spec_payload(manifest, name, dry_run=False, hours=hours)
+            try:
+                response = self._request("POST", route, payload=payload, rental=True, request_id=tag)
+            except LiumRentRejected:
+                self._journal_write(tag, "rejected", executor_id=post_executor)
+                return ProviderFact("not_created", actual_cost_microusd=0, absence_confirmed=True)
             if not isinstance(response, dict) or response.get("success") is not True:
                 raise LiumError("lium_creation_response_unconfirmed")
-            return ProviderFact("starting", _uuid(response.get("pod_id")))
+            instance = _uuid(response.get("pod_id"))
+            # Preserve a successful pod identity even when a later response
+            # validation fails. Reconciliation must retain that paid resource.
+            if manifest.server_side_selection:
+                try:
+                    self._validate_spec_response(response, manifest, dry_run=False)
+                except LiumError:
+                    self._journal_write(tag, "quarantined", executor_id=post_executor, instance_id=instance)
+                    raise
+            self._journal_write(tag, "confirmed", executor_id=post_executor, instance_id=instance)
+            return ProviderFact("starting", instance)
 
     def reconcile(self, tag, instance_id=None):
         if not self.enabled:
             raise LiumError("lium_provider_disabled")
+        marker = self._journal_read(_uuid(tag))
+        if marker and marker["phase"] in {"not_submitted", "rejected"} and instance_id is None:
+            return ProviderFact("not_created", actual_cost_microusd=0, absence_confirmed=True)
+        if marker and marker["phase"] in {"confirmed", "quarantined"}:
+            if instance_id is not None and _uuid(instance_id) != marker["instance_id"]:
+                raise LiumError("lium_instance_identity_conflict")
+            if instance_id is None:
+                # Recover the acknowledged identity before doing network I/O;
+                # subsequent reconcile/delete can work even if GET is down now.
+                return ProviderFact("starting", marker["instance_id"])
+            instance_id = marker["instance_id"]
         pod = self._exact_pod(tag, instance_id)
         if pod is not None:
             return self._running_fact(tag, pod)
@@ -501,6 +727,8 @@ class LiumProvider:
             if statement is not None:
                 return statement
         # Key visibility / eventual consistency is not authoritative absence.
+        if marker and marker["phase"] in {"confirmed", "quarantined"}:
+            return ProviderFact("starting", instance_id)
         return ProviderFact("unknown", _uuid(instance_id) if instance_id else None)
 
     def destroy(self, tag, instance_id):

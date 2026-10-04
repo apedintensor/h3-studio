@@ -29,7 +29,7 @@ from .execution_policy import ExecutionPolicies, read_policy
 from .lium_provider import BASE_URL, KEY_VARIABLE, PROFILE, SERVICE, LiumManifest, LiumProvider
 from .lium_runtime_aws import AwsLiumLoader, SECRET_ARN, SECRET_NAME, VERSION_ID
 from .repository import (Repository, Scope, attempts, budget_accounts, capacity_approvals,
-    capacity_cycles, instance_intents, jobs, registered_workers, request_hash, scaler_actions)
+    capacity_cycles, instance_intents, jobs, registered_workers, request_hash, scaler_actions, scaler_receipts)
 from .scaler import LaunchSpec, ScaleCoordinator
 from .settings import Settings
 from .worker import _slot_lock
@@ -157,6 +157,7 @@ class FiniteConfig:
                         or manifest.configuration_id != self.configuration_id or manifest.model_id != MODEL
                         or manifest.executor_id != launch.offer_id or manifest.template_id != launch.image_id
                         or manifest.region != launch.region or manifest.gpu_count != 1 or manifest.execution_slots != 1
+                        or manifest.minimum_vram_mib and manifest.minimum_vram_mib < 30*1024
                         or not 1 <= manifest.termination_hours <= 4 or manifest.approved_until > self.hard_deadline
                         or manifest.approved_until <= self.created_at or not manifest.allow_preflight_only_price_cap
                         or policy.instance_reservation_microusd < manifest.max_price_per_gpu_hour_microusd*manifest.termination_hours):
@@ -439,9 +440,30 @@ class FiniteController:
         rows = self.repo.list_instance_intents(pool=self.config.pool)
         with self.repo.engine.connect() as conn:
             actions = {r["intent_id"]: dict(r) for r in conn.execute(select(scaler_actions).where(scaler_actions.c.pool == self.config.pool)).mappings()}
-        if any(r["provider"] != "lium" or r["id"] not in actions
-                or actions[r["id"]]["launch_spec"] not in self.config.launches for r in rows):
-            raise ScalerError("finite_pool_contains_unapproved_intent")
+        for row in rows:
+            action = actions.get(row["id"])
+            if row["provider"] != "lium" or action is None:
+                raise ScalerError("finite_pool_contains_unapproved_intent")
+            if action["launch_spec"] in self.config.launches:
+                continue
+            with self.repo.engine.connect() as conn:
+                receipts = list(conn.execute(select(scaler_receipts.c.facts).where(
+                    scaler_receipts.c.intent_id == row["id"],
+                    scaler_receipts.c.operation == "operator-audit")).scalars())
+            # An exceptional, fenced handoff may replace a stale selector only
+            # after proving this exact old request was never submitted. Never
+            # rewrite its historical action or overlook an allocated instance.
+            settled = row["state"] == "destroyed" and row["provider_instance_id"] is None and row["billing_status"] == "settled"
+            verified = any(f.get("handoff_verified") is True and f.get("state") == "not_created"
+                and f.get("absence_confirmed") is True and f.get("actual_cost_microusd") == 0
+                and f.get("configuration_id") == self.config.configuration_id
+                and f.get("model_id") == MODEL
+                and isinstance(f.get("old_config_hash"), str) and HASH.fullmatch(f["old_config_hash"])
+                and isinstance(f.get("evidence_sha256"), str) and HASH.fullmatch(f["evidence_sha256"])
+                and f.get("launch_spec_sha256") == request_hash(action["launch_spec"])
+                for f in receipts if isinstance(f, dict))
+            if not settled or not verified:
+                raise ScalerError("finite_pool_contains_unapproved_intent")
         return rows, actions
 
     def _observations(self, instances):
@@ -586,6 +608,12 @@ class FiniteController:
                 continue
             if not row["provider_instance_id"]:
                 continue
+            execution_allowed = getattr(self.provider, "execution_allowed", None)
+            if callable(execution_allowed) and not execution_allowed(intent, row["provider_instance_id"]):
+                # A contradicting paid response retains identity/reservation
+                # for reconciliation, but must never bootstrap a usable worker.
+                boot_status[intent] = {"state": "rental_contract_requires_reconciliation"}
+                continue
             if intent not in self.boots:
                 from .production_scaler_boot import ProductionBoot
                 factory = self.boot_factory or ProductionBoot
@@ -598,7 +626,17 @@ class FiniteController:
                     self.request_drain()
             except Exception:
                 boot_status[intent] = {"state": "boot_observation_unconfirmed"}
-        return self.status(decision=decision.get("state"), boot=boot_status)
+        reason = decision.get("reason")
+        if not stopping:
+            if (any(row["state"] == "creation_unknown" for row in instances)
+                    or any(v.get("state") == "rental_contract_requires_reconciliation" for v in boot_status.values())):
+                reason = "creation_needs_reconciliation"
+            elif any(row["state"] == "starting" for row in instances):
+                reason = "gpu_starting"
+            elif any(row["state"] in ("ready", "busy") for row in instances):
+                reason = "gpu_busy"
+            self.cold.record_wait_reason(c.capacity_approval_id, reason or "searching")
+        return self.status(decision=decision.get("state"), reason=reason, boot=boot_status)
 
     def status(self, *, fresh_ledger_only=False, **extra):
         rows, _ = self._managed()
@@ -618,6 +656,11 @@ class FiniteController:
             "hard_deadline": self.config.hard_deadline, "active_job_ids": active[:1000], "active_jobs_truncated": len(active)>1000,
             "instances": [{k: r[k] for k in ("id", "state", "provider_instance_id", "hard_deadline", "billing_status")} for r in rows],
             "billing_pending": sum(r["billing_status"] != "settled" for r in rows), **extra}
+        unknown = [r["id"] for r in rows if r["state"] == "creation_unknown"]
+        if unknown:
+            value.update(reason="creation_needs_reconciliation",
+                recovery={"code": "creation_outcome_unknown", "intent_ids": unknown,
+                          "automatic_rerent_allowed": False})
         if fresh_ledger_only:
             value.update(snapshot_only=False, controller_exit_required=True)
         else:
@@ -681,7 +724,8 @@ def main(argv=None):
         loader = stdin_loader(config, sys.stdin.buffer) if args.credential_stdin else AwsLiumLoader(config.secret_arn, config.secret_version_id)
         repo = Repository(settings.database_url)  # Existing schema only.
         provider = LiumProvider(enabled=True, manifests=[LiumManifest(**v) for v in config.manifests], loader=loader,
-            idle_probe=lambda tag, instance: controller.idle_probe(tag, instance), clock=repo.clock)
+            idle_probe=lambda tag, instance: controller.idle_probe(tag, instance), clock=repo.clock,
+            journal_dir=config.work_dir/"rent-journal")
         config.work_dir.mkdir(parents=True, exist_ok=True)
         with _slot_lock(config.work_dir, "finite-production-scaler") as acquired:
             if not acquired:

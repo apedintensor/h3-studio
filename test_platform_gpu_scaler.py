@@ -21,6 +21,9 @@ from test_platform_gpu_acceptance import load, DEPLOY, validator, release, accep
 with patch.dict(sys.modules, {'release': release, 'check_config': validator, 'gpu_acceptance': acceptance}):
     scaler = load('test_finite_deploy', 'gpu_scaler.py')
 
+with patch.dict(sys.modules, {'release':release, 'gpu_scaler':scaler}):
+    handoff = load('test_backlog_host','gpu_handoff.py')
+
 
 def configuration():
     return {'cycle_id': 'synthetic-cycle', 'hard_deadline': 2000000000,
@@ -469,6 +472,184 @@ class FiniteControlTests(unittest.TestCase):
         self.assertFalse(closed['active'])
         self.assertEqual(closed['image_id'], image_id)
         self.assertEqual(closed['contracts'], contracts)
+
+
+class BacklogHostTests(unittest.TestCase):
+    def configs(self):
+        old=on_demand_configuration()
+        old['scale_policy'].update(instance_reservation_microusd=5600000,approved_remaining_microusd=46509655)
+        old.update(enabled=True,budget_account_ids=['original-budget'],execution_policy_sha256='e'*64,
+            launches=[{'provider':'lium','configuration_id':'original','model_id':'h3','offer_id':'old',
+                'image_id':'original-template'}], manifests=[{'configuration_id':'original','model_id':'h3',
+                'executor_id':'old','template_id':'original-template','gpu_count':1,'execution_slots':1,
+                'max_price_per_gpu_hour_microusd':1400000,'termination_hours':4,'approved_until':old['hard_deadline']}])
+        new=copy.deepcopy(old)
+        new['scale_policy']['instance_reservation_microusd']=4500000
+        new['launches'][0]['offer_id']=''
+        new['manifests'][0].update(executor_id='',compatible_gpu_names=['NVIDIA H100 80GB HBM3'],
+            minimum_vram_mib=70000,server_side_selection=True,minimum_ram_gib=64,minimum_disk_gib=100,
+            require_docker_in_docker=True,max_price_per_gpu_hour_microusd=1500000,termination_hours=3)
+        return old,new
+
+    def test_only_selector_price_ttl_and_reservation_can_change(self):
+        old,new=self.configs()
+        self.assertTrue(handoff.validate_delta(old,new))
+        changes=[lambda c:c.update(hard_deadline=c['hard_deadline']+1),
+            lambda c:c.update(created_at=c['created_at']+1),
+            lambda c:c.update(budget_account_ids=['replacement']),
+            lambda c:c.update(execution_policy_sha256='d'*64),
+            lambda c:c.update(max_cycles=7),
+            lambda c:c['scale_policy'].update(approved_remaining_microusd=50000000),
+            lambda c:c['scale_policy'].update(instance_reservation_microusd=4499999),
+            lambda c:c['manifests'][0].update(gpu_count=8),
+            lambda c:c['manifests'][0].update(template_id='replacement'),
+            lambda c:c['manifests'][0].update(termination_hours=4),
+            lambda c:c['manifests'][0].update(max_price_per_gpu_hour_microusd=1500001)]
+        for change in changes:
+            value=copy.deepcopy(new);change(value)
+            with self.subTest(change=change),self.assertRaises(release.ReleaseError):
+                handoff.validate_delta(old,value)
+
+    def test_freeze_precedes_admission_close_and_never_sends_term_or_drain(self):
+        old,_=self.configs();events=[]
+        pin={'commit':'a'*40}
+        frozen={'config_hash':scaler.fingerprint(old),'pid':100,'paused':True}
+        with patch.object(handoff,'record_path',return_value=Mock(exists=lambda:False)), \
+                patch.object(scaler,'protected_inputs',return_value=old), \
+                patch.object(scaler,'read_json',return_value=pin),patch.object(scaler,'verify_marker'), \
+                patch.object(scaler,'checked_release',return_value=('a'*40,Path('/release')/('a'*40),{})), \
+                patch.object(handoff,'supervisor',return_value={'pid':90,'active_state':'active'}), \
+                patch.object(handoff,'inspect',return_value={'State':{'Running':True,'Paused':False}}), \
+                patch.object(handoff,'frozen_identity',return_value=frozen), \
+                patch.object(release,'command',side_effect=lambda a,**kw:events.append(a)), \
+                patch.object(scaler,'close_admission',side_effect=lambda *a:events.append('close')), \
+                patch.object(scaler,'atomic'),patch.object(handoff,'command') as systemd:
+            result=handoff.freeze('b'*40,'sixnine-old.service')
+        self.assertEqual(events,[['pause',scaler.container_name(old)],'close'])
+        self.assertEqual(result['phase'],'frozen')
+        systemd.assert_not_called()
+
+    def test_retirement_kills_confirmed_main_then_already_paused_container_without_unpause(self):
+        old,_=self.configs();events=[]
+        host={'unit':'sixnine-old.service','pid':90,'active_state':'active'}
+        receipt={'phase':'ledger_fenced','old_commit':'a'*40,'target_commit':'b'*40,
+            'frozen':{'frozen_at':1000},'supervisor':host,'ledger':{'job_hashes':{'original-job':'a'*64}}}
+        def read(path,*args):
+            return receipt if Path(path).name == handoff.RECEIPT else old
+        def kill(*args):
+            events.append(('systemd',args));host['pid']=0;host['active_state']='failed';return b''
+        with patch.object(scaler,'read_json',side_effect=read), \
+                patch.object(scaler,'protected_inputs',return_value=old),patch.object(handoff,'core',return_value={'verified':True}), \
+                patch.object(scaler,'checked_release',return_value=('a'*40,Path('/release')/('a'*40),{})), \
+                patch.object(handoff,'frozen_identity',return_value=receipt['frozen']), \
+                patch.object(handoff,'supervisor',side_effect=lambda unit:dict(host)), \
+                patch.object(handoff,'command',side_effect=kill), \
+                patch.object(release,'command',side_effect=lambda a,**kw:events.append(('docker',a))), \
+                patch.object(handoff,'inspect',return_value={'State':{'Running':False,'Paused':False,
+                    'Restarting':False,'Status':'exited','ExitCode':137}}),patch.object(scaler,'marker'), \
+                patch.object(scaler,'atomic'):
+            result=handoff.retire(sleep=lambda s:None)
+        self.assertEqual(events[0],('systemd',('kill','--kill-whom=main','--signal=SIGKILL','sixnine-old.service')))
+        self.assertEqual(events[1],('docker',['kill','--signal=SIGKILL',scaler.container_name(old)]))
+        self.assertEqual(events[2],('docker',['rm',scaler.container_name(old)]))
+        self.assertEqual(result['preserved_job_ids'],['original-job'])
+        self.assertTrue(receipt['ledger']['host_retirement_confirmed'])
+
+    def test_ledger_failure_sends_no_host_signal_or_container_kill(self):
+        old,_=self.configs()
+        receipt={'phase':'ledger_fenced','target_commit':'b'*40,'ledger':{}}
+        with patch.object(scaler,'read_json',side_effect=[receipt,old]), \
+                patch.object(scaler,'protected_inputs',return_value=old), \
+                patch.object(handoff,'core',side_effect=release.ReleaseError('changed')), \
+                patch.object(handoff,'command') as systemd,patch.object(release,'command') as docker:
+            with self.assertRaises(release.ReleaseError):
+                handoff.retire()
+        systemd.assert_not_called();docker.assert_not_called()
+
+    def resume_fixture(self):
+        old,new=self.configs()
+        next_state={'version':1,'config_hash':scaler.fingerprint(new),'sequence':2,
+            'created_at':old['created_at'],'transfer_from':'original-grant-001'}
+        receipt={'version':1,'phase':'staged','target_commit':'b'*40,'old_commit':'a'*40,
+            'old_config_hash':scaler.fingerprint(old),'new_config_hash':scaler.fingerprint(new),
+            'supervisor':{'unit':'sixnine-old.service'},'ledger':{'host_retirement_confirmed':True},
+            'next_service_state':next_state}
+        pin={'active':False,'admission':'closed','commit':'a'*40,'config_hash':scaler.fingerprint(old)}
+        def read(path,*args):
+            return {handoff.RECEIPT:receipt,handoff.OLD:old,'active.json':pin}[Path(path).name]
+        return old,new,receipt,pin,read
+
+    def test_resume_gate_checks_staged_identity_host_job_proof_without_releasing_leader(self):
+        old,new,receipt,pin,read=self.resume_fixture()
+        with patch.object(scaler,'read_json',side_effect=read), \
+                patch.object(handoff,'supervisor',return_value={'pid':0}), \
+                patch.object(scaler,'require_new_controller') as empty, \
+                patch.object(handoff,'runtime_json',return_value=receipt['next_service_state']), \
+                patch.object(Path,'exists',return_value=False),patch.object(handoff,'core',return_value={'verified':True}) as core:
+            self.assertEqual(handoff.verify_resume(new,'b'*40,{}),receipt)
+        empty.assert_called_once()
+        self.assertEqual(core.call_args.args[2],'verify')
+        self.assertNotIn('apply',core.call_args.kwargs)
+
+    def test_unapproved_or_reused_handoff_can_never_release_leader(self):
+        old,new,receipt,pin,read=self.resume_fixture()
+        for phase in ['frozen','ledger_fenced','retired','activated']:
+            receipt['phase']=phase
+            with patch.object(scaler,'read_json',side_effect=read),patch.object(handoff,'core') as core:
+                with self.subTest(phase=phase),self.assertRaises(release.ReleaseError):
+                    handoff.verify_resume(new,'b'*40,{})
+            core.assert_not_called()
+
+    def test_activate_consumes_only_after_fresh_ledger_release(self):
+        old,new,receipt,pin,read=self.resume_fixture()
+        events=[]
+        with patch.object(handoff,'verify_resume',return_value=receipt), \
+                patch.object(handoff,'core',side_effect=lambda *a,**kw:events.append(('ledger',a[2],kw))), \
+                patch.object(scaler,'atomic',side_effect=lambda p,v:events.append(('receipt',v['phase']))):
+            result=handoff.activate_resume(new,'b'*40,{})
+        self.assertEqual(events[0],('ledger','release-leader',{'apply':True}))
+        self.assertEqual(events[1],('receipt','activated'))
+        self.assertEqual(result['phase'],'activated')
+
+    def test_resume_action_cannot_launch_before_offline_configuration_and_handoff_gate(self):
+        for gate_ok in (False,True):
+            _,config=self.configs();events=[]
+            process=Mock(returncode=0)
+            with tempfile.TemporaryDirectory() as tmp,ExitStack() as stack:
+                stack.enter_context(patch.dict(sys.modules,{'gpu_handoff':handoff,
+                    'fcntl':SimpleNamespace(LOCK_EX=1,LOCK_NB=2,flock=lambda *_:None)}))
+                stack.enter_context(patch.object(release,'ROOT',Path(tmp)))
+                stack.enter_context(patch.object(release,'check_host'))
+                stack.enter_context(patch.object(release,'command',return_value=b'2.38.2'))
+                stack.enter_context(patch.object(scaler,'checked_release',return_value=(
+                    'b'*40,Path(tmp),{'SIXNINE_IMAGE':'sixnine-platform:'+'b'*40})))
+                inputs=stack.enter_context(patch.object(scaler,'protected_inputs',return_value=config))
+                for name in ('require_new_controller','atomic','validate','verify_marker'):
+                    stack.enter_context(patch.object(scaler,name))
+                stack.enter_context(patch.object(scaler,'compose',return_value=b'{}'))
+                def gate(*a):
+                    events.append('gate')
+                    if not gate_ok:raise release.ReleaseError('invalid_handoff')
+                stack.enter_context(patch.object(handoff,'verify_resume',side_effect=gate))
+                stack.enter_context(patch.object(handoff,'activate_resume',side_effect=lambda *a:events.append('activate')))
+                stack.enter_context(patch.object(scaler,'controller_control',side_effect=lambda *a:
+                    events.append('validate') or {'config_valid':True,'provider_calls_enabled':False,
+                        'config_hash':scaler.fingerprint(config)}))
+                launch=stack.enter_context(patch.object(scaler,'launch',side_effect=lambda *a:events.append('launch') or process))
+                stack.enter_context(patch.object(scaler,'marker'))
+                stack.enter_context(patch.object(scaler,'wait_until_ready',side_effect=lambda *a:events.append('ready')))
+                stack.enter_context(patch.object(scaler,'enable_admission',side_effect=lambda *a:events.append('open')))
+                stack.enter_context(patch.object(scaler,'wait_for_controller'))
+                stack.enter_context(patch.object(scaler,'close_admission'))
+                stack.enter_context(patch.object(scaler,'restore_cpu',return_value={}))
+                stack.enter_context(patch('sys.stdout',new=io.StringIO()))
+                stack.enter_context(patch('sys.stderr',new=io.StringIO()))
+                self.assertEqual(scaler.main(['resume-handoff']),0 if gate_ok else 1)
+                inputs.assert_called_once_with(starting=False)
+            if gate_ok:
+                self.assertEqual(events,['gate','validate','activate','launch','ready','open'])
+            else:
+                launch.assert_not_called();self.assertEqual(events,['gate'])
 
 
 if __name__ == '__main__':

@@ -176,6 +176,82 @@ class LiumProviderTests(unittest.TestCase):
                 provider.create(TAG, launch(offer_id=OTHER), hard_deadline=10000)
         self.assertEqual(self.api.count("POST"), 0)
 
+    def test_opt_in_compatible_hardware_selects_available_alternative(self):
+        gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+        self.api.executors = [{"id": OTHER, "gpu_count": 2, "price_per_gpu": "0.8",
+            "specs": {"gpu": {"details": [{"name": gpu, "capacity": 97887}]}},
+            "location": {"country_code": "SG"}}]
+        provider = self.provider(manifests=(manifest(compatible_gpu_names=[gpu], minimum_vram_mib=95000,
+                                                     allowed_countries=["SG"]),))
+        self.api.hook = lambda req: httpx.Response(200, json={"success": True, "pod_id": POD}) if req.method == "POST" else None
+        self.assertIsNone(provider.preflight_availability(launch()))
+        result = provider.create(TAG, launch(), hard_deadline=10000)
+        self.assertEqual(result.instance_id, POD)
+        self.assertEqual(self.api.calls[-1][1], f"/api/executors/{OTHER}/rent")
+        self.assertEqual(self.api.calls[-1][2]["gpu_count"], 2)
+
+    def test_filter_only_manifest_needs_no_fixed_machine(self):
+        gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+        provider = self.provider(manifests=(manifest(executor_id="", compatible_gpu_names=[gpu], minimum_vram_mib=95000),))
+        self.api.executors = [{"id": OTHER, "gpu_count": 1, "price_per_gpu": "0.8",
+            "specs": {"gpu": {"details": [{"name": gpu, "capacity": 97887}]}}}]
+        self.assertEqual(provider.preflight_availability(launch(offer_id="")), "provider_inventory_unavailable")
+        self.api.executors[0]["gpu_count"] = 2
+        self.now += 61
+        self.assertIsNone(provider.preflight_availability(launch(offer_id="")))
+        self.api.hook = lambda req: httpx.Response(200, json={"success": True, "pod_id": POD}) if req.method == "POST" else None
+        self.assertEqual(provider.create(TAG, launch(offer_id=""), hard_deadline=10000).instance_id, POD)
+        with self.assertRaisesRegex(LiumError, "filter_required"):
+            manifest(executor_id="")
+
+    def test_hardware_selection_rejects_wrong_memory_price_country_and_name(self):
+        gpu = "NVIDIA RTX PRO 6000 Blackwell Workstation Edition"
+        for field, value in (("capacity", 49140), ("name", "NVIDIA RTX 6000 Ada Generation"),
+                             ("price", "1.01"), ("country", "US"), ("capacity", True)):
+            row = {"id": OTHER, "gpu_count": 2, "price_per_gpu": "0.8",
+                "specs": {"gpu": {"details": [{"name": gpu, "capacity": 97887}]}},
+                "location": {"country_code": "SG"}}
+            if field == "price": row["price_per_gpu"] = value
+            elif field == "country": row["location"]["country_code"] = value
+            else: row["specs"]["gpu"]["details"][0][field] = value
+            self.api.executors = [row]
+            provider = self.provider(manifests=(manifest(compatible_gpu_names=[gpu], minimum_vram_mib=95000,
+                                                         allowed_countries=["SG"]),))
+            self.assertEqual(provider.preflight_availability(launch()), "provider_inventory_unavailable")
+        self.assertEqual(self.api.count("POST"), 0)
+
+    def test_negative_inventory_cache_expires_without_caching_create(self):
+        provider = self.provider()
+        offers = self.api.executors
+        self.api.executors = []
+        self.assertEqual(provider.preflight_availability(launch()), "provider_inventory_unavailable")
+        count = len(self.api.calls)
+        self.api.executors = offers
+        self.assertEqual(provider.preflight_availability(launch()), "provider_inventory_unavailable")
+        self.assertEqual(len(self.api.calls), count)
+        self.now += 61
+        self.assertIsNone(provider.preflight_availability(launch()))
+        self.api.executors = []
+        from studio_platform.scaler import CreationNotSubmitted
+        with self.assertRaises(CreationNotSubmitted):
+            provider.create(TAG, launch(), hard_deadline=10000)
+        self.assertEqual(self.api.count("POST"), 0)
+
+    def test_rent_timeout_never_claims_not_submitted_or_retries(self):
+        from studio_platform.scaler import CreationNotSubmitted
+        provider = self.provider()
+        def timeout(req):
+            raise httpx.ReadTimeout("synthetic secret must not leave adapter")
+        self.api.on_rent = timeout
+        with self.assertRaises(LiumError) as caught:
+            provider.create(TAG, launch(), hard_deadline=10000)
+        self.assertNotIsInstance(caught.exception, CreationNotSubmitted)
+        self.assertEqual(str(caught.exception), "lium_request_unconfirmed")
+        self.assertEqual(provider.reconcile(TAG).state, "unknown")
+        with self.assertRaises(LiumError):
+            provider.create(TAG, launch(), hard_deadline=10000)
+        self.assertEqual(self.api.count("POST"), 1)
+
     def test_ssh_coordinates_require_exact_running_tag_and_public_host(self):
         provider = self.provider()
         self.api.pods = [self.pod()]

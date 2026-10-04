@@ -8,14 +8,27 @@ from dataclasses import asdict, replace
 import math
 import re
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .autoscale import Demand, ScalePolicy, ScaleState, Slot, recommend
 from .repository import (BudgetExceeded, Conflict, NotFound, Scope, budget_accounts,
     capacity_approvals, capacity_cycles, capacity_gate, capacity_waiters, canonical,
-    documents, instance_intents, jobs, pool_limits, registered_workers, request_hash, attempts)
+    documents, instance_intents, jobs, pool_limits, registered_workers, request_hash, attempts, scaler_receipts)
 from .scaler import LaunchSpec, _safe_id
+
+
+CAPACITY_WAIT_CODES = {
+    "provider_inventory_unavailable": "capacity_no_matching_gpu",
+    "provider_inventory_unconfirmed": "capacity_inventory_check_failed",
+    "creation_needs_reconciliation": "capacity_rental_reconciliation",
+    "provider_manifest_or_reservation_mismatch": "capacity_configuration_unavailable",
+    "ledger_capacity_or_budget_limit": "capacity_budget_or_limit",
+    "capacity_approval_or_cycle_conflict": "capacity_configuration_unavailable",
+    "gpu_starting": "capacity_gpu_starting",
+    "gpu_busy": "capacity_gpu_busy",
+    "searching": "capacity_searching_gpu",
+}
 
 
 def _future(value, now):
@@ -414,6 +427,17 @@ class ColdStartCoordinator:
                 intent = None
                 if waiter["intent_id"]:
                     intent = connection.execute(select(instance_intents).where(instance_intents.c.id == waiter["intent_id"])).mappings().one()
+                    if (reason is None and intent["state"] == "destroyed" and intent["provider_instance_id"] is None
+                            and connection.execute(select(scaler_receipts.c.id).where(
+                                scaler_receipts.c.intent_id == intent["id"],
+                                scaler_receipts.c.operation == "create",
+                                scaler_receipts.c.facts["state"].as_string() == "not_created",
+                                scaler_receipts.c.facts["absence_confirmed"].as_boolean() == True,
+                                scaler_receipts.c.facts["actual_cost_microusd"].as_integer() == 0)).first()):
+                        # A failed pre-POST check is not failed user work. The
+                        # on-demand controller transfers this same waiter into
+                        # the next approved cycle; expiry/cancel still applies.
+                        continue
                     if intent["state"] in ("destroyed", "draining", "destroying"):
                         reason = reason or "capacity_cycle_unavailable"
                     elif intent["hard_deadline"] <= self.repo.clock()+job["expected_runtime_s"]:
@@ -449,11 +473,32 @@ class ColdStartCoordinator:
                 waiter = self.repo._locked(connection, select(capacity_waiters).where(capacity_waiters.c.job_id == jid))
                 if waiter["state"] != "waiting_capacity":
                     continue
-                connection.execute(update(jobs).where(jobs.c.id == jid).values(status="queued", not_before=self.repo.clock(), updated_at=self.repo.clock()))
+                connection.execute(update(jobs).where(jobs.c.id == jid).values(status="queued", error_code=None,
+                    not_before=self.repo.clock(), updated_at=self.repo.clock()))
                 connection.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(state="activated"))
                 self.repo._emit(connection, "job.queued", jid, {"job_id": jid, "status": "queued"})
                 activated.append(jid)
         return activated, failed
+
+    def record_wait_reason(self, approval_id, reason):
+        """Publish bounded, non-secret capacity progress on the existing job DTO.
+
+        Scope to this immutable approval and its tenant; never replace a job
+        outcome or unrelated error. This is a waiting reason, not a failed job.
+        """
+        code = CAPACITY_WAIT_CODES.get(reason)
+        if code is None:
+            return
+        approval = self._approval(approval_id)
+        with self.repo.transaction() as connection:
+            pending = select(capacity_waiters.c.job_id).where(
+                capacity_waiters.c.approval_id == approval_id,
+                capacity_waiters.c.state == "waiting_capacity")
+            connection.execute(update(jobs).where(jobs.c.id.in_(pending),
+                jobs.c.tenant_id == approval["tenant_id"], jobs.c.status == "waiting_capacity",
+                or_(jobs.c.error_code.is_(None), jobs.c.error_code.in_(tuple(CAPACITY_WAIT_CODES.values()))),
+                or_(jobs.c.error_code.is_(None), jobs.c.error_code != code))
+                .values(error_code=code, updated_at=self.repo.clock()))
 
     def tick(self, leader_id, approval_id):
         if not self.enabled:

@@ -89,6 +89,10 @@ class ProviderProtocol(Protocol):
     def billing(self, tag: str, instance_id: str | None) -> int | None: ...
 
 
+class CreationNotSubmitted(Exception):
+    """Trusted adapter proof that this sole invocation never sent a create."""
+
+
 class DisabledProvider:
     enabled = False
     provider_id = "disabled"
@@ -178,6 +182,9 @@ class ScaleCoordinator:
                 fact = self.provider.destroy(tag, intent["provider_instance_id"])
             else:
                 fact = self.provider.reconcile(tag, intent["provider_instance_id"])
+        except CreationNotSubmitted:
+            fact = (ProviderFact("not_created", actual_cost_microusd=0, absence_confirmed=True)
+                    if operation == "create" else ProviderFact("unknown"))
         except Exception:
             fact = ProviderFact("unknown")
         return self._receipt(tag, operation, fact)
@@ -232,7 +239,8 @@ class ScaleCoordinator:
             state = scaler_receipts.c.facts["state"].as_string()
             wanted = ("destroyed", "not_created") if intent["provider_instance_id"] else ("destroyed", "not_created", "starting", "running")
             receipt = connection.execute(select(scaler_receipts).where(
-                scaler_receipts.c.intent_id == intent["id"], state.in_(wanted)).order_by(
+                scaler_receipts.c.intent_id == intent["id"], state.in_(wanted),
+                scaler_receipts.c.operation.in_(("create", "reconcile", "destroy"))).order_by(
                 case((state == "destroyed", 2), (state == "not_created", 1), else_=0).desc(),
                 scaler_receipts.c.observed_at.desc(), scaler_receipts.c.id.desc()).limit(1)).mappings().first()
         if receipt:
@@ -369,6 +377,23 @@ class ScaleCoordinator:
                 "scope": asdict(scope)})
             snapshot = canonical({"demands": [asdict(d) for d in demands], "slots": [asdict(s) for s in slots],
                 "active_intent_ids": [r["id"] for r in active]})
+            availability_reason = None
+            availability = getattr(self.provider, "preflight_availability", None)
+            if (availability and demands and not active and launch is not None
+                    and not policy.dry_run and self.provider.enabled is True):
+                # HTTP must remain outside the ledger lock. The transaction
+                # below rechecks leader and capacity after this bounded probe.
+                try:
+                    validate = getattr(self.provider, "validate_launch", None)
+                    if validate is not None:
+                        validate(launch, physical_gpus=policy.new_instance_physical_gpus,
+                            slots=policy.new_instance_slots, reserved_cost_microusd=policy.instance_reservation_microusd,
+                            hard_deadline=policy.hard_deadline)
+                    availability_reason = availability(launch)
+                    if availability_reason not in (None, "provider_inventory_unavailable", "provider_inventory_unconfirmed"):
+                        availability_reason = "provider_inventory_unconfirmed"
+                except Exception:
+                    availability_reason = "provider_inventory_unconfirmed"
             with self.repo.transaction() as connection:
                 leader = self._leader(connection, lease)
                 now = self.repo.clock()
@@ -401,6 +426,9 @@ class ScaleCoordinator:
                             hard_deadline=policy.hard_deadline)
                     except Exception:
                         return {"state": "blocked", "reason": "provider_manifest_or_reservation_mismatch", "observation": sequence}
+                if availability_reason:
+                    return {"state": "blocked", "reason": availability_reason, "observation": sequence,
+                            "retry_after_seconds": 60}
                 intent = self.repo.reserve_instance_intent(scope, pool, f"scaler-{sequence}",
                     physical_gpus=policy.new_instance_physical_gpus, slots=policy.new_instance_slots,
                     reserved_cost_microusd=policy.instance_reservation_microusd, hard_deadline=policy.hard_deadline,

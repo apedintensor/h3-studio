@@ -24,6 +24,12 @@ def source_snapshot(project, shot_id):
             actor_id = actor.get("characterId") if isinstance(actor, dict) else actor
             if isinstance(actor_id, str) and actor_id in lookup:
                 pending.append(actor_id)
+        location_id = node.get("data", {}).get("locationId")
+        if isinstance(location_id, str) and location_id:
+            pending.append(location_id)
+        for asset_id in node.get("data", {}).get("referenceAssetIds", []):
+            if isinstance(asset_id, str):
+                pending.append(asset_id)
         for look in node.get("data", {}).get("looks", []):
             for asset_id in look.get("gallery", {}).values():
                 if isinstance(asset_id, str) and asset_id in lookup:

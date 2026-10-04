@@ -92,6 +92,15 @@ def validate_project(project, max_bytes=8*1024*1024):
                 or e.get("parentId") is not None and not isinstance(e["parentId"], str)):
             raise ValueError("节点标题、顺序、状态或父级无效")
         data = e["data"]
+        if "locationId" in data and (e["type"] not in {"scene", "shot"}
+                or not isinstance(data["locationId"], str)
+                or data["locationId"] and not ID.fullmatch(data["locationId"])):
+            raise ValueError("地点绑定无效")
+        if "referenceAssetIds" in data and (e["type"] != "location"
+                or not isinstance(data["referenceAssetIds"], list) or len(data["referenceAssetIds"]) > 100
+                or any(not isinstance(v, str) or not ID.fullmatch(v) for v in data["referenceAssetIds"])
+                or len(set(data["referenceAssetIds"])) != len(data["referenceAssetIds"])):
+            raise ValueError("地点参考图列表无效")
         for name in ("cloudAssetId", "cloudArtifactId", "fileId"):
             if name in data and data[name] is not None and (not isinstance(data[name], str) or len(data[name]) > 200):
                 raise ValueError("素材文件身份无效")
@@ -182,6 +191,11 @@ def validate_project(project, max_bytes=8*1024*1024):
         if confirmed_at is not None and (not isinstance(confirmed_at, str) or len(confirmed_at) > 80):
             raise ValueError("字幕确认时间无效")
     for e in entities:
+        location_id = e["data"].get("locationId")
+        if location_id and (location_id not in lookup or lookup[location_id]["type"] != "location"):
+            raise ValueError("绑定的地点不存在")
+        if any(v not in lookup or lookup[v]["type"] != "image" for v in e["data"].get("referenceAssetIds", [])):
+            raise ValueError("地点参考图引用的图片不存在")
         for cast in e["data"].get("cast", []):
             actor_id = cast if isinstance(cast, str) else cast["characterId"]
             actor = lookup.get(actor_id)

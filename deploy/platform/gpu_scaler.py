@@ -2,8 +2,9 @@
 """Root-only, bounded production GPU control. No action is the default.
 
 The host reads one pinned encrypted runtime credential into a private stdin pipe.
-Only the controller owns provider reconciliation. Never stop/kill its container
-to restore the website: close API admission, request drain, and prove natural exit.
+Only the controller owns ordinary provider reconciliation. Restore closes API
+admission and proves a natural exit. An exceptional frozen backlog transfer is
+available only through the separately authenticated gpu_handoff receipt.
 """
 from __future__ import annotations
 
@@ -487,14 +488,17 @@ def main(argv=None):
     owns_barrier = False
     try:
         import fcntl
-        release.require(args in (['start'], ['restore-cpu']), 'explicit_scaler_action_required')
+        release.require(args in (['start'], ['restore-cpu'], ['resume-handoff']), 'explicit_scaler_action_required')
         release.check_host(release.ROOT)
         with (release.ROOT/'release.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             config = protected_inputs(starting=args == ['start'])
-            if args == ['start']:
+            if args in (['start'], ['resume-handoff']):
                 commit, directory, environment = checked_release()
                 require_new_controller(environment)
+                if args == ['resume-handoff']:
+                    import gpu_handoff
+                    gpu_handoff.verify_resume(config, commit, environment)
                 atomic(ROOT/'overlay.json', overlay(environment['SIXNINE_IMAGE']))
                 atomic(ROOT/'app-admission.json', release.app_admission_overlay(release.ROOT))
             else:
@@ -515,6 +519,8 @@ def main(argv=None):
             release.require(validation.get('config_valid') is True
                 and validation.get('provider_calls_enabled') is False
                 and validation.get('config_hash') == fingerprint(config), 'finite_configuration_validation_failed')
+            if args == ['resume-handoff']:
+                gpu_handoff.activate_resume(config, commit, environment)
             marker(commit, config, True)
             owns_barrier = True
             process = launch(directory, environment, config)

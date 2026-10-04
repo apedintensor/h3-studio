@@ -58,7 +58,7 @@ def json_config(config):
         value.pop("allowed_owners")
     for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[key] = str(value[key])
-    return value
+    return json.loads(json.dumps(value))
 
 
 def read_config(path):
@@ -270,6 +270,11 @@ class OnDemandController:
         if (not value["instances"] or not value["all_destroyed"] or value["active_jobs_truncated"]
                 or not all(b.children_done() for b in self.current.boots.values())):
             return False
+        # An inventory race must not consume all approved cycles in one tight
+        # loop. No-rent attempts retain the same job during this bounded pause.
+        rows, _ = self.current._managed()
+        if any(r["provider_instance_id"] is None and self.repo.clock()-r["updated_at"] < 60 for r in rows):
+            return False
         retired_path = self.current.config.work_dir/"children-retired.json"
         retired = {"config_hash": self.current.config.fingerprint(),
             "intent_ids": sorted(row["id"] for row in value["instances"])}
@@ -360,7 +365,7 @@ class OnDemandController:
             "idle_shutdown_seconds": 600, "minimum_gpu_instances": 0,
             "admission_ready": admission_ready,
             "phase": "drained" if drained else "draining" if self.stopping() else
-                "awaiting_jobs" if not value["instances"] else value["phase"],
+                ("waiting_capacity" if value["active_job_ids"] else "awaiting_jobs") if not value["instances"] else value["phase"],
             "drained": drained, "all_destroyed": all_destroyed,
             "billing_pending": sum(r["billing_status"] != "settled" for r in rows),
             "instances": [{k: r[k] for k in ("id", "state", "provider_instance_id", "hard_deadline", "billing_status")} for r in rows]}
@@ -409,7 +414,8 @@ def main(argv=None):
         verify_identity_files(config)
         loader = stdin_loader(config, sys.stdin.buffer) if args.credential_stdin else AwsLiumLoader(config.secret_arn, config.secret_version_id)
         provider = LiumProvider(enabled=True, manifests=[LiumManifest(**v) for v in config.manifests], loader=loader,
-            idle_probe=lambda tag, instance: controller.idle_probe(tag, instance), clock=repo.clock)
+            idle_probe=lambda tag, instance: controller.idle_probe(tag, instance), clock=repo.clock,
+            journal_dir=config.work_dir/"rent-journal")
         config.work_dir.mkdir(parents=True, exist_ok=True)
         with _slot_lock(config.work_dir, "on-demand-production-scaler") as acquired:
             if not acquired:

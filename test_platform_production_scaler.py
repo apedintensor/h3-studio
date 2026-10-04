@@ -256,6 +256,21 @@ class FiniteTests(LedgerCase):
         self.assertFalse(self.controller.tick()["drained"])
         self.assertFalse(self.provider.destroys)
 
+    def test_quarantined_rental_never_constructs_boot_or_activates_waiter(self):
+        self.provider.execution_allowed = lambda tag, instance: False
+        self.controller.boot_factory = lambda *args, **kwargs: self.fail("Quarantined rental booted")
+        job = self.waiting()
+        for _ in range(4):
+            value = self.controller.tick()
+            self.now += 16
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(self.controller.boots, {})
+        self.assertEqual(value["reason"], "creation_needs_reconciliation")
+        current = self.repo.get_job(self.scope, job["id"])
+        self.assertEqual((current["status"], current["error_code"]),
+                         ("waiting_capacity", "capacity_rental_reconciliation"))
+        self.assertGreater(self.repo.get_budget("finite-budget")["reserved_microusd"], 0)
+
     def test_other_owner_cold_waiter_fails_closed_before_provider(self):
         self.waiting(scope=Scope("sixnine", "supervan", "story-one"))
         with self.assertRaisesRegex(ScalerError, "scope_mismatch"):

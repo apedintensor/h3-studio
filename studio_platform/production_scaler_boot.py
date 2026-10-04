@@ -18,11 +18,39 @@ from sqlalchemy import select, update
 from .control import WorkerControl
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
 from .lium_bootstrap import BootConfig, BootController, BootError, SSHHost
+from .lium_provider import LiumManifest
 from .lium_multimodal_smoke import FirstLastSmoke, BoundedReferenceSmoke
 from .lium_reference_smoke import ReferenceSmoke
 from .qualification_profiles import MULTIMODAL_PROFILE, STAGE_RUNTIME_S
-from .repository import Repository, instance_intents, registered_workers
+from .repository import Repository, instance_intents, registered_workers, scaler_actions
 from .worker import ComfyBackend, SubmissionRejected, _slot_lock
+
+
+def _approved_boot_min_gpu_bytes(repo, finite, intent):
+    """Select this intent's trusted manifest, never the cheapest/first candidate.
+
+    The VRAM filter only permits boot qualification. It is not proof of a
+    successful inference and does not alter any of the qualification stages.
+    Historical unfiltered manifests retain BootConfig's 90-GiB default.
+    """
+    default = BootConfig.__dataclass_fields__["min_gpu_bytes"].default
+    if all(manifest.get("minimum_vram_mib", 0) == 0 for manifest in finite.manifests):
+        return default
+    with repo.engine.connect() as conn:
+        launch = conn.execute(select(scaler_actions.c.launch_spec).where(
+            scaler_actions.c.intent_id == intent["id"],
+            scaler_actions.c.pool == finite.pool)).scalar_one_or_none()
+    matching = [index for index, approved in enumerate(finite.launches) if approved == launch]
+    if len(matching) != 1 or matching[0] >= len(finite.manifests):
+        raise BootError("finite_boot_manifest_identity_unconfirmed")
+    manifest = LiumManifest(**finite.manifests[matching[0]])
+    if (manifest.configuration_id != finite.configuration_id
+            or manifest.model_id != launch.get("model_id")
+            or manifest.executor_id != launch.get("offer_id")
+            or manifest.template_id != launch.get("image_id")
+            or manifest.region != launch.get("region", "")):
+        raise BootError("finite_boot_manifest_identity_unconfirmed")
+    return manifest.minimum_vram_mib*1024**2 if manifest.minimum_vram_mib else default
 
 
 class ProductionBoot(BootController):
@@ -35,7 +63,8 @@ class ProductionBoot(BootController):
         config = BootConfig(finite.work_dir/"boot", finite.source_dir, finite.ssh_key_file,
             finite.known_hosts_file, local_port, finite.configuration_id, enabled=True,
             smoke_enabled=True, fleet_enabled=True, trust_first_host_key=finite.trust_first_host_key,
-            minimum_remaining_s=finite.drain_margin_s, recipe_ids=finite.recipe_ids)
+            minimum_remaining_s=finite.drain_margin_s, recipe_ids=finite.recipe_ids,
+            min_gpu_bytes=_approved_boot_min_gpu_bytes(repo, finite, intent))
         super().__init__(repo, provider, config, ssh_factory=ssh_factory, backend_factory=backend_factory,
             verify_smoke=verify_smoke, fleet_factory=self._fleet)
 

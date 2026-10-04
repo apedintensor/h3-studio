@@ -290,6 +290,43 @@ class GenerationDraftTests(unittest.TestCase):
         self.assertEqual(result.json()["effective_request"]["duration"], 5)
         self.assertEqual(result.json()["effective_request"]["steps"], 20)
 
+    def test_api_inherits_uploaded_story_images_only_for_saved_ref_input_mode(self):
+        self.setup_project()
+        self.source("portrait", "image")
+        self.source("station", "image")
+        record = self.client.get("/v1/projects/story-one").json()
+        document = record["project"]
+        document["entities"].extend([
+            {"id": "portrait-image", "type": "image", "title": "Portrait", "description": "", "parentId": None,
+             "version": 1, "status": "draft", "order": 0, "data": {"fileId": "portrait-file", "cloudAssetId": "portrait"}},
+            {"id": "station-image", "type": "image", "title": "Station", "description": "", "parentId": None,
+             "version": 1, "status": "draft", "order": 1, "data": {"fileId": "station-file", "cloudAssetId": "station"}},
+            {"id": "actor", "type": "character", "title": "Traveller", "description": "", "parentId": None,
+             "version": 1, "status": "draft", "order": 2, "data": {"looks": [
+                 {"id": "raincoat", "name": "Raincoat", "version": 1, "gallery": {"front": "portrait-image"}}]}},
+            {"id": "place", "type": "location", "title": "Station", "description": "", "parentId": None,
+             "version": 1, "status": "draft", "order": 3, "data": {"referenceAssetIds": ["station-image"]}}])
+        document["entities"][1]["data"].update(cast=[{"characterId": "actor", "lookId": "raincoat"}], locationId="place")
+        document["entities"][2]["data"].update(prompt="Enter the station", h3={"inputMode": "ref"})
+        self.client.put("/v1/projects/story-one", json={"project": document,
+            "expected_version": record["version"]}).raise_for_status()
+        draft = self.draft().json()
+        self.assertEqual(draft["issues"], [])
+        self.assertEqual(draft["draft"]["recipe_id"], "h3-base-ref2va-v1")
+        self.assertEqual([entry["asset_id"] for entry in draft["draft"]["inputs"]["images"]], ["portrait", "station"])
+        result = self.preflight()
+        self.assertEqual(result.status_code, 201, result.text)
+        self.assertEqual(result.json()["effective_request"]["inputs"]["images"], ["portrait", "station"])
+        _, headers = self.key(scopes=["projects:read", "jobs:write"])
+        denied = self.client.post("/v1/projects/story-one/shots/shot-one/generation-plans",
+            json={"expected_version": draft["project_version"]}, headers=headers)
+        self.assertEqual(denied.status_code, 404)  # Shared images still require assets:read.
+        self.configure(recipe_id="h3-base-fl2va-v1").raise_for_status()
+        self.assertEqual(self.draft().json()["draft"]["inputs"]["images"], [])
+        result = self.preflight()
+        self.assertEqual(result.status_code, 201, result.text)
+        self.assertEqual(result.json()["effective_request"]["inputs"]["images"], [])
+
     def test_upload_contract_matches_small_image_rejection_and_source_limits(self):
         from studio_platform.media import EXTENSIONS
         self.setup_project()

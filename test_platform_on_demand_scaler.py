@@ -186,6 +186,70 @@ class OnDemandTests(LedgerCase):
         self.assertEqual(self.provider.creates, [])
         self.assertEqual(self.repo.get_budget("finite-budget"), budget)
 
+    def test_inventory_wait_keeps_same_job_without_reservation_or_cycle_consumption(self):
+        self.provider.preflight_availability = lambda _: "provider_inventory_unavailable"
+        scope, job = self.submit()
+        reserved = self.repo.get_budget("job-budget")["reserved_microusd"]
+        for _ in range(8):
+            value = self.tick()
+        self.assertEqual(value["reason"], "provider_inventory_unavailable")
+        self.assertEqual(value["phase"], "waiting_capacity")
+        self.assertEqual(self.repo.get_job(scope, job["id"])["error_code"], "capacity_no_matching_gpu")
+        self.assertEqual(self.controller.sequence, 1)
+        self.assertEqual(self.provider.creates, [])
+        self.assertEqual(self.repo.list_instance_intents(), [])
+        self.assertEqual(self.repo.get_budget("finite-budget")["reserved_microusd"], 0)
+        self.assertEqual(self.repo.get_budget("job-budget")["reserved_microusd"], reserved)
+        self.provider.preflight_availability = lambda _: None
+        for _ in range(4):
+            self.tick()
+        self.assertEqual(self.repo.get_job(scope, job["id"])["status"], "queued")
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertIsNone(self.repo.get_job(scope, job["id"])["error_code"])
+
+    def test_wait_reason_never_rewrites_cancelled_job_or_accepts_raw_provider_text(self):
+        scope, job = self.submit()
+        cold = self.controller.current.cold
+        approval = self.controller.current.config.capacity_approval_id
+        cold.record_wait_reason(approval, "raw provider response must not be public")
+        self.assertIsNone(self.repo.get_job(scope, job["id"])["error_code"])
+        self.repo.request_cancel(scope, job["id"])
+        before = self.repo.get_job(scope, job["id"])
+        cold.record_wait_reason(approval, "provider_inventory_unavailable")
+        after = self.repo.get_job(scope, job["id"])
+        self.assertEqual(after["error_code"], before["error_code"])
+        self.assertEqual(after["status"], "cancelled")
+
+    def test_on_demand_configuration_accepts_filter_without_machine_id(self):
+        manifests = json.loads(json.dumps(self.config.manifests))
+        manifests[0].update(executor_id="", compatible_gpu_names=[
+            "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+            "NVIDIA RTX PRO 6000 Blackwell Server Edition"], minimum_vram_mib=95000)
+        launches = [{**self.config.launches[0], "offer_id": ""}]
+        config = replace(self.config, manifests=manifests, launches=launches)
+        self.assertEqual(config.launches[0]["offer_id"], "")
+        self.assertEqual(config.scale_policy, self.config.scale_policy)
+
+    def test_pre_post_inventory_race_releases_rent_and_preserves_job_for_next_cycle(self):
+        from studio_platform.scaler import CreationNotSubmitted
+        original = self.provider.create
+        def no_rent(*args, **kwargs):
+            raise CreationNotSubmitted()
+        self.provider.create = no_rent
+        scope, job = self.submit()
+        for _ in range(3):
+            self.tick()
+        self.assertEqual(self.controller.sequence, 1)
+        self.assertEqual(self.repo.get_job(scope, job["id"])["status"], "waiting_capacity")
+        self.assertEqual(self.repo.get_budget("finite-budget")["reserved_microusd"], 0)
+        self.assertEqual(self.repo.list_instance_intents()[0]["state"], "destroyed")
+        self.provider.create = original
+        for _ in range(8):
+            self.tick()
+        self.assertEqual(self.controller.sequence, 2)
+        self.assertEqual(self.repo.get_job(scope, job["id"])["status"], "queued")
+        self.assertEqual(len(self.provider.creates), 1)
+
     def test_idle_600_seconds_removes_then_other_owner_can_start_next_cycle(self):
         scope, job = self.start_job()
         self.assertEqual(len(self.provider.creates), 1)
@@ -215,6 +279,9 @@ class OnDemandTests(LedgerCase):
         self.assertEqual(self.controller.sequence, 1)
         self.assertEqual(self.repo.list_instance_intents()[0]["state"], "creation_unknown")
         self.assertEqual(self.provider.destroys, [])
+        status = self.controller.status(fresh_ledger_only=True)
+        self.assertEqual(status["reason"], "creation_needs_reconciliation")
+        self.assertFalse(status["recovery"]["automatic_rerent_allowed"])
 
     def test_next_job_resets_idle_timer_and_reuses_same_gpu(self):
         first = self.start_job()

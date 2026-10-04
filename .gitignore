@@ -73,6 +73,7 @@ inventory.json
 !studio_platform/storage_config.py
 !studio_platform/storage_multipart.py
 !studio_platform/storage_asset_journal.py
+!studio_platform/rent_journal.py
 !studio_platform/worker.py
 !studio_platform/control.py
 !studio_platform/execution_policy.py
@@ -200,6 +201,9 @@ inventory.json
 !deploy/platform/verify_public_scaling.py
 !deploy/platform/GPU-SCALER.zh-CN.md
 !test_platform_gpu_scaler.py
+!deploy/platform/gpu_handoff.py
+!studio_platform/backlog_handoff.py
+!test_platform_backlog_handoff.py
 !test_platform_gpu_acceptance.py
 !studio_platform/production_worker.py
 !studio_platform/drain_safe_runner.py
@@ -225,6 +229,8 @@ inventory.json
 !tools/ci_changes.py
 !tools/ci_change_scope.py
 !tools/prepare_release.py
+!tools/run_local_preview.py
+!test_platform_rent_journal.py
 !test_prepare_release.py
 !tools/build_frontend_release.py
 !tools/check_frontend_bundle.py

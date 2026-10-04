@@ -210,12 +210,37 @@ def configure(project, action, sources):
     shot["status"] = "review"
 
 
-def read_draft(project, shot_id):
+def selected_recipe(recipes, h3):
+    """Mirror the browser's explicit recipe, input mode, then default order."""
+    if h3.get("recipeId"):
+        return next((recipe for recipe in recipes if recipe["id"] == h3["recipeId"]), None)
+    if h3.get("inputMode"):
+        return next((recipe for recipe in recipes if recipe["mode"] == h3["inputMode"]), None)
+    return next(iter(recipes), None)
+
+
+def shot_location_ids(project, shot, lookup):
+    """Shot location overrides its scene default; explicit location edges add."""
+    scene = lookup.get(shot.get("parentId"), {})
+    bound = shot.get("data", {}).get("locationId") or scene.get("data", {}).get("locationId")
+    identities = ([bound] if bound else []) + [link["source"] for link in project["links"]
+        if link["target"] == shot["id"] and link["role"] in {"location", "reference"}
+        and lookup.get(link["source"], {}).get("type") == "location"]
+    if any(not isinstance(ident, str) for ident in identities):
+        raise ValueError("地点绑定格式无效，请重新选择")
+    return list(dict.fromkeys(identities))
+
+
+def read_draft(project, shot_id, *, recipes=None):
     shot = shot_entity(project, shot_id)
     h3 = shot["data"].get("h3", {})
+    available = recipes if recipes is not None else [{"id": key, "mode": mode} for key, mode in RECIPES.items()]
+    recipe = selected_recipe(available, h3)
     lookup = {e["id"]: e for e in project["entities"]}
     inputs = {"images": [], "videos": [], "audios": [], "first_frame": None, "last_frame": None, "guides": []}
     issues = []
+    if recipe is None:
+        issues.append("草稿配方已不可用，请明确选择后重新预检")
     ranges = shot["data"].get("referenceRanges", {})
     video_audio = h3.get("video_audio", {})
     if not isinstance(ranges, dict):
@@ -260,24 +285,47 @@ def read_draft(project, shot_id):
             references.append((entity, link["role"], ranges.get(link["id"])))
         elif link["role"] == "dependency":
             issues.append("前置步骤尚未明确选择为实际参考素材")
-    # Match the browser's explicit/inherited character look resolution.
-    scene = lookup.get(shot["parentId"], {})
-    cast = lambda e: [v for v in e.get("data", {}).get("cast", []) if isinstance(v, dict)]
-    own, inherited = cast(shot), cast(scene)
-    characters = list(dict.fromkeys([v.get("characterId") for v in [*inherited, *own]] +
-        [v["source"] for v in project["links"] if v["target"] == shot_id and v["role"] == "identity"
-         and lookup.get(v["source"], {}).get("type") == "character"]))
-    for ident in (x for x in characters if isinstance(x, str)):
-        character = lookup.get(ident, {})
-        binding = next((v for v in own if v.get("characterId") == ident), None) or next(
-            (v for v in inherited if v.get("characterId") == ident), {})
-        look = next((v for v in character.get("data", {}).get("looks", []) if v.get("id") == binding.get("lookId")), None)
-        if not look or not any(look.get("gallery", {}).values()):
-            issues.append("角色尚未选择可用造型和参考图：" + ident)
-            continue
-        for asset_id in filter(None, look.get("gallery", {}).values()):
-            if not any(e and e["id"] == asset_id for e, _, _ in references):
-                references.append((lookup.get(asset_id), "identity", None))
+    # Cast/location assignments remain story data in FL. Only REF turns their
+    # uploaded images into model inputs; explicit media edges stay explicit.
+    if recipe and recipe["mode"] == "ref":
+        scene = lookup.get(shot["parentId"], {})
+        cast = lambda e: [v for v in e.get("data", {}).get("cast", []) if isinstance(v, dict)]
+        own, inherited = cast(shot), cast(scene)
+        characters = list(dict.fromkeys([v.get("characterId") for v in [*inherited, *own]] +
+            [v["source"] for v in project["links"] if v["target"] == shot_id and v["role"] == "identity"
+             and lookup.get(v["source"], {}).get("type") == "character"]))
+        for ident in (x for x in characters if isinstance(x, str)):
+            character = lookup.get(ident, {})
+            binding = next((v for v in own if v.get("characterId") == ident), None) or next(
+                (v for v in inherited if v.get("characterId") == ident), {})
+            look = next((v for v in character.get("data", {}).get("looks", []) if v.get("id") == binding.get("lookId")), None)
+            if not look or not any(look.get("gallery", {}).values()):
+                issues.append("角色尚未选择可用造型和参考图：" + ident)
+                continue
+            for asset_id in filter(None, look.get("gallery", {}).values()):
+                if not any(e and e["id"] == asset_id for e, _, _ in references):
+                    references.append((lookup.get(asset_id), "identity", None))
+        try:
+            location_ids = shot_location_ids(project, shot, lookup)
+        except ValueError as error:
+            issues.append(str(error))
+            location_ids = []
+        for ident in location_ids:
+            location = lookup.get(ident)
+            if not location or location["type"] != "location":
+                issues.append("已绑定地点不存在，请重新选择")
+                continue
+            asset_ids = location["data"].get("referenceAssetIds", [])
+            if not isinstance(asset_ids, list) or any(not isinstance(asset_id, str) for asset_id in asset_ids):
+                issues.append("地点参考图格式无效，请重新选择")
+                continue
+            for asset_id in asset_ids:
+                asset = lookup.get(asset_id)
+                if asset is not None and asset["type"] != "image":
+                    issues.append("地点参考请选择已上传的图片")
+                    continue
+                if not any(e and e["id"] == asset_id for e, _, _ in references):
+                    references.append((asset, "reference", None))
     for entity, role, selected in references:
         value = entry_for(entity, selected)
         if value is None:
@@ -301,14 +349,14 @@ def read_draft(project, shot_id):
             value["media_id"] = value.pop("asset_id")
             value.update(time_seconds=guide.get("time_seconds"), use_audio=guide.get("use_audio", False))
             inputs["guides"].append(value)
-    draft = {"recipe_id": h3.get("recipeId", next(iter(RECIPES))),
+    draft = {"recipe_id": recipe["id"] if recipe else h3.get("recipeId"),
              "prompt": shot["data"].get("prompt", shot.get("description", "")),
              "controls": copy.deepcopy(h3.get("controls", {})), "inputs": inputs}
     return draft, list(dict.fromkeys(issues))
 
 
 def plan_body(project, shot_id, capabilities, derive):
-    draft, issues = read_draft(project, shot_id)
+    draft, issues = read_draft(project, shot_id, recipes=capabilities["recipes"])
     if issues:
         raise ValueError("；".join(issues))
     recipe = next((r for r in capabilities["recipes"] if r["id"] == draft["recipe_id"]), None)
