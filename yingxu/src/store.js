@@ -157,7 +157,7 @@ export function createStore({storage,now=()=>Date.now(),seed=legacySeed}={}){
   let raw=null;
   try{
     raw=storage?.getItem(KEY);
-    if(raw){const saved=JSON.parse(raw),valid=validateProject(saved.project||saved);if(!valid.ok)throw Error(valid.error);state={...state,project:valid.project};if(['guide','canvas'].includes(saved.mode))state={...state,mode:saved.mode};if(['journey','story','characters','locations','assets','production'].includes(saved.section))state={...state,section:saved.section};if(state.project.entities.some(e=>e.id===saved.selectedId))state={...state,selectedId:saved.selectedId};if(state.project.entities.some(e=>e.id===saved.scopeId&&e.type==='chapter'))state={...state,scopeId:saved.scopeId};}
+    if(raw){const saved=JSON.parse(raw),valid=validateProject(saved.project||saved);if(!valid.ok)throw Error(valid.error);state={...state,project:valid.project};if(['guide','canvas'].includes(saved.mode))state={...state,mode:saved.mode};if(['journey','story','characters','locations','assets','production','activity'].includes(saved.section))state={...state,section:saved.section};if(state.project.entities.some(e=>e.id===saved.selectedId))state={...state,selectedId:saved.selectedId};if(state.project.entities.some(e=>e.id===saved.scopeId&&e.type==='chapter'))state={...state,scopeId:saved.scopeId};}
   }catch(error){if(raw){recoveryRaw=raw;protectedRaw=true;backup(raw,'recovery');state={...state,notice:'已保存项目无法读取；原始数据已保留，请导出备份后检查导入文件。'};}}
   if(!state.project&&protectedRaw)state={...state,project:blank('待恢复的项目')};
   if(!state.project){let oldRaw=null;try{oldRaw=storage?.getItem(LEGACY_KEY);state={...state,project:oldRaw?migrateLegacy(JSON.parse(oldRaw)):migrateLegacy(seed)};if(oldRaw)state={...state,notice:'已迁移原章节项目；旧浏览器数据仍保留。'};}catch{state={...state,project:migrateLegacy(seed),notice:'旧项目无法迁移，原始数据仍保留。当前打开演示项目。'};}}
@@ -205,7 +205,7 @@ export function createStore({storage,now=()=>Date.now(),seed=legacySeed}={}){
     subscribe(fn){listeners.add(fn);return()=>listeners.delete(fn);},
     notify:say,
     setMode(mode){if(['guide','canvas'].includes(mode))changeView({mode});},
-    setSection(section){if(['journey','story','characters','locations','assets','production'].includes(section))changeView({section});},
+    setSection(section){if(['journey','story','characters','locations','assets','production','activity'].includes(section))changeView({section});},
     select(id){if(id===null||state.project.entities.some(e=>e.id===id))changeView({selectedId:id});},
     setScope(id){if(id===null||state.project.entities.some(e=>e.id===id&&e.type==='chapter'))changeView({scopeId:id});},
     addEntity(type,parentId=null,patch={}){

@@ -178,3 +178,11 @@ test('subtitle edits do not invalidate explicitly subtitle-off plans, and origin
 test('draft roughcut choices survive repair navigation without saving or submitting and clear when leaving the project',async()=>{
  const h=await renderHarness(),options={resolution:'480P',aspect:'9:16',burn_subtitles:true};h.controller.setRenderOptions(h.chapter,options);assert.deepEqual(h.controller.getState().renderOptions[h.chapter],options);assert.equal(h.calls.length,0);h.store.setSection('journey');h.store.updateEntity(h.shot,{description:'回到声音步骤修正字幕'});assert.equal(h.controller.getState().renderOptions[h.chapter].burn_subtitles,true);assert.equal(h.calls.length,0);h.controller.leave();assert.deepEqual(h.controller.getState().renderOptions,{});h.controller.destroy();
 });
+
+
+test('project activity read rejects late same-project workspace and account responses without editing drafts',async()=>{
+ const h=await harness().start();let finish;h.api.projectActivity=()=>new Promise(resolve=>finish=resolve);
+ const before=h.store.exportProject(),pending=h.controller.readProjectActivity(),rejected=assert.rejects(pending,/账户或项目已经切换/);
+ h.store.enterCloudProject(before,{account:'superdan',version:1});finish({items:[{id:'private'}]});await rejected;assert.deepEqual(h.store.exportProject(),before);
+ const pending2=h.controller.readProjectActivity(),rejected2=assert.rejects(pending2,/账户或项目已经切换/);await h.controller.logout();finish({items:[{id:'private'}]});await rejected2;h.controller.destroy();
+});

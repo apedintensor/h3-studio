@@ -10,9 +10,9 @@ const profiles={
 };
 const date=value=>value?new Date(typeof value==='number'?value*1000:value).toLocaleString():'尚未使用';
 
-export default function ApiKeys({account,projects=[],moreProjects=false}){
+export default function ApiKeys({account,projects=[],moreProjects=false,initialGrant=null}){
   const client=useMemo(()=>{const api=createCloudClient();api.setAccount(account);return api;},[account]);
-  const live=useRef(false),[keys,setKeys]=useState([]),[name,setName]=useState(''),[profile,setProfile]=useState('create'),[allProjects,setAllProjects]=useState(true),[selected,setSelected]=useState([]),[days,setDays]=useState(30),[busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState(''),[created,setCreated]=useState(null),[reveal,setReveal]=useState(false),[confirmRevoke,setConfirmRevoke]=useState(null);
+  const live=useRef(false),[keys,setKeys]=useState([]),[name,setName]=useState(''),[profile,setProfile]=useState(Object.hasOwn(profiles,initialGrant?.profile)?initialGrant.profile:'edit'),[allProjects,setAllProjects]=useState(initialGrant?.allProjects??true),[selected,setSelected]=useState(initialGrant?.projectIds||[]),[days,setDays]=useState(initialGrant?.expiresInDays||7),[busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState(''),[created,setCreated]=useState(null),[reveal,setReveal]=useState(false),[confirmRevoke,setConfirmRevoke]=useState(null);
   async function refresh(){const data=await client.apiKeys();if(live.current)setKeys(data.api_keys||[]);}
   useEffect(()=>{live.current=true;setCreated(null);setKeys([]);setError('');setBusy(true);refresh().catch(()=>{if(live.current)setError('API Key 列表暂时无法读取，请刷新重试。');}).finally(()=>{if(live.current)setBusy(false);});return()=>{live.current=false;client.reset();};},[client]);
   async function act(fn){setBusy(true);setError('');setNotice('');try{await fn();}catch{if(live.current)setError('操作未完成。请刷新列表核对；创建响应丢失时请撤销对应 Key 后重新创建，不会自动重试。');}finally{if(live.current)setBusy(false);}}

@@ -161,6 +161,8 @@ inventory.json
 # Reviewed Agent authoring API and distributable skill; never credential files.
 !studio_platform/guided.py
 !studio_platform/guided_schema.py
+!studio_platform/project_activity.py
+!studio_platform/agent_discovery.py
 !deploy/platform/verify_public_api.py
 !deploy/platform/verify_public_generation.py
 !studio_platform/lium_bootstrap.py
@@ -207,3 +209,4 @@ inventory.json
 !deploy/platform/production-worker.example.json
 !AGENT-API-RELEASE-20261004.zh-CN.md
 !BACKEND-HANDOFF-20261004.zh-CN.md
+!AGENT-ONBOARDING.zh-CN.md

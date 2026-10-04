@@ -174,6 +174,7 @@ export function createCloudController({store=defaultStore,client,storage=globalT
   return {subscribe(fn){listeners.add(fn);return()=>listeners.delete(fn);},getState:()=>state,
     async initialize(){const observedEpoch=epoch;try{const auth=await api.authConfig();if(observedEpoch!==epoch)return;emit({auth});await recheckSession({loadLists:true});}catch(error){if(observedEpoch===epoch)emit({error:error.message});}},
     recheckSession:()=>recheckSession(),checkRemoteVersion,
+    async readProjectActivity(options={}){requireCloud();const ctx=context();const result=await api.projectActivity(ctx.projectId,options);guard(ctx);return result;},
     login:(username,password)=>action(async()=>{const observedEpoch=epoch,result=await api.login(username,password);if(observedEpoch!==epoch)throw Error('登录期间会话已经改变，请重新核对。');const me=identity(result);if(typeof me!=='string')throw Error('登录响应缺少账户身份。');replaceIdentity(me);announceSession();await reloadProjects();await reloadCapabilities();offerResume();}),
     changePassword:(previous,next)=>action(async()=>{const ctx=accountContext();await api.changePassword(previous,next);guardAccount(ctx);rememberVisit({mode:'local'});replaceIdentity(null,'密码已修改，请重新登录；原 API Key 已撤销，云草稿仍按账户保留。');announceSession();}),
     logout:()=>action(async()=>{await api.logout();rememberVisit({mode:'local'});replaceIdentity(null,'已退出。云草稿仍按原账户保留，本机作品已恢复。');announceSession();}),

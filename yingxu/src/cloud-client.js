@@ -94,6 +94,7 @@ export function createCloudClient({fetcher=(...args)=>fetch(...args),onUnauthori
     changePassword:(old_password,new_password)=>request('/v1/auth/password',{method:'POST',body:{old_password,new_password}}),
     apiKeys:()=>request('/v1/api-keys'),createApiKey:body=>request('/v1/api-keys',{method:'POST',body}),revokeApiKey:keyId=>request(`/v1/api-keys/${id(keyId)}`,{method:'DELETE'}),
     projectMeta:projectId=>request(`/v1/projects/${id(projectId)}/meta`),
+    projectActivity:(projectId,{limit=50,beforeVersion}={})=>request(`/v1/projects/${id(projectId)}/activity?limit=${limit}${beforeVersion===undefined?'':`&before_version=${beforeVersion}`}`),
     upload:(file,projectId,assetId,key)=>{const body=new FormData();body.append('file',file,file.name||'reference');body.append('client_project_id',projectId);if(assetId)body.append('client_asset_id',assetId);return request('/v1/assets',{method:'POST',body,key});},
     asset:assetId=>request(`/v1/assets/${id(assetId)}`),
     assets:projectId=>request(`/v1/assets?client_project_id=${id(projectId)}`),

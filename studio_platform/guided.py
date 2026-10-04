@@ -25,6 +25,7 @@ from .auth import API_SCOPES, AuthenticationError, LoginLimited
 from .caption_server import caption_signature
 from .guided_schema import ACTION_FIELDS, contract as guided_contract, validate_action_fields
 from .project_validation import ID, TYPES, ROLES, validate_project
+from .project_activity import append_activity, metadata as activity_metadata, register_routes as register_activity_routes
 from .render_plans import ordered_chapter
 from .repository import Conflict, NotFound, Scope, canonical, documents, request_hash, artifacts, jobs
 
@@ -162,9 +163,30 @@ class Guided:
             if self.repo.engine.dialect.name == "postgresql":
                 conn.exec_driver_sql("SELECT pg_advisory_xact_lock(685939796868749721)")
             metadata.create_all(conn)
+            activity_metadata.create_all(conn)
 
     def envelope(self, row):
         return {"id": row["document_id"], "version": row["version"], "updated_at": row["updated_at"], "project": row["payload"]}
+
+    def save(self, principal, project_id, project, expected_version):
+        """Browser full-document save and its content-free activity are atomic."""
+        validate_project(project, self.settings.max_project_bytes)
+        if project["id"] != project_id or type(expected_version) is not int:
+            raise ValueError("需要匹配的项目ID与版本")
+        document_scope = Scope(self.settings.tenant_id, principal.owner, "__projects", principal.actor_id)
+        where = (self.repo._scope(documents, document_scope), documents.c.kind == "project", documents.c.document_id == project_id)
+        with self.repo.transaction() as conn:
+            row = self.repo._locked(conn, select(documents).where(*where))
+            if row is None:
+                raise NotFound("document_not_found")
+            if row["version"] != expected_version:
+                raise Conflict("document_version_conflict")
+            values = dict(payload=canonical(project), version=row["version"] + 1, updated_at=self.repo.clock())
+            conn.execute(update(documents).where(*where).values(**values))
+            append_activity(conn, tenant_id=self.settings.tenant_id, principal=principal,
+                project_id=project_id, version=values["version"], occurred_at=values["updated_at"],
+                before=row["payload"], after=project, event_type="project.saved")
+            return self.envelope({"document_id": project_id, **values})
 
     def mutate(self, principal, project_id, body, key=None, *, create=False):
         if key is not None and (not isinstance(key, str) or not ID.fullmatch(key)):
@@ -221,6 +243,11 @@ class Guided:
                         project_id="__projects", kind="project", document_id=project_id, **values))
                 else:
                     conn.execute(update(documents).where(*where).values(**values))
+                append_activity(conn, tenant_id=self.settings.tenant_id, principal=principal,
+                    project_id=project_id, version=version, occurred_at=values["updated_at"],
+                    before=None if create else row["payload"], after=project,
+                    actions=() if create else body["actions"],
+                    event_type="project.created" if create else "project.edited")
                 response = self.envelope({"document_id": project_id, **values})
                 if key:
                     conn.execute(insert(receipts).values(tenant=self.settings.tenant_id, owner=principal.owner,
@@ -395,6 +422,7 @@ class Guided:
 def register_routes(app):
     service = Guided(app)
     app.state.guided = service
+    register_activity_routes(app)
     auth = app.state.auth
 
     def browser(request):

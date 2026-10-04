@@ -32,6 +32,7 @@ from .http_limits import (ADMISSION_SCOPE_KEY, BodyLimitMiddleware, UploadAdmiss
                          RequestAdmission, RequestAdmissionMiddleware, admission_rejected)
 from .execution_policy import ExecutionPolicies
 from .render_plans import RECIPE as RENDER_RECIPE, compile_render, validate_render_source
+from .agent_discovery import PUBLIC_PATHS as AGENT_PUBLIC_PATHS, DISCOVERY_LINK
 
 COOKIE = "sixnine_session"
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -215,7 +216,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         public_paths = {"/healthz", "/api/auth/config", "/api/auth/login"}
         public_frontend = (settings.frontend_dir is not None and request.method in {"GET", "HEAD"}
             and (request.url.path in {"/", "/index.html", "/freestyle", "/freestyle/"} or request.url.path.startswith("/assets/")))
-        if request.url.path not in public_paths and not public_frontend and not principal:
+        public_discovery = request.method in {"GET", "HEAD"} and request.url.path in AGENT_PUBLIC_PATHS
+        if request.url.path not in public_paths and not public_frontend and not public_discovery and not principal:
             return JSONResponse({"detail": "请先登录"}, status_code=401)
         request.state.principal = principal
         if principal and not lease.acquire("owner", principal.owner):
@@ -236,6 +238,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
+        if request.url.path in {"/", "/index.html", "/for-agents", "/for-agents/"}:
+            response.headers["Link"] = DISCOVERY_LINK
         if principal and request.url.path.startswith("/v1/"):
             response.headers["X-Authenticated-Account"] = principal.owner
         return response
@@ -338,8 +342,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         project = validate_project(body.get("project"), settings.max_project_bytes)
         if project["id"] != project_id or type(body.get("expected_version")) is not int:
             raise HTTPException(422, "需要匹配的项目ID与版本")
-        return project_response(repo.put_document(project_scope(principal), "project", project_id, project,
-            expected_version=body["expected_version"]))
+        return app.state.guided.save(principal, project_id, project, body["expected_version"])
 
     def upload_asset(request: Request, file: UploadFile = File(...), client_project_id: str = Form(...), client_asset_id: str | None = Form(None)):
         principal = request.state.principal
@@ -625,6 +628,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     register_routes(app)
     from .guided import register_routes as register_guided_routes
     register_guided_routes(app)
+    from .agent_discovery import register_routes as register_agent_discovery_routes
+    register_agent_discovery_routes(app)
     if settings.frontend_dir is not None:
         if not (settings.frontend_dir / "index.html").is_file():
             raise ValueError("Configured frontend build is missing; build the reviewed Yingxu source snapshot first")
