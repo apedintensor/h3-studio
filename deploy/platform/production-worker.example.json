@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "enabled": false,
+  "handoff_id": "replace-with-unique-approved-handoff",
+  "work_dir": "/worker",
+  "ssh_key_file": "/worker-identity/key",
+  "known_hosts_file": "/worker-identity/known_hosts",
+  "host": "REPLACE_WITH_VERIFIED_PUBLIC_IP",
+  "ssh_port": 22,
+  "local_port": 18881,
+  "boot_identity": {
+    "intent_id": "REPLACE_WITH_ORIGINAL_INTENT_UUID",
+    "instance_id": "REPLACE_WITH_EXISTING_POD_UUID",
+    "configuration_id": "replace-with-qualified-configuration",
+    "sources": {
+      "bootstrap_cloud.py": "REPLACE_WITH_ORIGINAL_64_HEX_SHA256",
+      "model_manifest.json": "REPLACE_WITH_ORIGINAL_64_HEX_SHA256"
+    }
+  },
+  "gpu_uuid": "REPLACE_WITH_VERIFIED_GPU_UUID",
+  "worker_id": "replace-with-production-worker-id",
+  "pool": "replace-with-production-acceptance-pool",
+  "hard_deadline": 0,
+  "drain_margin_s": 900,
+  "collection_margin_s": 120,
+  "qualification_evidence_id": "replace-with-real-qualification-id",
+  "owner": "superdan",
+  "tenant": "sixnine"
+}

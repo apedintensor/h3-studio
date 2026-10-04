@@ -164,6 +164,48 @@ class LiumProviderTests(unittest.TestCase):
             self.provider(loader=bad).reconcile(TAG)
         self.assertNotIn("secret-test", str(caught.exception))
 
+    def test_same_configuration_can_bind_two_exact_executors(self):
+        provider = self.provider(manifests=(manifest(), manifest(executor_id=OTHER)))
+        self.assertEqual(provider._manifest(launch()).executor_id, EXECUTOR)
+        self.assertEqual(provider._manifest(launch(offer_id=OTHER)).executor_id, OTHER)
+        with self.assertRaises(LiumError):
+            provider._manifest(launch(offer_id=POD))
+        # A disappeared approved offer cannot silently rent another GPU.
+        for unused in range(2):
+            with self.assertRaisesRegex(LiumError, "unavailable"):
+                provider.create(TAG, launch(offer_id=OTHER), hard_deadline=10000)
+        self.assertEqual(self.api.count("POST"), 0)
+
+    def test_ssh_coordinates_require_exact_running_tag_and_public_host(self):
+        provider = self.provider()
+        self.api.pods = [self.pod()]
+        detail = {"id": POD, "executor": {"executor_ip_address": "8.8.8.8"}, "ports_mapping": {"22": "2022"}}
+        self.api.hook = lambda req: httpx.Response(200, json=detail) if req.url.path == "/api/pods/"+POD else None
+        self.assertEqual(provider.ssh_connection(TAG, POD), {"instance_id": POD, "host": "8.8.8.8", "port": 2022, "username": "root"})
+        for host in ("127.0.0.1", "10.0.0.1", "host.example", "1.2.3.4;touch /tmp/bad"):
+            detail["executor"]["executor_ip_address"] = host
+            with self.subTest(host=host), self.assertRaisesRegex(LiumError, "coordinates_unverified"):
+                provider.ssh_connection(TAG, POD)
+        detail["executor"]["executor_ip_address"] = "8.8.8.8"
+        for port in (True, "x", 65536, 0):
+            detail["ports_mapping"]["22"] = port
+            with self.subTest(port=port), self.assertRaisesRegex(LiumError, "coordinates_unverified"):
+                provider.ssh_connection(TAG, POD)
+        self.api.pods = [self.pod(tag=OTHER)]
+        with self.assertRaises(LiumError):
+            provider.ssh_connection(TAG, POD)
+
+    def test_actual_lifetime_shortens_relative_ttl_and_rejects_clock_ambiguity(self):
+        provider = self.provider()
+        self.api.pods = [self.pod()]
+        detail = {"id": POD, "pod_name": "sixnine-"+TAG, "created_at": stamp(900), "removal_scheduled_at": stamp(11700)}
+        self.api.hook = lambda req: httpx.Response(200, json=detail) if req.url.path == "/api/pods/"+POD else None
+        self.assertEqual(provider.lifetime(TAG, POD, local_created_at=900)["safe_deadline"], 11100)
+        detail.update(created_at=stamp(900).removesuffix("+00:00"), removal_scheduled_at=stamp(11700).removesuffix("+00:00"))
+        self.assertEqual(provider.lifetime(TAG, POD, local_created_at=900)["timezone_evidence"], "naive_utc_crosschecked_against_local_intent")
+        with self.assertRaisesRegex(LiumError, "lifetime_not_confirmed"):
+            provider.lifetime(TAG, POD, local_created_at=900+8*3600)
+
     def test_manifest_matches_exact_model_endpoint_count_and_operator_price_ack(self):
         provider = self.provider()
         for changes in ({"model_id": "other"}, {"region": "other"}, {"offer_id": OTHER}, {"image_id": OTHER}):

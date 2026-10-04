@@ -32,6 +32,31 @@ class ControlTests(LedgerCase):
         self.control.register(spec)
         self.control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
 
+    def test_known_instance_deadline_skips_long_jobs_but_admits_a_short_one(self):
+        self.repo.configure_pool("control-test", max_instances=1, max_physical_gpus=1)
+        intent = self.repo.reserve_instance_intent(self.scope, "control-test", "ttl-test", physical_gpus=1,
+            slots=1, reserved_cost_microusd=100_000, hard_deadline=self.now+600,
+            budget_account_ids=["owner-budget"], dry_run=False, provider="test-only")
+        self.repo.update_instance(intent["id"], "creating")
+        self.repo.update_instance(intent["id"], "starting", provider_instance_id="fake-instance")
+        self.ready(self.spec())
+        long_job = self.controlled_job()
+        self.assertIsNone(self.control.claim("worker", "control-test"))
+        plan = self.repo.create_plan(self.scope, {"recipe_id": "test-recipe", "request": {"model": "test-model"}},
+            {"pool": "control-test", "backend": "comfy-worker", "enabled": True,
+                "configuration_id": "manifest-test", "expected_runtime_s": 60},
+            expires_at=self.now+1000, estimated_cost_microusd=0)
+        short_job = self.repo.create_job(self.scope, plan["id"], "short-ttl-job")
+        claim = self.control.claim("worker", "control-test")
+        self.assertEqual(claim.job["id"], short_job["id"])
+        self.assertTrue(self.control.submission_allowed(claim.job))
+        from sqlalchemy import update
+        from studio_platform.repository import instance_intents
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id==intent["id"]).values(hard_deadline=self.now+90))
+        self.assertFalse(self.control.submission_allowed(claim.job))
+        self.assertEqual(self.repo.get_job(self.scope, long_job["id"])["status"], "queued")
+
     def test_cpu_render_slot_has_no_gpu_budget_and_fixed_instance_ownership(self):
         from sqlalchemy import select
         from studio_platform.repository import registered_devices

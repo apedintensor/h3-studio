@@ -162,6 +162,16 @@ inventory.json
 !studio_platform/guided.py
 !studio_platform/guided_schema.py
 !deploy/platform/verify_public_api.py
+!studio_platform/lium_bootstrap.py
+!studio_platform/lium_reference_smoke.py
+!bootstrap_cloud.py
+!LIUM-BOOTSTRAP.zh-CN.md
+!deploy/platform/deploy_approved.py
+!deploy/platform/ec2/ssm-deploy-document.json
+!deploy/platform/ec2/CD.zh-CN.md
+!tools/deploy_aws_release.py
+!studio_platform/lium_runtime_aws.py
+!LIUM-PRODUCTION-INTEGRATION.zh-CN.md
 !skills/
 !skills/sixnine-yingxu/
 !skills/sixnine-yingxu/SKILL.md
@@ -179,3 +189,9 @@ inventory.json
 !deploy/platform/ec2/resource-receipt.json
 !deploy/platform/ec2/sixnine-secrets.service
 !deploy/platform/ec2/README.zh-CN.md
+!deploy/platform/gpu_acceptance.py
+!test_platform_gpu_acceptance.py
+!studio_platform/production_worker.py
+!PRODUCTION-WORKER.zh-CN.md
+!deploy/platform/production-worker.example.json
+!AGENT-API-RELEASE-20261004.zh-CN.md

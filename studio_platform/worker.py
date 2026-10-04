@@ -456,7 +456,8 @@ class WorkerRunner:
         if isinstance(self.backend, MockBackend):
             return True
         try:
-            return callable(self.submission_guard) and self.submission_guard(job) is True
+            return (callable(self.submission_guard) and self.submission_guard(job) is True
+                and (self.control is None or self.control.submission_allowed(job)))
         except Exception:
             return False
 

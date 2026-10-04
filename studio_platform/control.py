@@ -277,6 +277,17 @@ class WorkerControl:
                     jobs.c.request["request"]["model"].as_string()), else_=jobs.c.request["model"].as_string())
                 bindings.extend((model == spec["model_id"],
                     jobs.c.execution_plan["configuration_id"].as_string() == spec["configuration_id"]))
+            if purpose == "generate":
+                deadlines = list(connection.execute(select(instance_intents.c.hard_deadline).where(
+                    instance_intents.c.provider == worker["provider"],
+                    instance_intents.c.provider_instance_id == worker["instance_id"],
+                    instance_intents.c.state != "destroyed")).scalars())
+                if deadlines:
+                    # A shorter job may fit even when a long queued job does
+                    # not. Existing attempts still reconcile/collect past this
+                    # gate; this must never cause another paid submission.
+                    remaining = min(deadlines)-self.repo.clock()-120
+                    bindings.append(jobs.c.expected_runtime_s < remaining)
             claim = self.queue.claim(worker_id, pool, purpose=purpose, lease_seconds=lease_seconds,
                 connection=connection, job_filter=and_(*bindings), validator=lambda job: self.matches(worker, job))
             if claim is None:
@@ -308,6 +319,23 @@ class WorkerControl:
                 state=state, current_job_id=None if terminal else job_id,
                 expires_at=self.repo.clock()+self.registration_seconds, updated_at=self.repo.clock()))
             return self._worker(connection, worker_id)
+
+    def submission_allowed(self, job):
+        """Recheck slot/TTL immediately before POST, after slow media uploads."""
+        worker_id = job.get("lease_worker_id")
+        if not worker_id:
+            return False
+        with self.repo.engine.connect() as connection:
+            worker = self._worker(connection, worker_id)
+            now = self.repo.clock()
+            if (worker["current_job_id"] != job["id"] or worker["drain_requested"]
+                    or worker["expires_at"] <= now or worker["state"] not in {"leased", "busy"}):
+                return False
+            intents = connection.execute(select(instance_intents.c.hard_deadline, instance_intents.c.state).where(
+                instance_intents.c.provider == worker["provider"],
+                instance_intents.c.provider_instance_id == worker["instance_id"])).mappings()
+            return all(row["state"] in {"starting", "ready", "busy"}
+                and row["hard_deadline"] > now+job["expected_runtime_s"]+120 for row in intents)
 
     def heartbeat(self, worker_id, fence, *, lease_seconds=None):
         seconds = self.registration_seconds if lease_seconds is None else lease_seconds

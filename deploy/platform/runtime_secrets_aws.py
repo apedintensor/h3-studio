@@ -69,8 +69,8 @@ def write_runtime(name, content):
             or stat.S_IMODE(info.st_mode) != 0o700):
         raise RuntimeError("Runtime secret directory is not protected")
     path = ROOT / name
-    # Truncate in place to preserve Docker's already-bound inode on a repeated
-    # hydration. Normal hydration never rotates passwords or replaces files.
+    # Preserve Docker's already-bound inode. Repeated hydration compares exact
+    # bytes without truncating; an unexpected rotation requires separate work.
     mode, group = (0o400, 0) if name == 'db_admin_password' else (0o440, 10001)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags, mode)

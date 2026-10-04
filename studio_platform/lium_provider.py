@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import importlib
+import ipaddress
 import json
 import math
 import os
@@ -200,10 +201,10 @@ class LiumProvider:
             raise LiumError("lium_invalid_settings")
         manifest_list = tuple(manifests)
         if (any(not isinstance(item, LiumManifest) for item in manifest_list)
-                or len({item.configuration_id for item in manifest_list}) != len(manifest_list)):
+                or len({(item.configuration_id, item.executor_id, item.template_id) for item in manifest_list}) != len(manifest_list)):
             raise LiumError("lium_duplicate_or_invalid_manifest")
         self.enabled = enabled
-        self._manifests = {item.configuration_id: item for item in manifest_list}
+        self._manifests = {(item.configuration_id, item.executor_id, item.template_id): item for item in manifest_list}
         self._loader = loader or _central_loader
         self._transport, self._idle_probe, self.clock = transport, idle_probe, clock
         self._timeout, self._ttl_margin = timeout_s, ttl_margin_s
@@ -330,13 +331,82 @@ class LiumProvider:
         return ProviderFact("destroyed", pod_id, actual_cost_microusd=actual)
 
     def _manifest(self, launch):
-        manifest = self._manifests.get(getattr(launch, "configuration_id", None))
+        manifest = self._manifests.get((getattr(launch, "configuration_id", None),
+            getattr(launch, "offer_id", None), getattr(launch, "image_id", None)))
         if (manifest is None or not isinstance(launch, LaunchSpec) or launch.provider != SERVICE
                 or launch.model_id != manifest.model_id or launch.region != manifest.region
                 or launch.offer_id != manifest.executor_id or launch.image_id != manifest.template_id
                 or not manifest.allow_preflight_only_price_cap or manifest.approved_until <= self.clock()):
             raise LiumError("lium_launch_manifest_unapproved")
         return manifest
+
+    def ssh_connection(self, tag, instance_id):
+        """Read exact provider-owned SSH coordinates, never execute its command.
+
+        The known API structure is executor.executor_ip_address and
+        ports_mapping['22']. A public address and numeric port are required;
+        arbitrary ssh command strings, URLs, secrets, and private targets are not
+        returned or interpreted. This remains CPU-side operational metadata.
+        """
+        pod = self._exact_pod(tag, instance_id)
+        if pod is None or str(pod.get("status", "")).upper() != "RUNNING":
+            raise LiumError("lium_pod_not_running_for_bootstrap")
+        detail = self._request("GET", "pods/"+_uuid(instance_id))
+        try:
+            if not isinstance(detail, dict) or _uuid(detail.get("id")) != _uuid(instance_id):
+                raise ValueError
+            if self._name(detail) is not None and self._name(detail) != _pod_name(tag):
+                raise ValueError
+            host = str(ipaddress.ip_address(detail["executor"]["executor_ip_address"]))
+            if not ipaddress.ip_address(host).is_global:
+                raise ValueError
+            port_value = detail["ports_mapping"]["22"]
+            if isinstance(port_value, bool) or not isinstance(port_value, (str, int)):
+                raise ValueError
+            port = int(port_value)
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except (KeyError, TypeError, ValueError, LiumError):
+            raise LiumError("lium_ssh_coordinates_unverified") from None
+        return {"instance_id": _uuid(instance_id), "host": host, "port": port, "username": "root"}
+
+    def lifetime(self, tag, instance_id, *, local_created_at, maximum_hours=4):
+        """A conservative actual-pod deadline, never an extension of approval.
+
+        Lium currently returns timezone-less pod times. Interpret that format as
+        UTC only after its creation timestamp agrees with our durable rent intent
+        within five minutes; otherwise refuse an expiry claim. Return an earlier
+        deadline with a ten-minute collection/clock margin. Caller may only
+        shorten its existing ledger deadline using this fact.
+        """
+        if (type(maximum_hours) is not int or not 1 <= maximum_hours <= 4
+                or type(local_created_at) not in (int, float) or not math.isfinite(local_created_at)):
+            raise LiumError("lium_invalid_lifetime_bound")
+        if self._exact_pod(tag, instance_id) is None:
+            raise LiumError("lium_lifetime_not_confirmed")
+        detail = self._request("GET", "pods/"+_uuid(instance_id))
+        try:
+            if (not isinstance(detail, dict) or _uuid(detail.get("id")) != _uuid(instance_id)
+                    or self._name(detail) != _pod_name(tag)):
+                raise ValueError
+            parsed = [datetime.fromisoformat(detail[k].replace("Z", "+00:00")) for k in ("created_at", "removal_scheduled_at")]
+            if (parsed[0].tzinfo is None) != (parsed[1].tzinfo is None):
+                raise ValueError
+            assumed = parsed[0].tzinfo is None
+            if assumed:
+                parsed = [v.replace(tzinfo=timezone.utc) for v in parsed]
+            created, removed = (v.timestamp() for v in parsed)
+            if (abs(created-local_created_at) > 300 or not 0 < removed-created <= maximum_hours*3600+300):
+                raise ValueError
+            safe = min(removed, created+maximum_hours*3600)-600
+            if safe <= self.clock():
+                raise ValueError
+        except (KeyError, TypeError, AttributeError, ValueError):
+            raise LiumError("lium_lifetime_not_confirmed") from None
+        return {"instance_id": _uuid(instance_id), "provider_created_at": detail["created_at"],
+            "provider_removal_scheduled_at": detail["removal_scheduled_at"], "safe_deadline": safe,
+            "timezone_evidence": "naive_utc_crosschecked_against_local_intent" if assumed else "explicit_offset",
+            "safety_margin_seconds": 600}
 
     def validate_launch(self, launch, *, physical_gpus, slots, reserved_cost_microusd, hard_deadline):
         """Pure pre-reservation check; no credentials/HTTP, no parallel budget.
