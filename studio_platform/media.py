@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import io
 import math
+from fractions import Fraction
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -156,6 +157,33 @@ def _video_rotation(stream):
     return (quarter_turn * 90) % 360
 
 
+def _native_video_timing(video, audio, container_duration):
+    """Recognize only a proven native grid, allowing <=1 ms container rounding.
+
+    Audio stream duration must not be longer than the proven video timeline.
+    This is deliberately stricter than the owned qualification fixture's AAC
+    padding allowance: arbitrary user inputs never receive that exception.
+    """
+    try:
+        frames = int(video["nb_frames"])
+        if (not 56 <= frames <= 362 or frames % 17 != 5
+                or Fraction(video["avg_frame_rate"]) != 24 or Fraction(video["r_frame_rate"]) != 24):
+            return None
+        exact, stream_duration = frames/24, float(video["duration"])
+        if (not 2 <= exact <= 15 or not math.isfinite(stream_duration)
+                or abs(stream_duration-exact) > 1e-6 or abs(container_duration-exact) > .001+1e-6):
+            return None
+        audio_duration = float(audio["duration"]) if audio is not None else None
+        if audio is not None and (not math.isfinite(audio_duration) or not 0 < audio_duration <= exact+1e-6):
+            return None
+        return {"duration_basis": "verified_native_video_frames_v1", "source_frame_count": frames,
+            "source_fps": 24, "source_video_stream_duration": stream_duration,
+            "source_audio_stream_duration": audio_duration,
+            "duration_rounding_correction_seconds": exact-container_duration}
+    except (KeyError, TypeError, ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+
 def inspect(path: Path, kind: str):
     if kind == "image":
         try:
@@ -206,6 +234,14 @@ def inspect(path: Path, kind: str):
     result = {"kind": kind, "duration": duration, "source_duration": duration,
               "has_audio": bool(audios), "model_ready": 2 <= duration <= 15, "notes": [],
               "video_stream_index": selected_index(videos), "audio_stream_index": selected_index(audios)}
+    if videos:
+        result["container_duration"] = duration
+        timing = _native_video_timing(videos[0], audios[0] if audios else None, duration)
+        if timing:
+            duration = timing["source_frame_count"]/timing["source_fps"]
+            result.update(timing, duration=duration, source_duration=duration, model_ready=2 <= duration <= 15)
+            if abs(timing["duration_rounding_correction_seconds"]) > 1e-6:
+                result["notes"].append("已核验24fps原生帧数，仅校正不超过1毫秒的容器时长舍入；原文件保留")
     if len(videos) > 1 or len(audios) > 1:
         result["notes"].append("模型副本仅选第一个实际视频轨和第一个音轨；原文件所有轨道保持不变")
     if not result["model_ready"]:
@@ -231,7 +267,7 @@ def _source_selection(path, metadata):
     file; these values describe the original, not the normalized model copy.
     """
     if ("video_stream_index" not in metadata or "audio_stream_index" not in metadata
-            or (metadata["kind"] == "video" and "source_rotation_degrees" not in metadata)):
+            or (metadata["kind"] == "video" and ("source_rotation_degrees" not in metadata or "container_duration" not in metadata))):
         return inspect(path, metadata["kind"])
     video, audio = metadata["video_stream_index"], metadata["audio_stream_index"]
     for index in (video, audio):
@@ -314,7 +350,13 @@ def normalize(path: Path, metadata: dict, target_dir: Path, *, max_output_bytes=
         result.update(sample_rate=32000, channels=2)
         result["notes"].append("模型副本为32kHz双声道，原音频保留")
         return target, result
-    frames = max(56, 17 * math.ceil((math.ceil(duration*24)-5)/17) + 5)
+    if metadata.get("duration_basis") == "verified_native_video_frames_v1":
+        frames = metadata["source_frame_count"]
+        if (type(frames) is not int or not 56 <= frames <= 362 or frames % 17 != 5
+                or metadata.get("source_fps") != 24 or abs(duration-frames/24) > 1e-6):
+            raise MediaError("受检视频帧时长记录不一致")
+    else:
+        frames = max(56, 17 * math.ceil((math.ceil(duration*24)-5)/17) + 5)
     target = target_dir / "normalized.mp4"
     args = ["-i", path, "-map", f'0:{metadata["video_stream_index"]}',
             "-vf", "fps=24,tpad=stop_mode=clone:stop_duration=1", "-frames:v", frames,
@@ -331,7 +373,8 @@ def normalize(path: Path, metadata: dict, target_dir: Path, *, max_output_bytes=
     if int(video.get("nb_frames", 0)) != frames:
         raise MediaError("视频归一化帧数验证失败")
     result.update(duration=frames/24, fps=24, frame_count=frames)
-    result["notes"].append(f"模型副本为24fps/{frames}帧，末帧延长到原生帧网格；原视频保留")
+    timing_note = "保留已核验原生帧网格" if metadata.get("duration_basis") == "verified_native_video_frames_v1" else "末帧延长到原生帧网格"
+    result["notes"].append(f"模型副本为24fps/{frames}帧，{timing_note}；原视频保留")
     return target, result
 
 

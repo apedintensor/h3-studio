@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import array
 import copy
+import hashlib
 import math
 from pathlib import Path
 import shutil
@@ -29,6 +30,62 @@ class MediaStreamSelectionTests(unittest.TestCase):
             check=True, timeout=30, stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL)
         return result.stdout
+
+    def native_reference(self, frames=107):
+        source = self.root / ("native-"+str(frames)+".mp4")
+        self.ffmpeg(["-f", "lavfi", "-i", "color=c=red:s=832x480:r=24",
+            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=32000",
+            "-frames:v", frames, "-t", frames/24, "-c:v", "libx264", "-threads", "1",
+            "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ar", "32000", "-ac", "2", source])
+        return source
+
+    def test_real_native_107_frame_input_keeps_grid_and_passes_unchanged_execution_limit(self):
+        from studio_platform.execution_policy import input_envelope_blockers
+        from studio_platform.qualification_profiles import MULTIMODAL_INPUT_LIMITS
+        source = self.native_reference()
+        original = hashlib.sha256(source.read_bytes()).hexdigest()
+        output, metadata = media.normalize(source, media.inspect(source, "video"), self.root)
+        self.assertEqual((metadata["frame_count"], metadata["fps"]), (107, 24))
+        self.assertEqual(metadata["duration"], 107/24)
+        self.assertEqual(metadata["duration_basis"], "verified_native_video_frames_v1")
+        self.assertEqual(int(next(s for s in media.probe(output)["streams"] if s["codec_type"] == "video")["nb_frames"]), 107)
+        compiled = {"recipe_id": "h3-base-ref2va-v1", "assets": {"clip": {"metadata": metadata}},
+            "request": {"inputs": {"images": [], "videos": ["clip"], "audios": []}, "guides": [], "video_audio": {"clip": True}}}
+        self.assertEqual(input_envelope_blockers(compiled, MULTIMODAL_INPUT_LIMITS), [])
+        self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), original)
+
+    def test_container_millisecond_rounding_of_real_stream_does_not_add_seventeen_frames(self):
+        source = self.native_reference()
+        original = source.read_bytes()
+        probe = media.probe
+        def rounded(path):
+            data = probe(path)
+            if Path(path) == source:
+                # Real encoded tracks, with the coarse container duration that
+                # some ffprobe/muxer versions report. Not a fabricated frame count.
+                data["format"]["duration"] = "4.459"
+            return data
+        with mock.patch.object(media, "probe", side_effect=rounded):
+            info = media.inspect(source, "video")
+            self.assertEqual(info["container_duration"], 4.459)
+            self.assertEqual(info["source_duration"], 107/24)
+            self.assertLess(abs(info["duration_rounding_correction_seconds"]), .001)
+            output, metadata = media.normalize(source, info, self.root)
+        self.assertEqual(metadata["frame_count"], 107)
+        self.assertEqual(int(next(s for s in probe(output)["streams"] if s["codec_type"] == "video")["nb_frames"]), 107)
+        self.assertEqual(source.read_bytes(), original)
+
+    def test_true_extra_frame_is_not_disguised_as_container_rounding(self):
+        from studio_platform.execution_policy import input_envelope_blockers
+        from studio_platform.qualification_profiles import MULTIMODAL_INPUT_LIMITS
+        source = self.native_reference(108)
+        info = media.inspect(source, "video")
+        self.assertNotIn("duration_basis", info)
+        _, metadata = media.normalize(source, info, self.root)
+        self.assertEqual(metadata["frame_count"], 124)
+        compiled = {"recipe_id": "h3-base-ref2va-v1", "assets": {"clip": {"metadata": metadata}},
+            "request": {"inputs": {"images": [], "videos": ["clip"], "audios": []}, "guides": [], "video_audio": {"clip": True}}}
+        self.assertTrue(any("总时长" in message for message in input_envelope_blockers(compiled, MULTIMODAL_INPUT_LIMITS)))
 
     def multitrack(self):
         source = self.root / "multitrack.mp4"
@@ -214,6 +271,21 @@ class MediaStreamSelectionTests(unittest.TestCase):
         source = self.rotated_video(45)
         with self.assertRaisesRegex(media.MediaError, "旋转"):
             media.inspect(source, "video")
+
+
+class NativeTimingBoundaryTests(unittest.TestCase):
+    def test_only_proven_native_grid_with_at_most_one_millisecond_container_error_is_corrected(self):
+        video = {"nb_frames": "107", "avg_frame_rate": "24/1", "r_frame_rate": "24/1", "duration": "4.458333"}
+        self.assertIsNotNone(media._native_video_timing(video, None, 107/24+.001))
+        self.assertIsNone(media._native_video_timing(video, None, 107/24+.001002))
+        for key, value in (("nb_frames", "108"), ("avg_frame_rate", "25/1"), ("r_frame_rate", "25/1"),
+                ("duration", "4.46"), ("duration", "N/A")):
+            with self.subTest(key=key, value=value):
+                self.assertIsNone(media._native_video_timing({**video, key: value}, None, 4.459))
+        for audio in ({"duration": str(107/24+.0001)}, {"duration": "4.48"}, {"duration": "N/A"}, {}):
+            with self.subTest(audio=audio):
+                self.assertIsNone(media._native_video_timing(video, audio, 4.459))
+        self.assertIsNotNone(media._native_video_timing(video, {"duration": "4.448"}, 4.459))
 
 
 if __name__ == "__main__":

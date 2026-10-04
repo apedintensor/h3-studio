@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import shutil
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -14,7 +16,54 @@ from studio_platform.worker import Outcome
 from test_platform_lium_reference_smoke import RefBackend
 
 
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU FFmpeg/ffprobe required")
+class RealMultimodalFixtureTests(unittest.TestCase):
+    def test_real_124_frame_aac_source_is_bounded_by_actual_reference_frames(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            video, audio = root/"raw.mp4", root/"raw.flac"
+            commands = [
+                ["-f", "lavfi", "-i", "color=c=red:s=1344x768:r=24", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=32000",
+                 "-map", "0:v:0", "-map", "1:a:0", "-frames:v", "124", "-t", str(124/24), "-c:v", "libx264",
+                 "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", str(video)],
+                ["-f", "lavfi", "-i", "sine=frequency=440:sample_rate=32000", "-t", str(124/24), "-ac", "2", "-c:a", "flac", str(audio)],
+            ]
+            for command in commands:
+                subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-threads", "2", *command],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True, timeout=30)
+            bootstrap = {"evidence": {"outputs": {
+                kind: {"filename": path.name, "size_bytes": path.stat().st_size, "sha256": BoundedReferenceSmoke.file_hash(path)}
+                for kind, path in (("video", video), ("audio", audio))}}}
+            target = root/BoundedReferenceSmoke.name
+            target.mkdir()
+            helper = BoundedReferenceSmoke(None, lambda: 0, None, None)
+            paths = helper.prepare(root, target, bootstrap)
+            for ident, (path, kind) in paths.items():
+                meta = helper.fixture_metadata(path, kind)
+                if kind == "video":
+                    self.assertEqual((meta["width"], meta["height"], meta["frame_count"], meta["fps"]), (832, 480, 107, 24))
+                    self.assertEqual(meta["duration"], 107/24)
+                    self.assertLessEqual(abs(meta["source_duration"]-meta["duration"]), .033)
+                with self.subTest(kind=kind, metadata=meta):
+                    helper.validate_fixture(ident, meta)
+
+
 class MultimodalSmokeTests(unittest.TestCase):
+    def test_fixture_muxer_rounding_preserves_exact_frame_duration_and_rejects_long_tracks(self):
+        helper = self.qualifier(BoundedReferenceSmoke)
+        for observed in (4.459, 4.48, 4.6):
+            with self.subTest(container_duration=observed):
+                self.inspect.side_effect = lambda path, kind: {"kind": "video", "width": 832, "height": 480,
+                    "duration": observed, "source_duration": observed, "has_audio": True}
+                meta = helper.fixture_metadata(Path("synthetic.mp4"), "video")
+                self.assertEqual(meta["duration"], 107/24)
+                self.assertEqual(meta["source_duration"], observed)
+                if observed < 4.5:
+                    helper.validate_fixture("video", meta)
+                else:
+                    with self.assertRaisesRegex(BootError, "fixture_shape"):
+                        helper.validate_fixture("video", meta)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

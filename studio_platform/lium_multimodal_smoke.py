@@ -7,11 +7,17 @@ and collect that same tag. Qualification is inference/shape proof, not quality.
 from contextlib import nullcontext
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from .media import ffmpeg, inspect, probe
 from .repository import request_hash
 from .worker import SubmissionRejected
+
+REFERENCE_VIDEO_DURATION = 107/24
+# One AAC frame at the fixture's 32kHz rate plus MP4 millisecond rounding.
+# Applies only to this controller-owned fixture, never user input admission.
+FIXTURE_CONTAINER_DURATION_TOLERANCE = 1024/32000 + .001
 
 
 class BoundedInputSmoke:
@@ -68,11 +74,7 @@ class BoundedInputSmoke:
                 for ident, (path, kind) in paths.items():
                     if path.is_symlink() or not path.is_file() or path.stat().st_size > 512*1024**2:
                         raise BootError("multimodal_qualification_input_unavailable")
-                    meta = inspect(path, kind)
-                    if kind == "video":
-                        stream = next(s for s in probe(path)["streams"] if s.get("codec_type") == "video")
-                        numerator, denominator = map(int, stream["avg_frame_rate"].split("/"))
-                        meta.update(fps=numerator/denominator, frame_count=int(stream["nb_frames"]))
+                    meta = self.fixture_metadata(path, kind)
                     self.validate_fixture(ident, meta)
                     metadata[ident] = meta
                     inputs[ident] = {"filename": path.name, "size_bytes": path.stat().st_size,
@@ -152,6 +154,20 @@ class BoundedInputSmoke:
         return {"state": "qualification_failed", "qualification_stage": self.name}
 
     @staticmethod
+    def fixture_metadata(path, kind):
+        meta = inspect(path, kind)
+        if kind == "video":
+            stream = next(s for s in probe(path)["streams"] if s.get("codec_type") == "video")
+            numerator, denominator = map(int, stream["avg_frame_rate"].split("/"))
+            fps, frames = numerator/denominator, int(stream["nb_frames"])
+            # Keep the observed container duration as separate evidence. MP4
+            # muxers can round to milliseconds or retain one AAC padding frame;
+            # the actual reference video is exactly the decoded frame grid.
+            meta.update(source_duration=meta["duration"], duration=frames/fps,
+                        fps=fps, frame_count=frames)
+        return meta
+
+    @staticmethod
     def validate_fixture(ident, meta):
         from .lium_bootstrap import BootError
         kind = meta.get("kind")
@@ -160,7 +176,11 @@ class BoundedInputSmoke:
             valid = valid and meta.get("width") == 2048 and meta.get("height") == 2048
         elif kind == "video":
             valid = valid and (meta.get("width"), meta.get("height"), meta.get("fps"), meta.get("frame_count")) == (832, 480, 24, 107)
-            valid = valid and abs(meta.get("duration", 0)-107/24) <= 1e-6 and meta.get("has_audio") is True
+            observed = meta.get("source_duration", meta.get("duration"))
+            valid = (valid and abs(meta.get("duration", 0)-REFERENCE_VIDEO_DURATION) <= 1e-6
+                and type(observed) in (int, float) and math.isfinite(observed)
+                and abs(observed-REFERENCE_VIDEO_DURATION) <= FIXTURE_CONTAINER_DURATION_TOLERANCE
+                and meta.get("has_audio") is True)
         elif kind == "audio":
             valid = valid and abs(meta.get("duration", 0)-4.45) <= 1e-6 and meta.get("has_audio") is True
         else:
