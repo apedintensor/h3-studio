@@ -520,13 +520,15 @@ class BacklogHostTests(unittest.TestCase):
                 patch.object(scaler,'checked_release',return_value=('a'*40,Path('/release')/('a'*40),{})), \
                 patch.object(handoff,'supervisor',return_value={'pid':90,'active_state':'active'}), \
                 patch.object(handoff,'inspect',return_value={'State':{'Running':True,'Paused':False}}), \
-                patch.object(handoff,'frozen_identity',return_value=frozen), \
+                patch.object(handoff,'frozen_identity',side_effect=lambda *a,**kw:{**frozen,'frozen_at':kw['frozen_at']}), \
+                patch.object(handoff.time,'time',side_effect=[1000,1120]), \
                 patch.object(release,'command',side_effect=lambda a,**kw:events.append(a)), \
                 patch.object(scaler,'close_admission',side_effect=lambda *a:events.append('close')), \
                 patch.object(scaler,'atomic'),patch.object(handoff,'command') as systemd:
             result=handoff.freeze('b'*40,'sixnine-old.service')
         self.assertEqual(events,[['pause',scaler.container_name(old)],'close'])
         self.assertEqual(result['phase'],'frozen')
+        self.assertEqual(result['frozen']['frozen_at'],1120)
         systemd.assert_not_called()
 
     def test_retirement_kills_confirmed_main_then_already_paused_container_without_unpause(self):

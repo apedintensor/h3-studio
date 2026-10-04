@@ -125,6 +125,13 @@ def freeze(commit, unit):
     release.command(['pause', scaler.container_name(config)], environment=environment, timeout=20)
     frozen = frozen_identity(environment, config, frozen_at=time.time())
     scaler.close_admission(directory, environment)
+    # CPU app recreation can take over a minute. Start the supplier proof's
+    # freshness window only after rechecking the same continuously paused
+    # container, rather than consuming it while waiting for website health.
+    confirmed = frozen_identity(environment, config, frozen_at=time.time())
+    release.require({k:v for k,v in confirmed.items() if k != 'frozen_at'}
+        == {k:v for k,v in frozen.items() if k != 'frozen_at'}, 'handoff_frozen_identity_changed')
+    frozen = confirmed
     scaler.atomic(record_path(OLD), config)
     receipt = {'version':1, 'phase':'frozen', 'target_commit':commit, 'old_commit':pin['commit'],
         'old_config_hash':scaler.fingerprint(config), 'old_pin':pin, 'supervisor':host, 'frozen':frozen}
