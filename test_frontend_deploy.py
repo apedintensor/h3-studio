@@ -37,6 +37,16 @@ class FrontendTransactions(unittest.TestCase):
         (self.root / 'approved-frontends' / (COMMIT + '.sha256')).write_text(digest)
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        if os.name == 'posix':
+            # The installer is root-only on the host. CI deliberately runs as
+            # an unprivileged user; emulate ownership, retaining real type,
+            # link-count, permission, size and inode checks on temporary files.
+            original_lstat = Path.lstat
+            def root_owned_stat(path, *args, **kwargs):
+                fields = list(original_lstat(path, *args, **kwargs))
+                fields[4] = 0
+                return os.stat_result(fields)
+            self.stack.enter_context(mock.patch.object(Path, 'lstat', root_owned_stat))
         self.manifest = self.stack.enter_context(mock.patch.object(host.release, 'manifest',
             return_value={'contracts': CONTRACTS, 'image_id': 'sha256:' + 'd' * 64}))
         self.stack.enter_context(mock.patch.object(host.release, 'validate_image_archive', return_value={'sha256:' + 'd' * 64}))

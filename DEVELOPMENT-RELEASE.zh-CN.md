@@ -17,10 +17,12 @@
 1. 编辑 canonical 前端 `../video-studio-design/studio-app`；通过 `python tools/sync_yingxu_source.py --write` 同步发布快照。不要直接维护两份前端。
 2. 开发中按需预览、做语法及受影响关键路径检查；批次完成后再提交。
 3. push/PR 只检查，不发布。`test` 为稳定汇总检查。完整本地 Git diff 决定范围；新文件、删除、未知路径或缺少基线走全检查。不是按任意 `.md` 后缀跳过检查，公开 Skill 是运行资源。
-4. 准备发布：Actions 选择 `deploy=true`，`release_kind=frontend` 或 `platform`。这一步只产生/上传验证后的不可变包。
+4. 本地准备发布：提交好批次后运行 `python tools/prepare_release.py --kind frontend` 或 `--kind platform`，可加 `--commit` 指定完整 HEAD。入口核对 main、目标仓库、源码干净和远端 SHA，push 一次，只取消同仓库/同 SHA/同 workflow 的未完成普通 push 检查，再 dispatch 一次准备任务。不会同步、commit、安装包、批准或部署。显式 DOCUMENTS 白名单内未提交文档可保留，例如用户的 `SCALING.zh-CN.md`；其他受审阅源码/配置和未跟踪文件必须先处理，ignored 私有文件不扫描。也可在 Actions 手动选择 `deploy=true` 与 `release_kind`，但不要与本地入口重复触发。
 5. 通过独立操作身份核对测试版本与 manifest 摘要，写入 host 对应批准目录，再 dispatch `approved_frontend_commit` 或 `approved_commit`。部署身份不能自批准或安装 root helper。
 
 平台准备会完整验收确切版本；前端准备只验收前端及发布边界，不运行全套 PostgreSQL 或重建 Python 镜像。不要同时为同一批次重复触发准备任务；已通过且未受修改影响的检查不反复执行。pip/npm 和 BuildKit 缓存用于加速依赖与镜像层，缓存命中不代替验证。
+
+本地入口在 ignored `.release-prepares/提交号-类型/receipt.json` 中先记意图、再执行变更。取消或 dispatch 超时/回应不明会停止；同一意图再次运行会拒绝，不自动重发。通过 `gh run list --repo apedintensor/h3-studio --workflow ci.yml --commit 完整SHA` 及收据核对，保留原意图，不靠删除收据重试。返回的 run ID 只表示观察到确切 SHA 的新准备任务，不表示检查、发布或部署完成。GitHub dispatch 没有直接返回 run ID；出现零个或多个候选时需人工核对。如果普通 push 检查已经完成，当前入口不复用其测试结果；为避免重复，应让本地入口负责该批次第一次 push。PR、其他 SHA、已完成检查及发布/部署任务不会被取消。
 
 ## 前端版本与回滚
 
