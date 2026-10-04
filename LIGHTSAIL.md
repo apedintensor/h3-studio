@@ -1,5 +1,7 @@
 # Lightsail 部署与 CI/CD
 
+这份文档保留的是早期独立 `server.py` / `web/` 服务的部署方式。当前映序与 H3 统一平台请使用 [deploy/platform/README.zh-CN.md](deploy/platform/README.zh-CN.md)；两套数据目录、发布器和备份约束不同，不要交叉套用。本文件中的“仅设计”、SQLite与旧路径均按这一历史范围理解。
+
 2026-10-04。当前为可验证的部署配置，未创建 Lightsail 实例、迁移本地数据或发布公网地址。
 GPU 已销毁，本发布配置固定关闭生成。多机/API 调度另见 `SCALING.zh-CN.md`，尚未接入线上。
 

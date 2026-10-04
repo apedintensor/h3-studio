@@ -1,43 +1,52 @@
 # 本轮可核对的验收索引
 
-记录截至2026-10-04 01:00 UTC，十小时工作尚未结束。最新修复候选为 `027039a55c74e3c25d9fa0369d9e11870263a2bc`；下表中明确标45d3的记录属于历史基线，不能代替新版本验收。下列点号目录是本机验收产物，不随Git源码推送；这些路径的存在不代表离机备份。
+截至2026-10-04 02:18 UTC。最终运行与前端源码是 `b588b60d00091d677b5936b39c01c0b27ba6b6ba`；最后60分钟固定版本观察已经通过；四组固定观察各自校验并确认相关进程退出。下列点号目录是本机验收产物，不随源码提交；存在于同盘不等于已有离机备份。
 
 ## 先看哪份
 
-- 用户入口：[五分钟走查](START-HERE.zh-CN.md)、[交付报告](DELIVERY-REPORT.zh-CN.md)。
-- 设计和范围：[架构](ARCHITECTURE.zh-CN.md)、[迭代故事](ITERATIONS.zh-CN.md)、[API契约](API-USAGE.zh-CN.md)。
-- 上线条件：[生产就绪复核](deploy/platform/READINESS-REVIEW.zh-CN.md)、[秘密供给](deploy/platform/RUNTIME-SECRETS.zh-CN.md)。
+- 用户：[五分钟走查](START-HERE.zh-CN.md)、[交付报告](DELIVERY-REPORT.zh-CN.md)。
+- 实现：[架构](ARCHITECTURE.zh-CN.md)、[27轮迭代](ITERATIONS.zh-CN.md)、[API契约](API-USAGE.zh-CN.md)。
+- 上线：[生产就绪复核](deploy/platform/READINESS-REVIEW.zh-CN.md)、[秘密供给](deploy/platform/RUNTIME-SECRETS.zh-CN.md)。
 
-## 原始记录
+## 最终源码与发布镜像
 
-| 证明什么 | 本机相对路径/外部运行 | 不证明什么 |
+| 证明什么 | 本机相对路径/外部运行 | 范围 |
 |---|---|---|
-| 45d3 Windows完整检查 | `.platform-preview-v2/regression-20261004-final-hardening-confirmed.log` | Windows没有Linux地址空间限额 |
-| 45d3 隔离PG专项 | `.platform-preview-v2/regression-pg-20261004-final-hardening.log` | 未访问生产数据 |
-| 45d3 Linux CI及前端构建 | [GitHub运行37163860227](https://github.com/apedintensor/h3-studio/actions/runs/37163860227) | push不会自动部署 |
-| 不可变镜像、HTTPS/PG、最大素材及发布包 | `.platform-final-release-20261004/45d3cccb7d32f91db18dfbbb1efe09c1e8c91c4b/FINAL-RECEIPT.json`，同级 `REPORT.zh-CN.md` | 没有核心代码overlay；仍非公网、GPU或云存储验收 |
-| 六小时滚动CPU模拟 | `.platform-soak-overnight-20261004/status.json` | 36/36、5次重启；不是单一commit六小时 |
-| 固定源码两小时CPU模拟 | `.platform-fixed-soak-20261004/manifest.json`；`source/.platform-soak-frozen-2h/status.json` | 运行中；最终状态必须读 `status` 与 `completed_at`，不能只看计数 |
-| 浏览器下载实际文件 | `.platform-preview-v2/browser-download-verification.json` | Chrome工具下载；不是操作系统另存为弹窗 |
-| 视频选段 | `.platform-preview-v2/trim-browser-verification.json` | 262帧CPU成片；不是H3新推理 |
-| 下载并发/慢连接 | `.platform-network-capacity-20261004/REPORT.zh-CN.md` | 旧25525ff镜像本地45秒测试，不是最终版公网负载SLA |
-| 媒体内存边界修正过程 | `.platform-media-capacity-20261004/RESULTS.zh-CN.md` | 源码覆盖实验与最终不可变镜像验证分别记录 |
-| 工作台状态与成片入口 | `.platform-preview-v2/studio-guide-final.jpg` | 截图不能替代附件哈希/实际解码 |
-| 原GPU已销毁 | `gpu-shutdown-receipt.json` | 历史API核验时间，不是当前最终账单 |
+| Windows全套 | `.platform-preview-v2/regression-final-aging.log` | 740项收集，728通过、12跳过；Linux资源限额另测 |
+| 本机隔离PG与媒体组合 | `.platform-preview-v2/regression-pg-final-aging.log` | 458项，456通过、2跳过；媒体测试用SQLite |
+| 固定提交GitHub CI | [运行37167471819](https://github.com/apedintensor/h3-studio/actions/runs/37167471819)；`.platform-preview-v2/ci-b588b60-receipt.json` | Linux740/7skip，PG组合458/2skip，前端214、96文件快照；部署跳过 |
+| 不可变镜像与六文件包 | `.platform-final-release-20261004/b588b60d00091d677b5936b39c01c0b27ba6b6ba/FINAL-RECEIPT.json`；同级REPORT | Linux244/244，无核心overlay；1GiB HTTP粗剪字幕音频/逐帧下载链路、独立HTTPS/PG双账户/重启通过；不是公网或GPU |
+| 最终固定60分钟CPU模拟 | `.platform-fixed-delivery-soak-20261004/manifest.json`；`source/.platform-soak-delivery-60m/status.json` | 01:16:33至02:16:37 UTC，24/24、无失败、0次计划重启，status=passed、completed_at与进程退出均已核对 |
+| 本轮临时PG容器清理 | `.platform-preview-v2/test-pg-cleanup.json` | 01:25核对精确ID/label/tmpfs无持久挂载后移除，确认不存在；预览SQLite不受影响 |
 
-整个最终发布包恰好六个文件，报告、日志和用户文件不能塞进 `bundle/`。镜像只含代码、依赖和许可字体；没有模型、媒体、数据库、中央库、SSH私钥或会话文件。
+最终image ID为 `sha256:716ac5aa2bea05d13e40ae65e0d862a0b1a7454c0bbdd8bc0672f0eb3409e011`；manifest SHA256为 `59272362ee09171964df66a0c9c2926d30926f70cba016c75771f9c25784b628`。包恰好六个文件，报告/日志/用户资产不进入bundle。镜像只含代码、依赖与许可字体；目标主机独立root发布控制器需另行安装批准。
 
-## 最新修复候选与失败证据
+## 真实用户流程与复现
 
-- 027039a Windows：`.platform-preview-v2/regression-final-race-timeline.log`，735项/723通过/12跳过。
-- 027039a PG+媒体：`.platform-preview-v2/regression-pg-final-race-timeline.log`，453项/451通过/2跳过。媒体测试明确使用SQLite；MPU新增25项实际使用PG随机schema。
-- 027039a GitHub：[运行37166508489](https://github.com/apedintensor/h3-studio/actions/runs/37166508489)，截至本段时间仍在运行。
-- 027039a固定75分钟：`.platform-fixed-release-soak-20261004/manifest.json`，`source/.platform-soak-release-75m/status.json`；00:58:05開始，预计02:13:05结束，未提前声明通过。
-- b879失败基线：[CI37165888551](https://github.com/apedintensor/h3-studio/actions/runs/37165888551)，并发ListParts遇另一请求已完成MPU；容器169项之前的边界失败记录在`.platform-final-release-20261004/b879864ede96d89c01a7a5d92069217fae81b833/INTERIM-RECEIPT.json`。后来的overlay验证不是原镜像全通过。
-- b879固定75分钟：`.platform-fixed-final-soak-20261004/manifest.json`，`source/.platform-soak-final-75m/status.json`；仅证明CPU模拟路径，不能覆盖该版本已知MPU/短镜头问题。
-- 发布前替包与工作目录满重试：`.platform-review-render-cache-20261004/REVIEW.zh-CN.md`及源码测试；修复在b879进入代码。
-- 机器身份与对象下载审查：`.platform-review-machine-download/check.py`；仅合成身份和fake云传输，不代表已验证真实存储账户。
+| 证明什么 | 路径 | 不证明什么 |
+|---|---|---|
+| 工作台与成片入口 | `.platform-preview-v2/studio-guide-final.jpg` | 截图不代替媒体完整解码 |
+| 实际浏览器下载 | `.platform-preview-v2/browser-download-verification.json` | Chrome工具取得并校验实际MP4文件，不是操作系统另存为弹窗 |
+| 剪辑入出点与声音位置 | `.platform-preview-v2/trim-browser-verification.json` | 262帧CPU成片，不是新H3推理 |
+| 最终控制/模型/网页契约审查 | `.platform-review-final-controls/REPORT.zh-CN.md`、`control_proof.py`、`result.json` | 纯函数与源码证明，不是所有GPU/供应商控制组合已验收 |
+| 4.9万任务容量与公平性 | `.platform-review-queue-capacity-20261004/REPORT.zh-CN.md`、`results.json`、`fairness-after.json` | 大积压属于027修复前；修复后22-job复现另记，不是GPU吞吐或百万队列证明 |
+| 机器身份与私有云下载 | `.platform-review-machine-download/check.py` | 合成身份与fake云传输，不是真实云账户，也不是所有SDK的重定向行为 |
+| 满缓存重试问题 | `.platform-review-render-cache-20261004/REVIEW.zh-CN.md` | 原45d3的失败复现，后续b879修复；最终b588回归覆盖 |
+| 下载并发/慢连接 | `.platform-network-capacity-20261004/REPORT.zh-CN.md` | 历史25525ff本地45秒数据，不是最终版公网SLA |
+
+## 历史版本必须分开读
+
+- **六小时滚动运行**：`.platform-soak-overnight-20261004/status.json`，18:07:21至00:07:29 UTC，36/36、5次计划重启、无失败。期间代码更新，不能叫最终版本六小时。
+- **45d3固定两小时**：`.platform-fixed-soak-20261004/manifest.json`及`source/.platform-soak-frozen-2h/status.json`，00:07:01至02:07:03 UTC，48/48、1次计划重启、无失败；进程退出已核对。
+- **b879固定75分钟**：`.platform-fixed-final-soak-20261004/manifest.json`及`source/.platform-soak-final-75m/status.json`，00:45:18至02:00:22 UTC，30/30、1次计划重启、无失败；进程退出已核对。它不覆盖该版本已知MPU/短镜头缺陷。
+- **027固定75分钟**：`.platform-fixed-release-soak-20261004/manifest.json`及`source/.platform-soak-release-75m/status.json`，00:58:05至02:13:09 UTC，30/30、1次计划重启、无失败、进程退出已核对；不覆盖后来的aging变更。
+- **45d3最大素材实测**：`.platform-final-release-20261004/45d3cccb7d32f91db18dfbbb1efe09c1e8c91c4b/FINAL-RECEIPT.json`，5760²/15秒，归一化写对象37.410秒，含读回完整解码49.299秒，3GiB/2CPU峰值约1.94GiB。相关核心文件相同不等于在b588重新测过。
+- **b879失败记录**：[CI37165888551](https://github.com/apedintensor/h3-studio/actions/runs/37165888551)及`.platform-final-release-20261004/b879864ede96d89c01a7a5d92069217fae81b833/INTERIM-RECEIPT.json`。并发ListParts及短镜头时间基是真实缺陷；后来的修复overlay没有改写原失败记录。
+- **027已通过基线**：[CI37166508489](https://github.com/apedintensor/h3-studio/actions/runs/37166508489)，`.platform-preview-v2/ci-027039a-receipt.json`和该commit镜像目录。随后又改aging和前端条件说明，最终证据见上表。
+- **GPU停机历史**：`gpu-shutdown-receipt.json`记录本轮旧Lium实例DELETE后API核验不存在及当时费用快照；不是最终供应商账单。本次十小时没有重租或付费生成。
 
 ## 复核原则
 
-生成来源、真实CPU媒体处理和GPU推理是三种证据。当前网页中的CPU模拟水印不应去掉；真实H3历史样片及费用记录保留各自时间和配置。汇总通过项不能覆盖明确跳过项，过往版本的负载结果不能自动归给新版本。目录同盘、Git可重建代码或一次成功恢复，都不能替代用户资产的独立备份。
+生成来源、真实CPU媒体处理、GPU推理分别记账。模拟水印保留；真实H3历史样片保持各自日期和配置。通过项不能覆盖跳过项，历史负载不能自动归给新版本，不同运行时段不相加成最终版本长测。源码重建能力不能代替素材、作品、未决上传与账务证据的独立备份。
+
+最终汇总收据为 `.platform-preview-v2/final-soak-observations.json`，含四个独立commit、源码归档SHA、实际起止时间、计数、0云/GPU调用和精确来源范围的进程退出检查。预览健康检查为mock生成、CPU粗剪开启、云创建关闭；该收据不授权生产上线。

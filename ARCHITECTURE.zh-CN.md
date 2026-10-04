@@ -6,7 +6,7 @@
 
 采用一套项目数据、素材、身份、能力定义、预检计划与任务账本。映序的引导流程、ReactFlow 无限画布、`/freestyle` 三种界面是同一业务模型的不同视图。ComfyUI 位于受控的模型执行层，不直接当作面向普通用户的主界面，也不允许浏览器提交任意可执行节点图。
 
-主站使用 `https://www.sixnine.art`。`sixnine.art` 和 `h3.sixnine.art` 由同一 HTTPS 入口跳转，后者进入主站 `/freestyle`，避免两套 Cookie、项目与素材重复。已有 Namecheap 停放记录尚未修改。
+目标主站为 `https://www.sixnine.art`。部署配置拟由同一 HTTPS 入口处理 `sixnine.art` 和 `h3.sixnine.art` 跳转，后者进入主站 `/freestyle`，避免两套 Cookie、项目与素材重复。已有 Namecheap 停放记录尚未修改。
 
 网页/API/数据库先部署在一台常驻 CPU 主机，模块保持独立进程边界；任务数量本身不要求立即拆成微服务。部署包适用于 Linux Docker 主机，兼容用户提出的 Lightsail 起步；需要 AWS 工作负载身份与更精细隔离时，可把同一包放在 EC2，不建立两套生产数据。初期单主机是明确的可用性边界，并不等于高可用系统。
 

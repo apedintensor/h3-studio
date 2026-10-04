@@ -2,7 +2,7 @@
 
 当前主线是映序引导制作、ReactFlow画布、`/freestyle`共用项目、私有素材和版本化`/v1` API的平台。代码入口为 `platform_app.py` / `studio_platform/`，新部署包位于 `deploy/platform/`。
 
-本轮功能、检查入口和待上线事项先看[交付报告](DELIVERY-REPORT.zh-CN.md)；报告中的执行状态与最终验证时间分开记录。
+先按[五分钟检查入口](START-HERE.zh-CN.md)查看本机工作室。本轮功能、测试与待上线事项见[交付报告](DELIVERY-REPORT.zh-CN.md)；报告中的执行状态与最终验证时间分开记录。
 
 - [当前架构与实现边界](ARCHITECTURE.zh-CN.md)
 - [实际v1 API接入方式](API-USAGE.zh-CN.md)
