@@ -3,9 +3,11 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import io
 import json
+import re
 import secrets
 import unittest
 from unittest.mock import patch
+import wave
 import zipfile
 
 from sqlalchemy import insert, select, update
@@ -263,6 +265,87 @@ class GuidedTests(unittest.TestCase):
         latest = self.client.get("/v1/projects/story-one").json()
         self.assertEqual(latest, result.json())
         self.assertEqual(self.client.get("/v1/projects/story-one/entities?type=shot", headers=headers).json()["entities"], [shot])
+
+    def test_discovered_schema_examples_execute_without_generation(self):
+        self.login()
+        _, headers = self.key()
+        schema = self.client.get("/v1/guided-schema", headers=headers).json()
+        self.assertEqual(schema["version"], 1)  # Preserve the original additive contract.
+        self.assertEqual(set(schema["actions"]), set(schema["operation_schemas"]))
+        self.assertEqual(len(schema["examples"]), 3)
+        self.assertEqual(schema["operation_schemas"]["shot.trim"]["required"], ["op", "end", "shot_id", "start"])
+        self.assertEqual(schema["operation_schemas"]["sound.generated"]["properties"]["gain"]["maximum"], 1)
+        variables = {"portrait_file": "portrait-fixture", "voice_file": "voice-fixture"}
+        wav = io.BytesIO()
+        with wave.open(wav, "wb") as source:
+            source.setnchannels(1)
+            source.setsampwidth(2)
+            source.setframerate(24000)
+            source.writeframes(b"\x00\x00" * 48000)
+        files = {"portrait-fixture": png(), "voice-fixture": wav.getvalue()}
+        def variable(name):
+            value = variables
+            for field in name.split("."):
+                value = value[field]
+            return value
+        def substitute(value):
+            if isinstance(value, dict):
+                return {k: substitute(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [substitute(v) for v in value]
+            if isinstance(value, str):
+                exact = re.fullmatch(r"\$\{([^}]+)\}", value)
+                if exact:
+                    return variable(exact[1])
+                return re.sub(r"\$\{([^}]+)\}", lambda match: str(variable(match[1])), value)
+            return value
+        # Execute the published bodies, not separately maintained sample copies.
+        for example in schema["examples"]:
+            for template in example["steps"]:
+                # Post-response inspection hints can reference this step's receipt.
+                step = substitute({k: v for k, v in template.items() if k != "require"})
+                options = {"headers": {**headers, **step.get("headers", {})}}
+                if "json" in step:
+                    options["json"] = step["json"]
+                if "multipart" in step:
+                    upload = step["multipart"]
+                    file = upload["file"]
+                    options.update(data=upload["fields"], files={file["field"]: (
+                        file["filename"], files[file["local_path"]], file["content_type"])})
+                result = self.client.request(step["method"], step["path"], **options)
+                self.assertIn(result.status_code, (200, 201), result.text)
+                if "save_response_as" in step:
+                    variables[step["save_response_as"]] = result.json()
+                    if "multipart" in step:
+                        self.assertEqual(result.json()["status"], "ready")
+        self.assertIn("00:00:00,000 --> 00:00:02,000", result.text)
+        self.assertIn("这封信，来自明天。", result.text)
+        ident = variables["story"]["id"]
+        final = self.client.get(f"/v1/projects/{ident}", headers=headers).json()["project"]
+        self.assertEqual({e["type"] for e in final["entities"]}, {"chapter", "scene", "shot", "image", "audio"})
+        shot = next(e for e in final["entities"] if e["id"] == "shot-one")
+        self.assertEqual(shot["data"]["selectedAssetId"], "portrait-reference")
+        self.assertEqual(final["links"][0]["role"], "firstFrame")
+        track = final["journey"]["soundTracks"]["chapter-one"][0]
+        self.assertEqual(track["fileId"], "cloud_asset_" + variables["audio_upload"]["asset_id"])
+        self.assertEqual(self.client.get("/v1/jobs", headers=headers).json()["jobs"], [])
+
+    def test_action_shape_errors_explain_recovery_without_committing_batch(self):
+        before = self.setup_project()
+        _, headers = self.key()
+        # One otherwise valid write must not commit before a malformed action.
+        malformed = [
+            ({"op": "shot.trim", "shot_id": "shot-one", "start": 0}, "end"),
+            ({"op": "asset.attach"}, "asset_id"),
+            ({"op": "image.generate"}, "operation_schemas"),
+            ({"op": "artifact.adopt", "artifact_id": "missing", "role": "reference"}, "允许字段"),
+        ]
+        for action, message in malformed:
+            response = self.edit([{"op": "project.update", "patch": {"title": "Do not commit"}}, action], headers=headers)
+            self.assertEqual(response.status_code, 422, response.text)
+            self.assertIn(message, response.json()["detail"])
+            self.assertIn("/v1/guided-schema", response.json()["detail"])
+            self.assertEqual(self.client.get("/v1/projects/story-one", headers=headers).json(), before)
 
     def test_concurrent_actions_commit_once_and_replay_same_receipt(self):
         self.setup_project()

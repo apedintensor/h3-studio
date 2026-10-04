@@ -18,16 +18,19 @@ class BundleTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.commit = "e"*40
         self.image = "sixnine-platform:"+self.commit
-        config = "b"*64+".json"
+        config_value = {"os": "linux", "architecture": "amd64", "config": {"Labels": {
+            "org.opencontainers.image.revision": self.commit}}}
+        config_digest = hashlib.sha256(json.dumps(config_value).encode()).hexdigest()
+        config = config_digest+".json"
         with tarfile.open(self.root/"image.tar.gz", "w:gz") as output:
-            for name, value in ((config, {}), ("manifest.json", [{"Config": config, "RepoTags": [self.image], "Layers": []}])):
+            for name, value in ((config, config_value), ("manifest.json", [{"Config": config, "RepoTags": [self.image], "Layers": []}])):
                 data = json.dumps(value).encode()
                 entry = tarfile.TarInfo(name)
                 entry.size = len(data)
                 output.addfile(entry, io.BytesIO(data))
         for name in ("compose.yaml", "Caddyfile", "init_database.py", "check_config.py"):
             (self.root/name).write_text("raise AssertionError('Never execute bundle code')", encoding="utf-8")
-        self.manifest = {"commit": self.commit, "image": self.image, "image_id": "sha256:"+"b"*64,
+        self.manifest = {"commit": self.commit, "image": self.image, "image_id": "sha256:"+config_digest,
             "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in self.root.iterdir()}}
         self.publish()
 

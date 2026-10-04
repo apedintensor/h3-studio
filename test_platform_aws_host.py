@@ -71,6 +71,21 @@ class ReleaseDownloadTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         (self.root/'incoming').mkdir()
         (self.root/'approved-releases').mkdir()
+        # CI is an unprivileged Linux user. Emulate only the independently
+        # provisioned approval directory/file UID; preserve modes, link count,
+        # bytes, paths and every real checksum check.
+        original_lstat = Path.lstat
+        approval_root = self.root/'approved-releases'
+        def approval_metadata(path, *args, **kwargs):
+            info = original_lstat(path, *args, **kwargs)
+            if path == approval_root or path.parent == approval_root:
+                fields = list(info)
+                fields[4] = 0
+                return os.stat_result(fields)
+            return info
+        ownership = mock.patch.object(Path, 'lstat', approval_metadata)
+        ownership.start()
+        self.addCleanup(ownership.stop)
         self.objects = {name: ('synthetic '+name).encode() for name in release.FILES}
         self.objects['release-manifest.json'] = json.dumps({'commit': COMMIT,
             'image': 'sixnine-platform:'+COMMIT, 'image_id': 'sha256:'+'b'*64,

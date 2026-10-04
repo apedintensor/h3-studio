@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .auth import API_SCOPES, AuthenticationError, LoginLimited
 from .caption_server import caption_signature
+from .guided_schema import ACTION_FIELDS, contract as guided_contract, validate_action_fields
 from .project_validation import ID, TYPES, ROLES, validate_project
 from .render_plans import ordered_chapter
 from .repository import Conflict, NotFound, Scope, canonical, documents, request_hash, artifacts, jobs
@@ -184,8 +185,7 @@ class Guided:
             if not isinstance(actions, list) or not 1 <= len(actions) <= 200:
                 raise ValueError("每次需要1至200个编辑操作")
             for index, action in enumerate(actions):
-                if not isinstance(action, dict):
-                    raise ValueError("每个操作必须为对象")
+                validate_action_fields(action)
                 if action.get("op") in {"asset.attach", "artifact.adopt"}:
                     resolved[index] = self.resolve(principal, project_id, action)
         try:
@@ -277,19 +277,8 @@ class Guided:
             "sourceHash": ref.get("source_hash"), "missingFile": False}}
 
     def apply(self, project, action, resolved=None):
+        validate_action_fields(action)
         op = action.get("op")
-        fields = {
-            "entity.create": {"entity"}, "entity.update": {"entity_id", "patch"},
-            "entity.delete": {"entity_id", "cascade"}, "link.create": {"link"}, "link.delete": {"link_id"},
-            "project.update": {"patch"}, "journey.update": {"patch"}, "layout.update": {"patch"},
-            "asset.attach": {"asset_id", "entity_id", "title", "parent_id", "shot_id", "role", "select"},
-            "artifact.adopt": {"artifact_id", "entity_id", "title", "parent_id", "shot_id", "select"},
-            "shot.select": {"shot_id", "entity_id"}, "shot.trim": {"shot_id", "start", "end"},
-            "captions.set": {"chapter_id", "cues"}, "captions.confirm": {"chapter_id", "reviewed"},
-            "sound.set": {"chapter_id", "tracks", "mode"}, "sound.generated": {"shot_id", "gain"}}
-        if not isinstance(op, str) or op not in fields:
-            raise ValueError("未知编辑操作；查看/v1/guided-schema")
-        object_fields(action, fields[op] | {"op"}, "操作包含不支持的字段")
         if op == "entity.create":
             new_entity(project, action.get("entity"))
         elif op == "entity.update":
@@ -461,12 +450,10 @@ def register_routes(app):
     def schema():
         return {"version": 1, "entity_types": sorted(TYPES), "link_roles": sorted(ROLES),
             "scopes": sorted(API_SCOPES), "max_actions": 200, "max_entities": 5000,
-            "actions": ["entity.create", "entity.update", "entity.delete", "link.create", "link.delete",
-                "project.update", "journey.update", "layout.update", "asset.attach", "artifact.adopt", "shot.select",
-                "shot.trim", "captions.set", "captions.confirm", "sound.set", "sound.generated"],
+            "actions": list(ACTION_FIELDS),
             "merge_semantics": "entity.data and journey patch merge one level; nested values replace",
             "example": {"expected_version": 1, "actions": [{"op": "entity.create", "entity": {
-                "id": "chapter-one", "type": "chapter", "title": "第一章"}}]}}
+                "id": "chapter-one", "type": "chapter", "title": "第一章"}}]}, **guided_contract()}
 
     @app.get("/v1/projects/{project_id}/meta")
     def project_meta(project_id: str, request: Request):

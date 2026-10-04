@@ -160,6 +160,8 @@ inventory.json
 
 # Reviewed Agent authoring API and distributable skill; never credential files.
 !studio_platform/guided.py
+!studio_platform/guided_schema.py
+!deploy/platform/verify_public_api.py
 !skills/
 !skills/sixnine-yingxu/
 !skills/sixnine-yingxu/SKILL.md

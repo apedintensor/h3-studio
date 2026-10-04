@@ -96,8 +96,13 @@ def approved_manifest(root, directory, commit):
 
 
 def validate_image_archive(path, expected):
-    """Inspect without extracting; reject extra image tags before docker load."""
-    entries, headers, total = set(), {}, 0
+    """Bind classic/config and containerd/descriptor IDs to one archive image.
+
+    Moby classic save writes an OCI manifest whose config digest is inspect.Id;
+    containerd inspect.Id can instead be its manifest/index digest. Resolve the
+    hashed descriptor chain, never simply accept an arbitrary second digest.
+    """
+    entries, headers, metadata, sizes, total, metadata_bytes = set(), {}, {}, {}, 0, 0
     with tarfile.open(path, mode="r|gz") as archive:
         for member in archive:
             name = member.name.rstrip("/")
@@ -105,44 +110,122 @@ def validate_image_archive(path, expected):
                     and all(part not in {"", ".", ".."} for part in name.split("/")), "unsafe_image_archive_path")
             entries.add(name)
             require(member.isfile() or member.isdir(), "image_archive_links_forbidden")
+            if member.isfile():
+                sizes[name] = member.size
             total += member.size
             require(len(entries) <= 10000 and total <= 4*1024**3 and member.size <= 2*1024**3,
                     "image_archive_expansion_limit")
             if name in {"manifest.json", "index.json"}:
                 require(member.isfile() and member.size <= 1024**2, "invalid_image_archive_metadata")
                 headers[name] = json.load(archive.extractfile(member))
+            elif member.isfile() and member.size <= 1024**2 and (
+                    re.fullmatch(r"blobs/sha256/[0-9a-f]{64}", name) or re.fullmatch(r"[0-9a-f]{64}\.json", name)):
+                raw = archive.extractfile(member).read()
+                try:
+                    value = json.loads(raw)
+                except (ValueError, UnicodeError):
+                    continue  # Small layer data, not a JSON descriptor/config.
+                metadata_bytes += len(raw)
+                require(metadata_bytes <= 16*1024**2, "image_archive_metadata_limit")
+                metadata[name] = ("sha256:"+hashlib.sha256(raw).hexdigest(), value)
     manifests = headers.get("manifest.json")
     require(isinstance(manifests, list) and len(manifests) == 1 and isinstance(manifests[0], dict),
             "image_archive_requires_one_image")
     value = manifests[0]
     require(value.get("RepoTags") == [expected["image"]]
             and isinstance(value.get("Layers"), list) and all(x in entries for x in value["Layers"])
-            and value.get("Config") in entries, "image_archive_identity_mismatch")
+            and all(isinstance(x, str) and x in sizes for x in value["Layers"])
+            and value.get("Config") in metadata, "image_archive_identity_mismatch")
+    config_digest, config = metadata[value["Config"]]
+    require(value["Config"] in {config_digest.removeprefix("sha256:")+".json",
+                               "blobs/sha256/"+config_digest.removeprefix("sha256:")}
+            and isinstance(config, dict) and config.get("os") == "linux" and config.get("architecture") == "amd64"
+            and config.get("config", {}).get("Labels", {}).get("org.opencontainers.image.revision") == expected["commit"],
+            "image_config_identity_mismatch")
+    identities = {config_digest}
     if "index.json" in headers:
         index = headers["index.json"]
-        require(isinstance(index, dict) and isinstance(index.get("manifests"), list) and len(index["manifests"]) == 1,
+        require(isinstance(index, dict) and index.get("schemaVersion") == 2
+                and isinstance(index.get("manifests"), list) and len(index["manifests"]) == 1,
                 "image_archive_requires_one_oci_reference")
         reference = index["manifests"][0]
+        require(isinstance(reference, dict), "oci_image_reference_mismatch")
         annotations = reference.get("annotations", {})
-        require(reference.get("digest") == expected["image_id"]
+        require(isinstance(annotations, dict)
                 and annotations.get("io.containerd.image.name") in {expected["image"], "docker.io/library/"+expected["image"]}
                 and annotations.get("org.opencontainers.image.ref.name") == expected["commit"],
                 "oci_image_reference_mismatch")
+        runnable, attestations, visited = [], [], set()
+
+        def descriptor(item, depth=0):
+            require(isinstance(item, dict) and depth <= 4 and len(visited) < 16, "oci_descriptor_graph_invalid")
+            digest = item.get("digest")
+            require(isinstance(digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                    and digest not in visited, "oci_descriptor_graph_invalid")
+            visited.add(digest)
+            filename = "blobs/sha256/"+digest.removeprefix("sha256:")
+            require(filename in metadata and metadata[filename][0] == digest
+                    and type(item.get("size")) is int and item["size"] == sizes[filename], "oci_descriptor_hash_or_size_mismatch")
+            document = metadata[filename][1]
+            require(isinstance(document, dict) and document.get("schemaVersion") == 2
+                    and document.get("mediaType") == item.get("mediaType"), "oci_descriptor_type_mismatch")
+            if item["mediaType"] == "application/vnd.oci.image.index.v1+json":
+                children = document.get("manifests")
+                require(isinstance(children, list) and 1 <= len(children) <= 8, "oci_descriptor_graph_invalid")
+                for child in children:
+                    descriptor(child, depth+1)
+            else:
+                require(item["mediaType"] == "application/vnd.oci.image.manifest.v1+json", "oci_descriptor_type_mismatch")
+                notes = item.get("annotations", {})
+                if isinstance(notes, dict) and notes.get("vnd.docker.reference.type") == "attestation-manifest":
+                    require(item.get("platform") == {"architecture": "unknown", "os": "unknown"}, "oci_attestation_invalid")
+                    attestations.append((item, document))
+                else:
+                    runnable.append((item, document))
+
+        descriptor(reference)
+        identities.add(reference["digest"])
+        require(len(runnable) == 1, "image_archive_requires_one_runnable_image")
+        item, image_manifest = runnable[0]
+        identities.add(item["digest"])
+        cfg = image_manifest.get("config", {})
+        require(isinstance(cfg, dict) and cfg.get("digest") == config_digest
+                and cfg.get("size") == sizes[value["Config"]], "oci_config_binding_mismatch")
+        layers = image_manifest.get("layers")
+        diff_ids = config.get("rootfs", {}).get("diff_ids")
+        require(isinstance(layers, list) and isinstance(diff_ids, list)
+                and len(layers) == len(diff_ids) == len(value["Layers"]), "oci_layer_binding_mismatch")
+        for layer, diff_id, filename in zip(layers, diff_ids, value["Layers"]):
+            # Classic save can retain uncompressed diff-id files while the OCI
+            # descriptor records source-layer digests. Containerd saves blobs.
+            require(isinstance(layer, dict) and isinstance(layer.get("digest"), str)
+                    and re.fullmatch(r"sha256:[0-9a-f]{64}", layer["digest"])
+                    and isinstance(diff_id, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", diff_id)
+                    and filename in {"blobs/sha256/"+layer["digest"][7:], "blobs/sha256/"+diff_id[7:]},
+                    "oci_layer_binding_mismatch")
+        for attestation, document in attestations:
+            require(attestation["annotations"].get("vnd.docker.reference.digest") == item["digest"]
+                    and document.get("subject", {}).get("digest", item["digest"]) == item["digest"]
+                    and isinstance(document.get("layers"), list)
+                    and all(isinstance(layer, dict) and layer.get("mediaType") == "application/vnd.in-toto+json"
+                            for layer in document["layers"]), "oci_attestation_invalid")
     else:
-        require(value["Config"] == expected["image_id"].removeprefix("sha256:")+".json",
+        require(value["Config"] == config_digest.removeprefix("sha256:")+".json",
                 "legacy_image_id_mismatch")
+    require(expected["image_id"] in identities, "approved_image_identity_not_in_archive")
+    return tuple(sorted(identities))
 
 
 def load_approved_image(root, directory, commit, environment):
     expected = manifest(directory, commit)
     approved_manifest(root, directory, commit)
-    validate_image_archive(directory / "image.tar.gz", expected)
+    identities = validate_image_archive(directory / "image.tar.gz", expected)
     command(["load", "--input", str(directory / "image.tar.gz")], environment=environment, timeout=300)
     image = json.loads(command(["image", "inspect", expected["image"]], environment=environment))[0]
-    require(image.get("Id") == expected["image_id"]
+    require(image.get("Id") in identities
             and image.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision") == commit,
             "loaded_image_does_not_match_approved_release")
-    return expected
+    return {**expected, "archive_image_ids": identities}
 
 
 def deployment_environment(path, commit):
@@ -303,7 +386,7 @@ def inspect_service(directory, environment, service):
 
 def verify_running_app(directory, environment, expected):
     value = inspect_service(directory, environment, "app")
-    require(value.get("Image") == expected["image_id"]
+    require(value.get("Image") in expected.get("archive_image_ids", (expected["image_id"],))
             and value.get("State", {}).get("Running") is True
             and value.get("State", {}).get("Health", {}).get("Status") == "healthy",
             "running_app_does_not_match_release")
@@ -346,7 +429,8 @@ def apply_locked(root, commit):
     expected = manifest(directory, commit)
     if previous == commit and state.get("status") in {"app_ready", "rolled_back_app_only"}:
         # A lost SSH response must not turn previous into a self-reference.
-        verify_running_app(directory, environment, expected)
+        identities = validate_image_archive(directory / "image.tar.gz", expected)
+        verify_running_app(directory, environment, {**expected, "archive_image_ids": identities})
         wait_proxy_stable(directory, environment)
         return
     fallback = state.get("previous") if previous == commit else previous
@@ -356,7 +440,7 @@ def apply_locked(root, commit):
     write_state(root, {**state, "current": previous, "pending": commit,
                       "status": "deploying", "updated_at": time.time()})
     try:
-        load_approved_image(root, directory, commit, environment)
+        expected = load_approved_image(root, directory, commit, environment)
         compose(directory, environment, "up", "-d", "db")
         compose(directory, environment, "run", "--rm", "db-init")
         compose(directory, environment, "up", "-d", "--no-deps", "app")

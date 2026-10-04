@@ -187,10 +187,13 @@ class ReleaseTests(unittest.TestCase):
 
     def archive(self, *, extra=False, unsafe=None):
         filename = self.root / "test-image.tar.gz"
-        config = "b"*64+".json"
+        config_value = {"os": "linux", "architecture": "amd64", "config": {"Labels": {
+            "org.opencontainers.image.revision": COMMIT}}}
+        self.value["image_id"] = "sha256:"+hashlib.sha256(json.dumps(config_value).encode()).hexdigest()
+        config = self.value["image_id"][7:]+".json"
         record = {"Config": config, "RepoTags": [self.value["image"]], "Layers": []}
         with tarfile.open(filename, "w:gz") as output:
-            for name, value in ((config, {}), ("manifest.json", [record, record] if extra else [record])):
+            for name, value in ((config, config_value), ("manifest.json", [record, record] if extra else [record])):
                 data = json.dumps(value).encode()
                 info = tarfile.TarInfo(name)
                 info.size = len(data)
@@ -199,6 +202,95 @@ class ReleaseTests(unittest.TestCase):
                 info = tarfile.TarInfo(unsafe)
                 output.addfile(info, io.BytesIO(b""))
         return filename
+
+    def oci_archive(self, *, containerd=False, mutate=None):
+        files = {}
+        def blob(value, media_type):
+            raw = json.dumps(value).encode()
+            digest = 'sha256:'+hashlib.sha256(raw).hexdigest()
+            files['blobs/sha256/'+digest[7:]] = raw
+            return {'mediaType': media_type, 'digest': digest, 'size': len(raw)}
+        config = blob({'os': 'linux', 'architecture': 'amd64', 'rootfs': {'diff_ids': []},
+            'config': {'Labels': {'org.opencontainers.image.revision': COMMIT}}}, 'application/vnd.oci.image.config.v1+json')
+        main = blob({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+            'config': config, 'layers': []}, 'application/vnd.oci.image.manifest.v1+json')
+        if containerd:
+            attest = blob({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+                          'subject': main, 'layers': []}, 'application/vnd.oci.image.manifest.v1+json')
+            attest.update(platform={'os': 'unknown', 'architecture': 'unknown'}, annotations={
+                'vnd.docker.reference.type': 'attestation-manifest', 'vnd.docker.reference.digest': main['digest']})
+            ref = blob({'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.index.v1+json',
+                'manifests': [main, attest]}, 'application/vnd.oci.image.index.v1+json')
+        else:
+            ref = dict(main)
+        ref['annotations'] = {'io.containerd.image.name': 'docker.io/library/'+self.value['image'],
+                              'org.opencontainers.image.ref.name': COMMIT}
+        index = {'schemaVersion': 2, 'mediaType': 'application/vnd.oci.image.index.v1+json', 'manifests': [ref]}
+        files['index.json'] = json.dumps(index).encode()
+        files['manifest.json'] = json.dumps([{'Config': 'blobs/sha256/'+config['digest'][7:],
+            'RepoTags': [self.value['image']], 'Layers': []}]).encode()
+        self.value['image_id'] = ref['digest'] if containerd else config['digest']
+        if mutate:
+            mutate(files, config, main, ref)
+        filename = self.root/'test-oci.tar.gz'
+        with tarfile.open(filename, 'w:gz') as output:
+            for name, raw in files.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(raw)
+                output.addfile(info, io.BytesIO(raw))
+        return filename, {config['digest'], main['digest'], ref['digest']}
+
+    def test_classic_and_containerd_ids_resolve_same_single_config(self):
+        for containerd in (False, True):
+            filename, identities = self.oci_archive(containerd=containerd)
+            self.assertEqual(set(release.validate_image_archive(filename, self.value)), identities)
+
+    def test_oci_identity_cannot_be_replaced_by_arbitrary_digest(self):
+        filename, _ = self.oci_archive()
+        self.value['image_id'] = 'sha256:'+'d'*64
+        with self.assertRaisesRegex(release.ReleaseError, 'approved_image_identity_not_in_archive'):
+            release.validate_image_archive(filename, self.value)
+
+    def test_oci_descriptor_tamper_and_additional_runnable_are_rejected(self):
+        def corrupt(files, config, main, ref):
+            files['blobs/sha256/'+main['digest'][7:]] += b' '
+        filename, _ = self.oci_archive(mutate=corrupt)
+        with self.assertRaisesRegex(release.ReleaseError, 'oci_descriptor_hash_or_size_mismatch'):
+            release.validate_image_archive(filename, self.value)
+        def extra(files, config, main, ref):
+            value = json.loads(files['index.json'])
+            value['manifests'].append(main)
+            files['index.json'] = json.dumps(value).encode()
+        filename, _ = self.oci_archive(mutate=extra)
+        with self.assertRaisesRegex(release.ReleaseError, 'requires_one_oci_reference'):
+            release.validate_image_archive(filename, self.value)
+
+    def test_loaded_and_running_id_can_only_use_archive_derived_set(self):
+        filename, ids = self.oci_archive()
+        expected = {**self.value, 'archive_image_ids': tuple(ids)}
+        for ident in ids:
+            with patch.object(release, 'inspect_service', return_value={'Image': ident,
+                    'State': {'Running': True, 'Health': {'Status': 'healthy'}}}):
+                release.verify_running_app(self.incoming, {}, expected)
+        with patch.object(release, 'inspect_service', return_value={'Image': 'sha256:'+'e'*64,
+                'State': {'Running': True, 'Health': {'Status': 'healthy'}}}), self.assertRaises(release.ReleaseError):
+            release.verify_running_app(self.incoming, {}, expected)
+
+    def test_classic_build_loaded_by_containerd_keeps_exact_bound_identity(self):
+        filename, identities = self.oci_archive()
+        (self.incoming/'image.tar.gz').write_bytes(filename.read_bytes())
+        containerd_id = next(value for value in identities if value != self.value['image_id'])
+        inspected = [{'Id': containerd_id, 'Config': {'Labels': {'org.opencontainers.image.revision': COMMIT}}}]
+        with patch.object(release, 'manifest', return_value=self.value), patch.object(release, 'approved_manifest'), \
+             patch.object(release, 'command', side_effect=[b'', json.dumps(inspected).encode()]):
+            result = release.load_approved_image(self.root, self.incoming, COMMIT, {})
+        self.assertEqual(set(result['archive_image_ids']), identities)
+        self.assertEqual(result['image_id'], self.value['image_id'])
+        inspected[0]['Config']['Labels']['org.opencontainers.image.revision'] = 'd'*40
+        with patch.object(release, 'manifest', return_value=self.value), patch.object(release, 'approved_manifest'), \
+             patch.object(release, 'command', side_effect=[b'', json.dumps(inspected).encode()]), \
+             self.assertRaisesRegex(release.ReleaseError, 'loaded_image_does_not_match'):
+            release.load_approved_image(self.root, self.incoming, COMMIT, {})
 
     def test_image_archive_rejects_extra_images_before_load(self):
         release.validate_image_archive(self.archive(), self.value)
@@ -245,6 +337,7 @@ class ApplyReleaseTests(unittest.TestCase):
             "deployment_environment": lambda path, commit: {**self.env, "SIXNINE_IMAGE": "sixnine-platform:"+commit},
             "manifest": lambda *args: self.expected,
             "load_approved_image": lambda *args: self.calls.append(("load", args[2])) or self.expected,
+            "validate_image_archive": lambda *args: (self.expected['image_id'],),
             "regular": lambda *args, **kwargs: None,
             "validate": lambda *args, **kwargs: None,
             "command": lambda *args, **kwargs: b"v5.5.1\n",

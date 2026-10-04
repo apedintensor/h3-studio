@@ -1,5 +1,13 @@
 # H3 Studio
 
+## 当前授权与部署进展（2026-10-04，本段优先于下方历史状态）
+
+用户已新授权：完成映序 Agent API、账户自助 API Key、部署公开网站，并实际验证多 GPU 队列与自动扩容。GPU 测试累计上限 US$50，不自动充值；其他设施初期预算目标低于 US$50/月。测试 GPU 完成后销毁，网站保留运行。历史关闭 GPU 指令不禁止此次已授权测试；不把测试额度视为无限持续租用授权。
+
+已创建新加坡 AWS EC2 CPU 控制主机 `i-03d81d2d153b5e2fd`，固定 IP `18.136.57.227`，六九域名 DNS 已切换；资源记录见 `deploy/platform/ec2/`。GitHub OIDC 仅可发布经测试的 S3 release bundle，主机仍须通过独立操作员通道批准确切 manifest SHA；准备就绪不代表已通过公网发布验收。密码与数据库凭据留 AWS Secrets Manager，站点容器通过 `/run` 文件读取；不得读出值到会话/日志。生产初始账号通过服务器内部安全管道建立。
+
+实际 GPU 测试由本轮独立控制器负责，状态见 `.platform-gpu-live`；检查持久账本与供应商状态后才能考虑租赁，不重复创建。单独测试环境成功不能写成生产服务器已连接，两个单卡任务并发也不等于单个任务使用张量并行。
+
 2026-10-04 十小时实现与本轮验收已完成：新的统一平台入口是 `platform_app.py` / `studio_platform/`，使用独立数据库与对象根，不覆盖旧 `data/`。映序 canonical 源码在 `../video-studio-design/studio-app`，`yingxu/` 是由 `tools/sync_yingxu_source.py` 产生的只读发布快照。当前架构见 `ARCHITECTURE.zh-CN.md`；新生产包在 `deploy/platform/`，旧 `deploy/` 只保留兼容。不能把下文初始“只有设计”的状态当作新代码未实现，也不能把本地代码/模拟验证当作公网或GPU已上线。
 
 新平台已实现 PostgreSQL/SQLite 持久任务、计划/预算、worker/fleet、受限私有存储、云项目/素材及CPU章节粗剪；运行证据见本轮验收记录。真实GPU默认关、云创建上限0、scaler默认dry-run；FakeProvider和模拟视频不是线上模型验收。Hippius只为实验adapter，不能替换缺少条件创建保证的AssetService。远端Linux中央凭据加载尚未完成，不复制DPAPI库或生成项目.env。
