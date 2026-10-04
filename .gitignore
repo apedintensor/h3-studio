@@ -166,3 +166,14 @@ inventory.json
 !skills/sixnine-yingxu/scripts/
 !skills/sixnine-yingxu/scripts/sixnine.py
 !tools/publish_aws_release.py
+!.github/workflows/archive-diagnostic.yml
+!deploy/platform/runtime_secrets_aws.py
+!deploy/platform/fetch_release_s3.py
+!deploy/platform/aws_bootstrap.py
+!deploy/platform/ec2/
+!deploy/platform/ec2/bootstrap-host.sh
+!deploy/platform/ec2/capacity_probe.py
+!deploy/platform/ec2/launch-spec.json
+!deploy/platform/ec2/resource-receipt.json
+!deploy/platform/ec2/sixnine-secrets.service
+!deploy/platform/ec2/README.zh-CN.md

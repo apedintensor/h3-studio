@@ -1,0 +1,39 @@
+name: Verify Docker archive compatibility
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build and inspect a synthetic archive (no app or credentials)
+        run: |
+          mkdir archive-fixture
+          printf 'FROM scratch\nLABEL org.opencontainers.image.revision="%s"\n' "$GITHUB_SHA" > archive-fixture/Dockerfile
+          docker build -t "sixnine-platform:$GITHUB_SHA" archive-fixture
+          python tools/build_platform_release.py "$GITHUB_SHA" archive-release
+          python - "$GITHUB_SHA" <<'PY'
+          import importlib.util,json,sys,tarfile
+          from pathlib import Path
+          sys.path.insert(0,str(Path('deploy/platform').resolve()))
+          import release
+          directory=Path('archive-release')
+          with tarfile.open(directory/'image.tar.gz','r|gz') as archive:
+              for member in archive:
+                  if member.isfile() and member.size<20000:
+                      print(member.name,json.load(archive.extractfile(member)))
+          try:
+              release.validate_image_archive(directory/'image.tar.gz',release.manifest(directory,sys.argv[1]))
+              print('Archive validated')
+          except release.ReleaseError as error:
+              print('Validator error code:',str(error))
+              raise SystemExit(1)
+          PY

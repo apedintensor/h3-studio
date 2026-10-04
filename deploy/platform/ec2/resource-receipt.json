@@ -1,0 +1,20 @@
+{
+  "created_date": "2026-10-04",
+  "account_id": "829135631045",
+  "region": "ap-southeast-1",
+  "instance_id": "i-03d81d2d153b5e2fd",
+  "launch_template_id": "lt-09ffcf32cf55437dd",
+  "launch_template_version": "1",
+  "security_group_id": "sg-07f25f9bf46d7dcae",
+  "allocation_id": "eipalloc-031078dff98d66620",
+  "association_id": "eipassoc-01a34e524e8b1a3bb",
+  "public_ip": "18.136.57.227",
+  "private_ip": "172.31.34.88",
+  "instance_role_arn": "arn:aws:iam::829135631045:role/sixnine-platform-ec2",
+  "instance_profile_arn": "arn:aws:iam::829135631045:instance-profile/sixnine-platform-ec2",
+  "initial_managed_policy": "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore",
+  "ami_owner": "099720109477",
+  "api_evidence": ["DescribeImages", "DescribeInstanceTypeOfferings", "GetProducts", "CreateRole", "AttachRolePolicy", "CreateInstanceProfile", "AddRoleToInstanceProfile", "CreateSecurityGroup", "AuthorizeSecurityGroupIngress", "CreateLaunchTemplate", "RunInstances", "AllocateAddress", "AssociateAddress"],
+  "application_published_by_bootstrap": false,
+  "contains_credentials": false
+}

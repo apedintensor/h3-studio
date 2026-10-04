@@ -1,0 +1,104 @@
+{
+  "LaunchTemplateName": "sixnine-platform-cpu-v1",
+  "VersionDescription": "4GiB two-account CPU host; no local generation/render worker",
+  "ClientToken": "sixnine-cpu-lt-20261004-v1",
+  "LaunchTemplateData": {
+    "ImageId": "ami-0c8eea4e9e5c38034",
+    "InstanceType": "t3a.medium",
+    "IamInstanceProfile": {
+      "Name": "sixnine-platform-ec2"
+    },
+    "CreditSpecification": {
+      "CpuCredits": "standard"
+    },
+    "MetadataOptions": {
+      "HttpTokens": "required",
+      "HttpPutResponseHopLimit": 1,
+      "HttpEndpoint": "enabled",
+      "InstanceMetadataTags": "disabled"
+    },
+    "Monitoring": {
+      "Enabled": false
+    },
+    "DisableApiTermination": true,
+    "InstanceInitiatedShutdownBehavior": "stop",
+    "BlockDeviceMappings": [
+      {
+        "DeviceName": "/dev/sda1",
+        "Ebs": {
+          "VolumeSize": 40,
+          "VolumeType": "gp3",
+          "Encrypted": true,
+          "DeleteOnTermination": false,
+          "Iops": 3000,
+          "Throughput": 125
+        }
+      }
+    ],
+    "NetworkInterfaces": [
+      {
+        "DeviceIndex": 0,
+        "SubnetId": "subnet-05209fe4f9ba5542c",
+        "Groups": [
+          "sg-07f25f9bf46d7dcae"
+        ],
+        "AssociatePublicIpAddress": false,
+        "DeleteOnTermination": true
+      }
+    ],
+    "TagSpecifications": [
+      {
+        "ResourceType": "instance",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "sixnine-platform-cpu"
+          },
+          {
+            "Key": "Project",
+            "Value": "sixnine-platform"
+          },
+          {
+            "Key": "ManagedBy",
+            "Value": "sixnine-approved-deployment"
+          }
+        ]
+      },
+      {
+        "ResourceType": "volume",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "sixnine-platform-cpu"
+          },
+          {
+            "Key": "Project",
+            "Value": "sixnine-platform"
+          },
+          {
+            "Key": "ManagedBy",
+            "Value": "sixnine-approved-deployment"
+          }
+        ]
+      },
+      {
+        "ResourceType": "network-interface",
+        "Tags": [
+          {
+            "Key": "Name",
+            "Value": "sixnine-platform-cpu"
+          },
+          {
+            "Key": "Project",
+            "Value": "sixnine-platform"
+          },
+          {
+            "Key": "ManagedBy",
+            "Value": "sixnine-approved-deployment"
+          }
+        ]
+      }
+    ]
+  },
+  "UserDataSource": "bootstrap-host.sh (base64 of exact LF bytes at launch)"
+}
