@@ -113,7 +113,15 @@ def prepare(kind, commit=None, *, root=ROOT, sleep=time.sleep):
     call(root, 'git', 'push', 'origin', commit + ':refs/heads/main')
     remote(root, commit)
     record('push_confirmed')
-    for candidate in runs(root, wid, commit, 'push'):
+    push_runs = []
+    for index in range(7):
+        push_runs = runs(root, wid, commit, 'push')
+        if push_runs:
+            break
+        if index < 6:
+            sleep(2)  # GitHub run inventory is eventually consistent after push.
+    require(push_runs, 'Push check is not visible yet; no dispatch sent. Inspect GitHub before continuing')
+    for candidate in push_runs:
         if candidate.get('status') == 'completed':
             continue
         item = api(root, f'repos/{REPO}/actions/runs/{candidate["id"]}')

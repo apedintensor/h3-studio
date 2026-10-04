@@ -22,6 +22,7 @@ class FakeCommands:
         self.status, self.branch, self.remote_reads = ' M SCALING.zh-CN.md\0', 'main', 0
         self.race, self.fail_cancel, self.fail_dispatch, self.dispatched = False, False, False, False
         self.complete_at_refresh, self.fresh = False, True
+        self.empty_push_reads = 0
 
     def __call__(self, args, **kwargs):
         self.calls.append(args)
@@ -51,6 +52,9 @@ class FakeCommands:
             elif '/runs?' in endpoint:
                 rows = self.pushes if 'event=push&' in endpoint else (
                     [run(20, **{}) | {'event': 'workflow_dispatch'}] if self.dispatched and self.fresh else [])
+                if 'event=push&' in endpoint and self.empty_push_reads:
+                    self.empty_push_reads -= 1
+                    rows = []
                 out = {'total_count': len(rows), 'workflow_runs': rows}
             elif endpoint.endswith('/runs/10'):
                 out = run(10) | ({'status': 'completed'} if self.complete_at_refresh else {})
@@ -137,6 +141,19 @@ class PrepareReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'run not observed'): self.prepare()
         self.assertEqual(self.receipt()['phase'], 'dispatch_acknowledged')
         self.assertEqual(sum(args[4].endswith('/dispatches') for args in self.fake.mutations() if args[0] == 'gh'), 1)
+
+    def test_late_push_visibility_is_observed_before_cancel_and_dispatch(self):
+        self.fake.empty_push_reads = 2
+        self.prepare()
+        self.assertEqual(self.receipt()['cancelled_run_ids'], [10])
+        self.assertEqual(len(self.fake.mutations()), 3)
+
+    def test_invisible_push_never_starts_duplicate_preparation(self):
+        self.fake.empty_push_reads = 20
+        with self.assertRaisesRegex(RuntimeError, 'not visible yet'):
+            self.prepare()
+        self.assertFalse(self.fake.dispatched)
+        self.assertEqual(len(self.fake.mutations()), 1)
 
 
 if __name__ == '__main__':
