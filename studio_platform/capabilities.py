@@ -78,6 +78,7 @@ def capabilities(settings):
         # serialize the operator policy (budget identities/pool bindings), and
         # never modify compile_request or a caller's explicitly chosen values.
         from .execution_policy import read_policy
+        from .qualification_profiles import QUEUED_TASK_PROFILE
         try:
             policy = read_policy(settings.execution_policy_file)
         except ValueError:
@@ -92,15 +93,18 @@ def capabilities(settings):
                 if envelope[field] == [value]}
             available = [recipe["label"] for recipe in recipes if recipe["id"] in policy["recipe_ids"]]
             runtime_required = policy["qualification"]["status"] == "runtime_required"
+            queued_task_validation = policy["qualification"].get("profile") == QUEUED_TASK_PROFILE
             for recipe in recipes:
                 qualified = recipe["id"] in policy["recipe_ids"]
                 recipe["execution_support"] = {
                     "status": ("runtime_required" if runtime_required else "qualified") if qualified else "not_qualified",
-                    "reason": ("可提交，GPU启动后先验证当前模式；验证通过后才执行原任务。仍需预检账户额度与容量窗口。" if runtime_required else
+                    "reason": ("可提交，GPU完成启动检查后直接执行队列中的真实任务；成功结果直接交付，失败会反馈原因并暂停该工作机接新任务。仍需预检账户额度与容量窗口。" if queued_task_validation else
+                        "可提交，GPU启动后先验证当前模式；验证通过后才执行原任务。仍需预检账户额度与容量窗口。" if runtime_required else
                         "此模式已有受限的执行范围；符合范围后仍需预检账户额度与实际计算容量。") if qualified else
                         "此生成方式尚未在当前云端开放。当前仅开放：" + "、".join(available) + "。素材和设置可以继续保存。",
                     "capacity_checked": False, "preflight_required": True,
                     "runtime_verification_required": runtime_required,
+                    "verification_method": "queued_user_task" if queued_task_validation else "startup_suite" if runtime_required else "historical_qualification",
                     "available_recipe_ids": list(policy["recipe_ids"]),
                     "expires_at": min(policy["qualification"]["expires_at"], policy["reservation"]["expires_at"])
                         - policy["reservation"]["expected_runtime_s"]}
@@ -108,6 +112,20 @@ def capabilities(settings):
                     # This allowlisted envelope contains input/control limits,
                     # never account, worker, approval or budget identities.
                     recipe["execution_support"]["constraints"] = copy.deepcopy(policy["envelope"])
+                    if "duration_reference_seconds" in policy["reservation"]:
+                        # Publish only these documented duration semantics,
+                        # never the full operator reservation / policy object.
+                        recipe["execution_support"]["duration_allowance"] = {
+                            "reference_native_duration_seconds": policy["reservation"]["duration_reference_seconds"],
+                            "baseline_runtime_allowance_s": policy["reservation"]["expected_runtime_s"],
+                            "scale_rule": "max(1, native_duration_seconds / reference_native_duration_seconds)",
+                            "rounding": "runtime and microusd reservations round upward",
+                            "estimate_basis": "operator_allowance", "performance_scaling_verified": False,
+                            "expires_at_semantics": "baseline_latest_start; request_specific_preflight_required",
+                            "native_sampling_duration_source": "generation_plan.output_spec.actual_duration",
+                            "requested_export_duration_source": "controls.duration",
+                            "actual_output_duration_source": "verified_artifact_metadata",
+                            "description": "expires_at是基线预留的最晚开始时间；具体时长和冷启动必须预检。额度与运行时间按原生补帧采样时长向上预留，不代表已测速度或最终费用。原生采样时长与请求导出时长分别处理，真实成片以核验文件为准。"}
                     if "input_limits" in policy["envelope"]:
                         recipe["execution_support"]["input_limit_semantics"] = {
                             "counts": "unique reference and guide assets per kind; first/last frames have separate slots",

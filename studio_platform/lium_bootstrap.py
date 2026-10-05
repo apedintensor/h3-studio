@@ -24,6 +24,7 @@ from .control import WorkerSpec
 from .fleet import FleetConfig, FleetSupervisor, SlotConfig
 from .lium_provider import InferenceIdleProof, _uuid
 from .repository import Conflict, instance_intents
+from .qualification_profiles import QUEUED_TASK_PROFILE
 from .worker import ComfyBackend, SubmissionRejected, _slot_lock
 
 REMOTE_ROOT = "/workspace/h3-studio"
@@ -97,6 +98,7 @@ class BootConfig:
     fleet_enabled: bool = False
     recipe_ids: tuple[str, ...] = ("h3-base-fl2va-v1",)
     minimum_remaining_s: int = 1200
+    qualification_profile: str = ""
 
     def __post_init__(self):
         for field in ("work_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
@@ -114,7 +116,11 @@ class BootConfig:
                 or type(self.minimum_remaining_s) is not int or not 120 <= self.minimum_remaining_s <= 7200
                 or self.recipe_ids not in (("h3-base-fl2va-v1",), ("h3-base-fl2va-v1", "h3-base-ref2va-v1"))):
             raise ValueError("bootstrap_configuration_requires_explicit_fl2va_smoke_envelope")
-        if self.fleet_enabled and not self.smoke_enabled:
+        if self.qualification_profile not in ("", QUEUED_TASK_PROFILE):
+            raise ValueError("bootstrap_qualification_profile_invalid")
+        if self.qualification_profile == QUEUED_TASK_PROFILE and self.smoke_enabled:
+            raise ValueError("queued_task_profile_cannot_submit_synthetic_smoke")
+        if self.fleet_enabled and not self.smoke_enabled and self.qualification_profile != QUEUED_TASK_PROFILE:
             raise ValueError("fleet_requires_successful_smoke")
 
 
@@ -430,6 +436,14 @@ class BootController:
                 "created_at": self.repo.clock(), "local_port": self.config.local_port}
             if state.get("identity") != identity or state.get("local_port") != self.config.local_port:
                 raise BootError("bootstrap_receipt_identity_conflict")
+            queued_task = self.config.qualification_profile == QUEUED_TASK_PROFILE
+            if receipt.exists():
+                if queued_task and state.get("qualification_profile") != QUEUED_TASK_PROFILE:
+                    raise BootError("bootstrap_qualification_profile_change_requires_new_configuration")
+                if not queued_task and state.get("qualification_profile") == QUEUED_TASK_PROFILE:
+                    raise BootError("bootstrap_qualification_profile_change_requires_new_configuration")
+            elif queued_task:
+                state["qualification_profile"] = QUEUED_TASK_PROFILE
             if state["phase"] == "bootstrap_failed":
                 # A retained failed attempt is terminal. Changing a marker or
                 # restarting remote setup requires separate audited recovery.
@@ -470,23 +484,28 @@ class BootController:
             if self.backend is None:
                 endpoint = f"http://127.0.0.1:{self.config.local_port}"
                 self.backend = self.backend_factory(endpoint=endpoint, enabled=True, allowed_origins=(endpoint,), comfy_revision=COMFY_REVISION)
-            if not self.config.smoke_enabled:
+            if not self.config.smoke_enabled and not queued_task:
                 if state["phase"] not in {"qualified", "fleet_starting", "fleet_started"}:
                     state["phase"] = "ready_for_qualification"
                 self._save(receipt, state)
                 return {"state": "ready_for_qualification", "generation_verified": False}
-            result = self._smoke(directory, receipt, state)
-            if result["state"] != "qualified":
-                return result
-            additional = self._additional_qualification(directory, state)
-            if additional["state"] != "qualified":
-                return additional
-            result.update({k: v for k, v in additional.items() if k != "state"})
+            if queued_task:
+                result = self._queued_task_runtime(directory, receipt, state)
+                if result["state"] != "runtime_ready":
+                    return result
+            else:
+                result = self._smoke(directory, receipt, state)
+                if result["state"] != "qualified":
+                    return result
+                additional = self._additional_qualification(directory, state)
+                if additional["state"] != "qualified":
+                    return additional
+                result.update({k: v for k, v in additional.items() if k != "state"})
             if not self.config.fleet_enabled:
                 return result
             if self.fleet is None:
                 if state["phase"] in {"fleet_starting", "fleet_started"}:
-                    return {"state": "fleet_recovery_required", "generation_verified": True}
+                    return {"state": "fleet_recovery_required", "generation_verified": not queued_task}
                 worker_id = "lium-"+intent_id.replace("-", "")
                 endpoint = f"http://127.0.0.1:{self.config.local_port}"
                 spec = WorkerSpec(worker_id, intent["pool"], "lium", intent["provider_instance_id"],
@@ -507,8 +526,43 @@ class BootController:
                 self._save(receipt, state)
             fleet_status = self.fleet.tick()
             attention = any(child.get("state") == "exited" for child in fleet_status.get("children", []))
-            return {"state": "fleet_attention_required" if attention else "fleet_running", "fleet": fleet_status, "generation_verified": True,
-                "qualification_scope": "single_host_fl2va_4s_480p_audio_smoke_only"}
+            return {**(result if queued_task else {}), "state": "fleet_attention_required" if attention else "fleet_running", "fleet": fleet_status,
+                "generation_verified": not queued_task,
+                "qualification_scope": "runtime_ready_awaiting_real_task" if queued_task else "single_host_fl2va_4s_480p_audio_smoke_only"}
+
+    def _queued_task_runtime(self, directory, receipt, state):
+        """Prove startup identity and idle endpoint, without an inference POST.
+
+        This contract permits the normal queue runner to validate real work.
+        It cannot be used to import or skip a historical synthetic submission.
+        """
+        if (state.get("qualification_profile") != QUEUED_TASK_PROFILE
+                or state.get("smoke_submission_started") is not None
+                or state.get("smoke_task_id") is not None or state.get("evidence") is not None
+                or state.get("phase") not in {"reserved", "bootstrap_starting", "booting", "runtime_ready", "fleet_starting", "fleet_started"}):
+            raise BootError("queued_task_runtime_receipt_conflict")
+        for name in ("reference-smoke", "firstlast4-768p-5s-v1", "ref4-bounded-768p-5s-v1"):
+            if (directory/name/"state.json").exists():
+                raise BootError("queued_task_runtime_receipt_conflict")
+        existing = state.get("runtime_validation")
+        if existing is not None and existing != {
+                "profile": QUEUED_TASK_PROFILE, "state": "runtime_ready", "generation_verified": False}:
+            raise BootError("queued_task_runtime_receipt_conflict")
+        # Once the fleet owns this endpoint, its normal attempt/fence controls
+        # are authoritative. Never mistake its live real task for foreign work.
+        if state["phase"] not in ("fleet_starting", "fleet_started"):
+            queue = self.backend._json("GET", "/queue")
+            if (not isinstance(queue, dict) or queue.get("queue_running") != [] or queue.get("queue_pending") != []):
+                return {"state": "runtime_upstream_busy", "generation_verified": False}
+            state["phase"] = "runtime_ready"
+        elif existing is None or state.get("fleet_recipe_ids") != list(self.config.recipe_ids):
+            raise BootError("queued_task_runtime_receipt_conflict")
+        state["runtime_validation"] = {
+            "profile": QUEUED_TASK_PROFILE, "state": "runtime_ready", "generation_verified": False}
+        self._save(receipt, state)
+        return {"state": "runtime_ready", "generation_verified": False,
+            "awaiting_real_task": True, "qualification_profile": QUEUED_TASK_PROFILE,
+            "qualification_scope": "runtime_ready_awaiting_real_task"}
 
     def _additional_qualification(self, directory, state):
         """Historical base smoke remains unchanged; production overrides this."""

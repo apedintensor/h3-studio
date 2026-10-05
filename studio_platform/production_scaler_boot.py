@@ -21,7 +21,7 @@ from .lium_bootstrap import BootConfig, BootController, BootError, SSHHost
 from .lium_provider import LiumManifest, InferenceIdleProof
 from .lium_multimodal_smoke import FirstLastSmoke, BoundedReferenceSmoke
 from .lium_reference_smoke import ReferenceSmoke
-from .qualification_profiles import MULTIMODAL_PROFILE, STAGE_RUNTIME_S
+from .qualification_profiles import MULTIMODAL_PROFILE, QUEUED_TASK_PROFILE, STAGE_RUNTIME_S
 from .repository import Repository, instance_intents, registered_workers, scaler_actions
 from .worker import ComfyBackend, SubmissionRejected, _slot_lock
 
@@ -62,7 +62,9 @@ class ProductionBoot(BootController):
         self._stopping = False
         config = BootConfig(finite.work_dir/"boot", finite.source_dir, finite.ssh_key_file,
             finite.known_hosts_file, local_port, finite.configuration_id, enabled=True,
-            smoke_enabled=True, fleet_enabled=True, trust_first_host_key=finite.trust_first_host_key,
+            smoke_enabled=finite.qualification_profile != QUEUED_TASK_PROFILE, fleet_enabled=True,
+            qualification_profile=QUEUED_TASK_PROFILE if finite.qualification_profile == QUEUED_TASK_PROFILE else "",
+            trust_first_host_key=finite.trust_first_host_key,
             minimum_remaining_s=finite.drain_margin_s, recipe_ids=finite.recipe_ids,
             min_gpu_bytes=_approved_boot_min_gpu_bytes(repo, finite, intent))
         super().__init__(repo, provider, config, ssh_factory=ssh_factory, backend_factory=backend_factory,
@@ -168,7 +170,37 @@ class ProductionBoot(BootController):
         result = super().tick(intent_id)
         # The base boot module remains compatible with its historical 4-step
         # smoke; only this subclass supplies the stronger immutable request.
-        if result.get("generation_verified"):
+        if self.finite.qualification_profile == QUEUED_TASK_PROFILE:
+            # Runtime readiness is not an inference receipt. The actual queue
+            # runner records success only after validating/storing real output.
+            result["qualification_scope"] = "runtime_ready_awaiting_real_task"
+            receipt = self.config.work_dir/intent_id/"bootstrap-state.json"
+            if receipt.exists():
+                try:
+                    state = json.loads(receipt.read_text(encoding="utf-8"))
+                    from .queued_task_runner import read_verification_summary
+                    summary = read_verification_summary(receipt.parent/"queued-task-evidence.json",
+                        expected_identity={**state["identity"], "qualification_profile": QUEUED_TASK_PROFILE})
+                    expected_worker = "lium-"+intent_id.replace("-", "")
+                    if (summary.get("worker_id", expected_worker) != expected_worker
+                            or summary.get("model_id", self.config.model_id) != self.config.model_id):
+                        raise ValueError("finite_real_task_evidence_identity_conflict")
+                except (OSError, ValueError, TypeError, KeyError):
+                    # Losing a proof does not prove that the upstream task
+                    # stopped. Quarantine admissions, retain the real task and
+                    # let the existing drain/idle/reconciliation path decide.
+                    self.request_drain()
+                    return {**result, "state": "fleet_attention_required", "generation_verified": False,
+                        "runtime_quarantined": True, "verification_evidence_unconfirmed": True,
+                        "error_code": "finite_real_task_evidence_unconfirmed"}
+                result.update(summary)
+                result["awaiting_real_task"] = not summary["generation_verified"]
+                if summary["generation_verified"]:
+                    result["qualification_scope"] = "single_host_completed_queued_jobs_only"
+                if summary.get("runtime_quarantined"):
+                    self.request_drain()
+                    result["state"] = "fleet_attention_required"
+        elif result.get("generation_verified"):
             result["qualification_scope"] = ("single_host_fl50_firstlast4_ref4_2048_inputs_compatibility_not_ref50_quality"
                 if self.finite.qualification_profile == MULTIMODAL_PROFILE else
                 "single_host_fl2va_5s_768p_50steps_audio_not_all_controls")
@@ -414,6 +446,16 @@ def run_child(config, intent_id, expected_hash, settings):
                 or identity.get("sources") != config.source_sha256 or identity.get("configuration_id") != config.configuration_id
                 or receipt.get("phase") not in ("fleet_starting", "fleet_started")):
             raise ScalerError("finite_child_configuration_mismatch")
+        queued_task = config.qualification_profile == QUEUED_TASK_PROFILE
+        if queued_task:
+            if (receipt.get("qualification_profile") != QUEUED_TASK_PROFILE
+                    or receipt.get("runtime_validation") != {
+                        "profile": QUEUED_TASK_PROFILE, "state": "runtime_ready", "generation_verified": False}
+                    or receipt.get("smoke_submission_started") is not None
+                    or receipt.get("smoke_task_id") is not None or receipt.get("evidence") is not None):
+                raise ScalerError("finite_child_runtime_validation_required")
+        elif receipt.get("qualification_profile") == QUEUED_TASK_PROFILE:
+            raise ScalerError("finite_child_qualification_profile_mismatch")
         worker_id = "lium-"+intent_id.replace("-", "")
         spec = fleet.slot(worker_id).spec
         if (len(fleet.slots) != 1 or spec.pool != config.pool or spec.configuration_id != config.configuration_id
@@ -433,8 +475,28 @@ def run_child(config, intent_id, expected_hash, settings):
                 and type(duration) in (float, int) and duration > 0
                 and repo.clock()+duration+config.collection_margin_s < deadline)
         predicate = job_scope_filter(config)
+        if queued_task:
+            from .queued_task_runner import QueuedTaskRunner, read_verification_summary
+            runner_type = QueuedTaskRunner
+            queued_kwargs = {"qualification_evidence_file": fleet_path.parent/"queued-task-evidence.json",
+                "evidence_identity": {**identity, "qualification_profile": QUEUED_TASK_PROFILE}}
+            summary = read_verification_summary(queued_kwargs["qualification_evidence_file"],
+                expected_identity=queued_kwargs["evidence_identity"])
+            if (summary.get("worker_id", worker_id) != worker_id or summary.get("model_id", spec.model_id) != spec.model_id):
+                raise ScalerError("finite_child_real_task_evidence_identity_conflict")
+            with repo.engine.connect() as conn:
+                worker = conn.execute(select(registered_workers).where(registered_workers.c.id == worker_id)).mappings().first()
+            if summary.get("runtime_quarantined") or worker is not None and worker["drain_requested"]:
+                if worker is not None:
+                    WorkerControl(repo).drain(worker_id)
+                if worker is None or worker["current_job_id"] is None:
+                    # mark_ready normally clears a drain. An exited process or
+                    # a restart must never revive a quarantined runtime.
+                    return 0
+        else:
+            runner_type, queued_kwargs = DrainSafeRunner, {}
         return run_slot(fleet, worker_id, settings, repository=repo,
-            runner_factory=lambda *a, **kw: DrainSafeRunner(*a, stop_new=stop_new, job_allowed=job_allowed,
-                job_filter=predicate, collection_lock_dir=config.work_dir/"collection-lock", **kw)) or 0
+            runner_factory=lambda *a, **kw: runner_type(*a, stop_new=stop_new, job_allowed=job_allowed,
+                job_filter=predicate, collection_lock_dir=config.work_dir/"collection-lock", **queued_kwargs, **kw)) or 0
     finally:
         repo.close()

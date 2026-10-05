@@ -17,7 +17,8 @@ import string
 from .capabilities import MODEL, RECIPES
 from .control import WorkerControl
 from .repository import BudgetExceeded, NotFound, identifier, request_hash
-from .qualification_profiles import FL50_PROFILE, MULTIMODAL_PROFILE, MULTIMODAL_INPUT_LIMITS, PROFILE_RECIPES
+from .qualification_profiles import (FL50_PROFILE, MULTIMODAL_PROFILE, QUEUED_TASK_PROFILE,
+    RUNTIME_PROFILES, MULTIMODAL_INPUT_LIMITS, PROFILE_RECIPES)
 
 
 POLICY = "self-hosted-default"
@@ -51,8 +52,9 @@ def validate_policy(value):
     if (not isinstance(qualification, dict) or not qualification_fields <= set(qualification)
             or set(qualification) - qualification_fields - {"profile"}
             or qualification["status"] not in {"unverified", "accepted", "runtime_required"}
-            or "profile" in qualification and qualification["profile"] not in {FL50_PROFILE, MULTIMODAL_PROFILE}
-            or qualification["status"] == "runtime_required" and qualification.get("profile") != MULTIMODAL_PROFILE
+            or "profile" in qualification and qualification["profile"] not in PROFILE_RECIPES
+            or qualification["status"] == "runtime_required" and qualification.get("profile") not in RUNTIME_PROFILES
+            or qualification.get("profile") == QUEUED_TASK_PROFILE and qualification["status"] != "runtime_required"
             or not positive(qualification["verified_at"], 1e12)
             or not positive(qualification["expires_at"], 1e12)
             or qualification["verified_at"] >= qualification["expires_at"]):
@@ -87,9 +89,9 @@ def validate_policy(value):
                 raise ValueError("Invalid qualified guide scope")
         if type(limits["allow_video_audio"]) is not bool:
             raise ValueError("Invalid reference video audio feature")
-    if qualification.get("profile") == MULTIMODAL_PROFILE:
+    if qualification.get("profile") in RUNTIME_PROFILES:
         limits = envelope.get("input_limits")
-        if limits is None or not set(recipes) <= set(PROFILE_RECIPES[MULTIMODAL_PROFILE]):
+        if limits is None or not set(recipes) <= set(PROFILE_RECIPES[qualification["profile"]]):
             raise ValueError("Runtime qualification requires its explicit input scope")
         for field, maximum in MULTIMODAL_INPUT_LIMITS.items():
             if isinstance(maximum, list):
@@ -109,10 +111,22 @@ def validate_policy(value):
     if any(not isinstance(options, list) or not options or any(not isinstance(x, str) or len(x)>80 for x in options) for options in controls.values()):
         raise ValueError("Invalid execution control values")
     quote = value["reservation"]
-    if (not isinstance(quote, dict) or set(quote) != {"cost_microusd", "expected_runtime_s", "expires_at", "source_id"}
+    quote_fields = {"cost_microusd", "expected_runtime_s", "expires_at", "source_id"}
+    if (not isinstance(quote, dict) or not quote_fields <= set(quote)
+            or set(quote) - quote_fields - {"duration_reference_seconds"}
             or type(quote["cost_microusd"]) is not int or not 0 < quote["cost_microusd"] <= 1000000000
             or not positive(quote["expected_runtime_s"], 86400) or not positive(quote["expires_at"], 1e12)):
         raise ValueError("Invalid execution reservation")
+    if "duration_reference_seconds" in quote:
+        reference = quote["duration_reference_seconds"]
+        if not positive(reference, 16):
+            raise ValueError("Invalid duration allowance reference")
+        # Keep even the largest derived allowance within the existing money /
+        # runtime field limits. A tiny denominator must not create overflow.
+        factor = max(1, envelope["max_duration_seconds"] / reference)
+        if (not math.isfinite(factor) or quote["cost_microusd"] * factor > 1000000000
+                or quote["expected_runtime_s"] * factor > 86400):
+            raise ValueError("Duration allowance exceeds reservation limits")
     identifier(quote["source_id"])
     accounts = value["budget_accounts"]
     if not isinstance(accounts, list) or not 1 <= len(accounts) <= 8 or len(set(accounts)) != len(accounts):
@@ -128,6 +142,26 @@ def validate_policy(value):
         except (KeyError, IndexError):
             raise ValueError("Invalid budget account template") from None
     return value
+
+
+def reservation_for_duration(policy, actual_duration):
+    """Apply an explicit operator allowance; this is not a speed prediction.
+
+    Old policies remain byte-for-byte equivalent in their reservation values.
+    With the opt-in reference, use the compiled native duration (including H3
+    frame snapping), never a UI edit length. Short clips / fewer steps / lower
+    resolutions cannot lower the operator's original minimum reservation.
+    """
+    quote = dict(policy["reservation"])
+    reference = quote.get("duration_reference_seconds")
+    if reference is None:
+        return quote
+    if not positive(actual_duration, 16):
+        raise ValueError("Invalid native duration for reservation")
+    factor = max(1, actual_duration / reference)
+    quote["cost_microusd"] = math.ceil(quote["cost_microusd"] * factor)
+    quote["expected_runtime_s"] = math.ceil(quote["expected_runtime_s"] * factor)
+    return quote
 
 
 def input_envelope_blockers(compiled, limits):
@@ -273,7 +307,8 @@ class ExecutionPolicies:
         if policy is None:
             base["blockers"].append("缺少有效的执行池验收与费用策略，暂不发起生成")
             return Admission(base, 0, now+900, unknown)
-        qualification, quote, envelope = policy["qualification"], policy["reservation"], policy["envelope"]
+        qualification, envelope = policy["qualification"], policy["envelope"]
+        quote = reservation_for_duration(policy, compiled["output_spec"]["actual_duration"])
         blockers = base["blockers"]
         if not policy["enabled"]:
             blockers.append("操作员已暂停此执行策略")
@@ -373,6 +408,13 @@ class ExecutionPolicies:
         estimate = {"currency": "USD", "cost_microusd": quote["cost_microusd"] if quote_known else None,
                     "source": quote["source_id"] if quote_known else "unknown", "kind": "budget_reservation",
                     "actual_charge_known": False, "description": "运营配置的预算预留额；实际费用另行核对，不代表最终账单"}
+        if "duration_reference_seconds" in quote:
+            reference = quote["duration_reference_seconds"]
+            estimate.update(estimate_basis="operator_allowance", duration_reference_seconds=reference,
+                native_duration_seconds=output["actual_duration"],
+                duration_scale_factor=max(1, output["actual_duration"] / reference),
+                expected_runtime_s=quote["expected_runtime_s"], performance_scaling_verified=False,
+                description="运营时长预留：按原生帧时长比例向上增加额度与执行时间，不降低原基线；不是已测速度或最终账单")
         return Admission(base, quote["cost_microusd"] if quote_known else 0, expiry, estimate)
 
     def ensure_current(self, plan, scope):
@@ -454,7 +496,9 @@ class ExecutionPolicies:
             policy = read_policy(self.settings.execution_policy_file)
             if policy is None:
                 return False
-            qualification, quote = policy["qualification"], policy["reservation"]
+            qualification = policy["qualification"]
+            quote = reservation_for_duration(policy,
+                job.get("request", {}).get("output_spec", {}).get("actual_duration"))
             now = self.repo.clock()
             return bool(policy["enabled"] and execution.get("policy_hash") == request_hash(policy)
                 and qualification["status"] in {"accepted", "runtime_required"}

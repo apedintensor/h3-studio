@@ -29,6 +29,7 @@ CAPACITY_WAIT_CODES = {
     "gpu_busy": "capacity_gpu_busy",
     "searching": "capacity_searching_gpu",
     "bootstrap_repair_required": "capacity_bootstrap_repair_required",
+    "queued_task_repair_required": "capacity_queued_task_repair_required",
 }
 
 

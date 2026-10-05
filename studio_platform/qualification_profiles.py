@@ -1,6 +1,8 @@
 """Explicit production qualification contracts; these constants grant no capacity.
 
-Every new instance still runs the selected suite before worker registration.
+The queued-task profile admits runtime-checked workers without a synthetic
+inference suite. Their first real queued job supplies request-specific proof.
+Legacy profiles still run their selected suite before worker registration.
 Historical evidence and this operator opt-in are never current inference proof.
 The optional suite runs FL at 50 steps and the new input paths at 4 steps. Its
 2048-pixel fixtures verify execution compatibility, not Ref50 speed or quality.
@@ -9,7 +11,10 @@ FL_RECIPE = "h3-base-fl2va-v1"
 REF_RECIPE = "h3-base-ref2va-v1"
 FL50_PROFILE = "fl50"
 MULTIMODAL_PROFILE = "fl50-firstlast4-ref4-v1"
-PROFILE_RECIPES = {FL50_PROFILE: (FL_RECIPE,), MULTIMODAL_PROFILE: (FL_RECIPE, REF_RECIPE)}
+QUEUED_TASK_PROFILE = "queued-task-first-v1"
+RUNTIME_PROFILES = {MULTIMODAL_PROFILE, QUEUED_TASK_PROFILE}
+PROFILE_RECIPES = {FL50_PROFILE: (FL_RECIPE,), MULTIMODAL_PROFILE: (FL_RECIPE, REF_RECIPE),
+                  QUEUED_TASK_PROFILE: (FL_RECIPE, REF_RECIPE)}
 
 MULTIMODAL_INPUT_LIMITS = {
     "max_images": 1, "max_videos": 1, "max_audios": 1,

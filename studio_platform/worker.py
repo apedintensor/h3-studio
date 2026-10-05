@@ -470,6 +470,10 @@ class WorkerRunner:
                 "simulation": isinstance(self.backend, MockBackend) or (self.backend.kind == "cpu-render"
                     and any(source.get("simulation") is True for source in job["request"].get("sources", {}).values()))}
 
+    def _observe(self, worker_id, job_id):
+        """Profile-specific observation runs while the physical slot lock is held."""
+        return self.control.observe(worker_id, job_id)
+
     def run_once(self, worker_id, pool):
         if not self.backend.enabled:
             return {"state": "disabled", "simulation": False}
@@ -494,7 +498,7 @@ class WorkerRunner:
                 self.control.recover_expired()
             result = self._run_once(worker_id, pool)
             if self.control and result.get("job_id"):
-                self.control.observe(worker_id, result["job_id"])
+                self._observe(worker_id, result["job_id"])
             return result
 
     def _claim(self, worker_id, pool, *, purpose):

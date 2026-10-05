@@ -23,19 +23,19 @@ import uuid
 from sqlalchemy import and_, or_, select, update
 
 from .autoscale import Demand, ScalePolicy, Slot, recommend
-from .capacity import ColdStartCoordinator
+from .capacity import ColdStartCoordinator, proven_unsubmitted_capacity_job
 from .control import WorkerControl
-from .execution_policy import ExecutionPolicies, read_policy
+from .execution_policy import ExecutionPolicies, read_policy, reservation_for_duration
 from .lium_provider import BASE_URL, KEY_VARIABLE, PROFILE, SERVICE, LiumManifest, LiumProvider
 from .lium_runtime_aws import AwsLiumLoader, SECRET_ARN, SECRET_NAME, VERSION_ID
 from .repository import (Repository, Scope, attempts, budget_accounts, capacity_approvals,
-    capacity_cycles, instance_intents, jobs, registered_workers, request_hash, scaler_actions, scaler_receipts)
+    capacity_cycles, capacity_gate, capacity_waiters, instance_intents, jobs, registered_workers, request_hash, scaler_actions, scaler_receipts)
 from .scaler import LaunchSpec, ScaleCoordinator
 from .settings import Settings
 from .worker import _slot_lock
 
 MODEL = "MiniMax-H3-Base-BF16"
-from .qualification_profiles import (FL_RECIPE, FL50_PROFILE, MULTIMODAL_PROFILE, PROFILE_RECIPES,
+from .qualification_profiles import (FL_RECIPE, FL50_PROFILE, MULTIMODAL_PROFILE, QUEUED_TASK_PROFILE, RUNTIME_PROFILES, PROFILE_RECIPES,
     MULTIMODAL_INPUT_LIMITS, MIN_MULTIMODAL_JOB_RUNTIME_S)
 
 RECIPE = FL_RECIPE  # Compatibility for existing exact FL50 operator configs.
@@ -261,7 +261,7 @@ def verify_policy(config, settings):
     policy = read_policy(settings.execution_policy_file)
     if (not policy or request_hash(policy) != config.execution_policy_sha256 or policy["pool"] != config.pool
             or policy["configuration_id"] != config.configuration_id or policy["recipe_ids"] != list(config.recipe_ids)
-            or policy["qualification"]["status"] != ("runtime_required" if config.qualification_profile == MULTIMODAL_PROFILE else "accepted")
+            or policy["qualification"]["status"] != ("runtime_required" if config.qualification_profile in RUNTIME_PROFILES else "accepted")
             or policy["qualification"]["evidence_id"] != config.qualification_evidence_id
             or policy["qualification"]["expires_at"] > config.hard_deadline
             or policy["reservation"]["expires_at"] > config.hard_deadline):
@@ -271,10 +271,12 @@ def verify_policy(config, settings):
     envelope = policy["envelope"]
     controls = {"sampler_name": ["res_multistep"], "scheduler": ["auto"], "video_decode": ["tiled"],
                 "audio_decode": ["normal"], "encoder_device": ["cpu"], "ref_image_size": ["max"]}
-    # Requested five seconds produces the H3 native 124-frame / 24fps clip.
-    # The policy compares native duration; six excludes the next integer
-    # requested duration (six seconds is 148 / 24fps) without rejecting five.
-    if (envelope["max_pixels"] > 1344*768 or envelope["max_duration_seconds"] > 6 or envelope["max_steps"] > 50
+    # Legacy synthetic suites qualified five-second output only. Their bound
+    # stays unchanged. The explicit real-task profile may admit the full native
+    # 4--15-second request range; readiness is never a claim that it has already
+    # generated that duration. Fifteen seconds snaps to 362 frames / 24fps.
+    maximum_duration = 362/24 if config.qualification_profile == QUEUED_TASK_PROFILE else 6
+    if (envelope["max_pixels"] > 1344*768 or envelope["max_duration_seconds"] > maximum_duration or envelope["max_steps"] > 50
             or envelope["controls"] != controls):
         raise ScalerError("finite_policy_outside_qualified_fl50_envelope")
     if config.qualification_profile == FL50_PROFILE:
@@ -282,7 +284,7 @@ def verify_policy(config, settings):
             raise ScalerError("finite_policy_outside_qualified_fl50_envelope")
     else:
         limits = envelope.get("input_limits")
-        if (policy["qualification"].get("profile") != MULTIMODAL_PROFILE
+        if (policy["qualification"].get("profile") != config.qualification_profile
                 or not isinstance(limits, dict) or set(limits) != set(MULTIMODAL_INPUT_LIMITS)
                 or envelope["max_reference_files"] > 3 or envelope["max_guides"] > 1
                 or policy["reservation"]["expected_runtime_s"] < MIN_MULTIMODAL_JOB_RUNTIME_S):
@@ -480,17 +482,28 @@ class FiniteController:
                 jobs.c.request["request"]["model"].as_string() == MODEL
                 ).order_by(jobs.c.created_at, jobs.c.id).limit(4097)).mappings())
             workers = list(conn.execute(select(registered_workers).where(registered_workers.c.pool == c.pool)).mappings())
+            busy_job_ids = {w["current_job_id"] for w in workers if w["current_job_id"]}
+            busy_runtimes = dict(conn.execute(select(jobs.c.id, jobs.c.expected_runtime_s).where(
+                self.scope_filter(), jobs.c.id.in_(busy_job_ids))).all()) if busy_job_ids else {}
         if len(pending) > 4096:
             raise ScalerError("finite_demand_window_exceeded")
         demands = [Demand(r["id"], r["owner_id"], r["created_at"], r["expected_runtime_s"], "operator-reservation")
                    for r in pending]
         slots = []
-        runtime = read_policy(self.settings.execution_policy_file)["reservation"]["expected_runtime_s"]
+        policy = read_policy(self.settings.execution_policy_file)
+        # A busy long task owns its full admitted allowance, not the historical
+        # five-second baseline. Missing bindings conservatively use the largest
+        # operator allowance; old unscaled policies retain their original value.
+        runtime = reservation_for_duration(policy, policy["envelope"]["max_duration_seconds"])["expected_runtime_s"]
         for w in workers:
             if (w["expires_at"] > now and not w["drain_requested"] and w["state"] in ("ready", "busy", "leased", "reconciling")
                     and w["spec"]["configuration_id"] == c.configuration_id
                     and any(i["provider_instance_id"] == w["instance_id"] and i["state"] in ("starting", "ready", "busy") for i in instances)):
-                slots.append(Slot(w["id"], "busy" if w["current_job_id"] else "ready", runtime if w["current_job_id"] else 0))
+                bound_runtime = busy_runtimes.get(w["current_job_id"])
+                if not (type(bound_runtime) in (int, float) and math.isfinite(bound_runtime) and bound_runtime > 0):
+                    bound_runtime = runtime
+                slots.append(Slot(w["id"], "busy" if w["current_job_id"] else "ready",
+                    bound_runtime if w["current_job_id"] else 0))
         for row in instances:
             if row["state"] == "starting" and not any(w["instance_id"] == row["provider_instance_id"] for w in workers):
                 slots.append(Slot("starting-"+row["id"], "starting", c.scale_policy["cold_start_s"]))
@@ -535,6 +548,12 @@ class FiniteController:
         recovery/collection path and reservation. Bounded pages are revisited.
         """
         self.repo.set_capacity_approval_enabled(self.config.capacity_approval_id, enabled=False)
+        if self.config.qualification_profile == QUEUED_TASK_PROFILE:
+            # A failing first user job must not cancel another user's accepted
+            # backlog. Revocation forbids new work; old waits keep their exact
+            # deadlines and reservations, without automatic replay or renewal.
+            self.hold_queued_task_backlog()
+            return
         self.cold.advance_once(self.config.capacity_approval_id)
         with self.repo.engine.connect() as conn:
             pending = list(conn.execute(select(jobs.c.id, jobs.c.tenant_id, jobs.c.owner_id, jobs.c.project_id).where(self.scope_filter(),
@@ -544,6 +563,54 @@ class FiniteController:
             # A simultaneous POST can change state before this call; the
             # repository then records cancel_requested/hold, never a false $0.
             self.repo.request_cancel(Scope(row["tenant_id"], row["owner_id"], row["project_id"]), row["id"])
+
+    def hold_queued_task_backlog(self):
+        """Preserve only this profile's proven-unsubmitted accepted jobs.
+
+        This inert backlog publication never proves upstream idle, permits a
+        replacement rental, or changes a submitted/unknown attempt. It is also
+        used by the on-demand repair hold, including after process restart.
+        """
+        if self.config.qualification_profile != QUEUED_TASK_PROFILE:
+            raise ScalerError("queued_task_backlog_profile_required")
+        from .capacity import CAPACITY_WAIT_CODES
+        code = "capacity_queued_task_repair_required"
+        with self.repo.transaction() as conn:
+            self.repo._locked(conn, select(capacity_gate).where(capacity_gate.c.id == "global"))
+            ids = list(conn.execute(select(jobs.c.id).where(self.scope_filter(),
+                jobs.c.status.in_(("queued", "waiting_capacity")),
+                jobs.c.execution_plan["policy_hash"].as_string() == self.config.execution_policy_sha256)
+                .order_by(jobs.c.id).limit(4097)).scalars())
+            if len(ids) > 4096:
+                raise ScalerError("finite_demand_window_exceeded")
+            for jid in ids:
+                job = self.repo._job(conn, jid, lock=True)
+                if not proven_unsubmitted_capacity_job(conn, job):
+                    continue
+                waiter = conn.execute(select(capacity_waiters).where(
+                    capacity_waiters.c.job_id == jid)).mappings().first()
+                deadlines = [self.config.hard_deadline - job["expected_runtime_s"]]
+                for field in ("qualification_expires_at", "quote_expires_at"):
+                    value = job["execution_plan"].get(field)
+                    if type(value) in (int, float) and math.isfinite(value):
+                        deadlines.append(value)
+                if waiter is not None:
+                    deadlines.append(waiter["deadline"])
+                if self.repo.clock() >= min(deadlines):
+                    self.repo._settle(conn, "job", jid, 0)
+                    conn.execute(update(jobs).where(jobs.c.id == jid).values(status="failed",
+                        error_code="capacity_wait_deadline_expired", fence=job["fence"]+1,
+                        updated_at=self.repo.clock()))
+                    if waiter is not None:
+                        conn.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == jid).values(state="failed"))
+                    self.repo._emit(conn, "job.failed", jid, {"job_id": jid, "status": "failed",
+                        "error_code": "capacity_wait_deadline_expired"})
+                elif job["error_code"] is None or job["error_code"] in CAPACITY_WAIT_CODES.values():
+                    if job["error_code"] != code:
+                        conn.execute(update(jobs).where(jobs.c.id == jid).values(error_code=code,
+                            updated_at=self.repo.clock()))
+                        self.repo._emit(conn, "job.capacity_wait", jid, {"job_id": jid,
+                            "status": job["status"], "error_code": code})
 
     def _boot_failure(self, intent, state):
         """Finite runs stop; on-demand preparation recovery may preserve backlog."""

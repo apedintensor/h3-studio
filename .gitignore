@@ -100,6 +100,8 @@ inventory.json
 !CHAPTER-RENDER-CONTRACT.md
 !CAPTION-BURN-IN-CONTRACT.zh-CN.md
 !ARCHITECTURE.zh-CN.md
+!SYSTEM-DESIGN-DUAL-GPU.zh-CN.md
+!LONG-DURATION.zh-CN.md
 !ITERATIONS.zh-CN.md
 !DELIVERY-REPORT.zh-CN.md
 !EVIDENCE-INDEX.zh-CN.md
@@ -223,6 +225,8 @@ inventory.json
 !studio_platform/scaler_entry.py
 !ON-DEMAND-GPU.zh-CN.md
 !studio_platform/qualification_profiles.py
+!studio_platform/queued_task_runner.py
+!QUEUED-TASK-START.zh-CN.md
 !studio_platform/lium_multimodal_smoke.py
 !FREESTYLE-ADMISSION.zh-CN.md
 

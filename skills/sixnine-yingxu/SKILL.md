@@ -53,6 +53,8 @@ Audio/video list entries and guides may include `source_range:{"start":0,"end":4
 
 `h3-base-fl2va-v1` supports text-only and optional first/last frames. `h3-base-ref2va-v1` requires references and cannot consume first/last-frame slots. Obtain supported controls and live bounds from capabilities; recipe IDs are not supplier model IDs. Seed is a uint64 **decimal string**. When a deployment preset applies to unset controls, use its supported values only for still-unset fields; never override the user's saved choices silently. Use `execution_support.constraints` and `input_limits`, not just model-wide maxima.
 
+Output duration is separate from the edit timeline and reference selections. Native frame snapping may make the sampled duration slightly longer than the requested export; inspect `output_spec` at preflight. A duration allowance can increase the operator's runtime and budget reservation for a longer clip; it is not measured speed or a final charge. The capability window describes the baseline: each actual request must still pass its own runtime, cold-start, budget and deadline checks. Never shorten the user's requested clip silently to pass admission.
+
 ## Stories, partial edits and return links
 
 For chapters, characters and scenes, list `/v1/projects` or create with title/logline. Read the current document and use `/v1/guided-schema` to build `POST /v1/projects/{id}/actions` with `expected_version` and stable `Idempotency-Key`. `entity.update` merges data one level; nested `h3` objects replace their whole value. Prefer `shot.configure_generation` for generation edits so web settings and API input stay aligned.
@@ -64,6 +66,8 @@ Use `/?project={id}&entity={entity_id}` for story content, `/?project={id}&panel
 ## Recovery and deliverables
 
 `execution_support.status=runtime_required` means a bounded request may queue while a newly started GPU completes qualification; it is not completed testing or immediately available capacity. Even `qualified` needs current preflight. Preserve drafts for `not_qualified`, `disabled`, `unavailable` or blocked plans; do not claim generation or evade a block with another recipe.
+
+If `verification_method=queued_user_task`, the new GPU performs runtime checks and executes the original queued user job directly. Runtime readiness does not prove generation; a verified real result is returned without generating a duplicate acceptance clip. An allowed longer duration has not necessarily been tested on that GPU.
 
 An unknown submission outcome keeps the **original plan and idempotency key**. Recover the original job/receipt or repeat that exact submission; do not change keys. A new take is a deliberate new saved draft/plan/key, not a timeout retry. `submission_unknown` and `recovery_hold` need reconciliation and must not trigger another paid job. Cancellation may still await upstream confirmation and billing.
 

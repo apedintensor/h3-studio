@@ -28,7 +28,8 @@ from .lium_runtime_aws import AwsLiumLoader
 from .production_scaler import (FiniteConfig, FiniteController, MODEL, RECIPE, ScalerError,
     save, stdin_loader, unique, validate_settings, verify_identity_files, verify_sources)
 from .repository import (Repository, capacity_approvals, capacity_cycles, capacity_waiters,
-    jobs, registered_workers, scaler_actions, scaler_leaders)
+    attempts, jobs, registered_workers, scaler_actions, scaler_leaders)
+from .qualification_profiles import QUEUED_TASK_PROFILE
 from .scaler import LaunchSpec
 from .settings import Settings
 from .worker import _slot_lock
@@ -212,11 +213,94 @@ class ServiceCycle(FiniteController):
         value = json.loads(path.read_text())
         if (value.get("version") != 1 or value.get("config_hash") != self.config.fingerprint()
                 or value.get("sources") != self.config.source_sha256
-                or value.get("reason") != "bootstrap_repair_required"):
+                or value.get("reason") not in {"bootstrap_repair_required", "queued_task_repair_required"}
+                or value.get("reason") == "queued_task_repair_required"
+                    and self.config.qualification_profile != QUEUED_TASK_PROFILE):
             raise ScalerError("ondemand_preparation_hold_identity_mismatch")
         return value
 
+    def _queued_task_failure_hold(self, intent, *, allow_unconfirmed=False):
+        """Quarantine a proven failing worker without cancelling unrelated work.
+
+        Startup identity and durable attempts are authoritative, including a
+        crash between SQL quarantine and its small evidence-file write. This
+        hold grants no replacement rental or idle proof: reconciliation,
+        collection, original waiter deadlines and provider billing still apply.
+        """
+        if self.config.qualification_profile != QUEUED_TASK_PROFILE:
+            return False
+        directory = self.config.work_dir/"boot"/intent["id"]
+        expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+            "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+        evidence = json.loads((directory/"bootstrap-state.json").read_text())
+        if (evidence.get("identity") != expected
+                or evidence.get("qualification_profile") != QUEUED_TASK_PROFILE
+                or evidence.get("phase") not in {"fleet_starting", "fleet_started"}
+                or evidence.get("runtime_validation") != {
+                    "profile": QUEUED_TASK_PROFILE, "state": "runtime_ready", "generation_verified": False}
+                or evidence.get("smoke_submission_started") is not None
+                or evidence.get("smoke_task_id") is not None or evidence.get("evidence") is not None):
+            return False
+        worker_id = "lium-"+intent["id"].replace("-", "")
+        proven = []
+        with self.repo.transaction() as conn:
+            worker = self.repo._locked(conn, select(registered_workers).where(registered_workers.c.id == worker_id))
+            if (not worker or worker["provider"] != "lium" or worker["instance_id"] != intent["provider_instance_id"]
+                    or worker["pool"] != self.config.pool
+                    or worker["spec"].get("configuration_id") != self.config.configuration_id
+                    or worker["spec"].get("model_id") != MODEL):
+                return False
+            rows = list(conn.execute(select(attempts, jobs.c.status.label("job_status"),
+                jobs.c.error_code.label("job_error"), jobs.c.execution_plan).join(jobs,
+                    (jobs.c.id == attempts.c.job_id) & (jobs.c.current_attempt_id == attempts.c.id)).where(
+                    attempts.c.worker_id == worker_id, jobs.c.pool == self.config.pool).limit(1025)).mappings())
+            if len(rows) > 1024:
+                return False
+            for row in rows:
+                if (row["execution_plan"].get("configuration_id") != self.config.configuration_id
+                        or row["execution_plan"].get("policy_hash") != self.config.execution_policy_sha256):
+                    continue
+                failed = row["job_status"] == "failed" and row["status"] == "failed" and row["upstream_stopped"] == 1
+                preparation = (row["job_status"] == "queued" and row["status"] == "deferred"
+                    and row["job_error"] in {"worker_preparation_not_ready", "worker_preparation_failed"}
+                    and row["submission_started_at"] is None and row["upstream_task_id"] is None)
+                collecting = (row["job_status"] == "collecting" and row["status"] == "collecting"
+                    and row["job_error"] == "collection_failed" and row["collection_failures"] > 0
+                    and bool(row["upstream_task_id"]) and row["upstream_stopped"] == 1)
+                if failed or preparation or collecting:
+                    proven.append({"job_id": row["job_id"], "attempt_id": row["id"]})
+            if not proven and not (allow_unconfirmed and worker["drain_requested"] == 1):
+                return False  # Unknown/claimed/running/cancelled is not failure proof.
+            conn.execute(update(registered_workers).where(registered_workers.c.id == worker_id).values(
+                drain_requested=1, state="draining", updated_at=self.repo.clock()))
+        save(self.config.work_dir/"preparation-hold.json", {"version": 1,
+            "config_hash": self.config.fingerprint(), **{k: expected[k] for k in ("intent_id", "instance_id", "sources")},
+            "reason": "queued_task_repair_required", "worker_id": worker_id,
+            "failed_attempts": proven,
+            "verification_state": "failed_attempt_confirmed" if proven else "evidence_unconfirmed_not_upstream_stopped",
+            "observed_at": self.repo.clock()})
+        self._record_repair_wait_reason()
+        self.request_drain()
+        return True
+
+    def _record_repair_wait_reason(self):
+        hold = self.preparation_hold()
+        if hold is None:
+            return
+        reason = hold["reason"]
+        self.cold.record_wait_reason(self.config.capacity_approval_id, reason)
+        if reason == "queued_task_repair_required":
+            self.hold_queued_task_backlog()
+
     def _boot_failure(self, intent, state):
+        if self.config.qualification_profile == QUEUED_TASK_PROFILE and state.get("state") in {
+                "fleet_attention_required", "fleet_recovery_required"}:
+            try:
+                if self._queued_task_failure_hold(intent,
+                        allow_unconfirmed=state.get("error_code") == "finite_real_task_evidence_unconfirmed"):
+                    return
+            except (OSError, ValueError, KeyError, TypeError):
+                pass  # Never infer failure/idle from unavailable evidence.
         if state.get("state") != "bootstrap_failed":
             return super()._boot_failure(intent, state)
         # Only a retained, identity-bound failure BEFORE model qualification
@@ -274,8 +358,9 @@ class ServiceCycle(FiniteController):
                 and getattr(self, "preserve_rollover", lambda: False)()):
             self.repo.set_capacity_approval_enabled(self.config.capacity_approval_id, enabled=False)
             if self.preparation_hold():
-                self._expire_held_waiters()
-                self.cold.record_wait_reason(self.config.capacity_approval_id, "bootstrap_repair_required")
+                if self.preparation_hold()["reason"] == "bootstrap_repair_required":
+                    self._expire_held_waiters()
+                self._record_repair_wait_reason()
             return
         super()._close_unsubmitted()
 
@@ -419,7 +504,7 @@ class OnDemandController:
             # A competing leader/lease must never become a shutdown exception.
             value = self.current.status(decision=value.get("phase", "not_leader"))
         if self.current.preparation_hold() and not self.stopping():
-            self.current.cold.record_wait_reason(self.current.config.capacity_approval_id, "bootstrap_repair_required")
+            self.current._record_repair_wait_reason()
         if self._can_rotate(value) and not self.stopping() and not self.current.preparation_hold():
             self.repo.set_capacity_approval_enabled(self.current.config.capacity_approval_id, enabled=False)
             # Keep unsettled invoice reservations. A cycle limit never resets spend.

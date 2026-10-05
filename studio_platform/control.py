@@ -301,8 +301,10 @@ class WorkerControl:
                 fence=worker["fence"]+1, expires_at=self.repo.clock()+lease_seconds, updated_at=self.repo.clock()))
             return claim
 
-    def observe(self, worker_id, job_id):
+    def observe(self, worker_id, job_id, *, quarantine_failures=False):
         """Read committed ledger facts after a turn; a running/unknown task holds its slot."""
+        if type(quarantine_failures) is not bool:
+            raise ValueError("invalid_failure_quarantine_option")
         with self.repo.transaction() as connection:
             worker = self._worker(connection, worker_id, lock=True)
             if worker["current_job_id"] != job_id:
@@ -316,10 +318,20 @@ class WorkerControl:
                 terminal = self._proven_unsubmitted_queue(connection, job)
                 unsafe_queued = not terminal
             state = "ready" if terminal else "unknown" if unsafe_queued or job["status"] in ("submission_unknown", "recovery_hold") else "busy"
-            if worker["drain_requested"]:
+            # Opt-in queued-task qualification must never briefly advertise a
+            # failing runtime as ready between separate observe/drain writes.
+            # Unknown submissions retain their binding for reconciliation;
+            # cancellation by the user is not evidence of a broken runtime.
+            quarantined = quarantine_failures and (job["status"] == "failed"
+                or job["status"] == "queued" and job.get("error_code") in {
+                    "worker_preparation_not_ready", "worker_preparation_failed"}
+                or job["status"] == "collecting" and job.get("error_code") == "collection_failed")
+            draining = bool(worker["drain_requested"] or quarantined)
+            if draining:
                 state = "draining"
             connection.execute(update(registered_workers).where(registered_workers.c.id == worker_id).values(
                 state=state, current_job_id=None if terminal else job_id,
+                drain_requested=int(draining),
                 expires_at=self.repo.clock()+self.registration_seconds, updated_at=self.repo.clock()))
             return self._worker(connection, worker_id)
 
