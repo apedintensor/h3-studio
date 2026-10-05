@@ -138,6 +138,10 @@ class ProductionBoot(BootController):
         if intent_id != self.intent_id:
             raise BootError("finite_boot_identity_mismatch")
         deadline = self._lifetime(intent)
+        from .runtime_adoption import prepare_adoption
+        adoption = prepare_adoption(self, {**intent, "hard_deadline": deadline})
+        if adoption is not None:
+            return adoption
         self._stopping = (self._stopping or stopping or intent["state"] in ("draining", "destroying", "destroyed")
             or self.repo.clock() >= deadline-self.finite.drain_margin_s)
         if self._stopping:

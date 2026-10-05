@@ -63,6 +63,8 @@ def as_json(config):
         value.pop("allowed_owners")
     if value["qualification_profile"] == "fl50":
         value.pop("qualification_profile")
+    if value["authorization_extension_s"] == 0:
+        value.pop("authorization_extension_s")
     for field in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[field] = str(value[field])
     return value

@@ -213,6 +213,8 @@ inventory.json
 !studio_platform/production_worker.py
 !studio_platform/drain_safe_runner.py
 !studio_platform/production_scaler.py
+!studio_platform/runtime_adoption.py
+!studio_platform/live_runtime_handoff.py
 !studio_platform/production_scaler_boot.py
 !test_platform_production_scaler.py
 !PRODUCTION-SCALER.zh-CN.md

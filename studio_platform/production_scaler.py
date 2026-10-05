@@ -100,6 +100,7 @@ class FiniteConfig:
     interval_s: int = 15
     allowed_owners: list[str] | None = None
     qualification_profile: str = FL50_PROFILE
+    authorization_extension_s: int = 0
 
     def __post_init__(self):
         if not isinstance(self.qualification_profile, str) or self.qualification_profile not in PROFILE_RECIPES:
@@ -113,6 +114,10 @@ class FiniteConfig:
                 or any(not isinstance(owner, str) for owner in self.allowed_owners)
                 or set(self.allowed_owners) != {"superdan", "supervan"}):
             raise ScalerError("finite_shared_owners_invalid")
+        if (type(self.authorization_extension_s) is not int or self.authorization_extension_s not in (0, 18000)
+                or self.authorization_extension_s and (self.allowed_owners is None
+                    or self.qualification_profile != QUEUED_TASK_PROFILE)):
+            raise ScalerError("finite_authorization_extension_invalid")
         for value in (self.cycle_id, self.project_id, self.pool, self.configuration_id,
                       self.capacity_approval_id, self.qualification_evidence_id):
             if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
@@ -123,7 +128,8 @@ class FiniteConfig:
                 raise ScalerError("finite_absolute_paths_required")
             object.__setattr__(self, field, path)
         if (any(type(x) not in (int, float) or not math.isfinite(x) for x in (self.created_at, self.hard_deadline))
-                or not 0 < self.hard_deadline-self.created_at <= (86400 if self.allowed_owners is not None else 14400)
+                or not 0 < self.hard_deadline-self.created_at <= (
+                    (86400 if self.allowed_owners is not None else 14400) + self.authorization_extension_s)
                 or type(self.drain_margin_s) is not int or not 120 <= self.drain_margin_s <= 3600
                 or type(self.collection_margin_s) is not int or not 30 <= self.collection_margin_s <= 900
                 or type(self.interval_s) is not int or not 5 <= self.interval_s <= 30
@@ -185,6 +191,10 @@ class FiniteConfig:
             value.pop("allowed_owners")
         if self.qualification_profile == FL50_PROFILE:
             value.pop("qualification_profile")
+        # Absent/default authorization keeps all historical config hashes.
+        # The explicitly authorized five-hour extension is immutable identity.
+        if self.authorization_extension_s == 0:
+            value.pop("authorization_extension_s")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)

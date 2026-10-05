@@ -124,7 +124,7 @@ jobs:
       - name: Queued user task startup and recovery contracts
         env:
           PLATFORM_TEST_DATABASE_URL: postgresql+psycopg://sixnine_test:sixnine-ci-test-only@127.0.0.1:5432/sixnine_test
-        run: python -m unittest test_platform_queued_task_policy test_platform_queued_boot test_platform_queued_task_runner test_platform_queued_task_hold test_platform_long_duration_policy test_platform_duration_quote -v
+        run: python -m unittest test_platform_queued_task_policy test_platform_queued_boot test_platform_queued_task_runner test_platform_queued_task_hold test_platform_long_duration_policy test_platform_duration_quote test_platform_runtime_adoption test_platform_live_runtime_handoff -v
 
   frontend:
     needs: changes

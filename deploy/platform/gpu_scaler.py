@@ -147,6 +147,12 @@ def on_demand_config(config):
     """The host accepts one narrow on-demand mode; unknown modes fail closed."""
     mode = config.get('service_mode')
     release.require(mode in (None, 'on-demand'), 'scaler_service_mode_invalid')
+    extension = config.get('authorization_extension_s', 0)
+    release.require(type(extension) is int and extension in (0, 18000)
+        and (extension == 0 or mode == 'on-demand'
+            and config.get('allowed_owners') == ['superdan', 'supervan']
+            and config.get('qualification_profile') == 'queued-task-first-v1'),
+        'scaler_authorization_extension_invalid')
     if mode is None:
         return False
     policy = config.get('scale_policy')
@@ -161,7 +167,7 @@ def on_demand_config(config):
         'scaler_on_demand_limits_invalid')
     created, deadline = config.get('created_at'), config.get('hard_deadline')
     release.require(type(created) in (int, float) and type(deadline) in (int, float)
-        and math.isfinite(created) and math.isfinite(deadline) and 0 < deadline-created <= 24*3600,
+        and math.isfinite(created) and math.isfinite(deadline) and 0 < deadline-created <= 24*3600+extension,
         'scaler_on_demand_authorization_window_invalid')
     return True
 
@@ -200,7 +206,8 @@ def protected_inputs(*, starting=False, now=None):
         now = time.time() if now is None else now
         deadline = config.get('hard_deadline')
         release.require(config.get('enabled') is True and type(deadline) in (int, float)
-            and math.isfinite(deadline) and now+300 < deadline <= now+(24 if on_demand else 4)*3600,
+            and math.isfinite(deadline) and now+300 < deadline <= now+(24 if on_demand else 4)*3600
+                + config.get('authorization_extension_s', 0),
             'scaler_explicit_finite_authorization_required')
         # Never resume an uncertain previous lifecycle via a fresh start.
         entries = {path.name for path in (ROOT/'control').iterdir()}

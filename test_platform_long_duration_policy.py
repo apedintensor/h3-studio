@@ -13,7 +13,7 @@ from comfy_workflow import native_output_spec
 from studio_platform.capabilities import compile_request
 from studio_platform.control import WorkerControl, WorkerSpec
 from studio_platform.execution_policy import reservation_for_duration, validate_policy
-from studio_platform.production_scaler import FiniteController, ScalerError, verify_policy
+from studio_platform.production_scaler import FiniteController, ScalerError, read_config, verify_policy
 from studio_platform.qualification_profiles import (
     FL50_PROFILE, MULTIMODAL_PROFILE, MULTIMODAL_INPUT_LIMITS, QUEUED_TASK_PROFILE,
 )
@@ -21,7 +21,7 @@ from studio_platform.repository import Repository, registered_workers, request_h
 from studio_platform.settings import Settings
 from test_platform_api import generation_request
 from test_platform_execution_policy import policy
-from test_platform_production_scaler import FakeProvider, configuration
+from test_platform_production_scaler import FakeProvider, as_json, configuration
 
 
 class LongDurationPolicyTests(unittest.TestCase):
@@ -158,6 +158,60 @@ class LongDurationPolicyTests(unittest.TestCase):
         self.verify()
         _, slots = controller._observations(instances)
         self.assertEqual(slots[0].available_after_s, 1800)
+
+    def test_explicit_five_hour_authorization_preserves_start_and_binds_config_identity(self):
+        from studio_platform.on_demand_scaler import json_config
+        deadline = self.config.created_at + 29*3600
+        changes = {'allowed_owners': ['superdan', 'supervan'], 'hard_deadline': deadline,
+            'scale_policy': {**self.config.scale_policy, 'hard_deadline': deadline}}
+        with self.assertRaises(ScalerError):
+            replace(self.config, **changes)
+        extended = replace(self.config, authorization_extension_s=18000, **changes)
+        self.assertEqual(extended.created_at, self.config.created_at)
+        self.assertEqual(extended.hard_deadline-self.config.created_at, 29*3600)
+        self.assertEqual(extended.scale_policy['approved_remaining_microusd'],
+                         self.config.scale_policy['approved_remaining_microusd'])
+        self.assertEqual(extended.manifests, self.config.manifests)
+        self.assertEqual(extended.budget_account_ids, self.config.budget_account_ids)
+        self.assertEqual(json_config(extended)['authorization_extension_s'], 18000)
+        self.assertEqual(extended.fingerprint(), request_hash(json_config(extended)))
+        self.assertNotIn('authorization_extension_s', json_config(self.config))
+        self.assertEqual(self.config.fingerprint(), request_hash(as_json(self.config)))
+        path = self.root/'synthetic-extension-config.json'
+        path.write_text(json.dumps(as_json(extended)), encoding='utf-8')
+        path.chmod(0o600)
+        loaded = read_config(path)
+        self.assertEqual(loaded.fingerprint(), extended.fingerprint())
+        self.assertEqual(loaded.created_at, extended.created_at)
+        self.assertEqual(loaded.authorization_extension_s, 18000)
+        with self.assertRaises(ScalerError):
+            replace(extended, hard_deadline=deadline+1,
+                scale_policy={**extended.scale_policy, 'hard_deadline': deadline+1})
+
+    def test_authorization_extension_rejects_other_values_profiles_or_private_scope(self):
+        for value in (True, 18000.0, -18000, 1, 18001, 36000, None, '18000'):
+            with self.subTest(value=value), self.assertRaises(ScalerError):
+                replace(self.config, allowed_owners=['superdan', 'supervan'], authorization_extension_s=value)
+        with self.assertRaises(ScalerError):
+            replace(self.config, authorization_extension_s=18000)
+        for profile in (FL50_PROFILE, MULTIMODAL_PROFILE):
+            with self.subTest(profile=profile), self.assertRaises(ScalerError):
+                replace(self.config, allowed_owners=['superdan', 'supervan'],
+                        authorization_extension_s=18000, qualification_profile=profile)
+
+    def test_host_accepts_only_same_explicit_five_hour_extension(self):
+        from test_platform_gpu_scaler import scaler, on_demand_configuration, release
+        original = on_demand_configuration()
+        extended = {**original, 'hard_deadline': original['hard_deadline']+18000,
+            'authorization_extension_s': 18000, 'qualification_profile': QUEUED_TASK_PROFILE}
+        self.assertTrue(scaler.on_demand_config(extended))
+        for field, value in (('authorization_extension_s', 0), ('authorization_extension_s', 36000),
+                             ('authorization_extension_s', 18000.0), ('authorization_extension_s', True),
+                             ('qualification_profile', MULTIMODAL_PROFILE), ('allowed_owners', ['superdan']),
+                             ('service_mode', None), ('hard_deadline', extended['hard_deadline']+1)):
+            with self.subTest(field=field, value=value), self.assertRaises(release.ReleaseError):
+                scaler.on_demand_config({**extended, field: value})
+        self.assertEqual(extended['created_at'], original['created_at'])
 
 
 if __name__ == '__main__':

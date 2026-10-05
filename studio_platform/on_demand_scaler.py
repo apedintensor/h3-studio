@@ -59,6 +59,8 @@ def json_config(config):
         value.pop("qualification_profile")
     if value.get("allowed_owners") is None:
         value.pop("allowed_owners")
+    if value.get("authorization_extension_s") == 0:
+        value.pop("authorization_extension_s")
     for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[key] = str(value[key])
     return json.loads(json.dumps(value))
