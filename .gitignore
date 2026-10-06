@@ -75,6 +75,14 @@ inventory.json
 !studio_platform/storage_asset_journal.py
 !studio_platform/rent_journal.py
 !studio_platform/worker.py
+!studio_platform/inference/
+!studio_platform/inference/__init__.py
+!studio_platform/inference/protocol.py
+!studio_platform/inference/outputs.py
+!studio_platform/inference/comfy.py
+!CURRENT-BASELINE.md
+!GENERATION-CONTRACT.md
+!GENERATION-FOUNDATION-RESULT.md
 !studio_platform/control.py
 !studio_platform/execution_policy.py
 !studio_platform/fleet.py

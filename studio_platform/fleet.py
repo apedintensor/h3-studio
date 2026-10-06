@@ -366,9 +366,8 @@ def run_slot(config, worker_id, settings, *, repository=None, store_factory=crea
                 control.mark_ready(worker_id, upstream_idle_confirmed=True)
             elif slot.confirmed_idle:
                 # A startup declaration alone is insufficient: the dedicated
-                # endpoint must currently report both running and pending empty.
-                queue = backend._json("GET", "/queue")
-                if (not isinstance(queue, dict) or queue.get("queue_running") != [] or queue.get("queue_pending") != []):
+                # engine must currently confirm idle through its adapter.
+                if backend.is_idle() is not True:
                     raise ValueError("fleet_upstream_idle_not_confirmed")
                 control.mark_ready(worker_id, upstream_idle_confirmed=True)
             elif worker["state"] != "ready" or worker["expires_at"] <= repo.clock():

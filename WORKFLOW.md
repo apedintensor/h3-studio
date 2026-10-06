@@ -36,13 +36,13 @@ Preserve other sessions' changes and existing operational limits. Use English on
 | A — Baseline and contracts | Verify existing entry points, versions, capabilities, states, and contracts |
 | B — Minimum generation loop | Complete submission, on-demand capacity, generation, persistence, and download for the same job |
 | C — Failure recovery | Handle duplicate submissions, unknown outcomes, cancellation, restart, and artifact collection |
-| D — Native engine comparison | Compare candidate engines under equivalent conditions and verify each capability |
+| D — WanGP runtime integration | Integrate upstream WanGP through an adapter and qualify it against the fixed baseline |
 | E — Dual-GPU redundancy | Isolate members and budgets, serve from the first ready member, and release idle capacity |
 | F — Object storage and recovery | Establish independent backups, object-storage migration, and recovery |
 | G — Scenario integration | Connect approved Quick Chat, Yingxu, and other scenarios to the shared backend |
 | H — Collaboration and scale | Add collaboration permissions and scale only when supported by demonstrated needs |
 
-The near-term sequence is **A → B → C**; use the plan and board for specific dependencies. Authorized local UX work can proceed independently, but a completed page cannot substitute for generation-loop acceptance. Split parent work packages into bounded, verifiable vertical slices rather than assigning “the entire frontend” or “the entire backend.”
+The near-term sequence is **A1 → A2 → B plus D integration → C recovery acceptance → public B/D proof**, then E/G. C semantics are designed alongside B/D. Use [CURRENT-BASELINE.md](CURRENT-BASELINE.md), [GENERATION-CONTRACT.md](GENERATION-CONTRACT.md), the plan and board for evidence and dependencies. Authorized local UX work can proceed independently, but a completed page cannot substitute for generation-loop acceptance. Split parent work packages into bounded, verifiable vertical slices rather than assigning “the entire frontend” or “the entire backend.”
 
 ## Claim work before editing
 

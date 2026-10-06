@@ -2,6 +2,8 @@
 
 ## Cross-session workflow (2026-10-06)
 
+Generation foundation entry points: read `CURRENT-BASELINE.md` for the dated source/production facts and `GENERATION-CONTRACT.md` for the frozen A2 compatibility and recovery contract before changing admission, workers or runtime routing. Follow the latest issue claim and `GENERATION-FOUNDATION-RESULT.md` for this batch's checks and remaining gates. A healthy website or historical inference receipt does not imply generation is currently enabled. WanGP is the selected target; the Comfy adapter extraction itself does not enable WanGP or renew a GPU operating window.
+
 For Sixnine/H3/Yingxu development, read `PROJECT-PLAN.md`, `WORKFLOW.md`, and `workflow/project.json` before editing. The shared Project is https://github.com/users/apedintensor/projects/2 and the repository is `apedintensor/h3-studio`. Read the assigned issue, parent package, dependencies and latest claim; claim a bounded scope with the session ID, branch/worktree and owned files. Check existing local changes and overlapping work. GitHub content is English. Keep task progress in the existing issue/Project and behavior in the spec; leave an evidence-based handoff before stopping. `Done`, local verification and production release are distinct. Respect the user's latest instructions and existing operational authorization; this workflow does not start GPUs, renew budgets or authorize deployment. A projectless session must be given this repository or Project link to find these instructions.
 
 ## 当前已租 GPU 切换真实队列策略（2026-10-05，执行中）
