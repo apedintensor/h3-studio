@@ -1,5 +1,7 @@
 # Sixnine 生成平台：架构收敛与可靠性实施顺序
 
+> 历史审查：2026-10-06 的静态证据，不是当前线上状态或新的执行顺序。现行决策以 PROJECT-PLAN.md、GENERATION-CONTRACT.md 和当前 Issue 为准；已选定 WanGP，D1/D2/B3 分别验收。
+
 日期：2026-10-06，Australia/Sydney。
 
 后续完整规划入口：[统一业务 API、生成后端与部署规划](UNIFIED-BACKEND-API-PLAN.zh-CN.md)。本文件保留本次可靠性审查的历史依据；后续API、技术栈与工作包决策统一在新规划中维护，避免两份方案独立漂移。

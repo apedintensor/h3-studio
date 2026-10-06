@@ -1,12 +1,12 @@
 # Sixnine 统一业务 API、生成后端与部署规划
 
-版本：0.1｜研究与本地代码核对日期：2026-10-06（Australia/Sydney）
+版本：0.2｜初始研究：2026-10-06；路线修订：2026-10-07（Australia/Sydney）
 
 **交付性质：可供讨论、拆任务和开发验收的完整设计建议；不是已上线声明。** 本轮未修改运行代码、安装软件、下载模型、调用付费 API、租用 GPU 或发布。文内路线、目标和接口增量，均需按后面的阶段实施并用证据验收。
 
 阅读顺序：先读第 1–4 节决定架构；第 5–11 节供后端和 Agent 接口开发；第 12–17 节供推理、GPU、部署开发；第 18–22 节用于安排工作和验收。
 
-本文件是本轮规划的单一入口，整合上一份 `GENERATION-RELIABILITY-ARCHITECTURE.zh-CN.md`。实际现状以代码、带日期的部署回执为准；已确认的快速创作 UI 以项目 AGENTS 指向的 mock 为准。发生冲突时记录差异并修订本文件，不能让新生成的设计文字默默覆盖用户决定。
+本文件是中文详细设计，补充英文 [PROJECT-PLAN.md](PROJECT-PLAN.md)，并整合早期 `GENERATION-RELIABILITY-ARCHITECTURE.zh-CN.md`。当前兼容约束读 [GENERATION-CONTRACT.md](GENERATION-CONTRACT.md)，带日期的运行事实读 [CURRENT-BASELINE.md](CURRENT-BASELINE.md) 与后续发布回执；不另维护一套任务状态。已确认的快速创作 UI 以项目 AGENTS 指向的 mock 为准。用户决定发生变化时修订对应段落，不让旧候选排序或新增设计文字覆盖已确认路线。
 
 导航见 [规划与实现索引](PLANNING-INDEX.zh-CN.md)。如何复用现有代码、哪些局部替换、哪些只作退役候选，见 [复用与模块化决策](REUSE-AND-MIGRATION-DECISION.zh-CN.md)；它补充本文的迁移方法，不另建路线图。
 
@@ -14,7 +14,7 @@
 
 推荐：**Python/FastAPI 模块化业务后端 + PostgreSQL 持久任务账本 + 独立 CPU 执行 Worker + 独立 GPU 容量控制器 + 可替换的推理引擎 + 私有媒体存储。**
 
-近期保留已有 EC2 CPU 控制面和 Lium GPU 通道；存储先保护现有 Local 数据，再迁移到私有 S3。当前 ComfyUI 作为已有真实生成证据的基线；**SGLang Diffusion 原生 H3 服务是首选新增生产候选**，通过参数覆盖、真实推理和故障恢复对照后，按 recipe 切换。vLLM-Omni 是第二候选，Diffusers 是自定义 pipeline 备选。此顺序是本项目的工程判断，不是上游承诺它一定最快或最可靠。
+近期保留已有 EC2 CPU 控制面和 Lium GPU 通道；存储先保护现有 Local 数据，再评估迁移到私有 S3。**用户已确认采用上游 WanGP headless runtime，通过薄适配器接入，并确认已获得授权。** 固定研究源码为 `deepbeepmeep/Wan2GP@0e58385fbde7ff102d276e4a9e490845de76b4ea`；组件权重、依赖和镜像仍须独立冻结。ComfyUI 保留已有任务的执行/恢复与回滚基线；通过参数、真实推理和恢复验收后，只切新接收任务。SGLang、vLLM-Omni、Diffusers 的内容保留为历史备选研究，不再是当前实施优先级。[R17]
 
 最先完成四件事：
 
@@ -25,11 +25,11 @@
 
 网站交互可以独立迭代。生成底座的验收不依赖新版映序页面完成，也不以换框架、换引擎或 GPU 显示 RUNNING 为通过标准。
 
-### 1.1 本次核查纠正的部署认识
+### 1.1 初始研究纠正的部署认识（历史比较，不改变当前选型）
 
-MiniMax 官方目前列出了 SGLang、vLLM、Diffusers、ComfyUI，并直接给出 SGLang 部署 H3-Base 的示例。自建全套开放组件是 H3-Base 的两个任务分区及编码器、视频/音频 VAE；完整系统的 Context-IR 与 Regenerate-2K 不能因为部署了 Base 就宣称已经具备。[R1]
+2026-10-06 初始查阅的 MiniMax 官方资料列出了 SGLang、vLLM、Diffusers、ComfyUI，并给出 SGLang 部署 H3-Base 示例。这些是上游支持证据，不是本站选型或实测。自建全套开放组件是 H3-Base 的两个任务分区及编码器、视频/音频 VAE；完整系统的 Context-IR 与 Regenerate-2K 不能因为部署了 Base 就宣称已经具备。[R1]
 
-SGLang 的 Ref2VA 文档允许参考素材与首尾 keyframe 组合；现有页面一律互斥是当前模板/执行池限制，不能成为永远写死的模型规则。新引擎是否覆盖任意时刻 guide、mask 及我们现有高级参数，仍需逐项核验。[R2]
+初始查阅的 SGLang Ref2VA 文档允许参考素材与首尾 keyframe 组合；这说明不能把旧页面的模板限制永久写成模型规则，但不能转用为 WanGP 已支持/已开放的证据。所选 WanGP 配方的首尾、参考、guide、mask 和高级参数，仍须按其固定源码与实际路径逐项核验。[R2][R17]
 
 “满血”在本项目定义为：**对所选公开模型/配方，不静默丢弃已经承诺的控制与输入；每个限制可解释。** 它不代表同时拥有所有托管功能，也不代表用蒸馏、量化或小编码器后仍与原始配方等价。
 
@@ -44,10 +44,10 @@ SGLang 的 Ref2VA 文档允许参考素材与首尾 keyframe 组合；现有页�
 | 任务恢复 | SQL 队列、lease/fence、提交未知对账、结果收集恢复已有 | 优先联调与验证真实故障，不把已有机制当新增功能 |
 | GPU 执行 | CPU WorkerRunner 调远端私有 ComfyUI；旧策略有真实生成记录 | 这是对照基线；GPU 本身不直接访问业务数据库 |
 | 最近新策略 | 10/5 发布了 queued-task-first；新冷启动/15 秒仍缺实测 | 不用旧测试证明新组合已可靠 |
-| 服务可用性 | 最近记录窗口截止 10/5 23:45；今天 10/6 | 必须重新只读核验当前状态，不能推断已停机或仍可服务 |
+| 服务可用性 | A1 已集中记录带日期的线上观察与未结算义务 | 查 CURRENT-BASELINE 与后续回执；不在本表另维护开关/实例数字，不从旧窗口推断今天可用性 |
 | 双机 | 已有设计、旧有限并发实测；当前按需代码仍有单机约束 | 双机按需与节点故障隔离仍需实施 |
 | 存储/协作 | 当前 Local 媒体；owner 隔离及版本冲突已有 | S3 迁移、跨账户协作尚不能称已完成 |
-| 新引擎 | SGLang、vLLM-Omni、Diffusers 有上游 H3 支持 | 本项目尚未验收，不能直接生产替换 |
+| 新引擎 | 已选 WanGP；B2 提供执行接口提取，D1为离线适配器/回执切片 | 尚未证明真实 WanGP 生成、全部控制或生产路由；历史备选不是并行实施任务 |
 
 证据入口见第 22 节。本轮未读取在线队列、账户余额或生产媒体。
 
@@ -115,7 +115,7 @@ flowchart TB
 | `control.py`、`fleet.py`、`production_scaler_boot.py` | 物理执行槽归属、进程监督、运行时引导 | 不等同供应商租赁；引擎相关准备通过明确接口处理 |
 | `on_demand_scaler.py`、`production_scaler.py`、`scaler.py`、`autoscale.py` | 按需周期、有限政策、租赁协调、纯容量建议 | 它们多数在同一调用链；拆开政策并保留唯一租赁副作用权威，不能按文件名删除父类 |
 | `production_worker.py` | 历史已交接单卡的有限验收入口 | 部署helper仍有引用；只列退役候选，不当作通用Worker重新扩写 |
-| 新增引擎 adapter 模块（具体目录随工作包定） | Comfy、SGLang、外部 API 协议转换 | 共享错误/回执合同；不在公开 DTO 暴露私有节点结构 |
+| `studio_platform/inference/` | B2已有Comfy适配与共享协议；拟增WanGP薄适配 | 共享错误/回执合同；不在公开DTO暴露私有节点或把新增类视为生产已启用 |
 
 先为上述边界建立可独立调用的接口，再逐步移动实现。不是把一个巨型文件平均切成几份，也不是强制每个模块独立部署。HTTP 层、领域命令、数据访问和供应商协议各自变化时，应能只验相关合同。
 
@@ -142,7 +142,7 @@ Quick Chat 现有隐藏 project/shot 是兼容执行投影，继续由服务维�
 
 ## 6. API 目录：保留真实入口，增量补齐合同
 
-以下“已有”表示本地代码或文档中存在，不表示当前公网可用。路径以实际 `/v1` 为基线；新增字段和端点标为“拟增”。先做兼容增量，不为架构整理整体改成 `/v2`。
+以下“已有”表示本地代码或文档中存在，不表示当前公网可用。Quick Chat及一次性连接码相关接口是本地未发布集成；不能把这张目录当公网SDK文档。路径以实际 `/v1` 和 A2 兼容映射为基线；新增字段和端点标为“拟增”。先做兼容增量，不为架构整理整体改成 `/v2`。
 
 | API 组 | 当前入口/规划入口 | 实施要求 |
 |---|---|---|
@@ -151,10 +151,10 @@ Quick Chat 现有隐藏 project/shot 是兼容执行投影，继续由服务维�
 | 能力 | 已有 `GET /v1/capabilities`、`GET /v1/guided-schema` | 补类型、版本、组合约束与明确开关状态 |
 | 故事目录 | 已有 `/v1/projects` 与项目读取/更新 | 含多个故事；权限分页；隐藏执行投影不出现在普通故事目录 |
 | 故事内容 | 已有 `/{project}/entities`、`/{project}/actions`、`/{project}/activity` | 对章、场、镜头、人物、地点提供类型化命令；不能绕过版本和权限 |
-| 素材 | 已有 `/v1/assets`、`/{id}/content`、`/{id}/derivatives`、`/{id}/resume` | ready 才参与推理；后续拟增上传会话/直传，但保留原上传 |
+| 素材 | 已有 `POST/GET /v1/assets`、`/{id}/content`、`/{id}/derivatives`、`/{id}/resume` | 上传/查询使用受授权校验的 `client_project_id`；ready 才参与推理；拟增上传会话/直传不替换原接口 |
 | 镜头草稿 | 已有镜头 `generation-draft`、`generation-plans` | 修改保存到当前镜头；冻结版本后再生成 |
 | 通用预检 | 已有 `POST /v1/generation-plans` | 统一 GenerationSpec；保留旧镜头输入兼容；拟增非镜头 source_ref |
-| 通用任务 | 已有 `/v1/jobs`、`/{id}`、取消及 artifacts 内容入口 | 增强分阶段状态、恢复动作与请求追踪；不改变已提交任务身份 |
+| 通用任务 | 已有 `/v1/jobs`、`/{id}`、取消及 artifacts 内容入口 | 当前 POST 提交 `{"plan_id":"..."}` 与 Idempotency-Key；不接受本文拟增GenerationSpec直接生视频；状态增量不改已提交身份 |
 | 批量 | 已有 `/v1/batches` | 与 Quick Chat 的 copies 聚合不同，但共用 jobs；逐项结果和恢复 |
 | 聊天目录 | 已有 `/v1/quick-chat/sessions` 与 session 读写 | 名称、下一轮设置、模型选择、版本控制 |
 | 聊天材料/轮次 | 已有 session `assets/materials/turns` | 发送可原子保存草稿卡；讨论和视频提交明确分开 |
@@ -252,8 +252,8 @@ Worker 领取使用现有租约和 fence 原子竞争；提交外部推理前先
 | 控制类别 | 对外规划 | 上线前依据 |
 |---|---|---|
 | 文生/首帧/尾帧/首尾 | 首批稳定能力 | 精确 FL2VA 配方及真实任务 |
-| 图片/视频/音频参考与混合 | 首批目标完整能力，分组合验收 | Ref2VA 编码、时长、输入上限及输出声音验证 |
-| 参考＋首尾 | 新引擎候选能力 | SGLang 文档声明；本服务未验证时不直接放开 |
+| 图片/视频/音频参考与混合 | 完整目标，Ref2VA另设组合验收，不阻塞首个FL单槽闭环 | Ref2VA 编码、时长、输入上限及输出声音验证 |
+| 参考＋首尾 | 所选recipe待核验组合 | WanGP精确参数映射与真实验收；历史SGLang文档不能作为本站启用依据 |
 | 时长/画幅/尺寸/声音 | 高频控件；服务返回原生采样规格 | 请求时长与成片帧数不能混为一值 |
 | seed/steps/sampler/shift | 高级参数，默认来自执行配置 | 不跨引擎机械映射同名参数 |
 | 任意时刻 guide | 当前已公开范围逐项对照 | 引擎支持不等于当前模板支持；未等价保留兼容路由 |
@@ -299,20 +299,21 @@ Agent 使用现有素材上传保存文件和来源说明，再执行场景绑�
 
 ## 11. 执行合同与恢复：不依赖具体推理框架
 
-建议 InferenceAdapter 的内部能力如下；接口为设计，不声称当前函数同名：
+B2已按 A2 提取的内部接口如下，见 `studio_platform/inference/protocol.py`。这不是公众 API，也没有启用 WanGP：
 
 ```text
-describe_capabilities(deployment) -> capabilities + fingerprint
-check_runtime(deployment) -> readiness evidence
-prepare_inputs(attempt, assets) -> immutable input manifest
-submit(attempt_id, fence, request_hash, compiled_request) -> receipt | unknown
-inspect(receipt or attempt_id) -> accepted/running/completed/failed/unknown
-request_cancel(receipt) -> requested/confirmed/unsupported/unknown
-collect(receipt) -> output manifest + bytes/authorized handles
-reconcile(attempt_id, request_hash) -> evidence, never speculative re-submit
+kind, enabled, slot_key
+prepare(job, attempt_tag, storage, heartbeat) -> prepared
+submit(prepared, attempt_tag) -> upstream_task_id
+reconcile(attempt_tag, upstream_task_id=None) -> Outcome
+poll(attempt_tag, upstream_task_id) -> Outcome
+cancel(attempt_tag, upstream_task_id) -> acknowledgement, not stop proof
+fetch(job, attempt_tag, upstream_task_id, target_dir, heartbeat) -> owned output paths
+is_idle() -> bool; only exactly True is idle evidence
+optional cost_resolver and close()
 ```
 
-现有 ComfyBackend 对应实现优先抽成适配器，随后实现 SGLangAdapter。LiumProvider 与二者是不同接口：它管理实例，不是视频模型 API。API 与 Worker 只依赖稳定的应用合同，不能让 node IDs、端口、shell 命令进入业务请求。
+ComfyBackend已提取到 `inference/comfy.py`，旧worker导入保留兼容；boot/准入/执行配置仍需后续解耦。下一步 WanGPAdapter 使用同一接口，D1只做默认禁用、注入假Session的适配器及持久操作回执，不加入生产backend枚举。引擎身份/完整能力探测、真实引导和私有传输是后续明确增量，不冒充上述接口已提供的行为。LiumProvider管理实例，不是视频模型API；业务请求不包含node IDs、端口或shell命令。
 
 | 故障位置 | 安全恢复 |
 |---|---|
@@ -326,7 +327,7 @@ reconcile(attempt_id, request_hash) -> evidence, never speculative re-submit
 | Worker 心跳失联 | 不直接判定 GPU 已停止；租约 fence 阻止旧 worker 改写新状态 |
 | 租赁创建结果不明 | 保留 intent、容量计数和资金预留，对账后再决定 |
 
-Comfy 的有限 history/queue 查询是已识别恢复边界。新引擎也必须核验异步 ID、重启后查询、输出保留和取消语义。一个 async API 或额外收据文件都不自动保证 exactly-once；平台承诺的是业务唯一接收、受控尝试、未知不盲重投、可审计恢复。
+Comfy 的有限 history/queue 查询是已识别恢复边界。WanGP headless Session/MCP内存句柄也不能作为重启后的任务权威；必须在调用前持久记录原attempt的操作意图，丢响应或丢句柄后对账同一操作，不自动重发。一个 async API 或额外收据文件都不自动保证 exactly-once；平台承诺业务唯一接收、受控尝试、未知不盲重投和可审计恢复。[R17]
 
 初期继续由 CPU Worker 上传素材、收集结果。后续引擎侧持久执行网关可作为适配增强，但不能另造独立调度系统。若供应商磁盘随 pod 销毁消失，网关本地记录也不能算跨销毁持久证明。
 
@@ -349,20 +350,23 @@ unknown 不能当空闲自动销毁，但也不能无限延长租赁：实例仍
 
 ## 12. 推理引擎选型与替代 ComfyUI 的路径
 
+当前决策是固定上游 WanGP headless 接入；下表其他框架保留历史比较价值。选型已确认，接入与上线仍须通过门槛，不能把“已选”写成“已验证”。
+
 | 方案 | H3 支持依据 | 优点 | 风险/限制 | 本项目选择 |
 |---|---|---|---|---|
-| **固定 ComfyUI + 官方 H3 节点** | MiniMax 推荐及 Comfy 官方教程 [R1][R5]；本项目有历史成功 | 复用现有工作流与高级控制，可作为对照 | 节点/模板版本耦合；历史查询与恢复须加强；插件更新会改变行为 | 保留基线与必要高级功能兼容 |
-| **SGLang Diffusion 原生服务** | 官方 H3 cookbook、异步视频接口 [R2] | 面向服务的部署、GPU 拓扑与优化选项；可摆脱业务对节点图依赖 | 本项目未验；高级 guide/mask、取消/重启持久性需对照；FL/Ref 分区的资源安排要清楚 | 首选新生产候选，通过门槛后逐 recipe 切换 |
-| **vLLM-Omni** | vLLM 官方 H3 recipe [R3] | 多模态 serving、共享组件、多卡配置 | 依赖 Omni 当前源码/版本，不是普通 wheel 即可；文档明确部分参考组合仍受限 | 第二候选，实际合同比通用宣传优先 |
-| **Diffusers ModularPipeline + 自建服务** | HF 专门 H3 文档 [R4] | 可自定义处理与组件共享，便于研究和精确控制 | 需自建服务、任务生命周期、调度与恢复；不能误用通用 DiffusionPipeline 示例 | 研究/特殊控制路径，非第一生产迁移 |
-| **SGLang 与 Comfy 混合** | SGLang cookbook 集成模式 [R2] | 能保留节点图，替换部分计算后端 | 仍有两套运行边界；仅 DiT 加速不等于完整原生服务迁移 | 专项实验，不作为默认架构 |
+| **固定上游 WanGP headless** | 固定SHA的Session API、H3 handler/pipeline [R17]；用户已确认授权 | 复用现成H3执行与内存管理，通过薄适配器连接 | 内存句柄不持久；默认INT8/20步、自动裁剪及控制映射不能照搬；组件版本与硬件仍待验 | 已选定接入；先D1离线，再真实映射/引导与单槽验收，最后只切新任务 |
+| **固定 ComfyUI + 官方 H3 节点** | MiniMax 推荐及 Comfy 官方教程 [R1][R5]；本项目有历史成功 | 复用原工作流，保留已接收任务解释器 | 节点/模板版本耦合；历史查询与恢复边界仍在 | 旧任务恢复、对照与回滚基线，不是另一条新增功能路线 |
+| **SGLang Diffusion 原生服务** | 初始研究：官方 H3 cookbook、异步视频接口 [R2] | 服务化部署、GPU拓扑与优化选项 | 本项目未验；高级控制、取消/重启持久性须核对 | 历史备选，无当前首选实施指令 |
+| **vLLM-Omni** | 初始研究：vLLM官方H3 recipe [R3] | 多模态serving、共享组件、多卡配置 | 依赖Omni具体版本；文档部分参考组合受限 | 历史备选，不与WanGP并行接入 |
+| **Diffusers ModularPipeline + 自建服务** | 初始研究：HF专门H3文档 [R4] | 可自定义处理与组件共享，便于研究和精确控制 | 需自建服务、任务生命周期、调度与恢复；不能误用通用 DiffusionPipeline 示例 | 历史备选，不与WanGP并行实施 |
+| **SGLang 与 Comfy 混合** | 初始研究：SGLang cookbook集成模式 [R2] | 能保留节点图，替换部分计算后端 | 仍有两套运行边界；仅 DiT 加速不等于完整原生服务迁移 | 历史专项研究，不是当前实施路径 |
 | **外部 H3 API** | MiniMax 托管 API；Engy/Boyesir 本地历史资源 | 减少我们负责的模型启动；可覆盖托管能力 | 控制不一定等价，限流/价格/数据传输/取消/未知计费各异 | 按 provider 验收后显式可选，不静默兜底 |
 
-vLLM-Omni 当前 recipe 特别注明 serving 路径接受的参考组合少于模型的总体上限；不能把“支持 H3”解读为全部控制已等价。[R3] 上游 main/nightly 文档会变化，实施时固定源码 SHA、镜像 digest、依赖锁与模型 revision，记录实际复现环境。
+初始查阅的vLLM-Omni recipe注明serving路径接受的参考组合少于模型总体上限；不能把“支持H3”解读为全部控制等价。[R3] 此处保留历史观察，不更新备选框架实时状态。WanGP实施时仍须固定源码SHA、镜像digest、依赖锁与每个模型组件revision；内存offload profile与权重量化是不同配置，不能混称“满血”。
 
 ### 12.1 更换引擎的门槛
 
-先用同一规范请求和素材制作能力矩阵：纯文本、首帧、尾帧、首尾、图片参考、视频参考及原声、音频参考、混合参考、最长时长和各个公开高级控制。针对新支持的混合首尾模式另开测试项；不拿旧 Comfy 模板限制当期望真值。
+首个真实验收固定一个FL2VA Base recipe、一个槽和明确参数包络，先证明原任务可交付；其余组合分别验收，不要求先跑完所有拓扑与加速模型。完整矩阵仍覆盖纯文本、首帧、尾帧、首尾、图片/视频/音频及混合参考、时长和已承诺高级控制。新支持的混合首尾模式独立记录；旧Comfy模板限制不是新引擎能力真值，未支持的请求也不能静默改变。
 
 在同硬件、同精度、同输入尺寸/帧数、同采样与权重条件下，比较成片质量、声音、峰值 GPU/CPU 内存、冷/暖执行时间和恢复行为。不同 kernel 不保证同 seed 的像素级一致，要用任务相关质量与控制遵从验收；若是量化/蒸馏，对照表必须单列质量变化。
 
@@ -384,7 +388,7 @@ vLLM-Omni 当前 recipe 特别注明 serving 路径接受的参考组合少于�
 | 2×5090 | 容量/成本候选；上游有 32GB×2 配方 | 不默认两张卡就两倍吞吐，CPU RAM/PCIe/模型卸载同样重要 |
 | H200/B200 等数据中心卡 | 暖机吞吐和多卡单任务延迟候选 | 不用硬件名推断整套功能已覆盖 |
 
-上游 cookbook 的 2×5090 配方还依赖大量主机 RAM；采购筛选不能只看 GPU 显存。任何新拓扑先登记为候选，按实际请求包络验收后成为可领取槽。[R2]
+初始SGLang cookbook的2×5090配方还依赖大量主机RAM；这是历史框架配方，不能当WanGP已验证的硬件规格。所选WanGP也须测CPU RAM、GPU显存、临时盘和模型组件配置；新拓扑先登记为候选，按实际请求包络验收后才能接单。[R2][R17]
 
 ### 13.2 原版与加速模型分别命名
 
@@ -432,7 +436,7 @@ Controller 作为独立受监督 CPU 服务，脱离桌面会话持续运行；�
 | 长流程 | 当前显式状态机与恢复循环 | Temporal，或特定 AWS 工作流 | 多阶段、长等待、跨服务补偿复杂度已超过维护成本 |
 | CPU 部署 | EC2 + Docker Compose；systemd 管理控制服务 | ECS/Fargate 承载 CPU API/Worker；RDS | 明确可用性目标，需要减少单机运维与独立扩容 |
 | GPU 部署 | Lium Provider + 固定容器 + 私有端口 | AWS GPU EC2/ECS、其他已验 provider | 库存、数据位置、成本或可靠性实测支持 |
-| 模型服务 | Comfy 基线 + SGLang 原生候选 | vLLM-Omni、Diffusers 服务 | 控制覆盖与质量/性能/恢复测试通过 |
+| 模型服务 | 上游WanGP薄适配接入；Comfy旧任务/回滚基线 | SGLang、vLLM-Omni、Diffusers仅历史备选 | 固定组件/控制/引导、单槽真实生成与恢复通过后才切新任务 |
 | 媒体 | Local 保护后迁移 S3 | R2；Hippius 实验 | 可用性/流量/语义/迁移验证通过 |
 | 运维 | 结构化日志、指标、审计、独立恢复命令 | OpenTelemetry 接入集中观察平台 | 先保证每单可定位，不先堆监控组件 |
 
@@ -499,22 +503,22 @@ CI 按改动范围执行：纯 UI 只做构建和交互边界；协议/权限/�
 | A 基线与合同 | P0 / 架构+后端 | 当前部署只读核验、能力/状态/错误映射、已有 API 类型清单 | 能说明当前接单到交付每层版本、开关和阻塞；无历史记录冒充健康 |
 | B 最小生成闭环 | P0 / 后端+执行 | 保留现有 API 的统一 GenerationService 边界、可关联阶段回执、自动下载验收脚本 | 同一任务从零容量到真实成片；暖单继续；空闲关机后再起；不依赖新 UI |
 | C 故障恢复 | P0 / 执行+控制器 | unknown/取消/重启/收集恢复合同与受控恢复工具 | PostgreSQL 竞争、跨 actor 重复提交、丢响应、下载失败、缺货和预算阻塞均符合合同 |
-| D 原生引擎比较 | P1，可与不相冲突的合同工作并行 / 推理 | 固定 SGLang 环境、adapter、功能矩阵、同口径报告 | 第12节功能、质量、耗时和恢复门槛通过；缺功能不静默抛弃 |
+| D WanGP执行层接入 | P0，通过A合同后与B的独立部分并行 / 推理 | 固定上游薄适配、持久回执、真实映射/引导与功能矩阵；分离D1离线和真实GPU验收 | 所选recipe控制、输出、资源和恢复门槛通过后只切新任务；不要求首批完成所有模型比较 |
 | E 双机冗余 | P1 / 控制器 | session/member、逐节点隔离与预算、先ready先服务 | 一台故障另一台可用，同任务不双投；unknown 保留计费/容量；600秒全池空闲关闭 |
 | F 对象存储与恢复 | P1 / 存储 | Local独立备份、S3读写与迁移计划、恢复演练 | 原输入/成片可核验，旧链接有兼容，迁移可回滚，不删除唯一副本 |
 | G 场景重新接入 | 基础闭环稳定后 / 前端+业务 | 认可 Quick Chat 的真实客户端、映序按用户故事改造 | 同一份数据/任务/结果；该上传的位置有真实上传；无后台参数泄漏到普通操作 |
 | H 协作与规模化 | P2 / 业务+运维 | 项目成员/审计、必要多副本与扩容 | 权限、冲突、撤销和规模验收后开放 |
 
-初步依赖：A → B → C；D 通过 A 的 adapter 合同后可开发，真实切换须经过 C 同等恢复验收；E 在单槽可靠后进行；F 的备份部分立即设计，迁移不阻塞 B；G 不能以不断改 UI 代替 B/C。
+依赖顺序：A1/A2 → B接口边界与D1离线切片 → 真实WanGP配置绑定、参数映射及私有引导/传输 → 对应C恢复验收 → B3公网单槽闭环。B3已有B1/B2/C2依赖由Issue/spec维护；缩小验收范围时显式调整，不默跳。D1只注入假Session并验证操作回执，不提供真实模型服务，不能直接视为`#18 → #16`已经准备好。E在单槽可靠后进行；F备份不等迁移，存储迁移不阻塞首个闭环；G不能以改UI替代B/C。
 
 ### 19.1 第一个实施批次的明确范围
 
-1. 当前生产只读对账，保留原 job、预算、窗口和未知租赁证据。
-2. 固定一个已有支持的 Base 执行 profile，统一 capabilities、准入、启动与 Worker 的配置标识。
-3. 将 `phase=job.status` 的粗粒度反馈补成真实阶段和原因，不重设计页面。
-4. 用真实 PostgreSQL 与假上游检查重复提交、重启、unknown、取消、结果恢复。
-5. 有效授权/预算下，用明确确认的队列任务验公网 API 冷启动与下载；成功直接交付，不复制用户任务。
-6. 形成带版本、任务身份、阶段耗时、artifact 校验和实例/费用对账的回执；只对受影响范围发布。
+1. 使用A1带日期基线与A2合同，操作前核对后续变化；保留原job、预算、窗口和未知租赁证据。
+2. 在B2同一执行接口上完成D1默认禁用、假Session的适配器/持久回执；离线验收不启动真实引擎。
+3. 后续固定一个WanGP Base profile的组件、依赖、镜像和真实参数映射，补齐runtime引导/私有传输与每attempt执行身份；旧Comfy恢复不受新路由影响，新backend不能绕过容量/槽位保护。
+4. 用假上游和明确隔离的PostgreSQL检查重复提交、启动丢响应、重启、unknown、取消和结果恢复；真实输出仍经现有ArtifactWriter校验。
+5. 具备当次发布/GPU授权和预算后，用明确确认的队列任务验公网冷启动与下载；成功直接交付。暖单和空闲关机后再起另记录，不复制用户任务当benchmark。
+6. 形成版本、任务身份、阶段耗时、artifact及费用/实例对账回执；页面只增加真实原因和进度，不重设计。若只验引擎隔离运行，不宣称B3公网验收完成。
 
 此批次不同时重写故事数据结构、迁移全部存储、启用所有加速模型或更换整套部署平台。
 
@@ -543,7 +547,7 @@ CI 按改动范围执行：纯 UI 只做构建和交互边界；协议/权限/�
 
 每个工作包交接必须包含：目标和不变规则、真实现有代码入口、请求/响应和状态、错误/恢复、兼容影响、验收项、上线状态。实现中的新发现回写同一个包，不再新增一份没有取代关系的“最终设计”。
 
-建议决策编号：ADR-01 模块化业务服务；ADR-02 PostgreSQL任务事实；ADR-03 CPU Worker/容量分离；ADR-04 引擎adapter；ADR-05 SGLang候选与Comfy保留；ADR-06 私有S3迁移；ADR-07 双机按需；ADR-08 契约版本/幂等；ADR-09 生产政策与测试窗口分离。本文是提案，用户明确确认后再标 accepted。
+建议决策编号：ADR-01 模块化业务服务；ADR-02 PostgreSQL任务事实；ADR-03 CPU Worker/容量分离；ADR-04 引擎adapter；ADR-05 上游WanGP薄适配与Comfy旧任务/回滚；ADR-06 私有S3迁移；ADR-07 双机按需；ADR-08 契约版本/幂等；ADR-09 生产政策与测试窗口分离。这些编号仍是文档组织建议，不另建任务状态；WanGP选择与授权已由用户确认，技术接入、其他架构细节和生产状态不能一起标成已完成。
 
 采用 Spec Kit 或 BMAD 时直接引用这些决策与现有 UX；流程工具用于跟踪 A–H 的规格、任务、验收。无需先重新访谈全产品、重生成界面或把全部旧代码倒写为规格。
 
@@ -553,11 +557,12 @@ CI 按改动范围执行：纯 UI 只做构建和交互边界；协议/权限/�
 
 配套 `UNIFIED-API-CONTRACT-EXAMPLES.draft.json` 给出拟增字段的预检、提交、状态、错误与adapter语义示例。所有ID/哈希为示例占位，不含秘密，不可直接用于当前公网；这是合同讨论材料，不是完整OpenAPI，也不覆盖当前所有旧字段。正式类型必须从实现生成并做兼容检查。
 
-文档完成检查：后端/API 与 H3 引擎分别只读复审，已修正显式重试身份、旧字段类型兼容、hash/provenance 权威、mask 证据等级及联合资源包络。配套 JSON 通过本地解析，章节与代码块结构已检查；这些检查不是软件集成测试或线上可用性验收。
+初始文档检查记录：后端/API与H3研究经只读复审，配套JSON曾通过本地解析；本次修订只对齐选型、接口事实和实施门槛，没有重验上游能力或运行系统。B2软件验收见独立记录；本文检查不是真实推理或线上可用性证明。
 
 ### 本地事实来源
 
 - `AGENTS.md`、`ARCHITECTURE.zh-CN.md`、`SYSTEM-DESIGN-DUAL-GPU.zh-CN.md`、`DEVELOPMENT-RELEASE.zh-CN.md`。
+- `PROJECT-PLAN.md`、`GENERATION-CONTRACT.md`、`CURRENT-BASELINE.md`、`GENERATION-FOUNDATION-RESULT.md`；本地 `.architecture-research/d1-implementation-scope.md` 与 WanGP 固定版本研究。
 - `QUICK-CHAT-INTEGRATION.zh-CN.md`、`QUICK-CHAT-BACKEND-IMPLEMENTATION.zh-CN.md` 与 `../video-studio-design/QUICK-CHAT-PRODUCT-SYSTEM-DESIGN.zh-CN.md`。
 - `studio_platform/api.py`、`generation_admission.py`、`repository.py`、`queue.py`、`control.py`、`fleet.py`、`worker.py`。
 - `quick_chat.py`、`quick_chat_routes.py`、`guided.py`、`guided_schema.py`、`assets.py`、`batches.py`、`auth.py`。
@@ -582,5 +587,6 @@ CI 按改动范围执行：纯 UI 只做构建和交互边界；协议/权限/�
 - **R14** [RDS Multi-AZ](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Concepts.MultiAZSingleStandby.html)：数据库高可用边界。
 - **R15** [EC2 安全最佳实践](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-security.html)：生产主机身份与安全基线。
 - **R16** [Google Creative Studio 架构](https://github.com/GoogleCloudPlatform/gcc-creative-studio#system-architecture)、[AWS 异步生成模式](https://aws.amazon.com/blogs/compute/part-2-serverless-generative-ai-architectural-patterns/)：业务模块化与异步任务的参考，不是本站已经达到的可用性保证。
+- **R17** [WanGP固定源码的headless API](https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/docs/API.md)、[H3 handler](https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/models/minimax_h3/minimax_h3_handler.py)、[Session实现](https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/shared/api.py)：已选路线的静态来源，非本站安装/实测证据；模型组件仍需各自固定版本。
 
 本方案不替代代码审查、最新发布回执或真实推理验收。引擎版本和供应商能力继续变化，实施阶段复核确切revision后冻结，保留此次判断和后续变更理由。

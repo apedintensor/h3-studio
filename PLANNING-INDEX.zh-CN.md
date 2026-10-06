@@ -1,6 +1,6 @@
 # Sixnine 规划、当前契约与证据索引
 
-维护日期：2026-10-06（Australia/Sydney）。这是阅读导航，不是部署回执。新会话先读适用 AGENTS → PROJECT-PLAN.md → WORKFLOW.md → 当前 Issue。本页补充本地详细研究；不默认把所有历史报告当作当前要求。
+维护日期：2026-10-07（Australia/Sydney）。这是阅读导航，不是部署回执。新会话先读适用 AGENTS → PROJECT-PLAN.md → WORKFLOW.md → 当前 Issue。本页补充本地详细研究；不默认把所有历史报告当作当前要求。
 
 ## 先看这三件事
 
@@ -8,13 +8,15 @@
 2. **改成什么架构**：[统一业务 API 与部署总规划](UNIFIED-BACKEND-API-PLAN.zh-CN.md)。中文详细设计补充英文 `PROJECT-PLAN.md`；其中 WanGP 选型已经确认，其余目标按工作包验收，不代表全部实现。
 3. **这一批接口如何验收**：[A2 当前生成契约](GENERATION-CONTRACT.md) 已固定；[A1 基线](CURRENT-BASELINE.md) 区分当前代码、本地未发布改动与线上只读事实；[本批结果](GENERATION-FOUNDATION-RESULT.md) 记录259项离线检查和后续门槛。[合同示例 JSON](UNIFIED-API-CONTRACT-EXAMPLES.draft.json) 仍只是拟增字段讨论材料，不能当当前可执行 API。
 
+下表部分 Quick Chat 契约在保全分支 `codex/quick-chat-preserved-20261006`，尚未随业务代码合入 main；跨仓库产品文档在 `apedintensor/sixnine-design`。本地相对路径用于这个工作区，不能假定单独克隆后端就有这些文件。
+
 ## 按职责读取
 
 | 问题 | 入口 | 权威范围和限制 |
 |---|---|---|
 | 已确认快速创作应该长什么样 | `../video-studio-design/quick-chat-mock/`，AGENTS 的 UI 还原规则 | 用户认可的视觉/交互基准；假 Key/假执行不是生产要求 |
-| 当前 Quick Chat 的真实接口与实现 | [集成契约](QUICK-CHAT-INTEGRATION.zh-CN.md)、[后端实现记录](QUICK-CHAT-BACKEND-IMPLEMENTATION.zh-CN.md)、[UI 修正记录](QUICK-CHAT-UI-RESTORE.zh-CN.md) | 本地实现/验收；是否发布另查回执 |
-| 产品数据和完整用户故事 | [Quick Chat 产品系统设计](../video-studio-design/QUICK-CHAT-PRODUCT-SYSTEM-DESIGN.zh-CN.md) | 产品基线；部分旧段落与最新直接出卡交互不一致，见复用决策第6节，不据旧句子倒退实现 |
+| 当前 Quick Chat 的真实接口与实现 | [集成契约](https://github.com/apedintensor/h3-studio/blob/fd136fbd5a9b9681c17af12131ed22997b8113e7/QUICK-CHAT-INTEGRATION.zh-CN.md)、[后端实现记录](https://github.com/apedintensor/h3-studio/blob/fd136fbd5a9b9681c17af12131ed22997b8113e7/QUICK-CHAT-BACKEND-IMPLEMENTATION.zh-CN.md)、[UI 修正记录](https://github.com/apedintensor/h3-studio/blob/fd136fbd5a9b9681c17af12131ed22997b8113e7/QUICK-CHAT-UI-RESTORE.zh-CN.md) | 本地实现/验收；是否发布另查回执 |
+| 产品数据和完整用户故事 | [Quick Chat 产品系统设计](https://github.com/apedintensor/sixnine-design/blob/2a7d0a5e16c679bbbf82a1f94f9f44fd970d59e0/QUICK-CHAT-PRODUCT-SYSTEM-DESIGN.zh-CN.md) | 产品基线；部分旧段落与最新直接出卡交互不一致，见复用决策第6节，不据旧句子倒退实现 |
 | 当前平台实现和旧 API | [架构基线](ARCHITECTURE.zh-CN.md)、[API 用法](API-USAGE.zh-CN.md)、实际源码/OpenAPI | 带日期的实现说明；不把旧上线状态当今天状态，OpenAPI 中未类型化部分仍需补齐 |
 | 任务/执行/容量合同 | [Queue](QUEUE-CONTRACT.md)、[Worker](WORKER-CONTRACT.md)、[Fleet](FLEET-CONTRACT.md)、[Scaler](SCALER-CONTRACT.md) | 保留已有语义；修改时核对代码与新工作包，不另造竞争的队列规则 |
 | 双机目标 | [双 GPU 设计](SYSTEM-DESIGN-DUAL-GPU.zh-CN.md) | 目标2、最低可服务1，非已上线声明；预算/实例/故障隔离须验收 |
@@ -26,7 +28,7 @@
 
 2026-10-06 已确认选型：用户确认已获得 WanGP 授权，采用上游 WanGP headless runtime，通过薄适配器接入。固定研究版本为 `deepbeepmeep/Wan2GP@0e58385fbde7ff102d276e4a9e490845de76b4ea`；源码 SHA 不替代依赖锁、模型组件 revision 或硬件验收。账户、持久任务、素材、预算和 GPU 控制器继续由 Sixnine 负责；Comfy 保留旧任务恢复和回滚基线，不另开新增功能路线。见 `PROJECT-PLAN.md` 第7节与 GitHub #4。
 
-[Wan2GP 对比研究](.architecture-research/WAN2GP-REVIEW-20261006.md) 保留选型前后的证据；其早期许可缺口已由上述用户确认解决。SGLang/vLLM-Omni/Diffusers 的比较仍可查阅，但只是历史备选研究，不再构成 SGLang 优先实施指令。选定 WanGP 不代表已经安装、接通真实模型或切换生产。
+`本地 .architecture-research/WAN2GP-REVIEW-20261006.md`（受保护研究记录，不随远端源码发布） 保留选型前后的证据；其早期许可缺口已由上述用户确认解决。SGLang/vLLM-Omni/Diffusers 的比较仍可查阅，但只是历史备选研究，不再构成 SGLang 优先实施指令。选定 WanGP 不代表已经安装、接通真实模型或切换生产。
 
 - 后端继续 `platform_app.py` / `studio_platform/`；新部署主线 `deploy/platform/`。
 - 前端编辑源：`C:\Users\danmo\Desktop\inference\video-studio-design\studio-app`；`yingxu/` 是生成的发布快照。
@@ -39,18 +41,18 @@
 
 实现遇到新发现，回写同一个工作包和相应契约。历史回执保持原状，新回执引用旧记录并注明版本与时间。已确认用户要求、目标提案、当前代码行为、本地测试、生产历史证据、当前在线核验是不同层次，不能互相代替。
 
-本地中文详细规划已进入精确 Git 白名单，但本次没有提交这些中文规划及其他会话的功能修改。英文工作流、总规划和路由已单独推送，见下节；不把白名单或本地保存当作远端备份。
+2026-10-07 审计整改：中文规划随 A3 文档批次纳管；Quick Chat/Agent Connect 实现保存在独立 draft 分支，canonical 前端及认可 mock 保存在私有 `apedintensor/sixnine-design`。是否已合并以 GitHub 回执为准；代码保全不表示产品验收或发布。
 
 ## 项目管理与跨会话恢复（2026-10-06 已建立）
 
 整体目标仍是同一套业务 API 支持网页与 Agent 完成 H3 创作。近期顺序为 A1→A2→B与D的有界实现→C恢复验收→B3公网真实生成验收；具体状态和依赖从看板读取。WanGP 下一切片 [D1 / #18](https://github.com/apedintensor/h3-studio/issues/18) 只做注入假 Session 的适配器与持久回执，不含真实模型、网络服务或生产路由。
 
-D1之后还须补齐固定模型/依赖与真实参数映射、私有 runtime 引导/传输、每个 attempt 的引擎绑定、旧 Comfy 恢复路由，以及新引擎容量/槽位保护。通过相关恢复测试并具备当次部署/GPU授权，才进入 B3；不能直接把 `#18 → #16` 当完整接入步骤。首个真实验收收窄为单槽、单个已支持 Base recipe；双机和更广参数矩阵后置，不为完成全部长期重构而推迟独立可验收的闭环。
+D1之后的 [D2 / #22](https://github.com/apedintensor/h3-studio/issues/22) 还须补齐固定模型/依赖与真实参数映射、私有 runtime 引导/传输、每个 attempt 的引擎绑定、旧 Comfy 恢复路由，以及新引擎容量/槽位保护。通过相关恢复测试并具备当次部署/GPU授权，才进入 B3；不能直接把 `#18 → #16` 当完整接入步骤。首个真实验收收窄为单槽、单个已支持 Base recipe；双机和更广参数矩阵后置，不为完成全部长期重构而推迟独立可验收的闭环。
 
 - [Sixnine Platform Delivery 私有看板](https://github.com/users/apedintensor/projects/2)，已关联 `apedintensor/h3-studio`。
-- [英文项目规划](PROJECT-PLAN.md) 与 [英文工作流](WORKFLOW.md) 是新克隆可用的起点；[中文阅读版](WORKFLOW.zh-CN.md) 留在本地。
+- [英文项目规划](PROJECT-PLAN.md) 与 [英文工作流](WORKFLOW.md) 是新克隆可用的起点；[中文阅读版](WORKFLOW.zh-CN.md) 提供对应说明。
 - [路由元信息](workflow/project.json) 记录真实 Project、字段与 A–H / 子任务 ID；它不是实时任务状态或授权账本。
-- 已创建 3 个里程碑、8 个父级工作包、8 个近期子任务；Roadmap / Delivery board / Ready to pick up / Blocked work 四个视图。
+- 建立时创建了3个里程碑、8个父级工作包及首批子任务；后续任务数量不在本页维护。Roadmap / Delivery board / Ready to pick up / Blocked work视图用于查询当前工作。
 - 已给现有协作者 `yutingk0805` 看板写权限；GitHub 新增内容统一用英文。
 - 工作流发布提交：`99755e60d0f1ce1e3fe09295a3de3dafbab4360b`。只提交 9 个工作流文件或入口增量；没有修改/发布应用运行代码，也没有启动 GPU。
 - 建立时的下一任务为 [A1 / #10](https://github.com/apedintensor/h3-studio/issues/10)。后续以 Ready 视图、依赖和最新认领为准，不能永远机械选择 #10。
