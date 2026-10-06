@@ -231,14 +231,14 @@ class FleetTests(LedgerCase):
         slot = replace(self.real_slot(), confirmed_idle=True)
         config = self.config(slot)
         settings = Settings(Path(self.temp.name), auth_mode="local-test", execution_backend="comfy-worker", generation_enabled=True)
-        queues = [{"queue_running": [[0, "foreign-task"]], "queue_pending": []},
-                  {"queue_running": [], "queue_pending": []}]
+        idle_checks = [False, True]
         stores, runners = [], []
         class FakeBackend:
             enabled, kind, slot_key = True, "comfy-worker", "fake-only-private-origin"
-            def _json(inner, method, path):
-                self.assertEqual((method, path), ("GET", "/queue"))
-                return queues.pop(0)
+            def is_idle(inner):
+                return idle_checks.pop(0)
+            def _json(inner, *args, **kwargs):
+                self.fail("fleet must not know an engine's private queue protocol")
             def close(inner):
                 pass
         class FakeRunner:
@@ -255,6 +255,34 @@ class FleetTests(LedgerCase):
         self.assertEqual(result["state"], "idle")
         self.assertEqual(len(stores), 1)
         self.assertTrue(callable(runners[0]["submission_guard"]))
+
+    def test_real_readiness_fails_closed_on_truthy_malformed_or_failed_probe(self):
+        from studio_platform.inference.protocol import BackendError
+        slot = replace(self.real_slot(), confirmed_idle=True)
+        config = self.config(slot)
+        settings = Settings(Path(self.temp.name), auth_mode="local-test", execution_backend="comfy-worker", generation_enabled=True)
+        stores, runners, closed = [], [], []
+        for evidence in (None, 1, "ready", {"ready": True}, [True], BackendError("probe_unavailable")):
+            with self.subTest(evidence=evidence):
+                class FakeBackend:
+                    enabled, kind, slot_key = True, "comfy-worker", "fake-only-private-origin"
+                    def is_idle(inner):
+                        if isinstance(evidence, Exception):
+                            raise evidence
+                        return evidence
+                    def close(inner):
+                        closed.append(True)
+                expected = BackendError if isinstance(evidence, Exception) else ValueError
+                with self.assertRaises(expected):
+                    run_slot(config, "worker0", settings, repository=self.repo,
+                        store_factory=lambda _: stores.append(True),
+                        backend_factory=lambda *_: FakeBackend(),
+                        runner_factory=lambda *args, **kwargs: runners.append(True), once=True)
+                from studio_platform.control import WorkerControl
+                self.assertNotEqual(WorkerControl(self.repo).get("worker0")["state"], "ready")
+        self.assertEqual(stores, [])
+        self.assertEqual(runners, [])
+        self.assertEqual(len(closed), 6)
 
     def test_config_file_rejects_secret_or_misspelled_fields_without_echo(self):
         self.write_config(self.config(self.mock_slot()))

@@ -20,6 +20,8 @@
 !platform_app.py
 !studio_platform/
 !studio_platform/*.py
+!studio_platform/inference/
+!studio_platform/inference/*.py
 !yingxu/
 !yingxu/package.json
 !yingxu/package-lock.json

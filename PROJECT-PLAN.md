@@ -31,7 +31,7 @@ The following is a source-code and historical-record baseline, not a fresh produ
 | Accounts | Ownership and PAT controls exist, but the account directory is fixed to `superdan` and `supervan`. | A real user directory, explicit identity migration, and later team membership. |
 | Assets | Private storage, validation, and recovery exist; staging and locks depend on one host. | Cross-host staging, operation leases, backup, and a tested object-store migration. |
 | GPU control | On-demand orchestration reuses finite-controller logic with single-node and finite-cycle constraints. | Separate continuing service policy from test policy; then implement node isolation and redundancy. |
-| Engines | A Comfy baseline has historical evidence. SGLang is a researched candidate. | Validate each engine, recipe, topology, and control envelope before enabling it. |
+| Engines | A Comfy baseline has historical evidence. The user selected WanGP as the target runtime on 2026-10-06 and confirmed its authorization. | Integrate upstream WanGP behind an adapter; validate each recipe, topology, control envelope and recovery behavior before switching. |
 
 Historical budgets, service deadlines, successful jobs, and deployment receipts do not establish today's available capacity.
 No plan, issue, restart, or configuration change renews an expired operating window or resets accumulated costs.
@@ -107,7 +107,13 @@ Do not make unknown work disappear by migrating it into an empty database or res
 ## 7. Engine and deployment decisions
 
 Retain pinned ComfyUI as the behavioral baseline and compatibility route while extracting the adapter boundary.
-SGLang Diffusion is the first native H3 serving candidate, not an already verified replacement.
+User decision, 2026-10-06: authorization for WanGP has been obtained. Adopt its existing headless runtime through a thin inference adapter, keeping upstream unchanged where practical. This replaces the earlier SGLang-first evaluation order; it does not establish completed integration or production readiness.
+
+WanGP owns model loading, media encoding, inference and decoding within an execution slot. Sixnine retains account ownership, generation admission, durable jobs/attempts, asset storage, budgets, recovery and GPU capacity management. Its local runtime queue must not become a competing business-task authority. Do not replace the approved frontend with WanGP's UI or expose its shared-instance login as our account system.
+
+Pin upstream code, dependencies, model revisions and component precision. Preserve all requested controls explicitly; reject unsupported combinations or obtain explicit trimming choices instead of silently changing inputs. Start with one active generation per isolated slot. Switch new jobs only after acceptance; retain the original engine binding for existing jobs and preserve a rollback route.
+
+SGLang Diffusion remains an alternative if the selected runtime misses a concrete acceptance requirement; it is not a parallel implementation obligation.
 vLLM-Omni is an alternative with its own serving limits; ordinary vLLM support is not equivalent.
 Diffusers' H3 ModularPipeline is a research/custom-service option that still needs service lifecycle and recovery implementation.
 External H3 APIs are explicit provider choices after validation, never silent substitutions for unknown self-hosted executions.
@@ -141,7 +147,7 @@ Use these packages to organize actual GitHub issues and specifications, not to m
 | A — Baseline and contracts | P0; first. | Versioned entry-point map, API/capability/state/error inventory, ownership and obligation baseline. | Every generation phase has a known authority and evidence source; local, historical, and current production facts are distinguished. |
 | B — Minimum generation loop | P0; uses A. | Generation-service and adapter boundaries, correlated phase receipts, download validation. | One authorized job completes cold start to real artifact; warm follow-up and restart after idle shutdown work without a new UI. |
 | C — Failure recovery | P0; follows B's boundaries; design alongside B. | Unknown/cancel/restart/collection contracts and controlled recovery tooling. | PostgreSQL races, cross-actor replay, lost responses, transfer failure, inventory/budget blockage, and recovery preserve identities and obligations. |
-| D — Native engine comparison | P1; A adapter contract; C-equivalent gates before switching. | Pinned SGLang adapter, capability matrix, controlled comparison report. | All selected recipe/control, quality, resource, and recovery gates pass; unmatched controls remain explicit. |
+| D — WanGP runtime integration | P0 integration alongside B after A; C-equivalent gates before switching. | Thin adapter to pinned upstream WanGP, capability matrix, controlled comparison with the existing Comfy baseline. | All selected recipe/control, quality, resource, and recovery gates pass; unmatched controls remain explicit. |
 | E — Two-node redundancy | P1; reliable single-slot B/C. | Durable pool/member state, per-node isolation, capacity and budget policy. | First healthy matching node serves; another failure does not stop it; no duplicate job dispatch; unknown capacity remains accounted for. |
 | F — Storage and recovery | P1; backup design may start with A. | Independent backup, S3 migration/rollback plan, restore exercise. | Old assets/results remain verifiable and retrievable; no unique copy is deleted; restored unknown operations are held. |
 | G — Scenario integration | After the core B/C loop; coordinated with A contracts. | Approved Quick Chat and usable Yingxu clients of the same API. | Real media inputs and results are visible; web/agents share objects; ordinary flows do not expose deployment parameters. |
@@ -152,11 +158,14 @@ Implement member-level failure isolation and explicit reservations; do not merel
 F migration does not block the initial B proof; its backup design should not wait for a storage-provider change.
 G must preserve the approved Quick Chat mock and current user decisions. Do not quietly redesign the frontend during backend extraction.
 
-## 9. First A/B/C batch and authorization boundaries
+## 9. First A/B/D batch and authorization boundaries
 
 The first batch fixes one supported Base profile and aligns capabilities, admission, bootstrap, and worker identity.
-Extract B's service and Comfy adapter boundaries without changing public semantics, task identity, or the rental ledger.
+The sequence is A1 baseline → A2 contract → B plus D integration → C recovery acceptance → public B/D proof, followed by E/G. C failure semantics are designed from the beginning, not added after paid work.
+Extract B's service and existing Comfy adapter boundaries without changing public semantics, task identity, or the rental ledger; integrate upstream WanGP behind that same boundary. Comfy remains the old-task/rollback baseline, not a competing new feature track.
 Add truthful phases and reasons through the existing UI/API rather than redesigning the creation experience.
+
+The dated A1 baseline is [CURRENT-BASELINE.md](CURRENT-BASELINE.md). The active A2 specification is [GENERATION-CONTRACT.md](GENERATION-CONTRACT.md). New sessions read these before changing generation/admission/runtime contracts, then check the live issue claim and acceptance evidence.
 
 Work that can proceed without production access or paid execution:
 
