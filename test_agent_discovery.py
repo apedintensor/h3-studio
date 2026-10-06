@@ -118,7 +118,7 @@ class AgentDiscoveryTests(unittest.TestCase):
 
     def test_quick_examples_save_one_web_draft_preflight_and_never_submit_implicitly(self):
         guide = self.client.get("/for-agents/guide.json").json()
-        self.assertEqual(guide["version"], 2)
+        self.assertEqual(guide["version"], 3)
         self.assertEqual(guide["web_links"]["quick"], "/freestyle?project={project_id}&entity={shot_id}")
         self.login()
         issued = self.client.post("/v1/api-keys", json={"name": "Quick agent fixture",
@@ -127,7 +127,7 @@ class AgentDiscoveryTests(unittest.TestCase):
         issued.raise_for_status()
         headers = {"Authorization": "Bearer "+issued.json()["api_key"]}
         self.client.cookies.clear()
-        example = guide["examples"]["create_quick_project"]
+        example = guide["legacy_quick_examples"]["create_quick_project"]
         created = self.client.request(example["method"], example["path"], json=example["body"], headers={**headers, **example["headers"]})
         self.assertEqual(created.status_code, 201, created.text)
         row = created.json()
@@ -136,7 +136,7 @@ class AgentDiscoveryTests(unittest.TestCase):
         self.assertEqual(len([e for e in row["project"]["entities"] if e["type"] == "shot"]), 1)
         retry = self.client.request(example["method"], example["path"], json=example["body"], headers={**headers, **example["headers"]})
         self.assertEqual(retry.json()["id"], row["id"])
-        example = guide["examples"]["configure_quick_text"]
+        example = guide["legacy_quick_examples"]["configure_quick_text"]
         body = copy.deepcopy(example["body"])
         body["expected_version"] = row["version"]
         body["actions"][0]["shot_id"] = shot_id
@@ -150,14 +150,14 @@ class AgentDiscoveryTests(unittest.TestCase):
         shot = next(e for e in current["project"]["entities"] if e["id"] == shot_id)
         self.assertEqual(shot["data"]["prompt"], body["actions"][0]["prompt"])
         self.assertEqual(shot["data"]["h3"]["controls"]["seed"], "42")
-        example = guide["examples"]["read_quick_draft"]
+        example = guide["legacy_quick_examples"]["read_quick_draft"]
         draft = self.client.get(example["path"].format(project_id=row["id"], shot_id=shot_id), headers=headers)
         self.assertEqual(draft.status_code, 200, draft.text)
         draft = draft.json()
         self.assertEqual(draft["project_version"], current["version"])
         self.assertEqual(draft["draft"]["prompt"], shot["data"]["prompt"])
         self.assertEqual(draft["web_url"], guide["web_links"]["quick"].format(project_id=row["id"], shot_id=shot_id))
-        example = guide["examples"]["plan_quick_draft"]
+        example = guide["legacy_quick_examples"]["plan_quick_draft"]
         plan = self.client.post(example["path"].format(project_id=row["id"], shot_id=shot_id),
             json={"expected_version": draft["project_version"]}, headers=headers)
         self.assertEqual(plan.status_code, 201, plan.text)
@@ -174,7 +174,32 @@ class AgentDiscoveryTests(unittest.TestCase):
         self.assertEqual(private["quick_creation"], public["quick_creation"])
         self.assertIn("shot.configure_generation", self.client.get("/v1/guided-schema").json()["operation_schemas"])
         self.assertIn("workspace=freestyle", self.client.get("/llms.txt").text)
-        self.assertIn("快速草稿", self.client.get("/for-agents").text)
+        self.assertIn('href="/quick-chat"', self.client.get("/for-agents").text)
+
+    def test_primary_quick_chat_examples_save_same_card_and_preflight_without_submission(self):
+        guide = self.client.get("/for-agents/guide.json").json()
+        self.assertNotIn("create_quick_project", guide["examples"])
+        self.login()
+        schema = self.client.get("/v1/quick-chat/schema").json()
+        example = guide["examples"]["create_chat_session"]
+        response = self.client.request(example["method"], example["path"], json=example["body"], headers=example["headers"])
+        self.assertEqual(response.status_code, 201, response.text)
+        session = response.json()["session"]
+        self.assertEqual(session["web_url"], "/quick-chat?session="+session["id"])
+        example = guide["examples"]["create_chat_card"]
+        response = self.client.request(example["method"], example["path"].format(session_id=session["id"]),
+            json=example["body"], headers=example["headers"])
+        self.assertEqual(response.status_code, 201, response.text)
+        revision = response.json()["revision"]
+        example = guide["examples"]["preflight_chat_card"]
+        response = self.client.request(example["method"], example["path"].format(session_id=session["id"], revision_id=revision["id"]),
+            json={"capabilities_version": schema["capabilities"]["capabilities_version"], "revision_hash": revision["input_hash"]},
+            headers=example["headers"])
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.json()["status"], "blocked")
+        timeline = self.client.get("/v1/quick-chat/sessions/"+session["id"]+"/timeline").json()
+        self.assertIn("card.created", [e["type"] for e in timeline["events"]])
+        self.assertEqual(self.client.get("/v1/projects").json()["projects"], [])
 
 
 if __name__ == "__main__":

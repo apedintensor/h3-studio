@@ -39,7 +39,19 @@ def api_path(value):
 
 
 def credential(args):
-    if args.profile:
+    if getattr(args, "connection", None):
+        if args.profile or args.registry_root or os.environ.get("SIXNINE_API_KEY"):
+            raise ValueError("Choose one explicit credential source; connection cannot be combined with environment or registry credentials")
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("sixnine_os_connection", Path(__file__).with_name("connect.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        state = module.SecureStore().load(args.base_url, args.connection)
+        if (not state or state.get("protocol") != module.PROTOCOL or state.get("status") != "connected"
+                or state.get("expected", {}).get("origin") != args.base_url):
+            raise ValueError("No activated OS-protected connection for this exact origin")
+        value = state.get("api_key")
+    elif args.profile:
         if not args.registry_root:
             raise ValueError("Specify the existing registry root with a profile")
         sys.path.insert(0, str(Path(args.registry_root).resolve()))
@@ -160,16 +172,24 @@ def download(client, args, transport=None, resolver=None):
 
 
 def resume_upload(client, args):
-    identity(args.project)
     identity(args.asset_id)
-    response = client.get("/v1/assets", params={"client_project_id": args.project})
+    session = getattr(args, "session", None)
+    if session:
+        response = client.get("/v1/quick-chat/sessions/"+identity(session)+"/assets",
+                              params={"client_asset_id": args.asset_id})
+    else:
+        identity(args.project)
+        response = client.get("/v1/assets", params={"client_project_id": args.project})
     check_response(response)
     matches = [asset for asset in response.json()["assets"] if asset.get("client_asset_id") == args.asset_id]
     if len(matches) != 1:
         raise ValueError("No unique original upload receipt found; reconcile the original upload before sending another file")
     asset = matches[0]
     if asset.get("status") != "ready":
-        response = client.post("/v1/assets/" + identity(asset.get("asset_id", asset.get("id"))) + "/resume")
+        asset_id = identity(asset.get("asset_id", asset.get("id")))
+        target = ("/v1/quick-chat/sessions/"+identity(session)+"/assets/"+asset_id+"/resume"
+                  if session else "/v1/assets/"+asset_id+"/resume")
+        response = client.post(target)
         check_response(response)
         asset = response.json()
     return asset
@@ -213,14 +233,19 @@ def run(args, transport=None, *, resolver=None, clock=time.monotonic, sleep=time
                 raise ValueError("JSON response exceeded the expected limit")
             write_json(response.json(), args.output)
         elif args.command == "upload":
-            identity(args.project)
+            session = getattr(args, "session", None)
+            if not session:
+                identity(args.project)
             identity(args.asset_id)
             path = Path(args.file)
             if not path.is_file() or path.stat().st_size > 512 * 1024 * 1024:
                 raise ValueError("Input must be an existing file of at most 512 MiB")
             with path.open("rb") as source:
-                response = client.post("/v1/assets", data={"client_project_id": args.project,
-                    "client_asset_id": args.asset_id}, files={"file": (path.name, source)})
+                target = "/v1/quick-chat/sessions/"+identity(session)+"/assets" if session else "/v1/assets"
+                data = {"client_asset_id": args.asset_id}
+                if not session:
+                    data["client_project_id"] = args.project
+                response = client.post(target, data=data, files={"file": (path.name, source)})
             if response.status_code == 422:
                 raise ValueError("Upload returned HTTP 422. Check /v1/capabilities upload_constraints and the original receipt; do not upload a new ID blindly. Invalid media needs an explicit source correction, not repeated resume attempts. Server details suppressed.")
             check_response(response)
@@ -238,6 +263,7 @@ def main():
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--registry-root")
     parser.add_argument("--profile")
+    parser.add_argument("--connection", help="Activated one-time connection ID in OS-protected storage")
     commands = parser.add_subparsers(dest="command", required=True)
     req = commands.add_parser("request")
     req.add_argument("method", choices=["GET", "POST", "PUT", "PATCH", "DELETE"])
@@ -246,12 +272,16 @@ def main():
     req.add_argument("--idempotency-key")
     req.add_argument("--output")
     upload = commands.add_parser("upload")
-    upload.add_argument("--project", required=True)
+    upload_target = upload.add_mutually_exclusive_group(required=True)
+    upload_target.add_argument("--project")
+    upload_target.add_argument("--session")
     upload.add_argument("--asset-id", required=True)
     upload.add_argument("--file", required=True)
     upload.add_argument("--output")
     resume = commands.add_parser("resume-upload", help="Find and resume the original accepted upload; never re-upload bytes")
-    resume.add_argument("--project", required=True)
+    resume_target = resume.add_mutually_exclusive_group(required=True)
+    resume_target.add_argument("--project")
+    resume_target.add_argument("--session")
     resume.add_argument("--asset-id", required=True, help="Original stable client_asset_id, not the receipt ID")
     resume.add_argument("--output")
     poll = commands.add_parser("poll", help="Bounded GET-only polling; no submissions or automatic adoption")

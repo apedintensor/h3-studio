@@ -26,7 +26,8 @@ from sqlalchemy.engine import URL
 from .storage import LocalObjectStore, _check_ancestors, _no_links, _copy, _sync_directory, key_belongs_to
 
 MIB = 1024*1024
-AUTH_TABLES = frozenset({"platform_accounts", "platform_sessions", "platform_service_clients", "platform_login_limits", "platform_personal_api_keys"})
+AUTH_TABLES = frozenset({"platform_accounts", "platform_sessions", "platform_service_clients", "platform_login_limits", "platform_personal_api_keys",
+                       "platform_agent_connections", "platform_agent_exchange_limits", "platform_agent_connection_audit"})
 
 
 class BackupError(Exception):
@@ -41,7 +42,8 @@ def _schemas():
     from .artifact_writer import _schema as writer
     from .batches import metadata as batches
     from .guided import metadata as guided
-    return (metadata, assets, quota, multipart, writer, batches, guided)
+    from .quick_chat import metadata as quick_chat
+    return (metadata, assets, quota, multipart, writer, batches, guided, quick_chat)
 
 
 def _tables():
@@ -457,6 +459,21 @@ def _quarantine_restored_database(path):
         db.execute("UPDATE platform_pool_limits SET max_instances=0,max_physical_gpus=0")
         db.execute("UPDATE platform_scaler_leaders SET expires_at=0,fence=fence+1")
         existing = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        if "platform_quick_chat_objects" in existing:
+            for ident, kind, raw in db.execute("SELECT id,kind,payload FROM platform_quick_chat_objects").fetchall():
+                value = json.loads(raw)
+                if kind == "turn" and value.get("status") in {"pending", "running"}:
+                    value.update(status="unknown", error_code="assistant_call_unknown")
+                    run = value.get("assistant_run", {})
+                    run.update(status="unknown", error_code="assistant_call_unknown", fence=run.get("fence", 0)+1)
+                    value["assistant_run"] = run
+                elif kind == "execution" and value.get("status") not in {"succeeded", "failed", "cancelled"}:
+                    value.update(status="recovery_hold", error_code="disaster_recovery_review_required")
+                elif kind == "preflight":
+                    value.update(status="blocked", expires_at=0, recovery_reason="disaster_recovery_review_required")
+                else:
+                    continue
+                db.execute("UPDATE platform_quick_chat_objects SET payload=? WHERE id=?", (json.dumps(value), ident))
         if "platform_capacity_approvals" in existing:
             db.execute("UPDATE platform_capacity_approvals SET enabled=0")
         if "platform_capacity_waiters" in existing:

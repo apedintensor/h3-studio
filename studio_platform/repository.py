@@ -381,7 +381,8 @@ class Repository:
                 raise NotFound("document_not_found")
             return dict(row)
 
-    def list_documents(self, scope, kind, *, limit=100, offset=0, allowed_ids=None, summary=False):
+    def list_documents(self, scope, kind, *, limit=100, offset=0, allowed_ids=None, summary=False,
+                       exclude_managed=False):
         """Project catalogs can read metadata without materializing every draft.
 
         Summary rows preserve the document envelope and expose only payload.title.
@@ -397,6 +398,9 @@ class Repository:
         statement = (select(*columns, documents.c.payload["title"].as_string().label("_title"))
                      if summary else select(documents))
         statement = statement.where(self._scope(documents, scope), documents.c.kind == kind)
+        if exclude_managed:
+            marker = documents.c.payload["integration_kind"].as_string()
+            statement = statement.where(or_(marker.is_(None), marker != "quick_chat"))
         if allowed is not None:
             statement = statement.where(documents.c.document_id.in_(allowed))
         with self.engine.connect() as connection:
@@ -601,6 +605,57 @@ class Repository:
                 admit_waiter(self, connection, scope, job, plan)
             connection.execute(update(jobs).where(jobs.c.id == job_id).values(status=status, updated_at=self.clock()))
             self._emit(connection, "job."+status, job_id, {"job_id": job_id})
+            return self._job(connection, job_id)
+
+    def refresh_unadmitted_plan(self, scope, job_id, plan_id):
+        """Replace an expired plan only for an inert Quick Chat execution.
+
+        No budget reservation, attempt, worker lease, or upstream obligation may
+        exist. The original job ID/key remains; this does not perform admission.
+        """
+        with self.transaction() as connection:
+            job = self._job(connection, job_id, scope, lock=True)
+            if (job["actor_id"] != "quick-chat-execution"
+                    or job["status"] not in {"planned", "blocked"}
+                    or job["attempt_no"] or job["current_attempt_id"]
+                    or job["lease_worker_id"] or job["lease_expires_at"]):
+                raise Conflict("upstream_stop_unconfirmed")
+            # Summary counters can disagree with recovered historical rows.
+            # An old attempt is still an execution obligation until reconciled;
+            # never refresh its request merely because the current lease is empty.
+            if connection.execute(select(attempts.c.id).where(
+                    attempts.c.job_id == job_id).limit(1)).first():
+                raise Conflict("upstream_stop_unconfirmed")
+            if connection.execute(select(budget_reservations.c.id).where(
+                    budget_reservations.c.reference_type == "job",
+                    budget_reservations.c.reference_id == job_id)).first():
+                raise Conflict("job_reservation_requires_reconciliation")
+            plan = self._locked(connection, select(plans).where(plans.c.id == plan_id,
+                                self._scope(plans, scope)))
+            if plan is None:
+                raise NotFound("plan_not_found")
+            if plan["expires_at"] <= self.clock():
+                raise Conflict("plan_expired")
+            old, new = job["request"], plan["request"]
+            if (old.get("server_source_hash") != new.get("server_source_hash")
+                    or old.get("client_ref") != new.get("client_ref")
+                    or old.get("recipe_id") != new.get("recipe_id")):
+                raise Conflict("shot_version_conflict")
+            if plan_id == job["plan_id"]:
+                return job
+            execution = plan["execution_plan"]
+            runtime = float(execution.get("expected_runtime_s", 600))
+            if not 0 < runtime <= 86400:
+                raise ValueError("invalid_expected_runtime")
+            digest = request_hash({"request_hash": plan["request_hash"], "plan_hash": plan["plan_hash"],
+                                   "estimated_cost_microusd": plan["estimated_cost_microusd"]})
+            connection.execute(update(jobs).where(jobs.c.id == job_id).values(
+                plan_id=plan_id, request=new, execution_plan=execution, request_hash=digest,
+                estimated_cost_microusd=plan["estimated_cost_microusd"], status="planned",
+                expected_runtime_s=runtime, pool=identifier(execution.get("pool", "h3-base-ref")),
+                updated_at=self.clock(), error_code=None))
+            self._emit(connection, "job.plan_refreshed", job_id,
+                       {"job_id": job_id, "plan_id": plan_id, "previous_plan_id": job["plan_id"]})
             return self._job(connection, job_id)
 
     def get_job(self, scope, job_id):

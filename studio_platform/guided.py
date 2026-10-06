@@ -523,9 +523,12 @@ def register_routes(app):
     @app.get("/v1/agent-guide")
     def guide():
         from .agent_discovery import public_guide
-        return {"version": 2, "schema_url": "/v1/guided-schema", "openapi_url": "/openapi.json", "skill_download_url": "/v1/agent-skill.zip",
+        return {"version": 3, "schema_url": "/v1/guided-schema", "quick_chat_schema_url": "/v1/quick-chat/schema",
+            "openapi_url": "/openapi.json", "skill_download_url": "/v1/agent-skill.zip",
             "quick_creation": public_guide()["quick_creation"], "examples_url": "/for-agents/guide.json",
-            "steps": ["Browser account creates scoped API key; pass Bearer on API calls only",
+            "authentication": public_guide()["authentication"],
+            "steps": [x["action"] for x in public_guide()["workflow"]],
+            "legacy_story_steps": ["Browser account creates scoped API key; pass Bearer on API calls only",
                 "For one clip, create workspace=freestyle; use project.journey.reviewShotId, shot.configure_generation and the saved-draft generation-plans route. Exact examples: /for-agents/guide.json",
                 "POST /v1/projects with title/logline and stable Idempotency-Key; select returned project id",
                 "POST /v1/projects/{id}/actions with expected_version and atomic actions",
@@ -604,7 +607,8 @@ def register_routes(app):
     @app.post("/v1/projects/{project_id}/actions")
     def actions(project_id: str, request: Request, body: dict, idempotency_key: str | None = Header(None)):
         p = request.state.principal
-        app.state.authorized_project(p, project_id, "projects:write")
+        from .generation_admission import reject_managed
+        reject_managed(app.state.authorized_project(p, project_id, "projects:write")["payload"])
         return service.mutate(p, project_id, body, idempotency_key)
 
     @app.post("/v1/projects/{project_id}/entities", status_code=201)
