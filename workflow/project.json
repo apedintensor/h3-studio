@@ -148,7 +148,61 @@
       "depends_on": [
         "B1",
         "B2",
-        "C2"
+        "C2",
+        "D2"
+      ]
+    },
+    "A3": {
+      "number": 19,
+      "node_id": "I_kwDOU6TGZc8AAAABVXZCqQ",
+      "url": "https://github.com/apedintensor/h3-studio/issues/19",
+      "title": "[A3] Preserve unpublished sources and reconcile cross-session guidance",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-4lak",
+      "depends_on": []
+    },
+    "G1": {
+      "number": 20,
+      "node_id": "I_kwDOU6TGZc8AAAABVXZLuQ",
+      "url": "https://github.com/apedintensor/h3-studio/issues/20",
+      "title": "[G1] Accept and integrate the preserved Quick Chat experience",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-4ljs",
+      "depends_on": [
+        "B1",
+        "B3"
+      ]
+    },
+    "G2": {
+      "number": 21,
+      "node_id": "I_kwDOU6TGZc8AAAABVXZVkg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/21",
+      "title": "[G2] Accept the preserved Agent Connect and discovery flow",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-4lsw",
+      "depends_on": [
+        "B1",
+        "G1"
+      ]
+    },
+    "D2": {
+      "number": 22,
+      "node_id": "I_kwDOU6TGZc8AAAABVXZeMg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/22",
+      "title": "[D2] Bind a pinned WanGP runtime to the production execution contract",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-4l1E",
+      "depends_on": [
+        "D1",
+        "B1",
+        "B2"
+      ]
+    },
+    "D1": {
+      "number": 18,
+      "node_id": "I_kwDOU6TGZc8AAAABVWZi_A",
+      "url": "https://github.com/apedintensor/h3-studio/issues/18",
+      "title": "[D1] Implement the WanGP adapter and durable execution receipts",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-3iFA",
+      "depends_on": [
+        "A2",
+        "B2"
       ]
     }
   },

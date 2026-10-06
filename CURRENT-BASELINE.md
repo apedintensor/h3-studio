@@ -1,6 +1,7 @@
 # Sixnine implementation and production baseline
 
-Observed: 2026-10-06, 22:20–22:25 Australia/Sydney (UTC+11).
+Source/workflow refreshed: 2026-10-07 Australia/Sydney.
+Last production observation: 2026-10-06, 22:20–22:25 Australia/Sydney (UTC+11); not rechecked by the audit-remediation batch.
 Work item: [A1 #10](https://github.com/apedintensor/h3-studio/issues/10).
 This is a dated baseline, not a live status page or permission to operate GPUs.
 
@@ -8,16 +9,16 @@ This is a dated baseline, not a live status page or permission to operate GPUs.
 
 | Surface | Observed identity | Evidence / limits |
 |---|---|---|
-| Repository HEAD and origin/main | `99755e60d0f1ce1e3fe09295a3de3dafbab4360b` | Local Git and remote tracking state; workflow baseline. |
+| Accepted generation foundation | `f51a90567227910cc2f30c55a8cb19b953d3d7a2` (PR #17) | A1/A2/B2 merged; not production-released. Read GitHub for subsequent source-only integration commits. |
 | Running production API image tag | `sixnine-platform:73ca224970ffdfae30e1bc7d99c50b2c96ce91af` | Read-only Docker inspection through official AWS MCP/SSM. |
 | Running image configuration digest | `sha256:9cda5689e60064ec2f6269b469274824f704f13186707fa5c6f2dc11f1a35ac2` | Docker image ID; do not confuse this with an OCI manifest/index digest. |
 | Frontend compatibility label | `sixnine-web-v1` | Fresh `/healthz`; this is not an independently verified frontend build SHA. |
-| Local Quick Chat and Agent connection | Unpublished working changes | Includes new session/turn/card/admission/assistant/connect modules and changes to API/auth/repository. Preserve them; not part of the deployed image evidence. |
-| Canonical frontend | `../video-studio-design/studio-app` | `yingxu/` is the generated release snapshot. Approved UX is the Quick Chat mock; publication remains separately gated. |
+| Quick Chat and Agent connection | Preserved branch `codex/quick-chat-preserved-20261006`, initial commit `fd136fbd5a9b9681c17af12131ed22997b8113e7` | G1 #20 / G2 #21 track acceptance. Draft source preservation is not a production release or acceptance of all included changes. |
+| Canonical frontend and approved mock | Private `apedintensor/sixnine-design`, initial commit `2a7d0a5e16c679bbbf82a1f94f9f44fd970d59e0` | Existing `../video-studio-design/studio-app` and `quick-chat-mock` paths unchanged; `yingxu/` remains the generated release snapshot. |
 
-The checkout was already dirty before this batch. Its API source includes changes absent from HEAD and production. Do not use an unqualified “current API” to describe all three. No source reset, migration, service start/stop, rental, or deployment was performed for this inventory.
+Unpublished source has a remote preservation branch; it differs from both accepted main and production. Use isolated worktrees and coordinate G1/G2 before changing its API/auth/repository/admission. Source-only preservation does not back up user media or production databases. The audit-remediation batch changes no service, cloud instance, budget or production deployment.
 
-## Fresh production facts
+## Last observed production facts (2026-10-06)
 
 Official AWS MCP confirmed the known Singapore CPU host is running and managed through SSM. App and PostgreSQL containers were healthy. The finite GPU controller `sixnine-ondemand-duration-20261005.service` was inactive/dead with successful exit status 0.
 
@@ -71,9 +72,11 @@ The first live proof is one explicitly confirmed task: upload/resolve owned medi
 
 ## Next implementation order
 
-1. A2: freeze compatibility, recovery and acceptance invariants.
-2. B2: extract the existing inference adapter and readiness seam without changing routing; retain old imports and historical jobs.
-3. B1/D: complete shared admission seams, per-attempt engine/config binding and private WanGP adapter/receipt. Review all GPU capacity gates before adding any backend value.
-4. C: exercise ambiguous start, cancellation, process loss and collection recovery; separate continuing service policy from finite acceptance policy.
-5. B3/D: authorized real-GPU qualification, public download proof and rollback before switching new jobs.
-6. E/G: redundancy and approved scenario integration; F backups start before any storage migration; H follows measured demand.
+1. A1/A2/B2 are accepted in PR #17. A3 #19 protects source and reconciles guidance; source checks do not prove runtime readiness.
+2. B1 #12 coordinates the existing shared admission extraction with preserved G1/G2; do not overwrite it from an old checkout.
+3. D1 #18 implements the offline adapter/receipt boundary. D2 #22 adds real pinned control mapping, original-attempt engine binding, protected host/bootstrap and generalized GPU guards.
+4. C1 #14 separates configuration/continuing policy from finite tests; C2 #15 exercises ambiguous start/cancel/restart/collection under the resulting contract.
+5. B3 #16 depends on the above gates and current operating authority for one real public cold/warm/idle-restart-to-download slice. WanGP is selected, not yet integrated or qualified.
+6. E broad redundancy and G production integration follow the reliable core; G1 #20 and G2 #21 may preserve/review local UX independently. F backups precede storage migration; H follows measured demand.
+
+The user delegates routine PR creation, checks and merge to agents. Source preservation, product acceptance and publication remain distinct. GitHub branch enforcement is recorded in the A3 completion comment; no account upgrade/public visibility change is authorized to obtain it.
