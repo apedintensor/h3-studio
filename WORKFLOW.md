@@ -13,7 +13,7 @@ Updated: 2026-10-06 (Australia/Sydney). This is the GitHub workflow entry point.
 
 ## Start a new session
 
-Read **applicable AGENTS → PROJECT-PLAN → this workflow → the assigned issue, its parent work package, and relevant specification**. Expand only the contracts, code, and evidence needed for that task. Local sessions may also consult `PLANNING-INDEX.zh-CN.md` for detailed historical research.
+Read **applicable AGENTS → PROJECT-PLAN → this workflow → the assigned issue, its parent work package, and relevant specification**. Expand only the contracts, code, and evidence needed for that task. Local sessions may also consult `PLANNING-INDEX.zh-CN.md` for detailed historical research. Do not load every historical report as current guidance.
 
 Use `workflow/project.json` to locate the actual remote work items. Read the latest claim, comments, PRs, dependencies, and status before proceeding. A screenshot or a past chat saying “done” does not replace these records. Reconcile discrepancies rather than assuming the current production state.
 
@@ -65,7 +65,19 @@ Claim / resume
 - Verification: <offline/local/production; allowed boundary>
 ```
 
-Every work item has one explicit integration owner. Parallel sessions use bounded child tasks with coordinated scopes. Separate worktrees do not eliminate contract conflicts. Commit only your own changes; do not reorganize another session's unfinished files.
+Every work item has one explicit integration owner. Parallel sessions use bounded child tasks with coordinated scopes and separate branches/worktrees; do not develop on shared main. Separate worktrees do not eliminate contract conflicts. Commit only owned changes, except an explicitly authorized source-preservation batch that records whose unfinished work it protects.
+
+## Agent-managed integration and source protection
+
+The user does not perform routine manual PR work. Agents create the PR, inspect its complete diff, run the selected checks and merge the authorized batch when ready. Use independent agent review for material authentication, persistence, generation or billing changes. Required checks are not bypassed; a human approval count is not a substitute for that review. The stable backend CI check is `test`.
+
+Keep incomplete or unapproved work in a clearly labelled draft/source branch; do not merge it just to back it up. Push reviewed source at meaningful checkpoints and before handoff, excluding secrets, media, runtime data, environments and dependencies. Unpublished does not mean uncommitted. Git protects source; database/media recovery remains a separate F obligation.
+
+Canonical frontend and approved mock are in the private `apedintensor/sixnine-design` repository at the existing `../video-studio-design` path. Its `test` workflow checks source without deploying it. The generated backend `yingxu/` snapshot remains on the existing release path. An approved source merge does not remove the user's existing frontend publication gate.
+
+Main protection should require PRs and the stable `test` result, disallow force-push/deletion, and require zero human approvals. If GitHub's account plan prevents enforcement, record that limitation and follow the same agent-managed workflow; do not make the repository public or buy an upgrade automatically.
+
+Engineering decides whether a request needs configuration or code. Account lists, bounded operating windows, idle limits and recipe envelopes belong in validated configuration where behavior already exists. New recovery semantics need implementation and tests. Neither path extends authorization or discards ledgers.
 
 ## Implement and verify a batch
 

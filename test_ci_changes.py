@@ -23,9 +23,56 @@ class ChangeClassificationTests(unittest.TestCase):
         result = ci.classify([("M", "README.md"), ("M", "deploy/platform/RELEASE.zh-CN.md")])
         self.assertEqual(result["category"], "docs")
         self.assertFalse(any(result[gate] for gate in ci.GATES))
-        for path in ("AGENTS.md", "new-guide.md", "skills/sixnine-yingxu/SKILL.md", "tools/README.md"):
+        for path in ("new-guide.md", "skills/sixnine-yingxu/SKILL.md", "tools/README.md"):
             with self.subTest(path=path):
                 self.assert_full(ci.classify([("M", path)]))
+
+    def test_reviewed_governance_modifications_are_docs_only(self):
+        paths = (
+            "AGENTS.md", "WORKFLOW.md", "WORKFLOW.zh-CN.md", "PROJECT-PLAN.md",
+            "CURRENT-BASELINE.md", "GENERATION-CONTRACT.md", "GENERATION-FOUNDATION-RESULT.md",
+            "PLANNING-INDEX.zh-CN.md", "UNIFIED-BACKEND-API-PLAN.zh-CN.md",
+            "REUSE-AND-MIGRATION-DECISION.zh-CN.md",
+        )
+        # Release preparation imports DOCUMENTS as a dirty-source exemption.
+        # Governance-only CI must not silently broaden that separate boundary.
+        self.assertFalse(set(paths) & ci.DOCUMENTS)
+        changes = [("M", path) for path in paths]
+        result = ci.classify(changes)
+        self.assertEqual(result["category"], "docs")
+        self.assertFalse(any(result[gate] for gate in ci.GATES))
+        for status in ("A", "D", "T"):
+            for path in paths:
+                with self.subTest(status=status, path=path):
+                    self.assert_full(ci.classify([(status, path)]))
+
+    def test_governance_docs_cannot_hide_critical_changes(self):
+        for path in (
+            "studio_platform/auth.py", "studio_platform/settings.py", "studio_platform/queue.py",
+            "studio_platform/on_demand_scaler.py", "tools/ci_changes.py",
+            ".github/workflows/ci.yml", "workflow/project.json", ".gitignore", ".dockerignore",
+            "skills/sixnine-yingxu/SKILL.md", "new-policy.md",
+        ):
+            with self.subTest(path=path):
+                self.assert_full(ci.classify([("M", "AGENTS.md"), ("M", "WORKFLOW.md"), ("M", path)]))
+
+    def test_docs_only_push_keeps_the_stable_test_aggregator(self):
+        with patch.object(ci, "git_changes", return_value=[("M", "AGENTS.md"), ("M", "WORKFLOW.md")]):
+            result = ci.plan("push", {"before": BASE}, SHA, MAIN, Path("."))
+        self.assertEqual(result["category"], "docs")
+        self.assertEqual(result["action"], "check")
+        self.assertFalse(any(result[gate] for gate in ci.GATES))
+
+        # Without a YAML dependency, guard the small literal workflow contract:
+        # no workflow-level paths filter may leave the required check pending,
+        # and unselected heavy jobs still flow into the unconditional aggregator.
+        workflow = (Path(__file__).resolve().parent / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        triggers = workflow.split("\njobs:", 1)[0]
+        self.assertNotRegex(triggers, r"(?m)^\s*paths(?:-ignore)?:")
+        aggregate = workflow.split("\n  test:\n", 1)[1].split("\n  publish-aws:\n", 1)[0]
+        self.assertIn("if: always()", aggregate)
+        self.assertIn("needs: [changes, python, postgres, frontend, frontend-tools, containers]", aggregate)
+        self.assertIn("expected = 'success' if selected == 'true' else 'skipped'", aggregate)
 
     def test_only_frontend_snapshot_can_use_frontend_gates(self):
         result = ci.classify([("M", "yingxu/src/Freestyle.jsx"), ("M", "yingxu/source-manifest.json")])
