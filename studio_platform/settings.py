@@ -61,6 +61,7 @@ class Settings:
     frontend_release_dir: Path | None = None
     execution_policy_file: Path | None = None
     render_enabled: bool = False
+    assistant_enabled: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
@@ -122,4 +123,5 @@ class Settings:
             frontend_release_dir=Path(os.environ["SIXNINE_FRONTEND_RELEASE_DIR"]) if os.environ.get("SIXNINE_FRONTEND_RELEASE_DIR") else None,
             execution_policy_file=Path(os.environ["SIXNINE_EXECUTION_POLICY_FILE"]) if os.environ.get("SIXNINE_EXECUTION_POLICY_FILE") else None,
             render_enabled=os.environ.get("SIXNINE_RENDER_ENABLED", "0") == "1",
+            assistant_enabled=os.environ.get("SIXNINE_ASSISTANT_ENABLED", "0") == "1",
         )

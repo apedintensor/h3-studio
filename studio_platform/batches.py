@@ -174,7 +174,8 @@ def register_routes(app):
         if set(body) != {"client_project_id", "plan_ids"}:
             raise HTTPException(422, "批次仅接受项目与已预检计划列表")
         principal, project_id = request.state.principal, body["client_project_id"]
-        app.state.authorized_project(principal, project_id, "jobs:write")
+        from .generation_admission import reject_managed
+        reject_managed(app.state.authorized_project(principal, project_id, "jobs:write")["payload"])
         # Reservation occurs before per-item validation so partial admission can
         # recover after a process crash. Ownership is still checked for every plan.
         record = service.reserve(principal, project_id, body["plan_ids"], idempotency_key)

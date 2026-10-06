@@ -2,6 +2,8 @@
 
 **New development session:** read [PROJECT-PLAN.md](PROJECT-PLAN.md), then [WORKFLOW.md](WORKFLOW.md), and claim an existing task on the [Sixnine Platform Delivery board](https://github.com/users/apedintensor/projects/2). [workflow/project.json](workflow/project.json) links the actual work packages and fields. Use English on GitHub; code completion, verification and production release are separate states.
 
+开发与架构先读 [规划与实现索引](PLANNING-INDEX.zh-CN.md)：包含目标设计、[现有代码复用与模块化决策](REUSE-AND-MIGRATION-DECISION.zh-CN.md)、当前接口契约及历史证据的分工。规划未等于实现或上线；以下早期走查入口不能证明今天的服务状态。
+
 当前主线是映序引导制作、ReactFlow画布、`/freestyle`共用项目、私有素材和版本化`/v1` API的平台。代码入口为 `platform_app.py` / `studio_platform/`，新部署包位于 `deploy/platform/`。
 
 先按[五分钟检查入口](START-HERE.zh-CN.md)查看本机工作室。本轮功能、测试与待上线事项见[交付报告](DELIVERY-REPORT.zh-CN.md)；报告中的执行状态与最终验证时间分开记录。

@@ -1,0 +1,254 @@
+{
+  "document": {
+    "title": "Sixnine unified generation contract examples",
+    "status": "design_examples_not_deployed",
+    "date": "2026-10-06",
+    "companion": "UNIFIED-BACKEND-API-PLAN.zh-CN.md",
+    "base_url": "https://api.example.invalid",
+    "notes": [
+      "This file is not OpenAPI, an SDK, a fixture for production, or proof that an endpoint accepts these fields.",
+      "All identifiers, hashes, timestamps, prices and runtime fingerprints below are fictional examples.",
+      "Existing /v1 route paths are retained where applicable; normalized source_ref and richer status fields are proposed additions.",
+      "Authentication headers are deliberately omitted. Ownership always comes from the authenticated principal, never an owner_id supplied by a caller.",
+      "Public responses expose safe profile identifiers, not GPU addresses, provider credentials or executable workflows."
+    ]
+  },
+  "examples": {
+    "normalized_spec": {
+      "scope": "Proposed server-validated value object for a direct creation; not today's HTTP request schema",
+      "value": {
+        "contract_version": "draft-1",
+        "source_ref": {
+          "kind": "direct_creation",
+          "id": "creation_demo",
+          "revision": 1,
+          "hash": "example-source-hash"
+        },
+        "model": {
+          "platform_model_id": "MiniMax-H3-Base-BF16",
+          "display_name": "H3 Base 原始档",
+          "upstream_repository": "MiniMaxAI/MiniMax-H3",
+          "upstream_revision": "example-pinned-revision",
+          "partition": "FL2VA"
+        },
+        "recipe": { "id": "example-h3-fl2va", "version": "example-1" },
+        "prompt": "纸船沿着浅溪缓缓向前，镜头贴近水面跟随，保留自然流水声。",
+        "inputs": [
+          {
+            "asset_id": "asset_first_frame_demo",
+            "content_hash": "example-input-hash",
+            "role": "first_frame",
+            "enabled": true
+          }
+        ],
+        "output": {
+          "requested_duration_seconds": "5",
+          "width": 832,
+          "height": 480,
+          "generate_audio": true
+        },
+        "controls": { "seed": "12345678901234567890" }
+      },
+      "server_resolves": [
+        "Asset ownership, ready state, decoded metadata and authoritative hashes",
+        "Engine and model revisions, precision, frame sampling, defaults and hardware envelope",
+        "Source revision and operation identity; actor attribution",
+        "Capabilities, current admission policy and immutable effective request"
+      ]
+    },
+    "preflight": {
+      "scope": "Proposed response additions to POST /v1/generation-plans; fictional admissible profile",
+      "http_status": 201,
+      "response": {
+        "plan_id": "plan_demo",
+        "status": "ready",
+        "request_hash": "example-effective-request-hash",
+        "capabilities_version": "example-capabilities-1",
+        "execution_profile_id": "example-validated-profile-1",
+        "expires_at_iso": "2026-10-06T12:05:00Z",
+        "source_ref": { "kind": "direct_creation", "id": "creation_demo", "revision": 1, "hash": "example-source-hash" },
+        "output_spec": {
+          "width": 832,
+          "height": 480,
+          "requested_duration_seconds": "5",
+          "sampled_frames": 124,
+          "fps": { "numerator": 24, "denominator": 1 },
+          "sampled_duration": { "numerator": 124, "denominator": 24 },
+          "generate_audio": true
+        },
+        "blockers": [],
+        "warnings": [],
+        "estimate": {
+          "reserved_on_submit": { "amount": "1.00", "currency": "USD" },
+          "price_source": "fictional_example_not_current_quote",
+          "meaning": "Reservation is not the final user charge or measured GPU cost"
+        },
+        "execution": {
+          "enabled": true,
+          "capacity_state": "none_ready",
+          "admission_mode": "wait_for_capacity",
+          "gpu_started_by_preflight": false
+        }
+      },
+      "invariants": [
+        "Preflight does not rent a GPU or submit an inference.",
+        "A ready plan is not an inventory guarantee; confirmation rechecks authorization, source, expiry and budget atomically.",
+        "Quick Chat cards must use their existing preflight/submission path, not bypass revision uniqueness through this route."
+      ]
+    },
+    "submit": {
+      "scope": "Existing direct-job request shape, with proposed richer response projection",
+      "request": {
+        "method": "POST",
+        "path": "/v1/jobs",
+        "headers": { "Idempotency-Key": "example-stable-operation-key" },
+        "body": { "plan_id": "plan_demo" }
+      },
+      "http_status": 202,
+      "response": {
+        "job_id": "job_demo",
+        "status": "queued",
+        "phase": "waiting_capacity",
+        "reason_code": "CAPACITY_UNAVAILABLE",
+        "action_required": "none",
+        "retry_after_seconds": 15,
+        "eta_seconds": null,
+        "request_id": "request_demo",
+        "links": { "self": "/v1/jobs/job_demo" }
+      },
+      "invariants": [
+        "Network replay uses the same key and body and returns the same accepted operation.",
+        "A separate owner/resource/revision operation constraint prevents a browser and another Agent from duplicating the same generation decision.",
+        "The caller polls this job; it does not submit a new job because capacity is unavailable."
+      ]
+    },
+    "job_projections": {
+      "scope": "Partial proposed public GET /v1/jobs/{id} projections; retain other existing fields",
+      "loading": {
+        "job_id": "job_demo",
+        "status": "queued",
+        "phase": "loading_model",
+        "phase_started_at": "2026-10-06T12:02:00Z",
+        "last_progress_at": "2026-10-06T12:02:10Z",
+        "reason_code": "MODEL_LOADING",
+        "action_required": "none",
+        "progress": null,
+        "eta_seconds": null,
+        "artifacts": []
+      },
+      "submission_unknown": {
+        "job_id": "job_demo",
+        "status": "running",
+        "phase": "reconciling",
+        "reason_code": "UPSTREAM_SUBMISSION_UNKNOWN",
+        "action_required": "none",
+        "recovery": { "state": "reconciling", "retry_mode": "poll_existing", "can_start_new_attempt": false },
+        "eta_seconds": null,
+        "artifacts": []
+      },
+      "succeeded": {
+        "job_id": "job_demo",
+        "status": "succeeded",
+        "phase": "completed",
+        "reason_code": null,
+        "action_required": "none",
+        "artifacts": [
+          {
+            "artifact_id": "artifact_video_demo",
+            "kind": "video",
+            "content_type": "video/mp4",
+            "content_hash": "example-output-hash",
+            "validated": true,
+            "provenance": "platform_generated",
+            "duration": { "numerator": 124, "denominator": 24 },
+            "content_url": "/v1/artifacts/artifact_video_demo/content"
+          }
+        ]
+      },
+      "invariants": [
+        "These are separate observations of one hypothetical job, not three jobs.",
+        "Unknown submission is unresolved, not proof of failure or permission to resubmit.",
+        "A succeeded result requires output validation, durable storage and committed artifact metadata.",
+        "Output duration is measured from the actual artifact; equality to the example sampling duration is not a universal guarantee."
+      ]
+    },
+    "problem": {
+      "scope": "Proposed RFC 9457 error; adapt legacy consumers before changing media type or fields",
+      "http_status": 422,
+      "content_type": "application/problem+json",
+      "response": {
+        "type": "https://api.example.invalid/problems/control-unsupported",
+        "title": "所选执行配置尚未开放此控制",
+        "status": 422,
+        "detail": "草稿已保留；请选择已验收的兼容配方或移除此项后重新预检。",
+        "instance": "/requests/request_validation_demo",
+        "code": "CONTROL_UNSUPPORTED",
+        "request_id": "request_validation_demo",
+        "retry_mode": "after_edit",
+        "action_required": "select_compatible_recipe_or_edit",
+        "field_errors": [
+          { "path": "inputs[1].guide", "code": "NOT_VERIFIED_FOR_PROFILE", "profile_id": "example-candidate-profile" }
+        ]
+      }
+    },
+    "capability_entry": {
+      "scope": "Proposed per-profile capability entry; explicitly not enabled or verified",
+      "value": {
+        "capability": "reference_with_first_last_frames",
+        "upstream_repository": "MiniMaxAI/MiniMax-H3",
+        "partition": "Ref2VA",
+        "engine": "sglang-diffusion",
+        "engine_revision": null,
+        "recipe_id": "example-candidate-ref2va",
+        "hardware_profile_id": null,
+        "declared": true,
+        "implemented": false,
+        "verified": false,
+        "enabled": false,
+        "declaration_source": "https://docs.sglang.io/cookbook/diffusion/MiniMax/MiniMax-H3",
+        "declaration_checked_on": "2026-10-06",
+        "verification_evidence": [],
+        "blocking_reason": "ADAPTER_AND_RUNTIME_MATRIX_NOT_VERIFIED"
+      }
+    },
+    "batch_semantics": {
+      "scope": "Proposed aggregate view; not a replacement for current Quick Chat Submission/Item or /v1/batches wire schemas",
+      "generation_decision_id": "decision_demo",
+      "items": [
+        { "item_id": "item_1_demo", "job_id": "job_1_demo", "seed": "1001", "status": "succeeded", "can_retry": false },
+        { "item_id": "item_2_demo", "job_id": "job_2_demo", "seed": "1002", "status": "failed", "can_retry": true, "reason": "OLD_EXECUTION_CONFIRMED_TERMINATED" },
+        { "item_id": "item_3_demo", "job_id": "job_3_demo", "seed": "1003", "status": "running", "can_retry": false, "reason": "UPSTREAM_SUBMISSION_UNKNOWN" }
+      ],
+      "invariants": [
+        "Retry selection contains only item_2_demo; item_1_demo stays successful and item_3_demo is reconciled.",
+        "An explicit user retry preserves the submission/item but creates a new execution and job, linked to the prior execution, matching the existing Quick Chat behavior.",
+        "Admission recovery and output collection recovery keep the original job; a platform technical retry uses a new attempt only under an explicit bounded policy.",
+        "A deliberate new draw is a new generation decision, not deletion of an idempotency record."
+      ]
+    },
+    "adapter_semantics": {
+      "scope": "Internal proposed protocol, not a public HTTP endpoint or confirmed native-engine feature",
+      "submit_command": {
+        "attempt_id": "attempt_demo",
+        "fence": 7,
+        "request_hash": "example-effective-request-hash",
+        "execution_profile_id": "example-validated-profile-1",
+        "input_manifest_id": "manifest_demo"
+      },
+      "unknown_receipt": {
+        "attempt_id": "attempt_demo",
+        "outcome": "unknown",
+        "provider_operation_id": null,
+        "submitted_at": "2026-10-06T12:03:00Z",
+        "next_action": "reconcile_existing_attempt",
+        "automatic_resubmit_allowed": false
+      },
+      "invariants": [
+        "Persist attempt intent before the upstream side effect; persist receipts and evidence after it.",
+        "A local fence protects database ownership; it cannot alone prevent an old process making an upstream call.",
+        "Idempotent upstream submission or an appropriate gateway is required before promising safe automatic replay.",
+        "Provider resource creation is a separate Capacity Controller contract with separate intent and cost accounting."
+      ]
+    }
+  }
+}

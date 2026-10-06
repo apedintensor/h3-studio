@@ -11,10 +11,13 @@ from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 PUBLIC_PATHS = frozenset({"/for-agents", "/for-agents/", "/llms.txt",
-    "/for-agents/guide.json", "/for-agents/SKILL.md", "/for-agents/skill.zip"})
+    "/for-agents/guide.json", "/for-agents/SKILL.md", "/for-agents/skill.zip",
+    "/for-agents/connect.py", "/for-agents/connect-manifest.json",
+    "/for-agents/references/quick-chat.md", "/for-agents/references/legacy-workflows.md"})
 DISCOVERY_LINK = '</for-agents>; rel="service-doc"; type="text/html", </llms.txt>; rel="alternate"; type="text/plain"'
 SKILL_ROOT = Path(__file__).resolve().parent.parent / "skills" / "sixnine-yingxu"
-SKILL_FILES = ("SKILL.md", "scripts/sixnine.py")
+SKILL_FILES = ("SKILL.md", "scripts/sixnine.py", "scripts/connect.py", "references/quick-chat.md",
+               "references/legacy-workflows.md")
 MAX_SKILL_BYTES = 512 * 1024
 
 
@@ -63,7 +66,7 @@ def quick_examples():
     }
 
 
-def public_guide():
+def legacy_guide():
     """Relative URLs deliberately keep discovery and credentials on one origin."""
     return {
         "name": "Sixnine / 映序", "version": 2, "api_version": "v1",
@@ -187,7 +190,7 @@ def skill_bundle():
     return output.getvalue()
 
 
-def llms_text():
+def legacy_llms_text():
     return """# Sixnine / 映序 — Agent integration
 
 > Use the authenticated API for one quick H3 clip or a multi-chapter story. Save the same prompt, separate media inputs and controls the user can edit on the website; plan generation and adopt candidates.
@@ -213,7 +216,7 @@ Adopt successful artifacts into the target shot and verify the saved document. R
 """
 
 
-def landing_html():
+def legacy_landing_html():
     guide = public_guide()
     steps = "".join(f'<li><strong>{html.escape(item["step"])}</strong><p>{html.escape(item["action"])}</p></li>' for item in guide["workflow"])
     example = html.escape(json.dumps(guide["examples"]["create_quick_project"], ensure_ascii=False, indent=2))
@@ -235,7 +238,111 @@ def landing_html():
 <p><small>Skill 包只包含 SKILL.md 和 scripts/sixnine.py；辅助脚本需要 Python 与 httpx。你也可以直接使用同源 HTTP API，无需安装 Skill。下载不会自动安装或授权。</small></p></main></body></html>'''
 
 
+def public_guide():
+    value = legacy_guide()
+    value.update(version=3, description="Persistent quick-chat creation or multi-chapter stories; web and Agent share conversations, media, immutable cards, batches and results.")
+    value["authentication"].update(
+        provisioning="Sign in, create a five-minute one-time connection code in Connect Codex. The public helper generates and saves the PAT in OS-protected storage, then registers its hash. Manual PAT is an advanced fallback.",
+        storage="Use scripts/connect.py with the user's exact origin; no internal AI-Registry setup is required. Code/PAT/verifier must never enter URLs, command arguments, logs or ordinary JSON.",
+        helper="/for-agents/connect.py", helper_manifest="/for-agents/connect-manifest.json",
+        connections="/v1/account/agent-connections", exchange="/v1/agent-connect/exchange",
+        assistant_scope="assistant:run is separate; old keys do not gain it automatically.")
+    value["legacy_quick_creation"] = value["quick_creation"]
+    value["legacy_quick_examples"] = quick_examples()
+    value["examples"] = {k: v for k, v in value["examples"].items() if k not in value["legacy_quick_examples"]}
+    value["examples"].update({
+        "create_chat_session": {"method": "POST", "path": "/v1/quick-chat/sessions",
+            "headers": {"Idempotency-Key": "chat-create-001"}, "body": {"title": "一束光中的叶子"},
+            "read_response": {"session_id": "session.id", "session_version": "session.version", "web_url": "session.web_url"}},
+        "create_chat_card": {"method": "POST", "path": "/v1/quick-chat/sessions/{session_id}/cards",
+            "headers": {"Idempotency-Key": "chat-card-001"}, "body": {"title": "光中的叶子", "prompt": "A green leaf moves gently in warm sunlight, with a slow camera push-in.",
+                "recipe_id": "h3-base-fl2va-v1", "controls": {"duration": 5, "resolution": "480P", "seed": "42"}, "inputs": {}, "copies": 1},
+            "notice": "Illustrative controls must be checked against current schema and deployment policy; creating a card does not submit generation."},
+        "preflight_chat_card": {"method": "POST", "path": "/v1/quick-chat/sessions/{session_id}/revisions/{revision_id}/preflights",
+            "headers": {"Idempotency-Key": "chat-preflight-001"}, "body": {"capabilities_version": "{current_capabilities_version}", "revision_hash": "{revision_input_hash}"},
+            "notice": "Use revision.input_hash, inspect actual blockers/settings/estimate/expiry; preflight does not rent GPU."},
+        "confirm_chat_card": {"method": "POST", "path": "/v1/quick-chat/sessions/{session_id}/revisions/{revision_id}/submissions",
+            "headers": {"Idempotency-Key": "chat-confirm-001"}, "body": {"preflight_id": "{returned_preflight_id}", "revision_hash": "{revision_input_hash}", "confirmed": True},
+            "notice": "Only within user authorization and a current ready preflight. Preserve this body/key for uncertain outcomes; do not create a second card to retry."}})
+    value["quick_creation"] = {
+        "schema": "/v1/quick-chat/schema", "sessions": "/v1/quick-chat/sessions",
+        "session": "/v1/quick-chat/sessions/{session_id}",
+        "assets": "/v1/quick-chat/sessions/{session_id}/assets",
+        "materials": "/v1/quick-chat/sessions/{session_id}/materials",
+        "timeline": "/v1/quick-chat/sessions/{session_id}/timeline",
+        "cards": "/v1/quick-chat/sessions/{session_id}/cards",
+        "reference": "/for-agents/references/quick-chat.md",
+        "web_url": "/quick-chat?session={session_id}",
+        "confirmation": "Preflight is not execution. Only confirmed=true submits a card revision; one revision has one submission across callers.",
+        "status": "Poll the original submission independently of timeline seq. Unknown upstream state cannot be resubmitted.",
+    }
+    value["authenticated_resources"].update(quick_chat_schema="/v1/quick-chat/schema",
+        quick_chat_sessions="/v1/quick-chat/sessions", connections="/v1/account/agent-connections")
+    value["web_links"]["conversation"] = "/quick-chat?session={session_id}"
+    value["workflow"] = [
+        {"step": "Discover", "action": "Read this guide and Skill on the exact user-supplied origin; discovery is not authorization."},
+        {"step": "Connect", "action": "Use the owner's one-time connection code with the public OS-storage helper; check origin, owner and authorization fingerprint before activation."},
+        {"step": "Choose", "action": "For one clip create a Quick Chat session; for chapters keep the existing story API. Do not edit Quick Chat's internal execution project through legacy routes."},
+        {"step": "Prepare", "action": "Upload images/video/audio to the session, bind ready receipts and explicit uses/ranges. Save a turn or create a complete card directly. Assistant calls need assistant:run and runtime enablement."},
+        {"step": "Confirm", "action": "Preflight the immutable revision, inspect actual settings/limits/estimate, then explicitly confirm. Save original IDs/body/idempotency keys before sending."},
+        {"step": "Observe", "action": "Read original submission and each item; retry only a stopped failed item, resume only unadmitted items. Preserve successes and unresolved obligations."},
+        {"step": "Return", "action": "Return the conversation web_url. Results become new references only through explicit result-imports, not automatic history inheritance."},
+    ]
+    value["limitations"] = ["Discovery confers no editing or spending permission.",
+        "Runtime schema and actual preflight are authoritative; offline tests do not prove live assistant/GPU operation.",
+        "Assistant media implementation/verification/enabling are reported separately for each exact model.",
+        "Image/music/Marble generation, shared teams and server media ZIP are outside this release."]
+    return value
+
+
+def llms_text():
+    return """# Sixnine / 映序
+
+Read [/for-agents/guide.json](/for-agents/guide.json) and [/for-agents/SKILL.md](/for-agents/SKILL.md).
+The owner connects an Agent with a five-minute one-time code. Download [/for-agents/connect.py](/for-agents/connect.py);
+it saves the formal PAT in OS-protected storage before exchange. No public user needs our internal Registry.
+Never put codes, keys or verifiers in URLs, argv, logs or ordinary JSON. Verify the exact origin/owner/fingerprint.
+
+For one clip, use /v1/quick-chat/sessions: upload and bind ready media, save turns and immutable card revisions,
+preflight, then explicitly confirm a submission. Web and Agent see the same durable conversation and outputs.
+Poll active submissions separately from timeline seq. Unknown outcomes reconcile the same operation; do not repost.
+Only stopped failed items may retry; unadmitted items resume their original identity. Result reuse is explicit.
+GET /v1/quick-chat/schema, /v1/capabilities and authenticated /openapi.json for current controls and enablement.
+Static discovery is not proof of available GPU or verified assistant media understanding.
+
+For multi-chapter stories, the existing /v1/projects and guided actions remain supported.
+Legacy single-shot drafts still support POST /v1/projects with workspace=freestyle and /freestyle links.
+Manual scoped PAT and scripts/sixnine.py are advanced alternatives. Creating/editing/preflight never rents GPU.
+Only a user's confirmed generation authorizes queue execution within the configured service policy.
+"""
+
+
+def landing_html():
+    steps = "".join('<li><strong>'+html.escape(x["step"])+ '</strong><p>'+html.escape(x["action"])+ '</p></li>' for x in public_guide()["workflow"])
+    return '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>映序 · 连接 AI</title><style>body{background:#f7f8f3;color:#1a3028;font:17px/1.7 system-ui;margin:0}main{max-width:900px;margin:auto;padding:40px 24px}a{color:#245c42}h1{font-size:44px}section{background:white;border:1px solid #d3dfd1;border-radius:16px;padding:24px;margin:24px 0}nav{display:flex;gap:20px;flex-wrap:wrap}li{margin:16px 0}code{font-size:14px}</style></head><body><main><nav><a href="/quick-chat">← 快速创作</a><a href="/llms.txt">llms.txt</a><a href="/for-agents/guide.json">机器指南</a></nav><h1>把想法交给 AI，<br>随时回网站接着做。</h1><p>网页与 Codex 共用会话、素材、任务卡和结果。一次连接后，你能看到 Agent 改了什么，再修改指定卡片或重试失败的一份。</p><nav><a href="/for-agents/SKILL.md">阅读 Skill</a><a href="/for-agents/skill.zip">下载 Skill 包</a><a href="/for-agents/connect.py">连接助手脚本</a></nav><section><h2>连接方式</h2><p>登录网页，在「连接 Codex」创建五分钟一次性连接码，把网页提供的连接说明交给 Agent。正式 Key 由本地助手生成并保存在系统凭据库中，服务器只登记 hash。网页随时查看和撤销连接。</p><p>连接码是临时授权，不放到 URL、公开 issue 或日志。公众无需配置我们的内部资源注册表；手工 API Key 是高级备用入口。</p></section><h2>Agent 的调用顺序</h2><ol>'''+steps+'''</ol><section><h2>准确的执行反馈</h2><p>编辑、上传和预检不会开 GPU。只有确认提交才进入已有队列；等待算力、准备 GPU、生成、收集、失败和结果均按真实记录显示。助手与 GPU 的当前能力以登录后的 schema/预检为准，这页不声称它们已上线或经过实测。</p><p>短剧仍可使用故事、章节、角色和分镜 API。快速聊天的内部执行项目由系统维护，不能用旧故事写接口绕过任务卡。</p></section></main></body></html>'''
+
+
 def register_routes(app):
+    @app.api_route("/for-agents/references/quick-chat.md", methods=["GET", "HEAD"], include_in_schema=False)
+    def quick_chat_reference():
+        return Response(read_skill_file("references/quick-chat.md"), media_type="text/plain; charset=utf-8")
+
+    @app.api_route("/for-agents/references/legacy-workflows.md", methods=["GET", "HEAD"], include_in_schema=False)
+    def legacy_reference():
+        return Response(read_skill_file("references/legacy-workflows.md"), media_type="text/plain; charset=utf-8")
+
+    @app.api_route("/for-agents/connect.py", methods=["GET", "HEAD"], include_in_schema=False)
+    def connection_helper():
+        return Response(read_skill_file("scripts/connect.py"), media_type="text/plain; charset=utf-8")
+
+    @app.api_route("/for-agents/connect-manifest.json", methods=["GET", "HEAD"], include_in_schema=False)
+    def connection_manifest():
+        import hashlib
+        return JSONResponse({"version": 1, "helper_url": "/for-agents/connect.py",
+            "sha256": hashlib.sha256(read_skill_file("scripts/connect.py")).hexdigest(),
+            "exchange_path": "/v1/agent-connect/exchange", "connections_path": "/v1/account/agent-connections",
+            "credential_storage": "OS protected", "internal_registry_required": False})
+
     @app.api_route("/for-agents", methods=["GET", "HEAD"], include_in_schema=False)
     @app.api_route("/for-agents/", methods=["GET", "HEAD"], include_in_schema=False)
     def agent_landing():

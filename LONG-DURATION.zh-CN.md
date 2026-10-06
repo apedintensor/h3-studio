@@ -1,6 +1,6 @@
 # 解除公网统一5秒输出限制
 
-2026-10-05，Sydney。用户明确要求解除当前约5.1667秒采样上限。本批状态：本地修改与发布准备；实际启用必须有公网和控制器回执，本文本身不是上线证明。
+2026-10-05 17:58，Sydney。用户明确要求解除当前约5.1667秒采样上限。本批已上线：完整CI37271780834、受保护发布73ca224、新监督器sequence005/admission open与公网GET验收通过。具体回执见`.platform-demand-live/NEW-START-STRATEGY-RESULT.zh-CN.md`和`final-duration-public-verification.json`。允许4–15秒请求，不代表15秒生成性能已经实测。
 
 ## 最终行为
 
@@ -22,9 +22,9 @@
 
 运营policy、config、capacity approval、worker与host marker都绑定身份。不能只覆盖JSON；旧审批与已提交任务保留原策略。
 
-本轮确认原sequence004真实任务`f5508e4a-3e50-4558-803a-f824c795b62d`仍等待容量，已租H100在旧策略的合成测试。用户明确要求立即换成真实队列策略。独立一次性helper冻结旧CPU后续提交、关闭新生成准入，确认所有已提交测试终态与上游队列为空后，在同一物理实例上接管；不打断已经开始的真实用户推理，不重复提交未知任务。
+原sequence004真实任务`f5508e4a-3e50-4558-803a-f824c795b62d`在升级检查期间已经开始并完成，单次attempt，旧策略结果完整保留。用户随后明确要求关机升级再开，实际采用旧GPU销毁及租赁对账完成后的finished-empty切换，未执行live SQL adoption，也没有重新提交原任务。
 
-SQL事务保留原job、request、plan、幂等键、预留费用、已租pod和真实TTL，仅迁移执行绑定、撤销旧领取权并隔离旧控制器。旧测试回执归档，新runtime回执明确记录身份桥接和generation_verified=false；模型及环境不重新下载。原budget IDs、created_at、max_cycles及sequence004保持，hard_deadline只按此次明确授权增加18000秒。未知提交、账本不一致或已开始真实推理时拒绝接管；切换过程和启用结果必须有独立回执。
+独立helper保留原job/request/plan/幂等键、六项终态任务待结算预留、预算与历史租赁；旧control和operator归档，新sequence从004继续到005。hard_deadline只增加明确授权18000秒，未充值或重置账本。公网后端及按需控制器已恢复，新真实任务触发下一次GPU启动；当前空队列没有额外租GPU。此前准备的同pod迁移代码只有离线证据，不是本轮实际执行路径。GPU销毁后的新实例仍须准备环境和模型，不宣称保留了旧pod缓存。
 
 ## 验收与证据
 

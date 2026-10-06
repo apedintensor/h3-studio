@@ -3,11 +3,16 @@ import asyncio
 import time
 from collections import Counter
 import threading
+import re
 from starlette.exceptions import HTTPException
 from starlette.responses import JSONResponse
 
 
 ADMISSION_SCOPE_KEY = "sixnine.request_admission"
+
+
+def is_asset_upload(path):
+    return path == "/v1/assets" or bool(re.fullmatch(r"/v1/quick-chat/sessions/[^/]+/assets", path))
 
 
 class RequestAdmission:
@@ -189,7 +194,7 @@ class BodyLimitMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         path = scope.get("path", "")
-        maximum = self.upload_bytes + 1024 * 1024 if path == "/v1/assets" else self.project_bytes
+        maximum = self.upload_bytes + 1024 * 1024 if is_asset_upload(path) else self.project_bytes
         if path == "/api/auth/login":
             maximum = min(maximum, 16 * 1024)
         total_seconds = min(self.total_seconds, self.login_seconds) if path == "/api/auth/login" else self.total_seconds

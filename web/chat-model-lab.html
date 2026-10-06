@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>映序 · 创作助手模型试聊</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f6f1;color:#182c27;font:15px/1.65 system-ui,"Microsoft YaHei",sans-serif}main{max-width:1280px;margin:auto;padding:30px 24px}header{display:flex;justify-content:space-between;align-items:center;gap:16px}h1{font-size:27px;margin:0}h2{font-size:18px;margin:0}p{margin:8px 0;color:#56665e}.tag{font-size:12px;border:1px solid #cbd4c8;padding:4px 10px;border-radius:20px}button,select,textarea{font:inherit}button,select{border:1px solid #cbd4c8;background:white;color:inherit;padding:9px 15px;border-radius:9px}button{cursor:pointer}button:disabled{opacity:.5;cursor:wait}button.primary{background:#203f32;color:white;border-color:#203f32}textarea{width:100%;resize:vertical;padding:12px;border:1px solid #bac8bc;border-radius:10px;background:white;color:inherit}textarea:focus,button:focus-visible,select:focus-visible{outline:3px solid #aac98d;outline-offset:2px}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:20px 0}.columns{display:grid;grid-template-columns:1fr 1fr;gap:18px}.panel{background:white;border:1px solid #d8dfd3;border-radius:15px;overflow:hidden}.panel>header{padding:18px;border-bottom:1px solid #e1e6dd}.messages{height:370px;overflow:auto;padding:18px}.empty{padding:50px 15px;text-align:center;color:#79877d}.bubble{white-space:pre-wrap;overflow-wrap:anywhere;border-radius:10px;padding:13px;margin-bottom:12px;background:#f0f3ec}.bubble.user{background:#e7eddf}.bubble.error{background:#fff0e7}.meta{font-size:12px;color:#647467;display:block;margin-bottom:5px}.composer{margin-top:20px;background:white;border:1px solid #d8dfd3;border-radius:15px;padding:18px}.actions{display:flex;gap:12px;justify-content:space-between;align-items:center;margin-top:12px}.notice{font-size:13px;color:#657266}details{margin:15px 0}summary{cursor:pointer}.status{min-height:26px}a{color:#315e49}@media(max-width:760px){.columns{grid-template-columns:1fr}.messages{height:280px}main{padding:20px 12px}header{align-items:flex-start}h1{font-size:22px}.actions{align-items:flex-start;flex-direction:column}}
+</style>
+<main>
+<header><div><span class="tag">本地模型试聊 · 真实 Google API</span><h1>选一个懂你创作意图的助手。</h1></div><button id="new">新对话</button></header>
+<p>同一句话分别发给两个模型，接着说“只改镜头，其他保持”，比较它们如何理解上下文。</p>
+<div class="toolbar"><label for="target">发送给</label><select id="target"><option value="both">两个模型同时对比</option value="gemma-4-31b-it">Gemma 4 31B IT</option><option value="gemini-3.8-flash">Gemini 3.8 Flash</option></select><button id="example">填入示例</button><button id="export">导出当前对话</button></div>
+<div class="columns">
+<section class="panel"><header><div><h2>Gemma 4 31B IT</h2><span class="meta">gemma-4-31b-it</span></div><span id="s0" class="tag">待你试用</span></header><div id="m0" class="messages" aria-live="polite"><div class="empty">这里会显示 Gemma 的回答</div></div></section>
+<section class="panel"><header><div><h2>Gemini 3.8 Flash</h2><span class="meta">gemini-3.8-flash</span></div><span id="s1" class="tag">待你试用</span></header><div id="m1" class="messages" aria-live="polite"><div class="empty">这里会显示 Gemini 的回答</div></div></section>
+</div>
+<div class="composer"><label for="prompt">描述创作想法，或继续提出修改</label><textarea id="prompt" rows="3" maxlength="16000" placeholder="例如：一个穿黄色雨衣的女孩在夜晚车站等车，慢慢推近镜头。先帮我整理成视频提示词。"></textarea>
+<details><summary>创作助手指令 · 两个模型共用</summary><p class="notice">首轮开始后固定，开启新对话可修改。每轮最多输出2048 tokens。</p><textarea id="instruction" rows="6" maxlength="6000"></textarea></details>
+<div class="actions"><span class="notice">文字会发送至 Google。此页不启动 H3、不租 GPU。历史只保存在当前标签页，刷新会清空。</span><button id="send" class="primary" disabled>发送并比较</button></div>
+<p class="status" id="status" role="status">正在加载模型选项……</p></div>
+<p class="notice">两边接收相同的本轮输入，各自沿用自己的历史回答。耗时包含网络与生成，不是正式性能基准。目录可见不代表每次调用都有额度；错误按实际响应显示，不自动换模型。</p>
+</main>
+<script>
+const ids=['gemma-4-31b-it','gemini-3.8-flash'];
+let histories=[[],[]], records=[[],[]], busy=false, available=[false,false];
+const $=id=>document.getElementById(id);
+function status(text){$('status').textContent=text}
+function append(i,role,text,meta=''){
+ const area=$('m'+i);area.querySelector('.empty')?.remove();const item=document.createElement('div');item.className='bubble '+role;
+ const label=document.createElement('span');label.className='meta';label.textContent=meta||(role==='user'?'你':'助手');item.append(label,document.createTextNode(text));area.append(item);area.scrollTop=area.scrollHeight;return item;
+}
+function targetIndices(){return ids.map((id,i)=>i).filter(i=>$('target').value==='both'||ids[i]===$('target').value)}
+function update(){const selected=targetIndices();$('send').disabled=busy||selected.some(i=>!available[i]);$('send').textContent=busy?'正在回答……':selected.length===2?'发送并比较':'发送';for(const name of ['new','target','example','prompt'])$(name).disabled=busy;$('instruction').disabled=busy||histories.some(h=>h.length);}
+$('target').onchange=update;
+$('example').onclick=()=>{$('prompt').value='一个穿黄色雨衣的女孩在雨夜车站等车，远处一辆末班车驶来。做一个5秒的电影感镜头，帮我整理完整视频提示词。'};
+$('new').onclick=()=>{histories=[[],[]];records=[[],[]];for(let i=0;i<2;i++){$('m'+i).replaceChildren();const p=document.createElement('div');p.className='empty';p.textContent='新对话，从这里开始';$('m'+i).append(p)}$('prompt').value='';status('新对话已开始。');update()};
+$('export').onclick=()=>{const blob=new Blob([JSON.stringify({created_at:new Date().toISOString(),instruction:$('instruction').value,models:ids.map((model,i)=>({model,turns:records[i]}))},null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='yingxu-model-comparison-'+Date.now()+'.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),30000)};
+$('send').onclick=async()=>{
+ const text=$('prompt').value.trim();if(!text||busy)return;const selected=targetIndices();const instruction=$('instruction').value;
+ busy=true;update();status('正在调用 Google；不会自动重试。');let failed=false;
+ await Promise.all(selected.map(async i=>{
+  const messages=[...histories[i],{role:'user',text}];const request_id=crypto.randomUUID();append(i,'user',text);const waiting=append(i,'assistant','正在回答……');
+  try{
+   const response=await fetch('/lab/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request_id,model:ids[i],messages,instruction})});const data=await response.json();waiting.remove();
+   if(!response.ok){failed=true;append(i,'error',data.message||'调用失败。','本轮未完成 · '+(data.error||response.status));records[i].push({request_id,input:text,error:data.error||response.status});return}
+   histories[i]=[...messages,{role:'model',text:data.text}];records[i].push({request_id,input:text,...data});
+   const u=data.usage||{};append(i,'assistant',data.text,`${data.elapsed_seconds} 秒 · 输出 ${u.candidatesTokenCount??'未知'} tokens · ${data.finish_reason||'完成'}`);
+   if(data.finish_reason==='MAX_TOKENS')append(i,'error','本轮达到输出上限，回答可能不完整。','输出提示');
+  }catch{waiting.remove();failed=true;append(i,'error','连接中断，服务端可能仍在处理并产生费用。不会自动重新发送。','结果待确认');records[i].push({request_id,input:text,error:'connection_unknown'})}
+ }));
+ busy=false;if(!failed)$('prompt').value='';status(failed?'部分调用未完成。成功的一侧已保留；失败的输入未加入该模型上下文。再次发送会是新调用。':'本轮完成。可以继续修改；两边分别保留自己的上下文。');update();
+};
+fetch('/lab/models').then(async r=>{if(!r.ok)throw Error();return r.json()}).then(data=>{
+ $('instruction').value=data.instruction;for(let i=0;i<2;i++){const m=data.models.find(x=>x.id===ids[i]);available[i]=!!m?.configured;$('s'+i).textContent=available[i]?'已配置 · 未试聊':(m?.message||'暂不可用')}
+ status('两个选项已准备。尚未测试生成，点发送后才调用 Google。');update();
+}).catch(()=>status('无法连接本地试聊后端，请检查本地服务。'));
+</script></html>

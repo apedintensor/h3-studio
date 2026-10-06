@@ -2,6 +2,8 @@
 
 编写日期：2026-10-04（悉尼）。**本文是待实现、待验收的架构；没有启动 GPU、调用供应商或证明当前具备分布式能力。** 当前 Lightsail 包装仍固定 `H3_GENERATION_ENABLED=0`。GPU 已按用户要求销毁，新增租赁须另有授权。
 
+同日供应商补充核查见 [API-PROVIDER-COMPATIBILITY.zh-CN.md](API-PROVIDER-COMPATIBILITY.zh-CN.md)：Engy 公共 OpenAPI 已确认 `/v2/video_generation` 等路由，但未提供完整请求体；Boyesir 新增逐型号公开能力与报价证据。下文供应商表保留最初设计时的历史依据，以补充核查区分新事实与未知项。仅执行公开只读 GET，没有使用买方凭据、上传或生成，也未实现 adapter。
+
 当前应用采用 SQLite、进程内 worker 与单个 loopback ComfyUI 入口。复制应用容器或增加 Uvicorn worker 不能直接获得安全的多 GPU 调度；会引入重复领取、重启状态冲突和重复计费风险。先让密码账户、网页、上传与历史下载稳定上线，再逐阶段增加生成能力。
 
 ## 1. 用户如何选择

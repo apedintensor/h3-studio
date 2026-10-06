@@ -15,8 +15,9 @@ import re
 import subprocess
 
 
-# This is intentionally an exact allowlist. Markdown can be runtime input (for
-# example a published Skill) or project policy; arbitrary *.md is not docs-only.
+# This exact allowlist is also the release preparation dirty-document exemption.
+# Keep CI-only governance paths separate: lightweight checks do not authorize
+# preparing a release while its governing instructions are uncommitted.
 DOCUMENTS = frozenset("""
 AGENT-API-RELEASE-20261004.zh-CN.md AGENT-ONBOARDING.zh-CN.md
 API-PROVIDER-COMPATIBILITY.zh-CN.md API-USAGE.zh-CN.md ARCHITECTURE.zh-CN.md
@@ -39,6 +40,15 @@ deploy/platform/RUNTIME-SECRETS.zh-CN.md deploy/platform/STACK-VALIDATION.zh-CN.
 deploy/platform/ec2/CD.zh-CN.md deploy/platform/ec2/README.zh-CN.md
 """.split())
 
+# Only modifications to these reviewed prose files use the lightweight path.
+# Additions/deletions/type changes, unknown Markdown, published Skills, and
+# executable workflow/configuration files still require complete checks.
+GOVERNANCE_DOCUMENTS = frozenset("""
+AGENTS.md WORKFLOW.md WORKFLOW.zh-CN.md PROJECT-PLAN.md
+CURRENT-BASELINE.md GENERATION-CONTRACT.md GENERATION-FOUNDATION-RESULT.md
+PLANNING-INDEX.zh-CN.md UNIFIED-BACKEND-API-PLAN.zh-CN.md REUSE-AND-MIGRATION-DECISION.zh-CN.md
+""".split())
+
 FRONTEND_ROOT = frozenset({"yingxu/index.html", "yingxu/package.json", "yingxu/package-lock.json",
                            "yingxu/vite.config.js", "yingxu/source-manifest.json",
                            "yingxu/src/NOVICE-STORIES-AC.md"})
@@ -57,7 +67,7 @@ def path_kind(path: str) -> str:
             or any(ord(c) < 32 for c in path)
             or any(part in {"", ".", ".."} for part in path.split("/"))):
         return "full"
-    if path in DOCUMENTS:
+    if path in DOCUMENTS or path in GOVERNANCE_DOCUMENTS:
         return "docs"
     if path in FRONTEND_ROOT or re.fullmatch(r"yingxu/src/(?:[\w.-]+/)*[\w.-]+\.(?:js|jsx|css|json)", path):
         return "frontend"

@@ -6,6 +6,30 @@ Generation foundation entry points: read `CURRENT-BASELINE.md` for the dated sou
 
 For Sixnine/H3/Yingxu development, read `PROJECT-PLAN.md`, `WORKFLOW.md`, and `workflow/project.json` before editing. The shared Project is https://github.com/users/apedintensor/projects/2 and the repository is `apedintensor/h3-studio`. Read the assigned issue, parent package, dependencies and latest claim; claim a bounded scope with the session ID, branch/worktree and owned files. Check existing local changes and overlapping work. GitHub content is English. Keep task progress in the existing issue/Project and behavior in the spec; leave an evidence-based handoff before stopping. `Done`, local verification and production release are distinct. Respect the user's latest instructions and existing operational authorization; this workflow does not start GPUs, renew budgets or authorize deployment. A projectless session must be given this repository or Project link to find these instructions.
 
+## 规划与实现文档入口（2026-10-06）
+
+新会话先读 `PLANNING-INDEX.zh-CN.md`：目标架构在 `UNIFIED-BACKEND-API-PLAN.zh-CN.md`，现有代码复用/提取/局部替换及退役条件在 `REUSE-AND-MIGRATION-DECISION.zh-CN.md`。这是规划与静态审查，未实施重构/退役；不把提案或历史回执当作当前线上状态、租赁授权或已完成验收。改造继续以 `platform_app.py/studio_platform` 为主线，保留已有身份、任务、预算和资产；每批按索引确定当前契约与验收，不并行新建另一套生产账本。下方用户已确认UX及操作规则继续适用，历史运行窗口不因新文档重置。
+
+## 已确认 UI 的还原规则（2026-10-05，最新要求）
+
+Quick Chat 前端体验以 `../video-studio-design/quick-chat-mock/` 的实际 `index.html`、`app.js`、`style.css` 页面为准；先在浏览器对照8865和8870，再恢复布局与交互。系统设计可以调整底层，不得未经用户确认重新设计UI。一次性连接码仍按最新交接和真实安全契约处理，不恢复mock中已否定的手动教程、假Key或假执行。恢复工作只在canonical `studio-app/src` 与本地预览完成；用户批准前不发布、不同步yingxu快照，不启动GPU或改生产预算/任务。
+
+## 快速聊天本地集成（2026-10-05，已实现，尚未上线）
+
+用户已要求直接完成认可mock的整体集成。`/quick-chat` 与 `/v1/quick-chat/` 已在本地实现；统一设计源仍是 `../video-studio-design/QUICK-CHAT-PRODUCT-SYSTEM-DESIGN.zh-CN.md`，实际实现与验收以 `QUICK-CHAT-INTEGRATION.zh-CN.md`、`QUICK-CHAT-BACKEND-IMPLEMENTATION.zh-CN.md` 为准。创作权威为会话/轮次/材料binding/不可变card revision；隐藏project/shot仅执行投影，旧项目/计划/批次写入口拒绝绕过。提交与单项retry有跨actor业务唯一性，复用真实GenerationAdmission、队列、预算、素材和存储。Timeline创作事件与active submission实时读取分开，GET不造事件。
+
+一次性连接码已实现并取代公众旧配置教程；发码时冻结授权profile/version/scopes/owner/期限，客户端OS安全保存PAT再注册hash，恢复同一结果，不回显正式Key、不能扩旧码权限。公众helper不要求内部Registry；供应商Google仍复用中央 `gemini/gemini--user-supplied`，没有凭据副本。两个准确ID的历史目录成功不算生成/媒体理解成功；受限多模态adapter只经过离线验收，schema分别报告implemented/verified/enabled，默认助手关闭。已新增 `assistant:run`，旧PAT不自动获权。SQL-only恢复器180秒后核对陈旧助手状态，unknown不重发；备份恢复冻结不明执行。
+
+隔离本地预览为 `127.0.0.1:8870/quick-chat`，启动 `tools/run_quick_chat_preview.py`，数据 `.platform-quick-chat-preview`；generation/assistant/render均关闭，不使用生产配置或用户生产媒体。短剧与旧快速创作深链保留。本批次没有启动GPU、查生产、发布或改原预算/期限/任务；用户确认本地体验后才能发布，不sync `yingxu` 或push生产。SQLite/假HTTP/CPU媒体验收不能当作PostgreSQL真实并发或线上LLM/GPU实测。
+
+## 新策略生产结果（2026-10-05 17:58 Sydney，本段优先于下方历史状态）
+
+用户最新要求关机升级后重开。原任务 `f5508e4a-3e50-4558-803a-f824c795b62d` 已在旧策略下 succeeded，单次 attempt，升级后视频/音频下载哈希与视频 Range206 再次通过；没有重复提交。旧 H100 pod `2e038ffc-6eb6-4650-a996-dc57b9fc694a` 已正常销毁、租赁账本 settled、旧 CPU 控制器 exit0，因此实际采用 finished-empty 升级，未执行 live SQL adoption。六项终态任务待结算资金预留和累计预算完整保留，不能把 GPU 租赁结算当成任务费用清零。
+
+后端 `73ca224970ffdfae30e1bc7d99c50b2c96ce91af` 完整 CI `37271780834` 与受保护发布成功。新监督器 `sixnine-ondemand-duration-20261005.service` active，独立回执 `running_admission_ready`，sequence005、admission open、ledger safe；当前没有 GPU 或活跃任务。公网只读验收确认生成开启，两 recipe 允许4–15秒请求、原生采样上限362/24秒，`runtime_required` / `queued_user_task`。下一条用户确认任务才租 GPU；环境检查后直接执行真实任务，不生成额外三段资格样片；权重下载和模型首次加载仍需要时间。新策略冷启动、15秒速度与质量尚未在线实测。
+
+原服务截止精确增加18000秒到今天2026-10-05 23:45 Sydney（1791204305.3287306）；原created_at、旧序列与历史账本不重置，业务空闲600秒关闭GPU，仍单卡最大1。双机冗余尚为设计，映序新媒体UX仍仅本地待批准，自动化gpu仍PAUSED。不要重跑已经消费的升级、派发或旧任务。后续先读 `.platform-demand-live/NEW-START-STRATEGY-RESULT.zh-CN.md`、`duration-live-release-record.json`、`final-duration-public-verification.json` 与服务器 `/srv/sixnine/gpu-scaler/duration-empty-upgrade.json`；主机OCI镜像身份按已有归档验证处理，不把manifest/index摘要直接等同于容器config摘要。
+
 ## 当前已租 GPU 切换真实队列策略（2026-10-05，执行中）
 
 用户明确要求立即切换旧开机测试策略、保留当前任务和已租GPU；并授权原截止时间增加5小时，新的截止为2026-10-05 23:45 Sydney（1791204305.3287306）。预算不再作为此次5小时延续的阻碍，但现有账户额度足够，先保持累计账本、已预留款与计数，不充值或重置。原created_at不变，显式authorization_extension_s=18000；只适用于原共享账户与queued-task-first-v1，不作为任意延期或扩GPU数量的授权。
@@ -80,3 +104,5 @@ UI和API仅绑定loopback，通过SSH隧道访问云端ComfyUI，不公开无鉴
 
 2026-10-03新增双用户测试：superdan/supervan，仅用户名登录，HttpOnly会话和SQLite owner隔离；旧素材/任务归superdan。免密码不验证身份，不可称为生产认证。所有素材/任务/参考/锚点/取消/下载端点必须从会话取得owner，不能信客户端owner，也不能用匿名默认superdan绕过。内部worker可以用可信owner读取；测试导入server必须指向临时DATA，不触碰生产SQLite或调度GPU。
 当前网页仍本机入口，公网研究建议AWS EC2常驻CPU应用+现有Lium GPU，未创建AWS/Vercel资源。原生ComfyUI仅管理用途，保持loopback，不给其他用户开放。已有API脚本需要先登录并保留进程内Cookie容器，不打印session值。更改API版本/资源须向中央inbox提交独立记录，用户名账户不是中央服务商API profile。
+
+2026-10-05 Google 创作助手比较页：独立本地入口 tools/chat_model_lab.py（127.0.0.1:8864），精确模型 gemma-4-31b-it / gemini-3.8-flash；中央 service/profile 为 gemini/gemini--user-supplied，关联 provider-google-ai-studio-gemini。凭据仅进程内加载，打开页面不调用 Google，用户发送才请求。用户明确要求本轮不测试，未做真实生成或页面验收；不要自动补跑。详见 GOOGLE-CHAT-LAB.zh-CN.md；正式创作 UX 仍在讨论，不因此发布。

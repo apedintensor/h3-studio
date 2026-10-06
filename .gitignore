@@ -10,6 +10,7 @@ inventory.json
 
 # This working folder contains private experiments and assets. Only explicitly
 # reviewed application/deployment files belong in the standalone Git repository.
+# Reviewed A1/A2/B2 contract and inference adapter files are allowed below.
 *
 !.gitignore
 !.gitattributes
@@ -257,9 +258,38 @@ inventory.json
 !deploy/platform/deploy_frontend.py
 !deploy/platform/ec2/ssm-frontend-document.json
 !DEVELOPMENT-RELEASE.zh-CN.md
+!studio_platform/google_chat.py
+!tools/chat_model_lab.py
+!web/chat-model-lab.html
+!GOOGLE-CHAT-LAB.zh-CN.md
+
+# Chat-native creation and one-time Agent connection (runtime data stays ignored).
+!studio_platform/generation_admission.py
+!studio_platform/quick_chat.py
+!studio_platform/quick_chat_routes.py
+!studio_platform/quick_chat_assistant.py
+!studio_platform/quick_chat_recovery.py
+!QUICK-CHAT-BACKEND-IMPLEMENTATION.zh-CN.md
+!studio_platform/agent_connect.py
+!studio_platform/agent_connect_routes.py
+!tools/agent_connect.py
+!tools/run_quick_chat_preview.py
+!skills/sixnine-yingxu/scripts/connect.py
+!skills/sixnine-yingxu/references/
+!skills/sixnine-yingxu/references/quick-chat.md
+!skills/sixnine-yingxu/references/legacy-workflows.md
+!QUICK-CHAT-INTEGRATION.zh-CN.md
+
+# Reviewed architecture planning only; no runtime receipts, secrets or assets.
+!PLANNING-INDEX.zh-CN.md
+!UNIFIED-BACKEND-API-PLAN.zh-CN.md
+!UNIFIED-API-CONTRACT-EXAMPLES.draft.json
+!REUSE-AND-MIGRATION-DECISION.zh-CN.md
+!GENERATION-RELIABILITY-ARCHITECTURE.zh-CN.md
 
 # Reviewed cross-session workflow; keep setup scripts and runtime evidence ignored.
 !WORKFLOW.md
+!WORKFLOW.zh-CN.md
 !PROJECT-PLAN.md
 !workflow/
 !workflow/project.json

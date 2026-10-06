@@ -2,7 +2,7 @@
 
 2026-10-05，Sydney。用户要求按需启动后直接执行队列中的真实任务，成功即交付；不再让用户等待每台新机器的三轮测试视频。
 
-本批次状态：本地实现与离线验收；尚未发布或切换生产控制器。公网原配置仍为 `fl50-firstlast4-ref4-v1`，不能把本文件视为线上启用回执。
+本批次生产状态（2026-10-05 17:58 Sydney）：后端73ca224完整CI与受保护发布通过；新控制器sequence005/admission open，公网两recipe已返回 `queued_user_task` / `runtime_required`、4–15秒范围。旧GPU销毁并结算后切换，原任务已在旧策略完成。当前空队列无GPU；下一条确认任务触发新策略。新策略真实冷启动与15秒推理尚未实测，回执见`.platform-demand-live/NEW-START-STRATEGY-RESULT.zh-CN.md`、`duration-live-release-record.json`、`final-duration-public-verification.json`。
 
 ## 新行为
 
