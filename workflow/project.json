@@ -1,0 +1,344 @@
+{
+  "schema_version": 1,
+  "repository": "apedintensor/h3-studio",
+  "project": {
+    "id": "PVT_kwHOAVQqAs4Bl2y8",
+    "number": 2,
+    "url": "https://github.com/users/apedintensor/projects/2",
+    "visibility": "PRIVATE"
+  },
+  "language": "en",
+  "plan": "PROJECT-PLAN.md",
+  "workflow": "WORKFLOW.md",
+  "authority": "Routing and issue identifiers only. Read GitHub for live task status; versioned evidence for releases.",
+  "work_packages": {
+    "A": {
+      "number": 1,
+      "node_id": "I_kwDOU6TGZc8AAAABVQaYkA",
+      "url": "https://github.com/apedintensor/h3-studio/issues/1",
+      "title": "[A] Establish the platform baseline and generation contract",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4WE"
+    },
+    "B": {
+      "number": 2,
+      "node_id": "I_kwDOU6TGZc8AAAABVQacLA",
+      "url": "https://github.com/apedintensor/h3-studio/issues/2",
+      "title": "[B] Deliver one reliable public generation path",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4ZU"
+    },
+    "C": {
+      "number": 3,
+      "node_id": "I_kwDOU6TGZc8AAAABVQagLg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/3",
+      "title": "[C] Recover failures without duplicate execution or lost outputs",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4c4"
+    },
+    "D": {
+      "number": 4,
+      "node_id": "I_kwDOU6TGZc8AAAABVQajWQ",
+      "url": "https://github.com/apedintensor/h3-studio/issues/4",
+      "title": "[D] Qualify a native H3 runtime behind the inference adapter",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4gA"
+    },
+    "E": {
+      "number": 5,
+      "node_id": "I_kwDOU6TGZc8AAAABVQanHg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/5",
+      "title": "[E] Deliver two-node on-demand GPU redundancy",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4jw"
+    },
+    "F": {
+      "number": 6,
+      "node_id": "I_kwDOU6TGZc8AAAABVQaqZQ",
+      "url": "https://github.com/apedintensor/h3-studio/issues/6",
+      "title": "[F] Protect media and migrate storage safely",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4nE"
+    },
+    "G": {
+      "number": 7,
+      "node_id": "I_kwDOU6TGZc8AAAABVQatsg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/7",
+      "title": "[G] Connect approved Quick Chat and Yingxu UX to the shared API",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4p4"
+    },
+    "H": {
+      "number": 8,
+      "node_id": "I_kwDOU6TGZc8AAAABVQawww",
+      "url": "https://github.com/apedintensor/h3-studio/issues/8",
+      "title": "[H] Prepare multi-user collaboration and measured scaling",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4tU"
+    }
+  },
+  "tasks": {
+    "A0": {
+      "number": 9,
+      "node_id": "I_kwDOU6TGZc8AAAABVQaziA",
+      "url": "https://github.com/apedintensor/h3-studio/issues/9",
+      "title": "[A0] Establish the shared workflow and session handoff",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w4w4",
+      "depends_on": []
+    },
+    "A1": {
+      "number": 10,
+      "node_id": "I_kwDOU6TGZc8AAAABVQa2-g",
+      "url": "https://github.com/apedintensor/h3-studio/issues/10",
+      "title": "[A1] Record the current code, deployment and pending-obligation baseline",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w40Y",
+      "depends_on": []
+    },
+    "A2": {
+      "number": 11,
+      "node_id": "I_kwDOU6TGZc8AAAABVQa6tA",
+      "url": "https://github.com/apedintensor/h3-studio/issues/11",
+      "title": "[A2] Freeze the generation lifecycle and compatibility contract",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w44I",
+      "depends_on": [
+        "A1"
+      ]
+    },
+    "B1": {
+      "number": 12,
+      "node_id": "I_kwDOU6TGZc8AAAABVQa9yQ",
+      "url": "https://github.com/apedintensor/h3-studio/issues/12",
+      "title": "[B1] Extract explicit generation services without changing behavior",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w48s",
+      "depends_on": [
+        "A2"
+      ]
+    },
+    "B2": {
+      "number": 13,
+      "node_id": "I_kwDOU6TGZc8AAAABVQbBSg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/13",
+      "title": "[B2] Isolate inference, readiness and output contracts",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w5Ag",
+      "depends_on": [
+        "A2"
+      ]
+    },
+    "C1": {
+      "number": 14,
+      "node_id": "I_kwDOU6TGZc8AAAABVQbExQ",
+      "url": "https://github.com/apedintensor/h3-studio/issues/14",
+      "title": "[C1] Separate service policy from finite GPU acceptance policy",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w5EU",
+      "depends_on": [
+        "A2",
+        "B2"
+      ]
+    },
+    "C2": {
+      "number": 15,
+      "node_id": "I_kwDOU6TGZc8AAAABVQbIWw",
+      "url": "https://github.com/apedintensor/h3-studio/issues/15",
+      "title": "[C2] Exercise ambiguous execution and recovery failures",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w5IY",
+      "depends_on": [
+        "B1",
+        "B2",
+        "C1"
+      ]
+    },
+    "B3": {
+      "number": 16,
+      "node_id": "I_kwDOU6TGZc8AAAABVQbLkg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/16",
+      "title": "[B3] Verify the public API cold-start-to-download lifecycle",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg-w5ME",
+      "depends_on": [
+        "B1",
+        "B2",
+        "C2"
+      ]
+    }
+  },
+  "views": {
+    "Delivery board": {
+      "id": "PVTV_lAHOAVQqAs4Bl2y8zgL7ktc",
+      "name": "Delivery board",
+      "number": 2,
+      "layout": "BOARD_LAYOUT",
+      "url": "https://github.com/users/apedintensor/projects/2/views/2"
+    },
+    "Ready to pick up": {
+      "id": "PVTV_lAHOAVQqAs4Bl2y8zgL7ktg",
+      "name": "Ready to pick up",
+      "number": 3,
+      "layout": "TABLE_LAYOUT",
+      "url": "https://github.com/users/apedintensor/projects/2/views/3"
+    },
+    "Blocked work": {
+      "id": "PVTV_lAHOAVQqAs4Bl2y8zgL7ktk",
+      "name": "Blocked work",
+      "number": 4,
+      "layout": "TABLE_LAYOUT",
+      "url": "https://github.com/users/apedintensor/projects/2/views/4"
+    },
+    "Roadmap": {
+      "id": "PVTV_lAHOAVQqAs4Bl2y8zgL7kkw",
+      "name": "Roadmap",
+      "number": 1,
+      "layout": "TABLE_LAYOUT",
+      "url": "https://github.com/users/apedintensor/projects/2/views/1"
+    }
+  },
+  "milestones": {
+    "M1": {
+      "number": 1,
+      "title": "M1 - Reliable generation foundation",
+      "url": "https://github.com/apedintensor/h3-studio/milestone/1"
+    },
+    "M2": {
+      "number": 2,
+      "title": "M2 - Runtime, capacity and storage",
+      "url": "https://github.com/apedintensor/h3-studio/milestone/2"
+    },
+    "M3": {
+      "number": 3,
+      "title": "M3 - Product integration and collaboration",
+      "url": "https://github.com/apedintensor/h3-studio/milestone/3"
+    }
+  },
+  "fields": {
+    "Status": {
+      "id": "PVTSSF_lAHOAVQqAs4Bl2y8zhkh_Oo",
+      "name": "Status",
+      "options": [
+        {
+          "id": "0943e77e",
+          "name": "Backlog"
+        },
+        {
+          "id": "30363675",
+          "name": "Ready"
+        },
+        {
+          "id": "e2173a20",
+          "name": "In progress"
+        },
+        {
+          "id": "121d5bc2",
+          "name": "In review"
+        },
+        {
+          "id": "090193c6",
+          "name": "Done"
+        }
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    "Priority": {
+      "id": "PVTSSF_lAHOAVQqAs4Bl2y8zhkiARM",
+      "name": "Priority",
+      "options": [
+        {
+          "id": "cd017d4d",
+          "name": "P0"
+        },
+        {
+          "id": "d3c5121c",
+          "name": "P1"
+        },
+        {
+          "id": "0af45907",
+          "name": "P2"
+        }
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    "Work package": {
+      "id": "PVTSSF_lAHOAVQqAs4Bl2y8zhkiATA",
+      "name": "Work package",
+      "options": [
+        {
+          "id": "bc8f165d",
+          "name": "A"
+        },
+        {
+          "id": "a8feeb38",
+          "name": "B"
+        },
+        {
+          "id": "dee824f5",
+          "name": "C"
+        },
+        {
+          "id": "ea0846e6",
+          "name": "D"
+        },
+        {
+          "id": "00bf4316",
+          "name": "E"
+        },
+        {
+          "id": "22a31475",
+          "name": "F"
+        },
+        {
+          "id": "c2beda5a",
+          "name": "G"
+        },
+        {
+          "id": "44e5b1cf",
+          "name": "H"
+        }
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    "Blocked": {
+      "id": "PVTSSF_lAHOAVQqAs4Bl2y8zhkiATI",
+      "name": "Blocked",
+      "options": [
+        {
+          "id": "603cd678",
+          "name": "No"
+        },
+        {
+          "id": "d6b2184a",
+          "name": "Yes"
+        }
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    "Release": {
+      "id": "PVTSSF_lAHOAVQqAs4Bl2y8zhkiATQ",
+      "name": "Release",
+      "options": [
+        {
+          "id": "3d0dc4d2",
+          "name": "Not required"
+        },
+        {
+          "id": "6fe0bc91",
+          "name": "Not released"
+        },
+        {
+          "id": "c1aa48fc",
+          "name": "Released"
+        }
+      ],
+      "type": "ProjectV2SingleSelectField"
+    },
+    "Session": {
+      "id": "PVTF_lAHOAVQqAs4Bl2y8zhkiATc",
+      "name": "Session",
+      "type": "ProjectV2Field"
+    },
+    "Branch / worktree": {
+      "id": "PVTF_lAHOAVQqAs4Bl2y8zhkiAVM",
+      "name": "Branch / worktree",
+      "type": "ProjectV2Field"
+    }
+  },
+  "runtime_authorization": "This setup grants no GPU rental, generation, budget extension or production deployment authority.",
+  "bootstrap_issue": 9,
+  "initial_next_issue": 10,
+  "live_selection": "Read Ready to pick up and current issue claims; initial_next_issue is bootstrap history, not a permanent instruction.",
+  "collaborators": [
+    {
+      "login": "yutingk0805",
+      "role": "WRITE",
+      "basis": "Existing repository collaborator authorized by the user."
+    }
+  ]
+}

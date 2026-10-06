@@ -1,0 +1,79 @@
+name: Work item
+description: Define a bounded change with an owner, a contract, and acceptance evidence.
+title: "[Work item] "
+labels: ["type:task"]
+projects: ["apedintensor/2"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read AGENTS.md → PROJECT-PLAN.md → WORKFLOW.md → the issue before implementation.
+        PROJECT-PLAN.md is the English architecture and A–H work-package entry point.
+        Use English on GitHub. Find the existing project and work-package issues in workflow/project.json; avoid duplicate work.
+        Link existing specifications instead of copying the architecture. Never include credentials, connection codes, private prompts, user media, or signed URLs.
+  - type: dropdown
+    id: work-package
+    attributes:
+      label: Work package
+      options:
+        - A — Baseline and contracts
+        - B — Minimum generation loop
+        - C — Failure recovery
+        - D — Native engine comparison
+        - E — Dual-GPU redundancy
+        - F — Object storage and recovery
+        - G — Scenario integration
+        - H — Collaboration and scale
+        - Cross-cutting maintenance
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: Describe the concrete problem and the desired behavior.
+      placeholder: |
+        Current behavior:
+        Expected behavior:
+        Out of scope:
+    validations:
+      required: true
+  - type: textarea
+    id: references
+    attributes:
+      label: Specification and dependencies
+      description: Link the parent issue, relevant existing specification or contract, and blocking issues. State unresolved decisions explicitly.
+      placeholder: |
+        Parent work package:
+        Specification / approved UX:
+        Dependencies:
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Change boundary
+      description: Identify modules/files, shared contracts, and compatibility constraints. Claim the work in a comment before editing.
+      placeholder: |
+        Modules / files:
+        Shared API / data / execution contracts:
+        Existing behavior that must remain:
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Use observable outcomes and specify the verification environment. Local verification and production release are separate.
+      placeholder: |
+        - [ ] ...
+        Verification environment:
+        Release expectation: Not required / Not released / separate release issue
+    validations:
+      required: true
+  - type: textarea
+    id: operating-boundary
+    attributes:
+      label: Operating boundary
+      description: Mention any required GPU, paid API, production, migration, or cleanup operations and their existing authorization. Creating this issue does not authorize them.
+      placeholder: Offline/local only, or the exact authorized operational scope and unresolved limits.

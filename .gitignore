@@ -249,3 +249,13 @@ inventory.json
 !deploy/platform/deploy_frontend.py
 !deploy/platform/ec2/ssm-frontend-document.json
 !DEVELOPMENT-RELEASE.zh-CN.md
+
+# Reviewed cross-session workflow; keep setup scripts and runtime evidence ignored.
+!WORKFLOW.md
+!PROJECT-PLAN.md
+!workflow/
+!workflow/project.json
+!.github/ISSUE_TEMPLATE/
+!.github/ISSUE_TEMPLATE/work-item.yml
+!.github/ISSUE_TEMPLATE/config.yml
+!.github/PULL_REQUEST_TEMPLATE.md

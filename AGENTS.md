@@ -1,5 +1,9 @@
 # H3 Studio
 
+## Cross-session workflow (2026-10-06)
+
+For Sixnine/H3/Yingxu development, read `PROJECT-PLAN.md`, `WORKFLOW.md`, and `workflow/project.json` before editing. The shared Project is https://github.com/users/apedintensor/projects/2 and the repository is `apedintensor/h3-studio`. Read the assigned issue, parent package, dependencies and latest claim; claim a bounded scope with the session ID, branch/worktree and owned files. Check existing local changes and overlapping work. GitHub content is English. Keep task progress in the existing issue/Project and behavior in the spec; leave an evidence-based handoff before stopping. `Done`, local verification and production release are distinct. Respect the user's latest instructions and existing operational authorization; this workflow does not start GPUs, renew budgets or authorize deployment. A projectless session must be given this repository or Project link to find these instructions.
+
 ## 当前已租 GPU 切换真实队列策略（2026-10-05，执行中）
 
 用户明确要求立即切换旧开机测试策略、保留当前任务和已租GPU；并授权原截止时间增加5小时，新的截止为2026-10-05 23:45 Sydney（1791204305.3287306）。预算不再作为此次5小时延续的阻碍，但现有账户额度足够，先保持累计账本、已预留款与计数，不充值或重置。原created_at不变，显式authorization_extension_s=18000；只适用于原共享账户与queued-task-first-v1，不作为任意延期或扩GPU数量的授权。
