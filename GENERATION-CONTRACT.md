@@ -253,7 +253,7 @@ Delivery is versioned and immutable; it is not inferred from the current default
 | Accepted execution contract | Delivery behavior |
 |---|---|
 | No `output_delivery` / `delivery_spec` | Historical requested-duration export, unchanged for existing jobs, Comfy and chapter roughcuts. A five-second H3 request delivers 120 frames. |
-| Explicit `output_delivery: native-frames-v1` | New qualified WanGP FL plans freeze `delivery_spec` with policy, fps, frame count, video duration and requested duration. All native frames remain: five requested seconds means 124 frames / 24 fps = 5.1667 seconds. No end-frame crop, frame-rate conversion, retiming or silence padding. |
+| Explicit `output_delivery: native-frames-v1` | New explicitly configured WanGP FL or bounded REF plans freeze `delivery_spec` with policy, fps, frame count, video duration and requested duration. All native frames remain: five requested seconds means 124 frames / 24 fps = 5.1667 seconds. No end-frame crop, frame-rate conversion, retiming or silence padding. |
 
 The native policy requires exactly matching video frame count, 24 fps, zero-based timestamps and native video-stream duration before and after export. Both the MP4 audio and independent FLAC derive from the complete generated waveform; neither is cut to the integer requested duration. Their observed lengths must remain within the existing 0.1-second audio tolerance of the native video timeline, including codec/sample rounding; larger mismatch rejects collection instead of being corrected silently. Video, container and audio durations remain distinct evidence. This tolerance is not a claim of perceptual lip-sync or real H3 audio qualification.
 
@@ -280,6 +280,47 @@ User authorization obtained on 2026-10-06. Pinned research revision: `deepbeepme
 - Every GPU backend must retain engine identity, capacity guards, endpoint uniqueness and original-attempt recovery routing. Adding an enum or passing configured-slot tests cannot bypass physical GPU limits or the remaining production activation gates.
 
 ## 8. Acceptance matrix
+
+### Offline REF candidate boundary (D4 #29)
+
+`deploy/wangp/manifest-ref2va-candidate.json` defines a separate pinned Ref2VA
+transformer and `sixnine-h3-ref2va-bf16-50-smallrefs-v1` compiler. It retains Base,
+BF16 transformer/text encoder, 50 steps, SDPA and MMGP profile 4. Its initial
+qualification input is at most one image, one silent video and one audio, with
+at least one visual reference; images/videos are 256--832 px per side, at most
+832x480 pixels and aspect ratio 0.4--2.5. A video is an explicit 2--3-second
+source selection normalized by the existing asset service to 24 fps and 56 or
+73 frames. Audio is 2--3 seconds, PCM16 WAV, 32 kHz stereo. Output is five
+requested seconds, 832x480 and 124 native frames. These conservative bounds are
+for the first qualification, not claims of the model's maximum capability.
+
+The compiler consumes immutable owned asset snapshots, preserves reference
+order, and maps images/video/audio to `image_refs` / `video_guide` /
+`audio_guide` with explicit `I`, `V-U`, and `A` flags. There is no soundtrack
+extraction, first/last mixing, automatic aggregate trimming or extra guide.
+The private resolver rechecks the actual staged content hash, image geometry,
+video frame count and absence of any audio track, and audio format/duration.
+Media metadata alone cannot attest silence. Typed file copies preserve exact
+normalized bytes; they do not transcode or shorten inputs.
+
+The manifest/profile, model-specific pristine Session defaults and owned
+launcher are bound together; legacy FL manifests and accepted jobs stay on
+their original route. Public `h3-base-ref2va-v1` requests use the strict REF
+compiler. Execution requires a separate explicit singleton REF policy,
+`native-frames-v1`, the bounded envelope above, and a matching manifest/worker
+or approved cold capacity. The controller opt-in is
+`execution_recipe_id: h3-base-ref2va-v1`; absence keeps the historical FL recipe
+and hash/serialization. Boot validates that recipe against the manifest's
+compiler/profile before staging. An FL policy or a legacy multi-recipe policy
+cannot enable new WanGP REF requests. Preflight/card construction never rents
+or starts inference; explicit job confirmation retains the existing path.
+
+This source change does not activate a production policy. Freeze a complete
+environment package and review a REF configuration before enabling its first
+real qualification job; record actual output, peak memory and cost before
+advertising GPU parity. Candidate construction or offline fake-Session success
+is not production availability. Mixed-reference peak RAM/VRAM have not been
+established for this candidate on one B200.
 
 | Gate | Required proof | Evidence level |
 |---|---|---|

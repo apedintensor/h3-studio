@@ -46,6 +46,10 @@ def fingerprint(value):
 
 def engine_config(config):
     backend = config.get('execution_backend', 'comfy-worker')
+    recipe = config.get('execution_recipe_id', '')
+    release.require(isinstance(recipe, str) and (not recipe or backend == 'wangp-worker'
+        and recipe == 'h3-base-ref2va-v1' and config.get('output_delivery') == 'native-frames-v1'),
+        'scaler_recipe_identity_invalid')
     release.require(backend in ('comfy-worker', 'wangp-worker'), 'scaler_backend_invalid')
     if backend == 'wangp-worker':
         release.require(isinstance(config.get('engine_manifest_digest'), str)

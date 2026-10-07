@@ -395,3 +395,51 @@ qualify a real accepted job through the complete API-to-download path, record th
 actual native/delivered media specs and audio stream, then reconcile cost/lease
 evidence. Adding further controls or variants requires a distinct declared and
 tested recipe; it must not weaken the immutable manifest binding of existing jobs.
+
+### Offline Ref2VA candidate
+
+`manifest-ref2va-candidate.json` is an unqualified source/weight manifest for
+the separate Ref2VA BF16 transformer. It is not a cold-bootstrap environment
+lock or a production profile. The transformer is 66,280,486,944 bytes with SHA256
+`ca877ed2b1bf72cfda76fe38117832544d6c0530abcfb9463e114cd767a39516`, from the pinned
+[HF revision](https://huggingface.co/DeepBeepMeep/MiniMax-H3/tree/adc81ccb71352192214d83d5fafb9487e860be39).
+It shares the pinned companion components with FL; retaining both transformers
+requires this extra storage. It does not establish enough disk headroom or
+peak RAM/VRAM for mixed inputs on the intended single B200.
+
+The first probe contract accepts one image, one silent selected video and one
+audio at most. Image/video geometry is 256--832 px per side, at most 832x480
+pixels and aspect 0.4--2.5. Videos select 2--3 source seconds and use the asset
+service's 24 fps/56-or-73-frame normalization; audio is 2--3 seconds at 32 kHz,
+stereo PCM16 WAV, with a visual reference present. Output is 832x480/124 frames,
+Base/BF16/50 steps. Oversized media and unsupported roles are rejected rather
+than handed to upstream's aggregate trimming. Actual video stream inspection
+must prove silence, even when the immutable metadata says `has_audio=false`.
+
+The pinned [handler](https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/models/minimax_h3/minimax_h3_handler.py)
+exposes broader source counts (9 images, 3 videos, 3 audio, 12 total) and
+trims overlong combined references. These are not our qualified input limits.
+`I` selects explicit image-reference dimensions; `V-U` supplies the silent
+video reference, and `A` the standalone audio. No `K` soundtrack extraction,
+additional guide, first/last mixing or VDN/pruned replacement is introduced.
+
+`test_platform_wangp_ref` and `test_platform_wangp_ref_api` exercise owned
+upload/selection, actual CPU media, strict mapping, explicit confirmation,
+cold waiting, private fake-Session delivery and native downloads; they import
+no model. Public plans now support the existing REF recipe ID, but only an
+explicit singleton REF policy with native delivery and the bounded envelope
+can admit it. Set `execution_recipe_id: h3-base-ref2va-v1` in a **new** controller
+configuration; its absent default retains FL and historical fingerprints.
+Boot requires the matching Ref manifest/compiler. Existing FL or legacy
+multi-recipe policies cannot silently route REF to their current weights.
+
+Before a live probe, bind a newly locked environment manifest to a reviewed
+configuration/policy and original capacity/budget authority. This source slice
+changes no enabled configuration. Upload via the existing owned asset endpoint,
+then pass `images: [image_asset_id]`, `videos: [{asset_id: video_asset_id,
+include_audio: false}]`, and `audios: [audio_asset_id]` in the normal generation
+plan inputs. Use recipe `h3-base-ref2va-v1`, duration 5, resolution `480P`,
+aspect `16:9`, and an explicit seed; omit an unused input kind. Inspect the
+preflight before explicitly confirming its plan ID. A first live sequence
+should qualify image, silent video, image+audio, then all three, preserving
+original jobs, measured memory and actual downloaded video/audio evidence.

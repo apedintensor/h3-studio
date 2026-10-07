@@ -65,6 +65,17 @@ def read_sources(config):
     manifest = EngineManifest.from_dict(json.loads(files['wangp-manifest.json']))
     if manifest.digest != config.engine_manifest_digest or manifest.document.get('synthetic'):
         raise BootError('wangp_boot_manifest_mismatch')
+    from .inference.wangp_compiler import H3FL2VACompiler
+    from .inference.wangp_ref_compiler import H3Ref2VACompiler, RECIPE_ID
+    try:
+        if tuple(config.recipe_ids) == (RECIPE_ID,):
+            H3Ref2VACompiler(manifest, None)
+        elif tuple(config.recipe_ids) == ('h3-base-fl2va-v1',):
+            H3FL2VACompiler(manifest, None)
+        else:
+            raise ValueError()
+    except ValueError:
+        raise BootError('wangp_boot_recipe_manifest_mismatch') from None
     return files, manifest.document
 
 

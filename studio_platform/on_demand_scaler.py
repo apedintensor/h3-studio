@@ -75,6 +75,8 @@ def json_config(config):
         value.pop("provider_preparation_timeout_s", None)
     if value.get("provider_preparation_failure_limit") == 2:
         value.pop("provider_preparation_failure_limit", None)
+    if not value.get("execution_recipe_id"):
+        value.pop("execution_recipe_id", None)
     if value.get("execution_backend", "comfy-worker") == "comfy-worker":
         value.pop("execution_backend", None)
         value.pop("engine_manifest_digest", None)

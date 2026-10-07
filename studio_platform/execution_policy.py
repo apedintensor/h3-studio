@@ -56,8 +56,8 @@ def validate_policy(value):
     for field in ("revision", "pool", "configuration_id"):
         identifier(value[field])
     recipes = value["recipe_ids"]
-    if "output_delivery" in value and recipes != ["h3-base-fl2va-v1"]:
-        raise ValueError("Native delivery requires the qualified WanGP FL recipe")
+    if "output_delivery" in value and recipes not in (["h3-base-fl2va-v1"], ["h3-base-ref2va-v1"]):
+        raise ValueError("Native delivery requires one explicitly bound WanGP recipe")
     if not isinstance(recipes, list) or not recipes or len(set(recipes)) != len(recipes) or any(r not in RECIPES for r in recipes):
         raise ValueError("Invalid execution policy recipes")
     qualification = value["qualification"]
@@ -127,6 +127,12 @@ def validate_policy(value):
         raise ValueError("Explicit execution control families required")
     if any(not isinstance(options, list) or not options or any(not isinstance(x, str) or len(x)>80 for x in options) for options in controls.values()):
         raise ValueError("Invalid execution control values")
+    if value["backend"] == "wangp-worker" and recipes == ["h3-base-ref2va-v1"]:
+        from .inference.wangp_ref_compiler import validate_envelope
+        if (recipes != ["h3-base-ref2va-v1"] or value.get("output_delivery") != "native-frames-v1"
+                or qualification.get("profile") != QUEUED_TASK_PROFILE):
+            raise ValueError("wangp_ref_explicit_recipe_and_native_delivery_required")
+        validate_envelope(envelope)
     quote = value["reservation"]
     quote_fields = {"cost_microusd", "expected_runtime_s", "expires_at", "source_id"}
     if (not isinstance(quote, dict) or not quote_fields <= set(quote)
@@ -351,6 +357,8 @@ class ExecutionPolicies:
             blockers.append("当前服务时段剩余时间不足以完成此配方，请等待服务续期后重新预检")
         if compiled["recipe_id"] not in policy["recipe_ids"] or compiled["request"]["model"] != policy["model_id"]:
             blockers.append("执行池未验收此模型或配方")
+        if backend == "wangp-worker" and compiled["recipe_id"] == "h3-base-ref2va-v1" and policy["recipe_ids"] != ["h3-base-ref2va-v1"]:
+            blockers.append("参考模式需要独立绑定的 Ref2VA 执行配置；不能沿用首尾帧执行池")
         request, output = compiled["request"], compiled["output_spec"]
         refs = len(set(a for a in compiled["assets"]))
         if output["width"]*output["height"] > envelope["max_pixels"]:

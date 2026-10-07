@@ -68,16 +68,23 @@ def capabilities(settings):
                 "source": {"comfyui_revision": COMFY_COMMIT}} for key, mode in RECIPES.items()]
     if settings.execution_backend == "wangp-worker":
         from .inference.wangp_compiler import control_schema as wangp_controls
+        from .inference.wangp_ref_compiler import control_schema as ref_controls
         from .inference.wangp_contract import UPSTREAM_REVISION
         for recipe in recipes:
             supported = recipe["mode"] == "fl"
-            recipe.update(implemented=supported, enabled=settings.generation_enabled and supported,
-                controls=wangp_controls() if supported else {},
+            recipe.update(implemented=True, enabled=settings.generation_enabled and supported,
+                controls=wangp_controls() if supported else ref_controls(),
                 validation_level="implementation_only_not_gpu_qualified",
                 source={"wangp_revision": UPSTREAM_REVISION})
             if supported:
                 recipe["limits"] = {**LIMITS, "max_images": 0, "max_videos": 0,
                     "max_audios": 0, "max_total_files": 2, "max_guides": 0}
+            else:
+                recipe["limits"] = {**LIMITS, "max_images":1, "max_videos":1, "max_audios":1,
+                    "max_total_files":3, "max_guides":0, "max_clip_duration":3,
+                    "max_total_video_duration":73/24, "max_total_audio_duration":3}
+                recipe["custom_canvas_constraints"].update(maximum_pixel_area=832*480,
+                    description="First REF qualification requires 832x480 output; wider controls are not enabled.")
     for recipe in recipes:
         recipe["execution_support"] = {
             "status": "disabled" if offline else "simulation" if settings.execution_backend == "mock" else "unavailable",
@@ -107,12 +114,16 @@ def capabilities(settings):
             if settings.execution_backend == "wangp-worker":
                 preset = {}
             available_recipes = [recipe for recipe in recipes
-                                 if recipe["implemented"] and recipe["id"] in policy["recipe_ids"]]
+                                 if recipe["implemented"] and recipe["id"] in policy["recipe_ids"]
+                                 and not (settings.execution_backend == "wangp-worker" and recipe["mode"] == "ref"
+                                     and policy["recipe_ids"] != [recipe["id"]])]
             available = [recipe["label"] for recipe in available_recipes]
             runtime_required = policy["qualification"]["status"] == "runtime_required"
             queued_task_validation = policy["qualification"].get("profile") == QUEUED_TASK_PROFILE
             for recipe in recipes:
-                qualified = recipe["implemented"] and recipe["id"] in policy["recipe_ids"]
+                qualified = recipe in available_recipes
+                if settings.execution_backend == "wangp-worker" and recipe["mode"] == "ref":
+                    recipe["enabled"] = qualified
                 recipe["execution_support"] = {
                     "status": ("runtime_required" if runtime_required else "qualified") if qualified else "not_qualified",
                     "reason": ("可提交，GPU完成启动检查后直接执行队列中的真实任务；成功结果直接交付，失败会反馈原因并暂停该工作机接新任务。仍需预检账户额度与容量窗口。" if queued_task_validation else
@@ -210,7 +221,10 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
         raise ValueError("请输入1至12000字符的单镜提示词")
     controls = copy.deepcopy(body.get("controls", {}))
     if backend == "wangp-worker":
-        from .inference.wangp_compiler import control_schema as selected_schema
+        if RECIPES[recipe] == "ref":
+            from .inference.wangp_ref_compiler import control_schema as selected_schema
+        else:
+            from .inference.wangp_compiler import control_schema as selected_schema
     else:
         selected_schema = control_schema
     if not isinstance(controls, dict) or set(controls) - set(selected_schema()):
@@ -279,13 +293,17 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
     assets = {key: resolve_asset(key) for key in dict.fromkeys(ids)}
     metadata = {key: val["metadata"] for key, val in assets.items()}
     request = {"backend": "comfy-local", "model": MODEL, "mode": RECIPES[recipe],
-               "prompt": prompt.strip(), "duration": 5, "resolution": "768P", "aspect_ratio": "16:9",
+               "prompt": prompt.strip(), "duration": 5,
+               "resolution": "480P" if backend == "wangp-worker" and RECIPES[recipe] == "ref" else "768P", "aspect_ratio": "16:9",
                "generate_audio": True, **controls, "inputs": inputs, "video_audio": video_audio}
     if type(request["duration"]) is not int or type(request["generate_audio"]) is not bool:
         raise ValueError("生成时长须为整数秒，声音开关须为布尔值")
     spec = native_output_spec(request)
     if backend == "wangp-worker":
-        from .inference.wangp_compiler import normalize_request
+        if RECIPES[recipe] == "ref":
+            from .inference.wangp_ref_compiler import normalize_request
+        else:
+            from .inference.wangp_compiler import normalize_request
         request = normalize_request(request, metadata, spec)
     else:
         validated = validate_controls(request, metadata, spec)

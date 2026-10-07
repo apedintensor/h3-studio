@@ -76,6 +76,8 @@ def as_json(config):
         value.pop('provider_preparation_timeout_s')
     if value['provider_preparation_failure_limit'] == 2:
         value.pop('provider_preparation_failure_limit')
+    if not value['execution_recipe_id']:
+        value.pop('execution_recipe_id')
     for field in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[field] = str(value[field])
     return value
