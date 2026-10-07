@@ -7,7 +7,7 @@ It describes implementation direction, not a claim of deployment, current health
 
 Start a work session with [WORKFLOW.md](WORKFLOW.md) and the work-package index in [workflow/project.json](workflow/project.json).
 Use the actual GitHub issues linked there; A–H below are parent work packages, not a second issue-numbering system.
-Accepted choices and their rationale are indexed in [DECISIONS.md](DECISIONS.md); this plan describes the resulting direction. Source-level wording was reconciled on 2026-10-08 against merged PR #25/#30, without a new production observation.
+Accepted choices and their rationale are indexed in [DECISIONS.md](DECISIONS.md); this plan describes the resulting direction. Source-level wording was reconciled on 2026-10-08 through merged PR #35. Exact release and protected production observations are recorded separately in [CURRENT-BASELINE.md](CURRENT-BASELINE.md).
 
 ## 1. North star
 
@@ -26,13 +26,13 @@ The following is a source-code and historical-record baseline, not a fresh produ
 | Area | Existing evidence | Remaining target |
 |---|---|---|
 | Business backend | `platform_app.py` / `studio_platform` implement authentication, assets, plans, jobs, budgets, and recovery. | Clear application-service boundaries and explicit compatibility contracts. |
-| Public generation | Historical receipts contain successful Comfy-based generation, download, and result integration. | Recheck current deployment and authorization; prove the new policy end to end. |
+| Public generation | Historical receipts contain successful Comfy-based generation, download, and result integration. Protected PR #34 recovery resumed the original WanGP task and triggered replacement GPU preparation. | Complete real WanGP inference, validated artifacts and authenticated download; preparation is not generation success. |
 | Quick Chat | `/quick-chat` and `/v1/quick-chat/` integration is preserved in draft PR #23, with sessions, turns, bindings, revisions, and submissions; it is not merged into this main baseline. | User-approved local UX and real generation integration before release. |
 | Quick Chat deployment | The isolated preview is local; generation and assistant execution are disabled there. | Do not describe local integration as released or currently generating. |
 | Accounts | Ownership and PAT controls exist, but the account directory is fixed to `superdan` and `supervan`. | A real user directory, explicit identity migration, and later team membership. |
 | Assets | Private storage, validation, and recovery exist; staging and locks depend on one host. | Cross-host staging, operation leases, backup, and a tested object-store migration. |
-| GPU control | The current D2/C1 working source adds explicit continuing single-slot policy to the existing controller; optional cycle count remains bounded by original authority and cumulative accounts. See the exact source/release boundary in `CURRENT-BASELINE.md`. | Complete combined recovery acceptance and actual service proof; then implement node isolation and redundancy. |
-| Engines | A Comfy baseline has historical evidence. WanGP was selected on 2026-10-06; PR #25 supplies offline adapter/receipt acceptance. Current D2 source adds cold engine/manifest binding, boot/reconnect and target package tooling. | Freeze and verify the actual target environment/models; qualify each declared recipe, topology, control envelope and recovery behavior before switching. |
+| GPU control | Released PR #33/#34 source adds continuing single-slot policy, cold preparation and controlled repair to the existing controller; original authority and cumulative accounts remain binding. PR #35's private receipt writer is merged but not deployed at the dated checkpoint. | Complete combined recovery acceptance and actual service proof; then implement node isolation and redundancy. |
+| Engines | A Comfy baseline has historical evidence. WanGP was selected on 2026-10-06; PR #25 supplies offline adapter/receipt acceptance. Released D2 source adds engine/manifest binding and preparation; the runtime package, exact environment lock and optional OS restore kit have CPU evidence. | Verify installed model identity and actual GPU compatibility; qualify each declared recipe, topology, control envelope and recovery behavior. CPU package checks do not prove runtime or output readiness. |
 
 Historical budgets, service deadlines, successful jobs, and deployment receipts do not establish today's available capacity.
 No plan, issue, restart, or configuration change renews an expired operating window or resets accumulated costs.
@@ -190,7 +190,7 @@ Work that needs its applicable production authorization and controls:
 The batch receipt records commit/image/profile, environment, job/attempt identity, phase timing, artifact validation, and rental reconciliation.
 Do not combine this batch with a story-model rewrite, wholesale storage migration, accelerated-model rollout, or hosting-platform migration.
 
-The missing transition is explicit: D1 #18 is accepted offline in PR #25. Current D2/C1 working source extends compilation, transport and attempt routing with cold approvals, WanGP boot/reconnect, target package tooling and continuing single-slot policy; see the pending PR/revision reference in `CURRENT-BASELINE.md`. Remaining gates are the actual target dependency/model lock and GPU compatibility, complete controller-process restart/recovery coverage, and real output evidence. Same-process SSH reconnect is not acceptance of a controller restart after fleet launch. Only then can #16 prove a real public WanGP path, with #12/#14/#15 compatibility and recovery gates. Start with one recipe/slot; broader redundancy does not block that slice.
+The missing transition is explicit: D1 #18 is accepted offline in PR #25. PR #33/#34 released cold approvals, WanGP preparation/reconnect, continuing single-slot policy and controlled repair; protected recovery resumed the same original task. The package/environment lock has CPU evidence, while installed-model verification, actual GPU readiness, complete controller-process restart/recovery coverage and real output remain open. See the exact release/checkpoint in `CURRENT-BASELINE.md`; PR #35 is merged ahead of that deployment. Same-process SSH reconnect or one preparation repair is not acceptance of the full recovery matrix. #16 still owns the real public WanGP path with #12/#14/#15 compatibility and recovery gates. Start with one recipe/slot; broader redundancy does not block that slice.
 
 Follow-up scopes from that integration: D3 #27 resolves last-frame/delivered-duration fidelity; C3 #28 reconciles historical supplier charges and retained reservations; D4 #29 expands and qualifies REF inputs. The first B3 text-to-video proof does not claim those broader controls. Read exact readiness and claims on GitHub; a completed source milestone does not satisfy a real-runtime gate.
 
