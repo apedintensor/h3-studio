@@ -79,7 +79,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fontconfig fonts-noto-cjk
+      - name: Install media test tools from signed Ubuntu repositories
+        timeout-minutes: 5
+        run: |
+          sudo sed -i -E 's#http://(azure.archive.ubuntu.com|archive.ubuntu.com|security.ubuntu.com)/ubuntu#https://\1/ubuntu#g' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 install -y ffmpeg fontconfig fonts-noto-cjk
       - run: python -m pip install -r requirements.lock.txt
       - name: Complete offline suite (temporary data, no model inference)
         run: python -m unittest discover -s . -p 'test_*.py' -v
@@ -114,7 +119,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fontconfig fonts-noto-cjk
+      - name: Install media test tools from signed Ubuntu repositories
+        timeout-minutes: 5
+        run: |
+          sudo sed -i -E 's#http://(azure.archive.ubuntu.com|archive.ubuntu.com|security.ubuntu.com)/ubuntu#https://\1/ubuntu#g' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 install -y ffmpeg fontconfig fonts-noto-cjk
       - run: python -m pip install -r requirements.lock.txt
       - name: PostgreSQL concurrency and API contracts (isolated CI service)
         env:
