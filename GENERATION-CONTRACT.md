@@ -169,6 +169,41 @@ unknown outcomes and repair holds still block unsafe rotation. Changing this
 configuration does not alter previously accepted request identities, leases,
 deadlines or bills, and does not itself grant spending authority.
 
+### E1: opt-in pool member admission (offline foundation)
+
+An operator approval may explicitly freeze `pool_members: {version: 1,
+member_ids: ["a", "b"]}`: exactly two distinct stable member IDs, each one GPU
+and one slot. Omitting it retains the legacy payload/hash and single-intent
+cycle. The existing ledger stores the unique `(approval_id, member_id)` to
+intent binding; intent creation, budget reservation and this binding commit
+atomically under the shared capacity/account locks. Each member binds at most
+one original intent. E1 has no replacement generation, provider call or second
+task/rental ledger; removal does not release an unconfirmed bill or renew a
+member binding, approval or deadline.
+
+Cold plans freeze `capacity_binding: "pool-members-v1"` with the exact approval
+ID/hash and current engine configuration. Their waiters belong to that approval,
+with no single `intent_id`. The first compatible ready member may activate the
+original job without rewriting its request, execution plan, budget reservation
+or deadline. Readiness must match the approved tenant/pool, recipe/model,
+configuration, backend/manifest/delivery and a live bound instance with enough
+original lifetime. Both members may be eligible, but `WorkerControl` and the
+existing queue remain the sole atomic claim/attempt authority. Generate claims
+recheck membership and current approval; an unbound same-configuration worker
+cannot take a pool-bound job. Existing unknown attempts retain their worker,
+original attempt identity and reservations; another member may serve distinct
+work, and approval revocation does not prevent original-attempt reconciliation.
+
+This is not an enabled two-node service. The legacy cold/finite controllers
+refuse these approvals. Warm admission for the same opted-in tenant/pool/config
+also fails closed, including after approval revocation/expiry, because E1 does
+not yet bind new warm plans to members. Legacy warm admission is unchanged.
+E2 must supply demand-triggered target two, fully bound warm admission, each
+member's independent preparation/recovery/holds, bounded replacement and the
+600-second no-obligation idle rule in the existing controller before enabling
+this mode. Offline SQLite/PostgreSQL races prove ledger behavior only; two-node
+provider operation, timing and production activation need separate evidence.
+
 ## 6. Output contract
 
 Engine success is not platform success. The worker validates expected geometry, duration, actual decodability and audio, normalizes the requested export, and publishes through the existing `ArtifactWriter` receipt. Audio-enabled generation requires an independent audio output as well as valid video; an engine returning only a muxed file needs an explicit verified extraction step.
