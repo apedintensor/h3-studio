@@ -65,10 +65,12 @@ def quick_examples():
 
 def public_guide():
     """Relative URLs deliberately keep discovery and credentials on one origin."""
+    from .quick_chat_routes import agent_contract
     return {
         "name": "Sixnine / 映序", "version": 2, "api_version": "v1",
         "description": "Create one quick H3 clip or edit a multi-chapter story; save the same prompt, separate references and controls visible on the website, plan generation and adopt results without replacing prior takes.",
         "discovery_is_authorization": False,
+        "quick_chat": agent_contract(),
         "runtime_state": "Not advertised by this static guide. Authenticate, read capabilities, and inspect an actual plan's execution, blockers and estimate. Disabled generation is not a successful generation.",
         "public_resources": {"html": "/for-agents", "text": "/llms.txt", "manifest": "/for-agents/guide.json",
             "skill": "/for-agents/SKILL.md", "skill_download": "/for-agents/skill.zip"},

@@ -315,3 +315,10 @@ inventory.json
 !deploy/wangp/runtime-host.in
 !deploy/wangp/Dockerfile.build
 !deploy/wangp/Dockerfile.runtime
+
+# Preserved Quick Chat authoring on the existing business ledger.
+!studio_platform/quick_chat.py
+!studio_platform/quick_chat_routes.py
+!studio_platform/quick_chat_assistant.py
+!studio_platform/quick_chat_recovery.py
+!studio_platform/google_chat.py
