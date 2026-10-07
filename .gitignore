@@ -338,3 +338,7 @@ inventory.json
 !studio_platform/backup_remote.py
 !studio_platform/backup_remote_cli.py
 !BACKUP-OFFDEVICE.md
+
+# Dedicated business backup infrastructure; no deployed targets or credentials.
+!deploy/platform/business-backup.json
+!deploy/platform/BUSINESS-BACKUP.md

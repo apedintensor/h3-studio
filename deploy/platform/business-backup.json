@@ -1,0 +1,199 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Independent encrypted business backups with retained versions and an operator-only assumed role; does not migrate live storage or deploy an application.",
+  "Metadata": {
+    "AWSToolsMetrics": {"AWSAgentToolkit": "aws-cloudformation@3"},
+    "com.aws.cloudformation.Context": {
+      "ref": [{"at": "deploy/platform/BUSINESS-BACKUP.md", "has": "permission contract, retained-resource recovery and deployment acceptance"}],
+      "must": ["Use a new dedicated backup bucket, never the release bucket", "Retain all versions and the decrypting key; no lifecycle expiration or deletion", "No app, controller, GPU or GitHub credential injection"]
+    }
+  },
+  "Parameters": {
+    "BackupBucketName": {
+      "Type": "String",
+      "MinLength": 25,
+      "MaxLength": 63,
+      "AllowedPattern": "sixnine-business-backup-[a-z0-9][a-z0-9-]*[a-z0-9]",
+      "Description": "A new globally unique dedicated bucket name. Existing buckets are not adopted by this template."
+    },
+    "SourceInstanceRoleName": {
+      "Type": "String",
+      "AllowedValues": ["sixnine-platform-ec2"],
+      "Description": "Exact existing EC2 role confirmed through GetInstanceProfile; supply explicitly. The role and its other policies are not replaced."
+    },
+    "ExpectedAccountId": {
+      "Type": "String",
+      "AllowedPattern": "[0-9]{12}",
+      "Description": "Explicit reviewed target account; checked against the CloudFormation account."
+    },
+    "ExpectedRegion": {
+      "Type": "String",
+      "AllowedValues": ["ap-southeast-1"],
+      "Description": "Explicit reviewed region; checked against the CloudFormation region."
+    }
+  },
+  "Rules": {
+    "ReviewedTargetOnly": {"Assertions": [
+      {"Assert": {"Fn::Equals": [{"Ref": "AWS::AccountId"}, {"Ref": "ExpectedAccountId"}]}, "AssertDescription": "Account must match the independently reviewed target."},
+      {"Assert": {"Fn::Equals": [{"Ref": "AWS::Region"}, {"Ref": "ExpectedRegion"}]}, "AssertDescription": "Region must match the independently reviewed target."}
+    ]}
+  },
+  "Resources": {
+    "BackupRole": {
+      "Type": "AWS::IAM::Role",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Separate temporary backup authority from the host role and application credentials.",
+        "must": ["Trust only the observed same-account EC2 role", "Retain the role with its data-access policy so retained backups remain retrievable"],
+        "mutable": "review-required"
+      }},
+      "Properties": {
+        "Description": "Operator-only business backup upload and verified versioned restore.",
+        "MaxSessionDuration": 3600,
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "OnlyReviewedHostBackupSession",
+            "Effect": "Allow",
+            "Principal": {"AWS": {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${SourceInstanceRoleName}"}},
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"sts:RoleSessionName": "sixnine-backup-copy"}}
+          }]
+        },
+        "Tags": [{"Key": "Project", "Value": "sixnine"}, {"Key": "Purpose", "Value": "business-backup"}]
+      }
+    },
+    "BackupKey": {
+      "Type": "AWS::KMS::Key",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Dedicated decrypting key survives stack changes together with the backup bytes.",
+        "must": ["Never schedule key deletion as cleanup", "Cryptographic access only through regional S3 for the exact backup object prefix", "Resource wildcard in this key policy denotes only this key"],
+        "mutable": "review-required"
+      }},
+      "Properties": {
+        "Description": "Sixnine independent business backup encryption key; retained for recovery.",
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "EnableKeyRotation": true,
+        "MultiRegion": false,
+        "KeyPolicy": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AccountAdministrationWithoutDataUseOrDeletion",
+              "Effect": "Allow",
+              "Principal": {"AWS": {"Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}},
+              "Action": ["kms:DescribeKey", "kms:GetKeyPolicy", "kms:PutKeyPolicy", "kms:UpdateKeyDescription", "kms:EnableKey", "kms:EnableKeyRotation", "kms:DisableKeyRotation", "kms:GetKeyRotationStatus", "kms:ListResourceTags", "kms:TagResource", "kms:UntagResource"],
+              "Resource": "*"
+            },
+            {
+              "Sid": "BackupRoleS3ObjectCryptography",
+              "Effect": "Allow",
+              "Principal": {"AWS": {"Fn::GetAtt": ["BackupRole", "Arn"]}},
+              "Action": ["kms:GenerateDataKey", "kms:Decrypt"],
+              "Resource": "*",
+              "Condition": {
+                "StringEquals": {"kms:ViaService": {"Fn::Sub": "s3.${AWS::Region}.${AWS::URLSuffix}"}, "kms:CallerAccount": {"Ref": "AWS::AccountId"}},
+                "StringLike": {"kms:EncryptionContext:aws:s3:arn": {"Fn::Sub": "arn:${AWS::Partition}:s3:::${BackupBucketName}/business-backups/*"}}
+              }
+            }
+          ]
+        },
+        "Tags": [{"Key": "Project", "Value": "sixnine"}, {"Key": "Purpose", "Value": "business-backup"}]
+      }
+    },
+    "BackupBucket": {
+      "Type": "AWS::S3::Bucket",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Independent off-device business copies; live Local storage and release artifacts stay on their own paths.",
+        "must": ["All versions retained; no lifecycle rules", "Disable bucket keys to retain object-prefix KMS enforcement", "No ACLs or public access", "Changing the bucket name does not migrate existing backups"],
+        "mutable": "review-required"
+      }},
+      "Properties": {
+        "BucketName": {"Ref": "BackupBucketName"},
+        "PublicAccessBlockConfiguration": {"BlockPublicAcls": true, "IgnorePublicAcls": true, "BlockPublicPolicy": true, "RestrictPublicBuckets": true},
+        "OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
+        "VersioningConfiguration": {"Status": "Enabled"},
+        "BucketEncryption": {"ServerSideEncryptionConfiguration": [{"BucketKeyEnabled": false, "ServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": {"Fn::GetAtt": ["BackupKey", "Arn"]}}}]},
+        "Tags": [{"Key": "Project", "Value": "sixnine"}, {"Key": "Purpose", "Value": "business-backup"}]
+      }
+    },
+    "BackupBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Preserve protection even when a retained bucket leaves the stack; backup transport uses only conditional single PUTs.",
+        "must": ["Deny wildcards protect all callers; they grant no access", "No multipart exemption or CopyObject path", "Never use this bucket as a service log destination"],
+        "mutable": "review-required"
+      }},
+      "Properties": {
+        "Bucket": {"Ref": "BackupBucket"},
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {"Sid": "DenyUnencryptedTransport", "Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": [{"Fn::GetAtt": ["BackupBucket", "Arn"]}, {"Fn::Sub": "${BackupBucket.Arn}/*"}], "Condition": {"Bool": {"aws:SecureTransport": "false"}}},
+            {"Sid": "DenyOlderTLS", "Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": [{"Fn::GetAtt": ["BackupBucket", "Arn"]}, {"Fn::Sub": "${BackupBucket.Arn}/*"}], "Condition": {"NumericLessThan": {"s3:TlsVersion": 1.2}}},
+            {"Sid": "DenyWrongOrMissingEncryption", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": {"Fn::Sub": "${BackupBucket.Arn}/*"}, "Condition": {"StringNotEquals": {"s3:x-amz-server-side-encryption": "aws:kms"}}},
+            {"Sid": "DenyWrongOrMissingKey", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": {"Fn::Sub": "${BackupBucket.Arn}/*"}, "Condition": {"StringNotEquals": {"s3:x-amz-server-side-encryption-aws-kms-key-id": {"Fn::GetAtt": ["BackupKey", "Arn"]}}}},
+            {"Sid": "DenyUnconditionalOrOverwritePut", "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": {"Fn::Sub": "${BackupBucket.Arn}/*"}, "Condition": {"StringNotEquals": {"s3:if-none-match": "*"}}},
+            {"Sid": "DenyObjectDeletion", "Effect": "Deny", "Principal": "*", "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"], "Resource": {"Fn::Sub": "${BackupBucket.Arn}/*"}},
+            {"Sid": "DenyBackupDataAccessOutsideBackupRole", "Effect": "Deny", "Principal": "*", "Action": ["s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"], "Resource": {"Fn::Sub": "${BackupBucket.Arn}/*"}, "Condition": {"ArnNotEquals": {"aws:PrincipalArn": {"Fn::GetAtt": ["BackupRole", "Arn"]}}}}
+          ]
+        }
+      }
+    },
+    "BackupAccessPolicy": {
+      "Type": "AWS::IAM::Policy",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Grant only the transport's observed safety reads, snapshot-prefix version listing, single PUT and verified reads.",
+        "must": ["No ListBucket, delete, multipart, ACL, bucket mutation or KMS administration", "Object wildcard is restricted to this dedicated bucket's business-backups prefix", "STS GetCallerIdentity requires no explicit identity permission"],
+        "mutable": "review-required"
+      }},
+      "Properties": {
+        "PolicyName": "BusinessBackupTransfer",
+        "Roles": [{"Ref": "BackupRole"}],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {"Sid": "ReadDestinationSafety", "Effect": "Allow", "Action": ["s3:GetBucketVersioning", "s3:GetBucketPublicAccessBlock", "s3:GetBucketOwnershipControls", "s3:GetEncryptionConfiguration"], "Resource": {"Fn::GetAtt": ["BackupBucket", "Arn"]}},
+            {"Sid": "CheckNewSnapshotPrefix", "Effect": "Allow", "Action": "s3:ListBucketVersions", "Resource": {"Fn::GetAtt": ["BackupBucket", "Arn"]}, "Condition": {"StringLike": {"s3:prefix": "business-backups/*/"}}},
+            {"Sid": "WriteNewEncryptedBackupObject", "Effect": "Allow", "Action": "s3:PutObject", "Resource": {"Fn::Sub": "${BackupBucket.Arn}/business-backups/*"}, "Condition": {"StringEquals": {"s3:if-none-match": "*", "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": {"Fn::GetAtt": ["BackupKey", "Arn"]}}}},
+            {"Sid": "ReadBackupObjectAndExactVersions", "Effect": "Allow", "Action": ["s3:GetObject", "s3:GetObjectVersion"], "Resource": {"Fn::Sub": "${BackupBucket.Arn}/business-backups/*"}},
+            {"Sid": "UseBackupKeyThroughS3Only", "Effect": "Allow", "Action": ["kms:GenerateDataKey", "kms:Decrypt"], "Resource": {"Fn::GetAtt": ["BackupKey", "Arn"]}, "Condition": {"StringEquals": {"kms:ViaService": {"Fn::Sub": "s3.${AWS::Region}.${AWS::URLSuffix}"}, "kms:CallerAccount": {"Ref": "AWS::AccountId"}}, "StringLike": {"kms:EncryptionContext:aws:s3:arn": {"Fn::Sub": "${BackupBucket.Arn}/business-backups/*"}}}}
+          ]
+        }
+      }
+    },
+    "InstanceAssumeBackupRolePolicy": {
+      "Type": "AWS::IAM::Policy",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Metadata": {"com.aws.cloudformation.Context": {
+        "why": "Append one uniquely named role-switch permission; preserve existing EC2 role policies and trust.",
+        "must": ["Existing EC2 role gains no direct S3/KMS permissions", "Host-root operator assumes credentials only in memory", "App/controller containers must remain unable to reach IMDS or host AWS credentials"],
+        "mutable": "review-required"
+      }},
+      "Properties": {
+        "PolicyName": {"Fn::Join": ["-", ["sixnine-backup-assume", {"Fn::Select": [2, {"Fn::Split": ["/", {"Ref": "AWS::StackId"}]}]}]]},
+        "Roles": [{"Ref": "SourceInstanceRoleName"}],
+        "PolicyDocument": {"Version": "2012-10-17", "Statement": [{"Sid": "AssumeOnlyDedicatedBackupRole", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": {"Fn::GetAtt": ["BackupRole", "Arn"]}, "Condition": {"StringEquals": {"sts:RoleSessionName": "sixnine-backup-copy"}}}]}
+      }
+    }
+  },
+  "Outputs": {
+    "BackupBucketName": {"Description": "Dedicated bucket; pass explicitly to the reviewed backup transport.", "Value": {"Ref": "BackupBucket"}},
+    "BackupKeyArn": {"Description": "Exact KMS key ARN; aliases are not accepted by the transport.", "Value": {"Fn::GetAtt": ["BackupKey", "Arn"]}},
+    "BackupRoleArn": {"Description": "Explicit same-account role_arn for in-memory operator assumption.", "Value": {"Fn::GetAtt": ["BackupRole", "Arn"]}},
+    "BackupPrefix": {"Description": "Only this object prefix is accessible to the backup role.", "Value": "business-backups/"},
+    "BackupRegion": {"Description": "Region of both the bucket and KMS key.", "Value": {"Ref": "AWS::Region"}},
+    "BackupAccountId": {"Description": "ExpectedBucketOwner and STS account binding for the operator config.", "Value": {"Ref": "AWS::AccountId"}}
+  }
+}
