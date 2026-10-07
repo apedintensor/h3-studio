@@ -439,7 +439,7 @@ def main(argv=None):
                 scaler.marker(commit, config, False)
                 print(json.dumps({'phase': 'service_complete', **result}), flush=True)
         return 0
-    except Exception:
+    except Exception as exc:
         # A partial operation never clears a hold, reruns a rental or blindly
         # unpauses a controller. Root must inspect the durable phase and ledger.
         code = str(exc) if isinstance(exc, release.ReleaseError) else ''

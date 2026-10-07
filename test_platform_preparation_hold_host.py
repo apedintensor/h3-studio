@@ -2,6 +2,7 @@
 from contextlib import ExitStack
 import copy
 import hashlib
+import io
 import json
 import os
 import stat
@@ -203,6 +204,17 @@ class PreparationHoldHostTests(unittest.TestCase):
         self.launch.assert_called_once()
         self.assertEqual(scaler.read_json(self.operation/'receipt.json')['phase'], 'resume_started')
         self.assertFalse(any(call.args[0][0] in ('kill','stop','pause','unpause') for call in self.commands.call_args_list))
+
+    def test_cli_validation_errors_are_static_and_other_exception_text_is_hidden(self):
+        fake_fcntl = SimpleNamespace(flock=lambda *a: None, LOCK_EX=2, LOCK_NB=4)
+        for error, expected in ((release.ReleaseError('repair_static_failure'), 'repair_static_failure'),
+                (RuntimeError('do-not-echo-private-input'), 'preparation_repair_incomplete_reconcile_receipt'),
+                (release.ReleaseError('do-not-echo-private-input'), 'preparation_repair_incomplete_reconcile_receipt')):
+            with self.subTest(error=type(error).__name__), patch.dict(sys.modules, {'fcntl': fake_fcntl}), \
+                    patch.object(release, 'check_host', side_effect=error), patch('sys.stdout', new_callable=io.StringIO) as output:
+                self.assertEqual(host.main(['--operation', '00000000-0000-4000-8000-000000000000', '--action', 'stage']), 1)
+                self.assertEqual(json.loads(output.getvalue())['safe_error'], expected)
+                self.assertNotIn('private-input', output.getvalue())
 
 
 if __name__ == '__main__':
