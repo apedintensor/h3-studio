@@ -127,8 +127,17 @@ deadlines, disk/cache guards and parent-death termination bound preparation; SDK
 partials never authorize a second bootstrap or job submission. Only safe completed
 file/byte counts and static errors enter status. Native SDK logs are discarded,
 and the child must be stopped/reaped before local preparation can be idle.
-Transfer completion does not certify model bytes: full size/hash verification
-remains required before the runtime owns its slot. Model-transfer speed, native
+Transfer completion does not certify model bytes: the launcher acquires exclusive
+journal/slot ownership, then performs full source/configuration/environment and
+model size/hash verification before Session initialization or HTTP readiness.
+Normal bootstrap launches that process once without a preceding duplicate
+`--verify-only`; explicit standalone verification remains available. Its private,
+atomic verification receipt binds manifest, slot, PID and host incarnation. The
+same authenticated readiness incarnation must confirm an idle runtime. Receipts
+never bypass verification in a new process; stale/mismatched evidence or startup
+uncertainty cannot authorize another start. The existing launch deadline and
+bootstrap marker remain binding, with verification and initialization shown as
+separate preparation phases. Model-transfer speed, native
 Xet interruption reuse and cross-instance model caching are not offline acceptance
 claims. See [the runtime preparation guide](deploy/wangp/README.md#bounded-public-model-transfer).
 

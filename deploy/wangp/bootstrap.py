@@ -268,16 +268,21 @@ def install(config, slot_key, token_file, *, launch=True):
         command = [python, "-m", "studio_platform.runtime_hosts.wangp_launcher", "--runtime-root", str(runtime),
             "--config", str(runtime_config), "--manifest", config["manifest_path"], "--model-root", str(model_root),
             "--state-dir", str(state), "--token-file", str(token_file), "--slot-key", slot_key, "--port", str(config["port"])]
-        status("runtime_verification")
-        verified = subprocess.run(command + ["--verify-only"], check=True, capture_output=True, text=True, env=environment)
-        evidence = json.loads(verified.stdout)
-        if evidence.get("manifest_digest") != manifest_digest or evidence.get("inference_verified") is not False:
-            raise ValueError("verification_receipt_mismatch")
-        (base / "runtime-verification.json").write_bytes(canonical(evidence))
         if not launch:
+            status("runtime_verification")
+            verified = subprocess.run(command + ["--verify-only"], check=True, capture_output=True, text=True, env=environment)
+            evidence = json.loads(verified.stdout)
+            if evidence.get("manifest_digest") != manifest_digest or evidence.get("inference_verified") is not False:
+                raise ValueError("verification_receipt_mismatch")
+            receipt_path = base / "runtime-verification.json"
+            fd = os.open(receipt_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "wb") as target:
+                target.write(canonical(evidence))
+                target.flush()
+                os.fsync(target.fileno())
             return status("runtime_files_verified", state="verified_not_started")
-        # The launcher independently checks token permissions and source/models,
-        # owns the journal lock, and fails closed if a journal already exists.
+        # Normal startup verifies once inside the owned launcher, before Session
+        # initialization/readiness. Its receipt never substitutes for a new hash.
         # GPU facts are observations, not an inferred resource guarantee.
         gpu = subprocess.run(["nvidia-smi", "--query-gpu=uuid,memory.total", "--format=csv,noheader,nounits"],
                              check=True, capture_output=True, text=True)
@@ -303,16 +308,22 @@ def install(config, slot_key, token_file, *, launch=True):
         with open(os.devnull, "wb") as quiet:
             child = subprocess.Popen(command + ["--create-journal"], cwd=str(source), env=environment,
                 stdin=subprocess.DEVNULL, stdout=quiet, stderr=quiet, start_new_session=True)
+        from studio_platform.runtime_hosts.wangp_launcher import VERIFICATION_RECEIPT, read_verification_receipt
         deadline = time.monotonic() + 900
         while time.monotonic() < deadline:
             if child.poll() is not None:
                 raise ValueError("runtime_process_exited")
+            verified = None
+            if (state / VERIFICATION_RECEIPT).exists():
+                verified = read_verification_receipt(state, manifest_digest=manifest_digest,
+                    slot_key=slot_key, pid=child.pid)
             try:
                 request = Request(f"http://127.0.0.1:{config['port']}/v1/readiness",
                                   headers={"Authorization": "Bearer " + token})
                 with urlopen(request, timeout=5) as response:
                     ready = json.loads(response.read(16385))
-                if (ready.get("manifest_digest") == manifest_digest and ready.get("slot_key") == slot_key
+                if (verified is not None and ready.get("manifest_digest") == manifest_digest
+                        and ready.get("slot_key") == slot_key and ready.get("incarnation") == verified["incarnation"]
                         and ready.get("idle") is True):
                     return status("runtime_ready", state="ready", pid=child.pid, runtime_verified=True,
                                   source_revision=manifest.document["source_revision"],
@@ -320,7 +331,7 @@ def install(config, slot_key, token_file, *, launch=True):
                                   port=config["port"], readiness_path="/v1/readiness")
             except Exception:
                 pass
-            status("runtime_start", pid=child.pid)
+            status("runtime_start" if verified else "runtime_verification", pid=child.pid)
             time.sleep(2)
         raise ValueError("runtime_readiness_timeout")
     except Exception as error:

@@ -138,9 +138,12 @@ The token remains a protected mode-0600 file and is used only in process memory.
 The bootstrap's exclusive `wangp-bootstrap-started.json` is separate from the
 controller's start identity. A repeated invocation returns `reconcile_required`
 without changing status, launching a second process, or resetting the journal.
-After downloading pinned public components and verifying every size/hash, the
-bootstrap starts the existing launcher on loopback only. It then checks the
-authenticated `/v1/readiness` response for the exact manifest, slot and idle state.
+After downloading pinned public components, bootstrap starts the existing
+launcher once. The launcher acquires exclusive journal/slot ownership before
+checking source, configuration, dependencies and every model size/hash. Only then
+does it initialize the Session and expose its loopback listener. Bootstrap checks
+both the private verification receipt and authenticated `/v1/readiness` for the
+same manifest, slot and live incarnation; readiness must report idle.
 `setup-status.json` records phases and safe error codes; successful readiness has
 `state=ready`, `runtime_verified=true`, source/manifest identity, observed GPU UUID
 and bytes, and always `inference_verified=false`. Any uncertainty after process
@@ -175,11 +178,28 @@ Xet may preallocate files. The initial disk check conservatively requires all
 missing model sizes plus 10 GiB free, even if SDK partial files already exist.
 
 `downloaded_unverified` is transfer completion only. The existing complete
-size/hash checks still run before runtime launch and inside the owned launcher.
+size/hash checks run once inside the owned launcher, before Session initialization
+or readiness. Normal bootstrap does not first run a duplicate `--verify-only`
+process. Standalone `--verify-only` remains available for an explicit inspection.
 This source change neither modifies the model manifest nor enables a new runtime
 configuration. Offline fake SDK and inert Linux process tests establish these
 guards; actual download throughput, interruption reuse and cold-start duration
 need a separately authorized future host measurement.
+
+The normal launch receipt is `slot-state/runtime-verification.json`, written
+atomically with mode 0600 after full verification. It binds the manifest, slot,
+process ID and randomly generated host incarnation, and explicitly does not
+certify inference. It is evidence for that process, not a reusable hash cache:
+every new launcher repeats the complete verification, including on recovery.
+An old receipt, HTTP response alone or child creation cannot establish readiness.
+The existing 900-second launch/readiness deadline includes this verification;
+status distinguishes `runtime_verification` from `runtime_start`. A failed receipt
+write prevents Session initialization; any bootstrap uncertainty after process
+creation retains the original start marker and requires reconciliation, never
+automatic relaunch. Non-launch inspection writes its separate root-level
+verification receipt and returns `verified_not_started` without creating a slot.
+Completed-file/byte counts remain protected setup/progress evidence; the current
+controller/API exposes preparation phases rather than those transfer counters.
 
 Environment attestation of an extracted package uses its hash-bound
 `.sixnine-environment.json`; the original git-checkout path remains available for
