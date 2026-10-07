@@ -145,6 +145,24 @@ class MemberLaunchTests(LedgerCase):
         self.assertEqual(len(self.provider.creates), 2)
         self.assertEqual(self.repo.get_budget("capacity-budget")["reserved_microusd"], 400_000)
 
+    def test_uncertain_execution_alone_keeps_obligation_but_does_not_finance_unused_b(self):
+        original = self.waiter()
+        first = self.create("a")
+        with self.repo.engine.connect() as connection:
+            row = connection.execute(select(instance_intents).where(instance_intents.c.id == first["intent_id"])).mappings().one()
+        control, worker = self.worker("a", instance=row["provider_instance_id"])
+        self.controller.advance_once("cold-approval")
+        claim = control.claim(worker.worker_id, "cold-pool")
+        control.queue.begin_submission(claim.lease)
+        control.queue.mark_submission_unknown(claim.lease)
+        control.observe(worker.worker_id, original["id"])
+        self.assertEqual(self.create("b"), {"state": "no_confirmed_pool_demand"})
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(self.repo.get_budget("capacity-budget")["reserved_microusd"], 200_000)
+        self.waiter("new-independent-work")
+        self.assertEqual(self.create("b")["state"], "creation_observed")
+        self.assertEqual(self.repo.get_job(self.scope, original["id"])["current_attempt_id"], claim.lease.attempt_id)
+
     def test_pre_post_cancel_retains_proof_of_no_call_and_refunds_only_that_member(self):
         job = self.waiter()
         original = self.launcher.before_create

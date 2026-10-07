@@ -1,4 +1,4 @@
-"""Pure operator policy for a continuing, single-slot service.
+"""Pure operator policy for explicit single-slot or two-member services.
 
 This is configuration validation, not an authorization grant, a budget update or
 a lease renewal. It has no database, cloud, credential or process dependencies.

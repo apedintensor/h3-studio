@@ -157,7 +157,7 @@ unknown outcomes and repair holds still block unsafe rotation. Changing this
 configuration does not alter previously accepted request identities, leases,
 deadlines or bills, and does not itself grant spending authority.
 
-### E1: opt-in pool member admission (offline foundation)
+### Opt-in pool member admission and original-pair controller
 
 An operator approval may explicitly freeze `pool_members: {version: 1,
 member_ids: ["a", "b"]}`: exactly two distinct stable member IDs, each one GPU
@@ -182,15 +182,45 @@ cannot take a pool-bound job. Existing unknown attempts retain their worker,
 original attempt identity and reservations; another member may serve distinct
 work, and approval revocation does not prevent original-attempt reconciliation.
 
-This is not an enabled two-node service. The legacy cold/finite controllers
-refuse these approvals. Warm admission for the same opted-in tenant/pool/config
-also fails closed, including after approval revocation/expiry, because E1 does
-not yet bind new warm plans to members. Legacy warm admission is unchanged.
-E2 must supply demand-triggered target two, fully bound warm admission, each
-member's independent preparation/recovery/holds, bounded replacement and the
-600-second no-obligation idle rule in the existing controller before enabling
-this mode. Offline SQLite/PostgreSQL races prove ledger behavior only; two-node
-provider operation, timing and production activation need separate evidence.
+The explicit `continuing-two-members` service policy adds a sorted, two-item
+`member_ids` list; historical single-slot policy fields and fingerprints remain
+unchanged. Both members use one real provider selector, rather than fabricated
+offer IDs. Each immutable approval marks `pool_controller:
+"continuing-two-members-v1"`. Warm requests require that current marker and
+freeze the same approval/member binding as cold requests; they never fall back
+to an unbound warm job. Legacy cold/finite controllers and E1-only warm grants
+continue to refuse the new lifecycle. The original shared queue remains the
+only generation dispatcher.
+
+One confirmed task can finance the two original approved members, subject to
+the existing account and capacity gates. The sole pool leader commits each
+member's instance reservation, immutable binding, scaler action and optional
+provider-preparation start barrier in one transaction before its sole create
+call. Repeated ticks/restarts reconcile that action; unknown A is never rented
+again, and separately approved original B may still serve different work.
+Sorted member IDs determine stable ports, independent of readiness or creation
+order. Foreign/unbound live instances and duplicate observed pod identities
+are held for reconciliation. Two pod IDs alone do not attest distinct physical
+host fault domains; that is a separate provider/live acceptance requirement.
+
+Member preparation failures and runtime quarantine do not revoke a healthy
+peer's approval. Existing exact-instance stop/idle evidence still gates
+destruction, and all original attempt recovery remains attached to its worker.
+Unknown/cancel/collection obligations prevent pool-idle shutdown but do not, by
+themselves, create new redundancy demand. Positive waiting/queued/claimed/
+submitting/running work supplies that demand. Drafts and preflight remain inert.
+The existing all-pool obligation timer gates the configured idle interval
+(600 seconds under the accepted operating target); a fast intervening job
+resets it. Global authority expiry/revocation still drains the entire service.
+
+This bounded E2 slice has no in-place member replenishment. A failed original
+member is not rebound or replaced with a third node. A fresh pair may open only
+after the previous pair is physically removed, rental bills settled, children
+proven stopped and original jobs safely transferable without another attempt.
+Runtime/preparation repair holds require explicit repair rather than automatic
+pair replacement. Rotation preserves original budgets, absolute authority,
+accepted requests and waiter deadlines. Offline tests do not enable this mode
+or establish provider operation, physical-host independence or production timing.
 
 ## 6. Output contract
 
