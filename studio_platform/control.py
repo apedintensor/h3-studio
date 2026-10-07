@@ -11,6 +11,7 @@ import re
 from sqlalchemy import and_, case, insert, select, update
 
 from .queue import TaskQueue
+from .inference.outputs import validate_delivery_policy
 from .repository import (
     BudgetExceeded, Conflict, NotFound, attempts, canonical, identifier, jobs,
     cpu_slots, instance_intents, registered_devices, registered_workers, request_hash,
@@ -33,8 +34,10 @@ class WorkerSpec:
     configuration_id: str
     backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
+    output_delivery: str = ""
 
     def __post_init__(self):
+        validate_delivery_policy(self.backend, self.output_delivery)
         for value in (self.worker_id, self.pool, self.provider, self.instance_id, self.model_id, self.configuration_id):
             identifier(value)
         if self.backend not in {"mock", "cpu-render", *REAL_GPU_BACKENDS}:
@@ -72,7 +75,22 @@ def worker_spec_payload(spec):
     value = asdict(spec)
     if spec.backend != "wangp-worker":
         value.pop("engine_manifest_digest")
+    if not spec.output_delivery:
+        value.pop("output_delivery")
     return canonical(value)
+
+
+def require_delivery_configuration(connection, backend, configuration_id, output_delivery):
+    """A configuration's recorded delivery identity cannot be reused or upgraded.
+
+    Retired records matter too: an old executable/configuration must not become
+    eligible for a newly defined export contract. IDs remain opaque.
+    """
+    rows = connection.execute(select(registered_workers.c.spec).where(
+        registered_workers.c.spec["backend"].as_string() == backend,
+        registered_workers.c.spec["configuration_id"].as_string() == configuration_id)).scalars()
+    if any(row.get("output_delivery", "") != output_delivery for row in rows):
+        raise Conflict("configuration_output_delivery_conflict")
 
 
 class WorkerControl:
@@ -105,7 +123,7 @@ class WorkerControl:
                 and previous.upstream_task_id is None)
 
     def pool_status(self, pool, *, model_id, configuration_id, recipe_id=None,
-                    backend="comfy-worker", engine_manifest_digest=None):
+                    backend="comfy-worker", engine_manifest_digest=None, output_delivery=""):
         """Read-only readiness of exact operator-bound slots, not a GPU probe.
 
         An expired registration is reported as unknown without modifying its
@@ -114,6 +132,7 @@ class WorkerControl:
         """
         for value in (pool, model_id, configuration_id):
             identifier(value)
+        validate_delivery_policy(backend, output_delivery)
         if recipe_id is not None:
             identifier(recipe_id)
         if backend not in {"mock", "cpu-render", *REAL_GPU_BACKENDS}:
@@ -134,6 +153,7 @@ class WorkerControl:
                 if (spec["backend"] != backend or spec["model_id"] != model_id
                     or spec["configuration_id"] != configuration_id
                     or backend == "wangp-worker" and spec.get("engine_manifest_digest") != engine_manifest_digest
+                    or spec.get("output_delivery", "") != output_delivery
                     or recipe_id is not None and recipe_id not in spec["recipe_ids"]):
                     continue
                 matched += 1
@@ -162,6 +182,7 @@ class WorkerControl:
         repo = self.repo
         with repo.transaction() as connection:
             limits = None if spec.backend == "cpu-render" else repo._lock_capacity(connection)
+            require_delivery_configuration(connection, spec.backend, spec.configuration_id, spec.output_delivery)
             existing = repo._locked(connection, select(registered_workers).where(registered_workers.c.id == spec.worker_id))
             if existing:
                 if existing["spec_hash"] != digest or existing["state"] == "retired":
@@ -259,7 +280,8 @@ class WorkerControl:
         if not isinstance(effective, dict):
             return False
         if (job["pool"] != spec["pool"] or execution.get("backend") != spec["backend"]
-            or execution.get("enabled") is not True):
+            or execution.get("enabled") is not True
+            or execution.get("output_delivery", "") != spec.get("output_delivery", "")):
             return False
         if spec["recipe_ids"] and request.get("recipe_id") not in spec["recipe_ids"]:
             return False
@@ -315,6 +337,11 @@ class WorkerControl:
                     jobs.c.execution_plan["configuration_id"].as_string() == spec["configuration_id"]))
             if spec["backend"] == "wangp-worker":
                 bindings.append(jobs.c.execution_plan["engine_manifest_digest"].as_string() == spec["engine_manifest_digest"])
+            # Do not claim unsupported jobs then fail them: old slot identities
+            # cannot acquire native-delivery work, including collection/recovery.
+            from sqlalchemy import func
+            bindings.append(func.coalesce(jobs.c.execution_plan["output_delivery"].as_string(), "")
+                            == spec.get("output_delivery", ""))
             if purpose == "generate":
                 deadlines = list(connection.execute(select(instance_intents.c.hard_deadline).where(
                     instance_intents.c.provider == worker["provider"],

@@ -38,7 +38,7 @@ Direct generation independent of a story is a target, not an invented available 
 
 1. Authenticate and authorize the real principal on every write/read, including Agent calls. Preserve project scope and account-change protection.
 2. Resolve media from the asset service and snapshot selected derivatives/clips, owner, source versions and content identity. Never accept a client path or arbitrary URL as a trusted model input.
-3. Freeze normalized controls, canonical seed (existing decimal string), request/source hashes, requested export duration and native output geometry/frame duration. Later user edits cannot change accepted work.
+3. Freeze normalized controls, canonical seed (existing decimal string), request/source hashes, requested duration and native output geometry/frame duration. When an operator-qualified native delivery policy is selected, also freeze its explicit delivery specification in the execution plan. Later user edits cannot change accepted work.
 4. Plan/preflight/assistant/card creation must not provision a GPU or start video generation. Only explicit confirmed admission can start paid video inference or demand-triggered GPU provisioning. Assistant model calls and storage have separate authorization/cost semantics and are not claimed to be free. Reservations and job admission are transactional; unknown cost is not zero.
 5. Legacy idempotency namespace is tenant/owner/project/actor/key. Same key with equivalent admitted data returns the existing job; conflicting data rejects. Do not globally change that namespace.
 6. Quick Chat additionally uses stable submission/item/execution business identity across Agents. Its queue actor is an internal idempotency namespace, not an authenticated user. Preserve actual caller authorization separately.
@@ -125,7 +125,22 @@ deadlines or bills, and does not itself grant spending authority.
 
 Engine success is not platform success. The worker validates expected geometry, duration, actual decodability and audio, normalizes the requested export, and publishes through the existing `ArtifactWriter` receipt. Audio-enabled generation requires an independent audio output as well as valid video; an engine returning only a muxed file needs an explicit verified extraction step.
 
-The existing exports are MP4/H.264, 24 fps, and independent FLAC for audio-enabled jobs; requested export duration is distinct from padded native sampling duration. Current normalization remains unchanged in B2. Content hash/size, ownership, job/attempt linkage, storage quota and durable publication are recorded before completion.
+Exports are MP4/H.264, 24 fps, and independent FLAC for audio-enabled jobs. Requested duration is distinct from padded native sampling duration. Content hash/size, ownership, job/attempt linkage, storage quota and durable publication are recorded before completion.
+
+Delivery is versioned and immutable; it is not inferred from the current default at collection time:
+
+| Accepted execution contract | Delivery behavior |
+|---|---|
+| No `output_delivery` / `delivery_spec` | Historical requested-duration export, unchanged for existing jobs, Comfy and chapter roughcuts. A five-second H3 request delivers 120 frames. |
+| Explicit `output_delivery: native-frames-v1` | New qualified WanGP FL plans freeze `delivery_spec` with policy, fps, frame count, video duration and requested duration. All native frames remain: five requested seconds means 124 frames / 24 fps = 5.1667 seconds. No end-frame crop, frame-rate conversion, retiming or silence padding. |
+
+The native policy requires exactly matching video frame count, 24 fps, zero-based timestamps and native video-stream duration before and after export. Both the MP4 audio and independent FLAC derive from the complete generated waveform; neither is cut to the integer requested duration. Their observed lengths must remain within the existing 0.1-second audio tolerance of the native video timeline, including codec/sample rounding; larger mismatch rejects collection instead of being corrected silently. Video, container and audio durations remain distinct evidence. This tolerance is not a claim of perceptual lip-sync or real H3 audio qualification.
+
+The optional policy/capability is bound through operator policy, capacity approval, boot/config identity, worker registration and the accepted execution plan. Missing fields preserve historical hashes. Native and legacy workers cannot share a recorded configuration identity; configuration IDs remain opaque. Exact worker capability matching applies to generation and collection, and an old recovery spec cannot attach to a native worker record. Rollout requires a separately qualified configuration/registration; existing workers, accepted attempts and historical artifacts are not relabelled. No default or currently enabled operational configuration is changed by adding this implementation.
+
+Collection receipts for native jobs additionally bind the frozen delivery specification. Publication validates native-only timing metadata against that specification; legacy metadata contracts remain unchanged. API preflight exposes the planned delivery under `execution.delivery_spec`, jobs expose the same descriptor, and downloadable artifacts retain verified timing evidence. Unknown policies or malformed descriptors fail closed before a new engine submission.
+
+[D3 #27](https://github.com/apedintensor/h3-studio/issues/27) separates deterministic CPU export evidence from real last-image conditioning. Frame preservation does not establish model fidelity. A real first/last-image example and its actual video/audio/download evidence remain necessary before advertising qualified ending fidelity. Fixed exact-duration retiming is not part of this policy.
 
 On a process restart, an existing collection receipt resumes the same publication. A download, transcode, storage or database failure cannot cause a new generation. GPU scratch files cannot be discarded before durable output/obligation handling permits shutdown. Unknown final supplier billing keeps its reservation independently of video delivery.
 

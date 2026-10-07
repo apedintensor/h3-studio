@@ -24,7 +24,7 @@ from .repository import Conflict, LeaseLost, Scope, money
 from .storage import ObjectAlreadyExists, ObjectNotFound, StorageWriteUncertain
 # Compatibility exports retain the same objects for existing worker callers.
 from .inference.comfy import ComfyBackend
-from .inference.outputs import _request, _shape
+from .inference.outputs import _request, _shape, delivery_spec
 from .inference.protocol import (BackendError, InferenceBackend, NotReady, Outcome,
                                  RenderCacheCapacityExceeded, SubmissionRejected,
                                  SubmissionUncertain, TAG, TASK)
@@ -225,6 +225,7 @@ class WorkerRunner:
                     return self._summary(self.queue.fail(lease, "execution_policy_unavailable_before_submission",
                         actual_cost_microusd=0, upstream_stopped=True))
                 try:
+                    delivery_spec(job)  # Reject unknown/malformed export policy before any engine preparation.
                     prepared = self.backend.prepare(job, tag, self.store, heartbeat)
                 except RenderCacheCapacityExceeded:
                     # No submission intent/POST exists. Retained input/cache
@@ -324,6 +325,9 @@ class WorkerRunner:
             return self._summary(self.queue.complete(lease, specs, actual_cost_microusd=self._cost(job, task_id),
                                                      settlement=writer.settlement(receipt)))
         width, height, duration, audio = _shape(job)
+        delivery = delivery_spec(job)
+        if delivery is not None:
+            duration = delivery["duration_s"]
         writer.begin_staging(job, lease.attempt_id, tag, kinds=("video", "audio") if audio else ("video",))
         directory = self.work_dir / tag
         directory.mkdir(parents=True, exist_ok=True)
@@ -333,6 +337,12 @@ class WorkerRunner:
         stream = next((s for s in raw.get("streams", []) if s.get("codec_type") == "video"), {})
         if (stream.get("width"), stream.get("height")) != (width, height):
             raise BackendError("output_dimensions_mismatch")
+        if delivery is not None:
+            _validate_native_timing(stream, delivery)
+            if audio:
+                if "audio" not in paths:
+                    raise BackendError("independent_audio_missing")
+                _validate_audio(paths["audio"], duration)
         try:
             if float(raw["format"]["duration"]) < duration - .1:
                 raise BackendError("output_too_short")
@@ -346,9 +356,27 @@ class WorkerRunner:
             "-vf", "fps=24", "-c:v", "libx264", "-preset", "veryfast", "-crf", request.get("export_crf", 18),
             "-pix_fmt", "yuv420p"]
         args += ["-c:a", "aac", "-ar", "32000", "-ac", "2"] if audio else ["-an"]
+        if delivery is not None:
+            # Keep the complete native timeline. Both audio deliveries use the
+            # original generated waveform; no trim, pad, fps filter or atempo.
+            args = ["-i", paths["video"]]
+            if audio:
+                args += ["-i", paths["audio"], "-map", "0:v:0", "-map", "1:a:0"]
+            args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", request.get("export_crf", 18),
+                     "-pix_fmt", "yuv420p", "-fps_mode", "passthrough"]
+            args += ["-c:a", "aac", "-ar", "32000", "-ac", "2"] if audio else ["-an"]
         with _lease_keepalive(heartbeat):
             ffmpeg([*args, "-fs", 512*1024*1024+1, "-movflags", "+faststart", final], timeout=media_timeout)
             video_evidence = _validate_video(final, width, height, duration, audio, timeout=media_timeout)
+            if delivery is not None:
+                observed = probe(final)
+                observed_video = next(s for s in observed["streams"] if s.get("codec_type") == "video")
+                _validate_native_timing(observed_video, delivery)
+                video_evidence.update(delivery_spec=delivery, frame_count=delivery["frame_count"],
+                    container_duration_s=float(observed["format"]["duration"]))
+                if audio:
+                    observed_audio = next(s for s in observed["streams"] if s.get("codec_type") == "audio")
+                    video_evidence["audio_duration_s"] = float(observed_audio.get("duration", observed["format"]["duration"]))
         files = [("video", final, "video/mp4", video_evidence)]
         if audio:
             if "audio" not in paths:
@@ -356,10 +384,12 @@ class WorkerRunner:
             output = directory / "verified.flac"
             heartbeat()
             with _lease_keepalive(heartbeat):
-                ffmpeg(["-i", paths["audio"], "-t", duration, "-c:a", "flac", "-ar", "32000", "-ac", "2",
+                ffmpeg(["-i", paths["audio"], *([] if delivery is not None else ["-t", duration]),
+                        "-c:a", "flac", "-ar", "32000", "-ac", "2",
                         "-fs", 512*1024*1024+1, output], timeout=media_timeout)
                 actual_audio_duration = _validate_audio(output, duration, flac=True, timeout=media_timeout)
-            files.append(("audio", output, "audio/flac", {"duration_s": actual_audio_duration, "has_audio": True}))
+            files.append(("audio", output, "audio/flac", {"duration_s": actual_audio_duration, "has_audio": True,
+                **({"delivery_spec": delivery} if delivery is not None else {})}))
         with _lease_keepalive(heartbeat):
             receipt = writer.prepare(job, lease.attempt_id, tag, files)
             specs = writer.write(receipt, heartbeat)
@@ -416,6 +446,18 @@ def _lease_keepalive(heartbeat, *, interval_s=30):
         thread.join(timeout=5)
     if lost:
         raise LeaseLost("lease_lost_during_media_stage")
+
+
+def _validate_native_timing(stream, delivery):
+    """Reject an unexpected native timeline instead of coercing its frame rate."""
+    try:
+        if (Fraction(stream["avg_frame_rate"]) != delivery["fps"]
+                or int(stream["nb_frames"]) != delivery["frame_count"]
+                or abs(float(stream["duration"])-delivery["duration_s"]) > .001
+                or abs(float(stream.get("start_time", 0))) > .001):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        raise BackendError("native_output_timing_mismatch") from None
 
 
 def _validate_video(path, width, height, duration, audio, *, timeout=180):

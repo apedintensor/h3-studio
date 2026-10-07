@@ -85,7 +85,8 @@ def make_slot(config, intent, report, directory):
     endpoint = f'http://127.0.0.1:{config.local_port}'
     spec = WorkerSpec('lium-'+intent['id'].replace('-', ''), intent['pool'], 'lium',
         intent['provider_instance_id'], (report['gpus'][0]['uuid'],), config.recipe_ids,
-        config.model_id, config.configuration_id, 'wangp-worker', config.engine_manifest_digest)
+        config.model_id, config.configuration_id, 'wangp-worker', config.engine_manifest_digest,
+        output_delivery=config.output_delivery)
     return SlotConfig(spec, True, endpoint, (endpoint,), '', True,
         runtime_config_file=str(directory/'wangp-client.json'))
 

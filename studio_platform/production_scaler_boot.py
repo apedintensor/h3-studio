@@ -73,6 +73,7 @@ class ProductionBoot(BootController):
             trust_first_host_key=finite.trust_first_host_key,
             minimum_remaining_s=finite.drain_margin_s, recipe_ids=finite.recipe_ids,
             execution_backend=finite.execution_backend, engine_manifest_digest=finite.engine_manifest_digest,
+            output_delivery=finite.output_delivery,
             min_gpu_bytes=_approved_boot_min_gpu_bytes(repo, finite, intent))
         super().__init__(repo, provider, config, ssh_factory=ssh_factory, backend_factory=backend_factory,
             verify_smoke=verify_smoke, fleet_factory=self._fleet)

@@ -259,12 +259,17 @@ track, preserves the native MP4, and hands both to the host for checksum sealing
 Failure during packaging retries the same completed result; it never regenerates.
 A crash before durable sealing remains unknown for reconciliation, not safe retry.
 
-The current worker exports the requested integer duration (for example 120 frames
-for 5 seconds), while the native H3 sample can have 124 frames. A last-image
-condition applies to that native ending and may be cut from the delivered export.
-The mapping tests do not prove the last frame remains visible in the delivered
-video. B3 should first prove text-to-video; accepting last-frame fidelity requires
-an explicit export/endpoint contract and a real last-frame test.
+Legacy/default worker export uses the requested integer duration (for example
+120 frames for 5 seconds), while the native H3 sample can have 124 frames. D3 adds
+the opt-in `native-frames-v1` delivery contract to preserve all native frames and
+the complete generated waveform for new separately qualified WanGP plans.
+It requires matching operator-policy, cold-approval, boot and worker capability
+identities; an existing configuration or accepted task is not silently upgraded.
+See [the output contract](../../GENERATION-CONTRACT.md#6-output-contract) for
+duration/audio validation and compatibility. Current first-proof configuration
+remains on its original export behavior. CPU numbered-frame evidence establishes
+export behavior only: B3 should first prove text-to-video, and a real first/last
+example is still needed before claiming qualified last-frame fidelity.
 
 ## Checks and remaining gates
 

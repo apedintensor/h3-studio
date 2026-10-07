@@ -111,8 +111,11 @@ class BootConfig:
     qualification_profile: str = ""
     execution_backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
+    output_delivery: str = ""
 
     def __post_init__(self):
+        from .inference.outputs import validate_delivery_policy
+        validate_delivery_policy(self.execution_backend, self.output_delivery)
         for field in ("work_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             if not Path(getattr(self, field)).is_absolute():
                 raise ValueError("bootstrap_paths_must_be_absolute")
@@ -520,6 +523,8 @@ class BootController:
             "sources": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
         if self.config.execution_backend == "wangp-worker":
             value.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
+        if self.config.output_delivery:
+            value["output_delivery"] = self.config.output_delivery
         return value
 
     def _connect_backend(self, intent, directory, state):

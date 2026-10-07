@@ -80,6 +80,16 @@ class WanGPBootTests(LedgerCase):
             self.assertEqual(self.boot().tick(self.intent['id'])['state'], 'runtime_ready')
         self.assertEqual((self.host.starts, self.host.uploads), (1, 1))
 
+    def test_native_delivery_capability_binds_boot_marker_slot_and_reconnect(self):
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        boot = self.boot(fleet_enabled=True, output_delivery=NATIVE_DELIVERY)
+        with patch('studio_platform.wangp_bootstrap.connect_backend', self.connect):
+            result = boot.tick(self.intent['id'])
+        self.assertEqual(result['state'], 'fleet_running')
+        self.assertEqual(boot.fleet.config.slots[0].spec.output_delivery, NATIVE_DELIVERY)
+        self.assertEqual(self.host.identity['output_delivery'], NATIVE_DELIVERY)
+        self.assertEqual(self.host.starts, 1)
+
     def test_wrong_manifest_and_missing_marker_never_register_or_relaunch(self):
         self.host.lose_start = True
         self.boot().tick(self.intent['id'])

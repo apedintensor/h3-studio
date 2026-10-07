@@ -313,13 +313,14 @@ class TaskQueue:
         """
         cost = None if actual_cost_microusd is None else money(actual_cost_microusd)
         specs = canonical(artifact_specs)
+        from .inference.outputs import NATIVE_EVIDENCE_FIELDS, validate_delivery_evidence
         if not isinstance(specs, list) or not specs:
             raise ValueError("missing_artifacts")
         for spec in specs:
             if not isinstance(spec, dict) or spec.get("validated") is not True:
                 raise ValueError("artifact_not_validated")
             allowed_keys = {"kind", "object_key", "size_bytes", "sha256", "validated", "content_type",
-                            "width", "height", "duration_s", "fps", "has_audio"}
+                            "width", "height", "duration_s", "fps", "has_audio"} | NATIVE_EVIDENCE_FIELDS
             if set(spec) - allowed_keys:
                 raise ValueError("artifact_metadata_not_allowed")
             identifier(spec.get("kind"))
@@ -337,6 +338,8 @@ class TaskQueue:
             if job["status"] != "collecting" and not (
                 job["status"] == "cancel_requested" and job["cancel_from_status"] == "collecting"):
                 raise InvalidTransition("not_collecting")
+            for spec in specs:
+                validate_delivery_evidence(job, spec, spec["kind"])
             if settlement is not None:
                 settlement(connection, specs)
             artifact_ids = []

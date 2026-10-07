@@ -26,7 +26,7 @@ _ROOT_FIELDS = {"version", "qualification_profile", "identity", "worker_id", "in
     "model_id", "verified", "evidence", "failures"}
 _CONTROL_FIELDS = {"mode", "duration", "resolution", "aspect_ratio", "steps", "generate_audio", "video_decode",
     "audio_decode", "encoder_device"}
-_OUTPUT_FIELDS = {"artifact_id", "kind", "sha256", "size_bytes", "width", "height", "duration_s", "fps", "has_audio"}
+_OUTPUT_FIELDS = {"artifact_id", "kind", "sha256", "size_bytes", "width", "height", "duration_s", "fps", "has_audio", "frame_count"}
 
 
 def _id(value):
@@ -40,6 +40,12 @@ def _identity(value):
     if not isinstance(value, dict):
         raise ValueError("queued_task_evidence_identity_invalid")
     fields = _IDENTITY_FIELDS
+    if "output_delivery" in value:
+        from .inference.outputs import NATIVE_DELIVERY, validate_delivery_policy
+        validate_delivery_policy(value.get("backend"), value["output_delivery"])
+        if value["output_delivery"] != NATIVE_DELIVERY:
+            raise ValueError("queued_task_output_delivery_invalid")
+        fields = fields | {"output_delivery"}
     if "backend" in value or "engine_manifest_digest" in value:
         fields = fields | {"backend", "engine_manifest_digest"}
         if (value.get("backend") != "wangp-worker"
@@ -198,6 +204,7 @@ class QueuedTaskRunner(DrainSafeRunner):
         spec, identity = worker["spec"], self.evidence_identity
         if (spec["backend"] != identity.get("backend", "comfy-worker")
                 or spec.get("engine_manifest_digest", "") != identity.get("engine_manifest_digest", "")
+                or spec.get("output_delivery", "") != identity.get("output_delivery", "")
                 or worker["instance_id"] != identity["instance_id"]
                 or spec["configuration_id"] != identity["configuration_id"]):
             raise ValueError("queued_task_worker_identity_conflict")

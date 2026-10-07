@@ -104,8 +104,11 @@ class FiniteConfig:
     execution_backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
     service_policy: dict | None = None
+    output_delivery: str = ""
 
     def __post_init__(self):
+        from .inference.outputs import validate_delivery_policy
+        validate_delivery_policy(self.execution_backend, self.output_delivery)
         if self.execution_backend not in {"comfy-worker", "wangp-worker"}:
             raise ScalerError("finite_backend_invalid")
         if self.execution_backend == "wangp-worker":
@@ -223,6 +226,8 @@ class FiniteConfig:
             value.pop("engine_manifest_digest")
         if self.service_policy is None:
             value.pop("service_policy")
+        if not self.output_delivery:
+            value.pop("output_delivery")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
@@ -300,6 +305,7 @@ def verify_policy(config, settings):
     if (not policy or request_hash(policy) != config.execution_policy_sha256 or policy["pool"] != config.pool
             or policy["backend"] != config.execution_backend
             or policy.get("engine_manifest_digest", "") != config.engine_manifest_digest
+            or policy.get("output_delivery", "") != config.output_delivery
             or policy["configuration_id"] != config.configuration_id or policy["recipe_ids"] != list(config.recipe_ids)
             or policy["qualification"]["status"] != ("runtime_required" if config.qualification_profile in RUNTIME_PROFILES else "accepted")
             or policy["qualification"]["evidence_id"] != config.qualification_evidence_id
