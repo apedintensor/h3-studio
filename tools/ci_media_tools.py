@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import os
 from pathlib import Path
 import platform
@@ -13,6 +14,7 @@ import sys
 SOURCES = ("/etc/apt/sources.list.d/ubuntu.sources", "/etc/apt/apt-mirrors.txt",
            "/etc/apt/apt-mirrors-security.txt")
 FONT = "Noto Sans CJK SC"
+OFFICIAL_MIRROR = re.compile(r"https://((?:azure\.)?archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu/?(?=\s|$)")
 
 
 def https_sources(text):
@@ -20,6 +22,44 @@ def https_sources(text):
     # with archive.ubuntu.com caused measured slow package downloads in CI.
     return re.sub(r"http://((?:azure\.)?archive\.ubuntu\.com|security\.ubuntu\.com)/ubuntu\b",
                   r"https://\1/ubuntu", text)
+
+
+def mirror_available(host):
+    # This probe selects no package or new trust root. APT still authenticates
+    # every index/package. Never follow a redirect or send caller credentials.
+    connection = http.client.HTTPSConnection(host, timeout=5)
+    try:
+        connection.request("HEAD", "/ubuntu/dists/noble/InRelease")
+        return connection.getresponse().status == 200
+    except (OSError, http.client.HTTPException):
+        return False
+    finally:
+        connection.close()
+
+
+def reachable_sources(sources, probe=mirror_available):
+    converted = {name: https_sources(text) for name, text in sources.items()}
+    available = {host: probe(host) for host in sorted({match.group(1)
+        for text in converted.values() for match in OFFICIAL_MIRROR.finditer(text)})}
+    result = {}
+    for name, text in converted.items():
+        if name.endswith(("apt-mirrors.txt", "apt-mirrors-security.txt")):
+            # Preserve ordering/priority among reachable configured mirrors.
+            # A failing Azure host otherwise retries for *each* metadata file.
+            lines = []
+            for line in text.splitlines(keepends=True):
+                match = OFFICIAL_MIRROR.match(line.strip())
+                if match and not available[match.group(1)]:
+                    continue
+                lines.append(line)
+            text = "".join(lines)
+            if not any(available[match.group(1)] for match in OFFICIAL_MIRROR.finditer(text)):
+                raise RuntimeError("No configured official HTTPS mirror is reachable")
+        elif any(not available[match.group(1)] for match in OFFICIAL_MIRROR.finditer(text)):
+            # Do not invent a replacement for an unfamiliar direct-source setup.
+            raise RuntimeError("Configured direct Ubuntu HTTPS source is unreachable")
+        result[name] = text
+    return result
 
 
 def run(args, **kwargs):
@@ -76,20 +116,18 @@ def install(cache):
     if cache != root / "sixnine-ci-apt":
         raise ValueError("Unexpected CI archive cache directory")
     cache.mkdir(parents=True, exist_ok=True)
-    for name in SOURCES:
-        path = Path(name)
-        if path.is_file():
-            original = path.read_text()
-            converted = https_sources(original)
-            if converted != original:
-                run(["sudo", "tee", str(path)], input=converted, text=True, stdout=subprocess.DEVNULL)
+    originals = {name: Path(name).read_text() for name in SOURCES if Path(name).is_file()}
+    for name, converted in reachable_sources(originals).items():
+        if converted != originals[name]:
+            run(["sudo", "tee", name], input=converted, text=True, stdout=subprocess.DEVNULL)
     # Custom archive directory survives Docker's literal /var/cache/apt cleanup
     # hook. Keep normal APT metadata/signature/hash validation and install by
     # package name, never `dpkg -i` or `apt install ./restored-file.deb`.
     # Match the official x64 runner's bounded failover rather than retrying the
     # same slow mirror for minutes before consulting its next listed mirror.
     options = ["-o", "Acquire::Retries=1", "-o", "Acquire::http::Timeout=15",
-        "-o", "Acquire::https::Timeout=15", "-o", "APT::Update::Error-Mode=any",
+        "-o", "Acquire::https::Timeout=15", "-o", "Acquire::Languages=none",
+        "-o", "APT::Update::Error-Mode=any",
         "-o", "Dir::Cache::archives="+str(cache),
         "-o", "APT::Keep-Downloaded-Packages=true",
         "-o", "Binary::apt::APT::Keep-Downloaded-Packages=true"]

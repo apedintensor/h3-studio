@@ -25,6 +25,35 @@ class MediaToolTests(unittest.TestCase):
             media.install("unused")
         run.assert_not_called()
 
+    def test_unreachable_official_mirror_removed_once_without_new_mirror(self):
+        path = "/etc/apt/apt-mirrors.txt"
+        sources = {path: "http://azure.archive.ubuntu.com/ubuntu priority:10\n"
+                        "http://archive.ubuntu.com/ubuntu priority:20\n",
+            "/etc/apt/sources.list.d/ubuntu.sources":
+                "URIs: mirror+file:/etc/apt/apt-mirrors.txt\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"}
+        probes = []
+        def probe(host):
+            probes.append(host)
+            return host == "archive.ubuntu.com"
+        result = media.reachable_sources(sources, probe)
+        self.assertEqual(result[path], "https://archive.ubuntu.com/ubuntu priority:20\n")
+        self.assertEqual(result["/etc/apt/sources.list.d/ubuntu.sources"], sources["/etc/apt/sources.list.d/ubuntu.sources"])
+        self.assertEqual(sorted(probes), ["archive.ubuntu.com", "azure.archive.ubuntu.com"])
+        with self.assertRaisesRegex(RuntimeError, "No configured"):
+            media.reachable_sources(sources, lambda host: False)
+
+    def test_unreachable_direct_source_cannot_acquire_a_guessed_fallback(self):
+        with self.assertRaisesRegex(RuntimeError, "direct Ubuntu"):
+            media.reachable_sources({"/etc/apt/sources.list.d/ubuntu.sources":
+                "URIs: http://azure.archive.ubuntu.com/ubuntu\n"}, lambda host: False)
+
+    def test_mirror_probe_does_not_follow_redirects_and_closes(self):
+        with patch.object(media.http.client, "HTTPSConnection") as connection:
+            connection.return_value.getresponse.return_value.status = 302
+            self.assertFalse(media.mirror_available("archive.ubuntu.com"))
+            connection.return_value.request.assert_called_once_with("HEAD", "/ubuntu/dists/noble/InRelease")
+            connection.return_value.close.assert_called_once()
+
     def test_missing_font_preserves_usable_ffmpeg(self):
         with patch.object(media, "usable", return_value=True), patch.object(media, "run",
                 return_value=subprocess.CompletedProcess([], 0, "DejaVu Sans")):
