@@ -166,6 +166,9 @@ class NativeDeliveryTests(LedgerCase):
         response.raise_for_status()
         job = response.json()
         self.assertEqual(job["status"], "succeeded", job)
+        listed = client.get("/v1/jobs")
+        listed.raise_for_status()
+        self.assertEqual(next(item for item in listed.json()["jobs"] if item["id"] == job_id), job)
         files = {}
         for artifact in job["artifacts"]:
             response = client.get(artifact["content_url"])

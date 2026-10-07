@@ -698,6 +698,10 @@ class Repository:
                        else func.json_typeof(jobs.c.request[field]))
             columns.append(present.label("_type_"+field))
         columns.append(jobs.c.execution_plan["backend"].label("_summary_backend"))
+        columns.append(jobs.c.execution_plan["delivery_spec"].label("_summary_delivery_spec"))
+        present = (func.json_type(jobs.c.execution_plan, "$.delivery_spec") if self.engine.dialect.name == "sqlite"
+                   else func.json_typeof(jobs.c.execution_plan["delivery_spec"]))
+        columns.append(present.label("_type_delivery_spec"))
         return columns
 
     def _decode_job_summaries(self, values):
@@ -711,6 +715,9 @@ class Repository:
                         value = kind == "true"
                     row["request"][field] = value
             row["execution_plan"] = {"backend": row.pop("_summary_backend")}
+            delivery = row.pop("_summary_delivery_spec")
+            if row.pop("_type_delivery_spec") is not None:
+                row["execution_plan"]["delivery_spec"] = delivery
 
     @staticmethod
     def _job_batch_predicate(tenant_id, owner_id, job_projects, *, maximum):
