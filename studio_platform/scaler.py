@@ -209,7 +209,7 @@ class ScaleCoordinator:
             if action is None:
                 return
             phase = self.preparation(connection, row)
-            if (phase is None or phase["phase"] != "awaiting_provider" or row["state"] != "starting"
+            if (phase is None or phase["phase"] != "awaiting_provider" or row["state"] not in {"starting", "destroyed"}
                     or not row["provider_instance_id"] or action["destroy_started_at"] is not None):
                 return
             now = self.repo.clock()
@@ -217,8 +217,13 @@ class ScaleCoordinator:
             fresh = action["last_observed_at"] is not None and 0 <= now-action["last_observed_at"] <= 30
             failed = fact.provider_status in {"FAILED", "STOPPED"}
             expired = fact.provider_status == "PENDING" and now-row["created_at"] >= self.preparation_timeout_s
-            if (not fresh or fact.state != "starting" or fact.instance_id != row["provider_instance_id"]
-                    or not (failed or expired)):
+            # A provider TTL can remove an actual pod before our timeout. Its
+            # immutable terminal fact still needs the positive unused barrier;
+            # it permits backlog preservation, never another DELETE.
+            removed = (row["state"] == "destroyed" and fact.state == "destroyed"
+                and action["last_observed_at"] is not None and action["last_observed_at"] <= now)
+            if (fact.instance_id != row["provider_instance_id"]
+                    or not removed and (not fresh or fact.state != "starting" or not (failed or expired))):
                 return
             if connection.execute(select(registered_workers.c.id).where(
                     registered_workers.c.provider == row["provider"],
@@ -228,14 +233,15 @@ class ScaleCoordinator:
             # and no runtime evidence. Status PENDING/STOPPED alone is never idle.
             if self.unused_preparation_guard(connection, dict(row)) is not True:
                 return
-            reason = "provider_preparation_failed" if failed else "provider_preparation_timeout"
+            reason = "provider_preparation_failed" if failed or removed else "provider_preparation_timeout"
             self._preparation_receipt(connection, row, "retiring_unused", instance_id=row["provider_instance_id"],
                 reason=reason, provider_status=fact.provider_status, observed_at=action["last_observed_at"])
-            self.repo.update_instance(row["id"], "draining", connection=connection)
-            self.repo.update_instance(row["id"], "destroying", connection=connection)
-            connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == row["id"])
-                .values(destroy_started_at=now))
-            destroy = True
+            if not removed:
+                self.repo.update_instance(row["id"], "draining", connection=connection)
+                self.repo.update_instance(row["id"], "destroying", connection=connection)
+                connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == row["id"])
+                    .values(destroy_started_at=now))
+                destroy = True
         if destroy:
             fact, at = self._call(intent, "destroy")
             self._apply(lease, intent["id"], fact, at)
@@ -508,6 +514,17 @@ class ScaleCoordinator:
                         self._reconcile(lease, intent)
                 for intent in self._active(pool):
                     self._retire_unused_preparation(lease, intent)
+                if self.preparation_timeout_s is not None:
+                    with self.repo.engine.connect() as connection:
+                        removed = list(connection.execute(select(instance_intents).join(scaler_receipts,
+                            scaler_receipts.c.intent_id == instance_intents.c.id).where(
+                            instance_intents.c.pool == pool, instance_intents.c.state == "destroyed",
+                            instance_intents.c.provider_instance_id.is_not(None),
+                            scaler_receipts.c.operation == "provider_preparation",
+                            scaler_receipts.c.facts["binding"].as_string() == self.preparation_binding,
+                            scaler_receipts.c.facts["phase"].as_string() == "awaiting_provider")).mappings())
+                    for intent in removed:
+                        self._retire_unused_preparation(lease, intent)
                 for intent in self._active(pool):
                     self._drain_or_destroy(lease, intent, policy)
                 # This cycle owns one preparation attempt. A fresh service cycle

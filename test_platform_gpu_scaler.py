@@ -132,6 +132,10 @@ class FiniteControlTests(unittest.TestCase):
         for invalid in (True, 0, -1, 119, 7201, 1800.0, float('nan'), '1800'):
             with self.subTest(invalid=invalid), self.assertRaises(release.ReleaseError):
                 scaler.on_demand_config({**original, 'provider_preparation_timeout_s': invalid})
+        for invalid in (True, 0, -1, 6, 2.0, None, '2'):
+            with self.subTest(limit=invalid), self.assertRaises(release.ReleaseError):
+                scaler.on_demand_config({**original, 'provider_preparation_timeout_s': 1800,
+                    'provider_preparation_failure_limit': invalid})
 
     def test_on_demand_requires_exact_owner_pair_and_single_gpu_idle_policy(self):
         config = on_demand_configuration()

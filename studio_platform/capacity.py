@@ -32,6 +32,7 @@ CAPACITY_WAIT_CODES = {
     "provider_preparation_timeout": "capacity_provider_preparation_timeout",
     "provider_preparation_failed": "capacity_provider_preparation_failed",
     "provider_ttl_unconfirmed": "capacity_provider_ttl_unconfirmed",
+    "provider_preparation_retry_limit": "capacity_provider_preparation_retry_limit",
     "gpu_busy": "capacity_gpu_busy",
     "searching": "capacity_searching_gpu",
     "bootstrap_repair_required": "capacity_bootstrap_repair_required",

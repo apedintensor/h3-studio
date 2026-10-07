@@ -114,11 +114,16 @@ class FiniteConfig:
     service_policy: dict | None = None
     output_delivery: str = ""
     provider_preparation_timeout_s: int | None = None
+    provider_preparation_failure_limit: int = 2
 
     def __post_init__(self):
         if self.provider_preparation_timeout_s is not None and (type(self.provider_preparation_timeout_s) is not int
                 or not 120 <= self.provider_preparation_timeout_s <= 7200):
             raise ScalerError("invalid_provider_preparation_timeout")
+        if (type(self.provider_preparation_failure_limit) is not int
+                or not 1 <= self.provider_preparation_failure_limit <= 5
+                or self.provider_preparation_timeout_s is None and self.provider_preparation_failure_limit != 2):
+            raise ScalerError("invalid_provider_preparation_failure_limit")
         from .inference.outputs import validate_delivery_policy
         validate_delivery_policy(self.execution_backend, self.output_delivery)
         if self.execution_backend not in {"comfy-worker", "wangp-worker"}:
@@ -242,6 +247,8 @@ class FiniteConfig:
             value.pop("output_delivery")
         if self.provider_preparation_timeout_s is None:
             value.pop("provider_preparation_timeout_s")
+        if self.provider_preparation_failure_limit == 2:
+            value.pop("provider_preparation_failure_limit")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
@@ -705,6 +712,9 @@ class FiniteController:
         """Service cycles override this to retain backlog before capacity advance."""
         pass
 
+    def _capacity_advance_allowed(self):
+        return True
+
     def _bootstrap_start_allowed(self, intent_id, lease):
         """Fence upload completion before remote setup; never acquire ownership here."""
         from .repository import capacity_waiters
@@ -780,7 +790,7 @@ class FiniteController:
                 before_create=self.create_allowed)
         self._sync_provider_preparation()
         stopping = self.stopping()
-        if not stopping:
+        if not stopping and self._capacity_advance_allowed():
             self.cold.advance_once(c.capacity_approval_id)
         instances, _ = self._managed()
         boot_status = {}
