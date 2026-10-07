@@ -167,6 +167,18 @@ class AbsoluteTTLTests(unittest.TestCase):
         self.assertEqual(provider.lifetime(TAG, POD, local_created_at=900.25)["safe_deadline"], 7500.25)
         self.assertEqual(self.marker()["absolute_ttl"]["deadline"], 8100.25)
 
+    def test_submicrosecond_database_clock_never_rounds_schedule_up(self):
+        # datetime would normally round this target upward to .000001.
+        created = 900.0000006
+        self.detail["created_at"] = stamp(created)
+        provider = self.start(created_at=created)
+        ttl = self.marker()["absolute_ttl"]
+        self.assertEqual(ttl["deadline"], created+7200)
+        self.assertEqual(ttl["effective_deadline"], 8100)
+        self.assertTrue(ttl["attempts"][0]["confirmed"])
+        self.assertEqual(self.posts()[0][2]["removal_scheduled_at"], stamp(8100))
+        self.assertEqual(provider.lifetime(TAG, POD, local_created_at=created)["safe_deadline"], 7500)
+
     def test_mixed_timezone_and_changed_creation_identity_refuse_schedule(self):
         self.detail.update(created_at=stamp(900).removesuffix("+00:00"), removal_scheduled_at=stamp(9000))
         provider = self.start()

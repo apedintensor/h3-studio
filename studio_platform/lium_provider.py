@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import importlib
 import ipaddress
@@ -347,12 +347,20 @@ class LiumProvider:
                 if previous and (len(ttl["attempts"]) != 1 or not previous["acknowledged"]
                         or not previous["confirmed"] or previous["status"] != "PENDING" or detail["status"] != "RUNNING"):
                     raise ValueError
+                # DB clocks can retain sub-microsecond precision. ISO datetime
+                # rounds to microseconds; never round the approved ceiling up.
+                target_time = datetime.fromtimestamp(ttl["effective_deadline"], timezone.utc)
+                if target_time.timestamp() > ttl["effective_deadline"]:
+                    target_time -= timedelta(microseconds=1)
+                ttl["effective_deadline"] = target_time.timestamp()
+                if ttl["effective_deadline"] <= self.clock():
+                    raise ValueError
                 # The lock and fsynced intent precede the only allowed request.
                 ttl["attempts"].append({"target": ttl["effective_deadline"], "started_at": self.clock(),
                     "status": detail["status"], "acknowledged": False, "confirmed": False})
                 self._journal.update_ttl(tag, ttl)
                 self._request("POST", "pods/"+instance_id+"/schedule-removal", payload={
-                    "removal_scheduled_at": datetime.fromtimestamp(ttl["effective_deadline"], timezone.utc).isoformat()})
+                    "removal_scheduled_at": target_time.isoformat()})
                 ttl["attempts"][-1]["acknowledged"] = True
                 self._journal.update_ttl(tag, ttl)
                 detail, _, removed = self._ttl_observation(tag, instance_id, ttl)
