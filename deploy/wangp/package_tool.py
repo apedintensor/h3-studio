@@ -178,13 +178,17 @@ def prepare(upstream, output, base_image, wheelhouse=None, system_debs="/var/cac
 
 def bind_manifest(source, environment_lock, output, image):
     from studio_platform.runtime_hosts.wangp_environment import validate_lock
+    from studio_platform.runtime_hosts.wangp_session import CORE_VERSIONS
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image):
         raise ValueError("wangp_runtime_image_digest_required")
     value = json.loads(Path(source).read_text(encoding="utf-8"))
     lock = validate_lock(json.loads(Path(environment_lock).read_text(encoding="utf-8")))
+    if any(lock["installed_packages"].get(name) != version for name, version in CORE_VERSIONS.items()):
+        raise ValueError("wangp_manifest_core_versions_mismatch")
     value.update(runtime_digest=digest(lock), runtime_digest_kind="sixnine-environment-lock-sha256",
                  runtime_image=image, inference_qualified=False)
-    value["runtime_recipe"].update(full_dependency_lock=digest(lock), image_digest=image,
+    value["runtime_recipe"].update(python=lock["python"], full_dependency_lock=digest(lock), image_digest=image,
+                                 cuda_recipe="PyTorch cu128 wheels; exact native packages in the environment lock",
                                  image_qualification="build identity only; GPU execution unverified")
     # A new identity; never overwrite the historical candidate/accepted manifest.
     with Path(output).open("xb") as target:

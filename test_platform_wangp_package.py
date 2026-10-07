@@ -11,6 +11,7 @@ import zipfile
 from unittest.mock import patch
 
 from studio_platform.runtime_hosts import wangp_environment as env
+from studio_platform.runtime_hosts.wangp_session import CORE_VERSIONS
 
 ROOT = Path(__file__).resolve().parent
 
@@ -42,7 +43,7 @@ class PackageTests(unittest.TestCase):
             "source_files": {"wgp.py": {"size_bytes": 16, "sha256": env.sha_file(self.source / "wgp.py")}},
             "wheels": [{"file": "example-1.0-py3-none-any.whl", "name": "example", "version": "1.0",
                         "size_bytes": 1, "sha256": "c" * 64}],
-            "installed_packages": {"example": "1.0"}, "system_packages": {"libc6:amd64": "2.36-9"},
+            "installed_packages": {"example": "1.0", **CORE_VERSIONS}, "system_packages": {"libc6:amd64": "2.36-9"},
         }
 
     def test_source_hash_and_extra_executable_file_are_enforced(self):
@@ -182,11 +183,16 @@ class PackageTests(unittest.TestCase):
         result = package.bind_manifest(ROOT / "deploy/wangp/manifest.json", lock_file, output, image)
         value = json.loads(output.read_text())
         self.assertEqual(value["runtime_digest"], env.digest(self.lock))
+        self.assertEqual(value["runtime_recipe"]["python"], self.lock["python"])
         self.assertEqual(value["runtime_recipe"]["full_dependency_lock"], env.digest(self.lock))
         self.assertFalse(value["inference_qualified"])
         self.assertFalse(result["inference_verified"])
         with self.assertRaises(FileExistsError):
             package.bind_manifest(ROOT / "deploy/wangp/manifest.json", lock_file, output, image)
+        self.lock["installed_packages"]["torch"] = "2.7.1"
+        lock_file.write_bytes(env.canonical(self.lock))
+        with self.assertRaisesRegex(ValueError, "core_versions_mismatch"):
+            package.bind_manifest(ROOT / "deploy/wangp/manifest.json", lock_file, self.root / "wrong.json", image)
 
 
 if __name__ == "__main__":
