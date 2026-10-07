@@ -181,6 +181,8 @@ class FiniteConfig:
                 or any(not isinstance(v, str) or not IDENTIFIER.fullmatch(v) for v in self.budget_account_ids)):
             raise ScalerError("finite_existing_budget_ids_required")
         try:
+            from .service_policy import service_member_ids
+            member_ids = service_member_ids(self)
             policy = ScalePolicy(**self.scale_policy)
             recommend([], [], [], now=self.created_at, policy=policy)
             launches = [LaunchSpec(**v) for v in self.launches]
@@ -189,7 +191,7 @@ class FiniteConfig:
                     or not 1 <= policy.max_instances <= 2 or policy.max_physical_gpus != policy.max_instances
                     or policy.new_instance_slots != 1 or policy.new_instance_physical_gpus != 1
                     or not policy.approved_remaining_microusd or not policy.instance_reservation_microusd
-                    or len(launches) != policy.max_instances or len(manifests) != len(launches)
+                    or len(launches) != (1 if member_ids else policy.max_instances) or len(manifests) != len(launches)
                     or len({v.offer_id for v in launches}) != len(launches)):
                 raise ValueError
             for launch, manifest in zip(launches, manifests):
