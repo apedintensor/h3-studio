@@ -28,10 +28,11 @@ from .storage import LocalObjectStore, StorageError, S3ObjectStore
 from .storage_config import S3StorageConfig, R2_CREDENTIAL_FIELDS, load_storage_credentials
 from .source_snapshot import source_snapshot, validate_source_ref
 from .http_limits import (ADMISSION_SCOPE_KEY, BodyLimitMiddleware, UploadAdmission,
-                         RequestAdmission, RequestAdmissionMiddleware, admission_rejected, is_asset_upload)
+                         RequestAdmission, RequestAdmissionMiddleware, admission_rejected, is_asset_upload, body_limit)
 from .execution_policy import ExecutionPolicies
 from .render_plans import RECIPE as RENDER_RECIPE, compile_render, validate_render_source
 from .agent_discovery import PUBLIC_PATHS as AGENT_PUBLIC_PATHS, DISCOVERY_LINK
+from .agent_connect_routes import EXCHANGE_PATH, register_routes as register_agent_connect_routes
 from .frontend import FRONTEND_CONTRACT, STATIC_CACHE_SCOPE_KEY, is_public_frontend
 from .generation_admission import GenerationAdmission, reject_managed
 
@@ -182,7 +183,7 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
                 return JSONResponse({"detail": "无效访问域名"}, status_code=400)
         elif host.split(":")[0] not in {"localhost", "127.0.0.1", "testserver"}:
             return JSONResponse({"detail": "本地服务仅支持loopback入口"}, status_code=400)
-        maximum = settings.max_upload_bytes + 1024*1024 if is_asset_upload(request.url.path) else settings.max_project_bytes
+        maximum = body_limit(request.url.path, settings.max_project_bytes, settings.max_upload_bytes)
         length = request.headers.get("content-length")
         if length and (len(length) > 20 or not length.isascii() or not length.isdigit() or int(length) > maximum):
             return JSONResponse({"detail": "请求体超过限制"}, status_code=413)
@@ -225,7 +226,8 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
         public_paths = {"/healthz", "/api/auth/config", "/api/auth/login"}
         public_frontend = is_public_frontend(settings, request.method, request.url.path)
         public_discovery = request.method in {"GET", "HEAD"} and request.url.path in AGENT_PUBLIC_PATHS
-        if request.url.path not in public_paths and not public_frontend and not public_discovery and not principal:
+        public_exchange = request.method == "POST" and request.url.path == EXCHANGE_PATH
+        if request.url.path not in public_paths and not public_frontend and not public_discovery and not public_exchange and not principal:
             return JSONResponse({"detail": "请先登录"}, status_code=401)
         request.state.principal = principal
         if principal and not lease.acquire("owner", principal.owner):
@@ -674,6 +676,7 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
         assistant_enabled=assistant_enabled)
     from .quick_chat_recovery import QuickChatRecovery
     app.state.quick_chat_recovery = QuickChatRecovery(app.state.quick_chat)
+    register_agent_connect_routes(app)
     from .batches import register_routes
     register_routes(app)
     from .guided import register_routes as register_guided_routes
