@@ -679,6 +679,34 @@ class FiniteController:
         """Finite runs stop; on-demand preparation recovery may preserve backlog."""
         self.request_drain()
 
+    def _bootstrap_start_allowed(self, intent_id, lease):
+        """Fence upload completion before remote setup; never acquire ownership here."""
+        from .repository import capacity_waiters
+        try:
+            if self.stopping():
+                return False
+            with self.repo.transaction() as conn:
+                self.scaler._leader(conn, lease)
+                intent = conn.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()
+                approval = conn.execute(select(capacity_approvals).where(
+                    capacity_approvals.c.id == self.config.capacity_approval_id)).mappings().one()
+                if (intent["pool"] != self.config.pool or intent["state"] not in {"starting", "ready", "busy"}
+                        or intent["hard_deadline"]-self.repo.clock() < self.config.drain_margin_s
+                        or not approval["enabled"] or approval["expires_at"] <= self.repo.clock()
+                        or not self.approval_current(approval["payload"])):
+                    return False
+                if self.config.qualification_profile == QUEUED_TASK_PROFILE:
+                    demand = conn.execute(select(jobs.c.id).join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
+                        capacity_waiters.c.approval_id == approval["id"],
+                        capacity_waiters.c.intent_id == intent_id,
+                        capacity_waiters.c.state == "waiting_capacity", capacity_waiters.c.deadline > self.repo.clock(),
+                        jobs.c.status.in_(("queued", "waiting_capacity")), self.scope_filter()).limit(1)).first()
+                    if demand is None:
+                        return False
+                return True
+        except Exception:
+            return False
+
     def tick(self):
         c = self.config
         lease = self.scaler.acquire(c.pool, self.leader_id)
@@ -753,10 +781,17 @@ class FiniteController:
                 factory = self.boot_factory or ProductionBoot
                 self.boots[intent] = factory(self.repo, self.provider, c, row, self.port_for(intent),
                     config_path=getattr(self, "config_path", None))
+                if c.execution_backend == "wangp-worker":
+                    configure = getattr(self.boots[intent], "enable_pollable_upload", None)
+                    if configure is not None:
+                        configure()
+            if c.execution_backend == "wangp-worker":
+                self.boots[intent].start_guard = lambda intent=intent, lease=lease: self._bootstrap_start_allowed(intent, lease)
             try:
                 boot_status[intent] = self.boots[intent].tick(intent, stopping=stopping)
                 if boot_status[intent].get("state") in ("qualification_failed", "qualification_deadline_insufficient",
-                        "bootstrap_failed", "fleet_recovery_required", "fleet_attention_required"):
+                        "bootstrap_failed", "fleet_recovery_required", "fleet_attention_required",
+                        "staging_failed", "staging_cancelled", "staging_recovery_required"):
                     self._boot_failure(row, boot_status[intent])
             except Exception:
                 boot_status[intent] = {"state": "boot_observation_unconfirmed"}

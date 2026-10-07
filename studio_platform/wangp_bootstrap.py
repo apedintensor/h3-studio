@@ -133,12 +133,18 @@ class WanGPSSHHost(SSHHost):
         self.config = config
         super().__init__(config, coordinates)
 
-    def upload(self, files):
+    def upload(self, files, *, progress=None, should_stop=None):
+        def check():
+            if should_stop is not None and should_stop():
+                from .bootstrap_staging import UploadCancelled
+                raise UploadCancelled
+        check()
         if set(files) != SOURCE_NAMES:
             raise BootError('wangp_boot_source_set_invalid')
         self.run("from pathlib import Path; import json; Path('/workspace/h3-studio').mkdir(parents=True,exist_ok=True); print(json.dumps({'ok':True}))")
         with self.client.open_sftp() as sftp:
             for name, data in files.items():
+                check()
                 target = REMOTE_ROOT+'/'+name
                 try:
                     with sftp.open(target, 'rb') as f:
@@ -149,7 +155,7 @@ class WanGPSSHHost(SSHHost):
                         f.write(data)
         dependency = dependency_source(self.config, json.loads(files['wangp-runtime.json']))
         if dependency is not None:
-            self._upload_dependency(*dependency)
+            self._upload_dependency(*dependency, progress=progress, should_stop=should_stop)
 
     @contextmanager
     def _transfer_sftp(self, deadline):
@@ -204,10 +210,16 @@ class WanGPSSHHost(SSHHost):
                     timer.cancel()
                 channel.close()
 
-    def _upload_dependency(self, path, expected, size):
+    def _upload_dependency(self, path, expected, size, *, progress=None, should_stop=None):
         # Upload can be resumed before the launch marker exists. Only an exact
         # verified prefix is appended; the final file is published atomically.
         deadline = time.monotonic() + DEPENDENCY_TRANSFER_SECONDS
+        def check():
+            if should_stop is not None and should_stop():
+                from .bootstrap_staging import UploadCancelled
+                raise UploadCancelled
+            _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+        check()
         self.ensure_connected()
         script = '''import hashlib,json,os,stat
 from pathlib import Path
@@ -227,6 +239,7 @@ if p.exists():
 else: print(json.dumps({'present':False,'complete':False,'size':0,'sha256':hashlib.sha256(b'').hexdigest()}))
 '''
         prior = self.run(script, limit=4096, timeout=_transfer_remaining(deadline, 600))
+        check()
         if (type(prior.get('size')) is not int or not 0 <= prior['size'] <= size
                 or type(prior.get('complete')) is not bool or type(prior.get('present')) is not bool):
             raise BootError('wangp_dependency_existing_untrusted')
@@ -234,13 +247,15 @@ else: print(json.dumps({'present':False,'complete':False,'size':0,'sha256':hashl
         with path.open('rb') as source:
             remaining = prior['size']
             while remaining:
-                _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+                check()
                 chunk = source.read(min(8*1024**2, remaining))
                 if not chunk: raise BootError('wangp_dependency_local_truncated')
                 prefix.update(chunk); remaining -= len(chunk)
             if prefix.hexdigest() != prior.get('sha256'):
                 raise BootError('wangp_dependency_existing_mismatch')
-            _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+            check()
+            if progress is not None:
+                progress(prior['size'], size)
             if prior['complete']:
                 if prior['size'] != size or prefix.hexdigest() != expected:
                     raise BootError('wangp_dependency_existing_mismatch')
@@ -250,8 +265,10 @@ else: print(json.dumps({'present':False,'complete':False,'size':0,'sha256':hashl
                 with sftp.open(target, 'ab' if prior['present'] else 'wx') as remote:
                     remote.set_pipelined(True)
                     for chunk in iter(lambda: source.read(8*1024**2), b''):
-                        _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+                        check()
                         prefix.update(chunk); remote.write(chunk)
+                        if progress is not None:
+                            progress(source.tell(), size)
             if source.tell() != size or prefix.hexdigest() != expected:
                 raise BootError('wangp_dependency_source_hash_mismatch')
         result = self.run('''import hashlib,json,os,stat
@@ -270,6 +287,7 @@ print(json.dumps({'verified':True}))
         _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
         if result != {'verified': True}:
             raise BootError('wangp_dependency_transfer_unconfirmed')
+        check()
 
     def start(self, identity):
         # Token generation is only in the initial reserved phase, never reconnect.

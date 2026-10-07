@@ -93,6 +93,7 @@ class ProductionBoot(BootController):
 
     def request_drain(self):
         self._stopping = True
+        self.cancel_preparation()
         if self.fleet:
             self.fleet.drain()
 
@@ -149,6 +150,9 @@ class ProductionBoot(BootController):
             or self.repo.clock() >= deadline-self.finite.drain_margin_s)
         if self._stopping:
             self.request_drain()
+            if self.preparation_pending():
+                return {"state": "draining", "children_done": False,
+                        "preparation": self.preparation_status()}
             # A real queued task may still be executing or collecting after
             # admission closes. Keep its original tunnel reachable even though
             # this branch deliberately never enters boot/start again.
@@ -187,7 +191,7 @@ class ProductionBoot(BootController):
             # runner records success only after validating/storing real output.
             result["qualification_scope"] = "runtime_ready_awaiting_real_task"
             receipt = self.config.work_dir/intent_id/"bootstrap-state.json"
-            if receipt.exists():
+            if receipt.exists() and result.get("state") in {"runtime_ready", "fleet_running", "fleet_attention_required"}:
                 try:
                     state = json.loads(receipt.read_text(encoding="utf-8"))
                     from .queued_task_runner import read_verification_summary
@@ -431,6 +435,8 @@ class ProductionBoot(BootController):
         # Only the owning process can currently prove child exit; full fleet
         # reconstruction remains a separate recovery operation.
         try:
+            if self.preparation_pending():
+                return False
             if self.fleet is not None:
                 expected = {slot.spec.worker_id for slot in self.fleet.config.slots if slot.enabled}
                 return (bool(expected) and set(self.fleet.children) == expected
@@ -446,7 +452,8 @@ class ProductionBoot(BootController):
                     return False
                 state = json.loads(raw)
                 if (not isinstance(state, dict) or state.get("phase") not in {
-                        "reserved", "bootstrap_starting", "booting", "bootstrap_failed",
+                        "reserved", "staging", "staged", "staging_failed", "staging_cancelled",
+                        "bootstrap_starting", "booting", "bootstrap_failed",
                         "ready_for_qualification", "runtime_ready", "smoke_submitting",
                         "smoke_running", "qualification_failed", "qualified"}
                         or "fleet_recipe_ids" in state

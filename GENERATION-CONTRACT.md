@@ -100,6 +100,19 @@ upload, reinstall, restart or resubmit. A complete controller-process restart
 after fleet launch still requires explicit recovery under C2; transport recovery
 must not be reported as acceptance of that wider requirement.
 
+WanGP source/dependency staging is a pollable upload-only operation within this
+same controller. Its identity-bound `staging` receipt precedes remote bytes;
+an OS-held per-intent lock prevents concurrent uploads on the durable controller
+host. The main loop continues leader renewal, wait/deadline reconciliation and
+safe progress snapshots while transfer runs. Before setup starts, it rechecks the
+current leader fence, approval, original waiter deadline, remaining rental life
+and confirmed demand. Upload completion is not setup permission. A process lost
+before setup may resume only verified source bytes; `bootstrap_starting` and
+later phases reconcile the original remote marker and never replay setup.
+Preparation cancellation is cooperative and may wait for a bounded in-flight
+SSH operation. Pending transfer is not child-exit or upstream-idle evidence;
+staging failure retains original accepted backlog and accounting for repair.
+
 Continuing single-slot operation is an explicit `service_policy`, validated
 against the existing scope, absolute window, budget ceiling and idle interval.
 `max_cycles: null` removes the old test-cycle count only. Each new rental remains

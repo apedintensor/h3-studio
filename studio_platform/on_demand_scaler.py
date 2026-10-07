@@ -323,7 +323,7 @@ class ServiceCycle(FiniteController):
                     return
             except (OSError, ValueError, KeyError, TypeError):
                 pass  # Never infer failure/idle from unavailable evidence.
-        if state.get("state") != "bootstrap_failed":
+        if state.get("state") not in {"bootstrap_failed", "staging_failed"}:
             return super()._boot_failure(intent, state)
         # Only a retained, identity-bound failure BEFORE model qualification
         # can hold backlog. A failed inference or lost submission stays under
@@ -333,7 +333,7 @@ class ServiceCycle(FiniteController):
             evidence = json.loads(path.read_text())
             expected = self._bootstrap_identity(intent)
             boot = self.boots[intent["id"]]
-            if (evidence.get("identity") != expected or evidence.get("phase") != "bootstrap_failed"
+            if (evidence.get("identity") != expected or evidence.get("phase") != state.get("state")
                     or evidence.get("smoke_submission_started") is not None or getattr(boot, "fleet", None) is not None
                     or any((path.parent/name/"state.json").exists() for name in (
                         "firstlast4-768p-5s-v1", "ref4-bounded-768p-5s-v1", "reference-smoke", "reference-full-smoke"))):

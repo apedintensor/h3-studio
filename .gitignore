@@ -302,6 +302,7 @@ inventory.json
 # Engine-bound cold boot and explicit continuing-service policy.
 !studio_platform/service_policy.py
 !studio_platform/wangp_bootstrap.py
+!studio_platform/bootstrap_staging.py
 !test_platform_wangp_bootstrap.py
 !studio_platform/runtime_hosts/wangp_environment.py
 !deploy/wangp/bootstrap.py

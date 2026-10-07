@@ -444,6 +444,35 @@ class BootController:
         self.bound_intent = None
         self.bound_instance = None
         self.idle_since = None
+        self._preparation = None
+        self.start_guard = None
+
+    def enable_pollable_upload(self):
+        """Production WanGP preparation only; preserve historical CLI behavior."""
+        if self.config.execution_backend != "wangp-worker":
+            raise BootError("pollable_staging_requires_wangp")
+        if self._preparation is None:
+            from .bootstrap_staging import PollableUpload
+            self._preparation = PollableUpload()
+
+    def preparation_pending(self):
+        return self._preparation is not None and self._preparation.pending()
+
+    def cancel_preparation(self):
+        if self._preparation is not None:
+            self._preparation.cancel()
+
+    def preparation_status(self):
+        return self._preparation.snapshot() if self._preparation is not None else {}
+
+    def _start_allowed(self, intent_id):
+        if self.start_guard is not None and self.start_guard() is not True:
+            return False
+        with self.repo.engine.connect() as conn:
+            intent = conn.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()
+        return (intent["provider_instance_id"] == self.bound_instance
+            and intent["state"] in {"starting", "ready", "busy"}
+            and intent["hard_deadline"]-self.repo.clock() >= self.config.minimum_remaining_s)
 
     def _save(self, path, state):
         state["updated_at"] = self.repo.clock()
@@ -560,11 +589,38 @@ class BootController:
                 # A retained failed attempt is terminal. Changing a marker or
                 # restarting remote setup requires separate audited recovery.
                 return {"state": "bootstrap_failed", **safe_bootstrap_diagnosis(state.get("failure"))}
+            if state["phase"] in {"staging_failed", "staging_cancelled"}:
+                return {"state": state["phase"], "phase": "staging_dependencies"}
+            if state["phase"] in {"staging", "staged"} and self._preparation is None:
+                return {"state": "staging_recovery_required"}
             if not self.host:
                 coordinates = self.provider.ssh_connection(intent_id, intent["provider_instance_id"])
                 self.host = self.ssh_factory(self.config, coordinates)
+            if self._preparation is not None and state["phase"] in {"reserved", "staging"}:
+                if not self._start_allowed(intent_id):
+                    self.cancel_preparation()
+                    return {**self.preparation_status(), "state": "staging_authority_unavailable"}
+                # Persist before the upload thread touches remote source bytes.
+                if state["phase"] == "reserved":
+                    state.update(phase="staging", staging_started_at=self.repo.clock())
+                    self._save(receipt, state)
+                result = self._preparation.poll(directory, intent_id,
+                    lambda **options: self.host.upload(files, **options))
+                state["staging"] = result
+                if result["state"] in {"staged", "staging_failed", "staging_cancelled"}:
+                    state["phase"] = result["state"]
+                self._save(receipt, state)
+                if result["state"] != "staged":
+                    return result
             if state["phase"] == "reserved":
                 self.host.upload(files)
+                state["phase"] = "staged"
+            if state["phase"] == "staged":
+                # Upload completion is not permission to start. Ownership,
+                # revocation, deadline and cancellation may have changed.
+                if not self._start_allowed(intent_id):
+                    self._save(receipt, state)
+                    return {"state": "bootstrap_start_not_authorized"}
                 state["phase"] = "bootstrap_starting"
                 self._save(receipt, state)
                 try:
