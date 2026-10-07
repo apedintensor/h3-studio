@@ -17,6 +17,7 @@ import re
 import signal
 import stat
 import sys
+import tempfile
 import time
 import uuid
 
@@ -57,13 +58,20 @@ def unique(pairs):
 
 
 def save(path, value):
+    """Publish a private receipt without inheriting a permissive process umask."""
     path = Path(path)
-    temporary = path.with_suffix(".tmp")
-    with temporary.open("w", encoding="utf-8") as out:
-        json.dump(value, out, sort_keys=True)
-        out.flush()
-        os.fsync(out.fileno())
-    temporary.replace(path)
+    descriptor, name = tempfile.mkstemp(prefix="."+path.name+".", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        # mkstemp creates a new owner-only inode before any receipt bytes are
+        # written. Each replacement stays private even if the old file is 0644.
+        with os.fdopen(descriptor, "w", encoding="utf-8") as out:
+            json.dump(value, out, sort_keys=True)
+            out.flush()
+            os.fsync(out.fileno())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
