@@ -33,15 +33,16 @@ class _JoinedUploadFile(UploadFile):
 
 
 class StrictAssetParser(MultiPartParser):
-    def __init__(self, headers, stream):
+    def __init__(self, headers, stream, *, allowed_fields=_FIELDS):
         super().__init__(headers, stream, **UPLOAD_FORM_LIMITS)
+        self.allowed_fields = allowed_fields
         self._asset_seen_fields = set()
         self._asset_complete = False
 
     def on_headers_finished(self):
         super().on_headers_finished()
         name = self._current_part.field_name
-        if name not in _FIELDS or name in self._asset_seen_fields:
+        if name not in self.allowed_fields or name in self._asset_seen_fields:
             raise MultiPartException(_FIELD_ERROR)
         self._asset_seen_fields.add(name)
         if self._current_part.file is not None:
@@ -111,7 +112,7 @@ async def _finish_before_cancelling(operation):
         return response
 
 
-async def _handle_upload(request: Request, original_handler):
+async def _handle_upload(request: Request, original_handler, *, allowed_fields=_FIELDS):
     parser = None
     try:
         content_type, _ = parse_options_header(request.headers.get("Content-Type"))
@@ -119,7 +120,7 @@ async def _handle_upload(request: Request, original_handler):
             # This route has the larger file-upload body budget; never send
             # URL-encoded/JSON bodies into a different in-memory form parser.
             raise HTTPException(415, "素材上传须使用multipart/form-data")
-        parser = StrictAssetParser(request.headers, request.stream())
+        parser = StrictAssetParser(request.headers, request.stream(), allowed_fields=allowed_fields)
         try:
             form = await parser.parse()
         except MultiPartException as error:
@@ -129,7 +130,7 @@ async def _handle_upload(request: Request, original_handler):
         request._form = form
         seen = set()
         for name, _ in form.multi_items():
-            if name not in _FIELDS or name in seen:
+            if name not in allowed_fields or name in seen:
                 raise HTTPException(400, _FIELD_ERROR)
             seen.add(name)
         # Required fields and their types remain FastAPI's normal 422 contract.
@@ -155,3 +156,15 @@ class AssetUploadRoute(APIRoute):
             return await _handle_upload(request, original_handler)
 
         return strict_asset_upload
+
+
+class QuickChatAssetUploadRoute(APIRoute):
+    """Session ID comes from the authenticated URL, not a multipart project ID."""
+    def get_route_handler(self):
+        original_handler = super().get_route_handler()
+
+        async def strict_session_upload(request: Request):
+            return await _handle_upload(request, original_handler,
+                                        allowed_fields=frozenset({"file", "client_asset_id"}))
+
+        return strict_session_upload

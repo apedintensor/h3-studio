@@ -5,9 +5,19 @@ admission boundary. This module does not own a queue, permissions or GPU calls.
 """
 from .capabilities import capabilities
 from .generation_draft import plan_body, read_draft
-from .repository import Conflict
+from .repository import Scope, Conflict
 from .render_plans import RECIPE as RENDER_RECIPE
 from .source_snapshot import source_snapshot
+
+
+def managed_project(project):
+    return (project.get("integration_kind") == "quick_chat"
+            or project.get("journey", {}).get("integration_kind") == "quick_chat")
+
+
+def reject_managed(project):
+    if managed_project(project):
+        raise Conflict("quick_chat_managed_resource")
 
 
 class GenerationAdmission:
@@ -19,10 +29,19 @@ class GenerationAdmission:
         self.owned_plan, self.plan_response, self.check_source = owned_plan, plan_response, check_source
         self.capabilities_provider = capabilities_provider or (lambda: capabilities(self.settings))
 
-    def preflight(self, principal, project, shot_id, *, expected_version):
+    def task_scope(self, principal, project_id, business_identity=None):
+        if business_identity is None:
+            return self.scope(principal, project_id)
+        # Only a queue idempotency namespace; the real caller is authorized
+        # separately on every operation and recorded by the authoring service.
+        return Scope(self.settings.tenant_id, principal.owner, project_id, "quick-chat-execution")
+
+    def preflight(self, principal, project, shot_id, *, expected_version=None):
         project_id = project["id"]
         record = self.authorized_project(principal, project_id, "jobs:write")
-        if record["version"] != expected_version:
+        if expected_version is None and not managed_project(project):
+            raise Conflict("document_version_conflict")
+        if expected_version is not None and record["version"] != expected_version:
             raise Conflict("document_version_conflict")
         if source_snapshot(project, shot_id) != source_snapshot(record["payload"], shot_id):
             raise Conflict("shot_version_conflict")
@@ -40,19 +59,25 @@ class GenerationAdmission:
 
         body = plan_body(project, shot_id, self.capabilities_provider(), derive)
         latest = self.authorized_project(principal, project_id, "jobs:write")
-        if latest["version"] != expected_version:
+        if expected_version is not None and latest["version"] != expected_version:
             raise Conflict("document_version_conflict")
+        if source_snapshot(project, shot_id) != source_snapshot(latest["payload"], shot_id):
+            raise Conflict("shot_version_conflict")
         return self.plan_response(principal, body, latest["payload"])
 
-    def create(self, principal, plan_id, key, *, initial_status=None):
+    def create(self, principal, plan_id, key, *, initial_status=None, business_identity=None):
         plan = self.owned_plan(principal, plan_id)
-        task_scope = self.scope(principal, plan["project_id"])
+        project = self.authorized_project(principal, plan["project_id"], "jobs:write")["payload"]
+        if business_identity is None:
+            reject_managed(project)
+        elif not managed_project(project):
+            raise Conflict("quick_chat_projection_required")
+        task_scope = self.task_scope(principal, plan["project_id"], business_identity)
         # Replaying a lost response keeps the immutable original even if the
         # editable source has since changed. The ledger compares request hashes.
         existing = self.repo.lookup_job_by_idempotency(task_scope, key)
         if existing:
             return self.repo.create_job(task_scope, plan_id, key)
-        project = self.authorized_project(principal, plan["project_id"], "jobs:write")["payload"]
         self.check_source(project, plan["request"])
         execution = plan["execution_plan"]
         enabled_setting = (self.settings.render_enabled if plan["request"]["recipe_id"] == RENDER_RECIPE
@@ -65,10 +90,31 @@ class GenerationAdmission:
         return self.repo.create_job(task_scope, plan_id, key, initial_status=status,
                                     budget_account_ids=budgets)
 
-    def enqueue(self, principal, job):
-        task_scope = self.scope(principal, job["project_id"])
+    def create_planned(self, principal, plan_id, business_identity):
+        return self.create(principal, plan_id, business_identity, initial_status="planned",
+                           business_identity=business_identity)
+
+    def enqueue(self, principal, job, *, business=False):
         plan = self.owned_plan(principal, job["plan_id"])
         project = self.authorized_project(principal, job["project_id"], "jobs:write")["payload"]
+        if not business:
+            reject_managed(project)
+        elif not managed_project(project) or job["actor_id"] != "quick-chat-execution":
+            raise Conflict("quick_chat_execution_required")
         self.check_source(project, plan["request"])
+        task_scope = self.task_scope(principal, job["project_id"], job["id"] if business else None)
         budgets = self.policies.ensure_current(plan, task_scope)
         return self.repo.enqueue(task_scope, job["id"], budget_account_ids=budgets)
+
+    def refresh_planned(self, principal, job_id, plan_id):
+        job = self.repo.get_job_for_owner(self.settings.tenant_id, principal.owner, job_id)
+        project = self.authorized_project(principal, job["project_id"], "jobs:write")["payload"]
+        if not managed_project(project) or job["actor_id"] != "quick-chat-execution":
+            raise Conflict("quick_chat_execution_required")
+        plan = self.owned_plan(principal, plan_id)
+        if plan["project_id"] != job["project_id"]:
+            raise Conflict("plan_not_available")
+        self.check_source(project, plan["request"])
+        task_scope = self.task_scope(principal, job["project_id"], job_id)
+        self.policies.ensure_current(plan, task_scope)
+        return self.repo.refresh_unadmitted_plan(task_scope, job_id, plan_id)
