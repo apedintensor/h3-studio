@@ -31,8 +31,8 @@ The following is a source-code and historical-record baseline, not a fresh produ
 | Quick Chat deployment | The isolated preview is local; generation and assistant execution are disabled there. | Do not describe local integration as released or currently generating. |
 | Accounts | Ownership and PAT controls exist, but the account directory is fixed to `superdan` and `supervan`. | A real user directory, explicit identity migration, and later team membership. |
 | Assets | Private storage, validation, and recovery exist; staging and locks depend on one host. | Cross-host staging, operation leases, backup, and a tested object-store migration. |
-| GPU control | On-demand orchestration reuses finite-controller logic with single-node and finite-cycle constraints. | Separate continuing service policy from test policy; then implement node isolation and redundancy. |
-| Engines | A Comfy baseline has historical evidence. WanGP was selected on 2026-10-06; PR #25 supplies offline adapter/receipt acceptance and partial compiler/transport/configured-routing implementation. | Complete the pinned runtime and cold-start integration; validate each recipe, topology, control envelope and recovery behavior before switching. |
+| GPU control | The current D2/C1 working source adds explicit continuing single-slot policy to the existing controller; optional cycle count remains bounded by original authority and cumulative accounts. See the exact source/release boundary in `CURRENT-BASELINE.md`. | Complete combined recovery acceptance and actual service proof; then implement node isolation and redundancy. |
+| Engines | A Comfy baseline has historical evidence. WanGP was selected on 2026-10-06; PR #25 supplies offline adapter/receipt acceptance. Current D2 source adds cold engine/manifest binding, boot/reconnect and target package tooling. | Freeze and verify the actual target environment/models; qualify each declared recipe, topology, control envelope and recovery behavior before switching. |
 
 Historical budgets, service deadlines, successful jobs, and deployment receipts do not establish today's available capacity.
 No plan, issue, restart, or configuration change renews an expired operating window or resets accumulated costs.
@@ -188,7 +188,7 @@ Work that needs its applicable production authorization and controls:
 The batch receipt records commit/image/profile, environment, job/attempt identity, phase timing, artifact validation, and rental reconciliation.
 Do not combine this batch with a story-model rewrite, wholesale storage migration, accelerated-model rollout, or hosting-platform migration.
 
-The missing transition is explicit: D1 #18 is accepted offline in PR #25; D2 #22 has partial compilation, transport, attempt-bound routing and capacity guards, but still needs the full runtime lock and on-demand bootstrap/recovery. Only then can #16 prove a real public WanGP path, with #12/#14/#15 compatibility and recovery gates. Start with one recipe/slot; broader redundancy does not block that slice.
+The missing transition is explicit: D1 #18 is accepted offline in PR #25. Current D2/C1 working source extends compilation, transport and attempt routing with cold approvals, WanGP boot/reconnect, target package tooling and continuing single-slot policy; see the pending PR/revision reference in `CURRENT-BASELINE.md`. Remaining gates are the actual target dependency/model lock and GPU compatibility, complete controller-process restart/recovery coverage, and real output evidence. Same-process SSH reconnect is not acceptance of a controller restart after fleet launch. Only then can #16 prove a real public WanGP path, with #12/#14/#15 compatibility and recovery gates. Start with one recipe/slot; broader redundancy does not block that slice.
 
 Follow-up scopes from that integration: D3 #27 resolves last-frame/delivered-duration fidelity; C3 #28 reconciles historical supplier charges and retained reservations; D4 #29 expands and qualifies REF inputs. The first B3 text-to-video proof does not claim those broader controls. Read exact readiness and claims on GitHub; a completed source milestone does not satisfy a real-runtime gate.
 
@@ -206,5 +206,5 @@ Local Chinese documents retain detailed research and historical context; keep th
 Every handoff identifies scope, owned files, contracts, invariants, dependencies, tests, unresolved questions, and deployment status.
 One integration owner coordinates shared contracts and release; independent sessions must not race on the same runtime authority.
 Batch related changes, run affected checks during development, then complete risk-appropriate regression and one coordinated release.
-Open decisions include ongoing production authorization, target waiting/recovery times, public-user scope, collaboration policy, and storage location.
+Current operating authority and its exact bounds are recorded in dated issue/operational receipts, not inferred from this plan; the latest user instruction is reflected in `CURRENT-BASELINE.md`. Open decisions include target waiting/recovery times, public-user scope, collaboration policy and storage location.
 Those decisions do not block safe contract work, but a placeholder never grants spending, migration, or production permission.
