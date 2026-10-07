@@ -692,6 +692,8 @@ class BootController:
                 if self.config.execution_backend == "wangp-worker":
                     value["version"] = 2
                     value["slots"][0].update(comfy_revision="", runtime_config_file=slot.runtime_config_file)
+                if not spec.output_delivery:
+                    value["slots"][0].pop("output_delivery")
                 cfg_path.write_text(json.dumps(value), encoding="utf-8")
                 self.fleet = self.fleet_factory(config, self.repo, cfg_path)
                 state["fleet_recipe_ids"] = list(self.config.recipe_ids)
