@@ -60,4 +60,3 @@ class InertPlanHistoryReview(admission_test.LedgerCase):
         self.assertEqual(result["review-running-turn"]["assistant_run"]["fence"], 10)
         self.assertEqual(result["review-preflight"]["status"], "blocked")
         self.assertEqual(result["review-preflight"]["expires_at"], 0)
-

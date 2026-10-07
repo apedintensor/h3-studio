@@ -42,4 +42,3 @@ class QuickChatRecovery:
         self.stop.set()
         if self.task is not None:
             await self.task
-
