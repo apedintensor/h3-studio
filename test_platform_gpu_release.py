@@ -39,7 +39,6 @@ class PinnedExecutionTests(unittest.TestCase):
         self.put('active.json', self.pin)
         self.put('operator/scaler.json', self.config)
         self.put('operator/execution-policy.json', self.policy)
-        self.put('app-admission.json', release.app_admission_overlay(self.root))
         self.actual = {'Name': '/'+self.pin['container_name'], 'Image': IMAGE,
             'Config': {'Labels': {'com.docker.compose.project': 'sixnine-platform',
                 'com.docker.compose.service': 'gpu-controller', 'com.sixnine.finite.config-hash': self.pin['config_hash']}},
@@ -49,6 +48,9 @@ class PinnedExecutionTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(release, 'regular'))
         self.stack.enter_context(patch.object(release, 'protected_directory'))
+        # Temporary CI files belong to the runner, not root. Install the
+        # existing filesystem boundary fakes before reading operator input.
+        self.put('app-admission.json', release.app_admission_overlay(self.root))
         self.stack.enter_context(patch.object(release, 'approved_manifest'))
         self.stack.enter_context(patch.object(release, 'manifest', return_value={'contracts': CONTRACTS, 'files': FILES}))
         self.stack.enter_context(patch.object(release, 'validate_image_archive', return_value={IMAGE}))
