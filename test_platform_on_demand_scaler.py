@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, PropertyMock
 
 from sqlalchemy import delete, insert, select, update
 
@@ -17,7 +17,7 @@ from studio_platform.control import WorkerControl
 from studio_platform.execution_policy import ExecutionPolicies
 from studio_platform.on_demand_scaler import (OnDemandConfig, OnDemandController, ServiceCycle, cycle_config,
     main, json_config, verified_service_receipt)
-from studio_platform.production_scaler import MODEL, RECIPE, ScalerError
+from studio_platform.production_scaler import MODEL, RECIPE, ScalerError, FiniteConfig
 from studio_platform.queue import TaskQueue
 from studio_platform.repository import Conflict, Scope, request_hash, instance_intents, attempts, capacity_waiters, jobs
 from studio_platform.settings import Settings
@@ -25,6 +25,7 @@ from test_platform_api import generation_request
 from test_platform_execution_policy import policy
 from test_platform_production_scaler import configuration, FakeProvider, FakeBoot
 from test_platform_repository import LedgerCase
+from test_platform_service_policy import service_policy
 
 
 class HeartbeatBoot(FakeBoot):
@@ -36,6 +37,147 @@ class HeartbeatBoot(FakeBoot):
 
 
 class OnDemandTests(LedgerCase):
+    def test_wangp_one_use_approval_forwards_exact_engine_binding(self):
+        from studio_platform.qualification_profiles import QUEUED_TASK_PROFILE
+        # This tests only the coordinator seam, with no WanGP bootstrap import
+        # or provider call. Source/recipe qualification is validated elsewhere.
+        with patch.object(FiniteConfig, "source_names", new_callable=PropertyMock,
+                          return_value={"bootstrap_cloud.py", "model_manifest.json"}):
+            config = replace(cycle_config(self.config, 2), execution_backend="wangp-worker",
+                engine_manifest_digest="a"*64, qualification_profile=QUEUED_TASK_PROFILE)
+        cycle = ServiceCycle(self.repo, self.settings, config, provider=None)
+        with patch.object(self.repo, "approve_capacity") as approve:
+            cycle.initialize()
+        self.assertEqual(approve.call_args.kwargs["backend"], "wangp-worker")
+        self.assertEqual(approve.call_args.kwargs["engine_manifest_digest"], "a"*64)
+        self.assertEqual(approve.call_args.args, (config.capacity_approval_id,))
+        self.assertEqual(self.provider.creates, [])
+
+    def configure_continuing_service(self, *, ceiling=30_000_000, idle=60, cycles=None):
+        """Fresh explicit service using the same existing fake ledger accounts."""
+        end = self.now+30*86400
+        selected = service_policy(self.now, end=end, ceiling=ceiling, idle=idle, cycles=cycles)
+        scale = {**self.config.scale_policy, "hard_deadline": end,
+            "approved_remaining_microusd": ceiling, "idle_before_drain_s": idle}
+        value = json.loads(json.dumps(self.value))
+        value["pool"] = "continuing-pool"
+        value["qualification"]["expires_at"] = end-100
+        value["reservation"]["expires_at"] = end-100
+        self.path.write_text(json.dumps(value))
+        self.config = replace(self.config, pool=value["pool"], cycle_id="continuing-service",
+            capacity_approval_id="continuing-approval", created_at=self.now, hard_deadline=end,
+            work_dir=self.root/"continuing-service", scale_policy=scale, service_policy=selected,
+            max_cycles=cycles, execution_policy_sha256=request_hash(value),
+            manifests=[{**manifest, "approved_until": end} for manifest in self.config.manifests])
+        self.value = value
+        self.repo.configure_pool(self.config.pool, max_instances=1, max_physical_gpus=1)
+        self.controller = OnDemandController(self.repo, self.settings, self.config,
+            provider=self.provider, boot_factory=HeartbeatBoot)
+        self.controller.initialize()
+
+    def test_continuing_service_runs_more_than_eight_rentals_without_resetting_pending_bills(self):
+        self.repo.configure_budget("finite-budget", tenant_id="sixnine", limit_microusd=30_000_000)
+        self.configure_continuing_service()
+        original_deadline = self.config.hard_deadline
+        self.assertEqual(self.provider.creates, [])
+        for cycle in range(1, 10):
+            scope, job = self.start_job(story="service-story-"+str(cycle))
+            self.finish(scope, job)
+            self.tick()
+            for _ in range(6):
+                status = self.tick()
+            self.assertEqual(self.controller.sequence, cycle+1)
+            self.assertEqual(len(self.provider.creates), cycle)
+            self.assertEqual(len(self.provider.destroys), cycle)
+            self.assertEqual(self.repo.get_budget("finite-budget")["reserved_microusd"], cycle*2_000_000)
+            self.assertEqual(self.config.hard_deadline, original_deadline)
+        self.assertIsNone(status["max_cycles"])
+        self.assertEqual(status["idle_shutdown_seconds"], 60)
+        before = self.repo.get_budget("finite-budget")
+        self.assertTrue(verified_service_receipt(self.config))
+        resumed = OnDemandController(self.repo, self.settings, self.config, provider=self.provider, boot_factory=HeartbeatBoot)
+        resumed.initialize()
+        self.assertEqual(resumed.sequence, 10)
+        self.assertEqual(self.repo.get_budget("finite-budget"), before)
+        self.assertEqual(len(self.provider.creates), 9)
+
+    def test_continuing_ceiling_subtracts_existing_spend_and_reservations_even_with_larger_db_limit(self):
+        from studio_platform.repository import budget_accounts
+        self.repo.configure_budget("finite-budget", tenant_id="sixnine", limit_microusd=30_000_000)
+        with self.repo.transaction() as conn:
+            conn.execute(update(budget_accounts).where(budget_accounts.c.id == "finite-budget")
+                .values(spent_microusd=1_000_000, reserved_microusd=500_000))
+        before = self.repo.get_budget("finite-budget")
+        self.configure_continuing_service(ceiling=4_000_000)
+        self.assertEqual(self.controller.current.remaining_budget(), 2_500_000)
+        self.assertEqual(self.repo.get_budget("finite-budget"), before)
+        scope, job = self.start_job()
+        self.finish(scope, job)
+        self.tick()
+        for _ in range(6):
+            status = self.tick()
+        self.assertTrue(status["drained"])
+        self.assertEqual(self.controller.sequence, 1)
+        self.assertEqual(len(self.provider.creates), 1)
+        account = self.repo.get_budget("finite-budget")
+        self.assertEqual(account["limit_microusd"], 30_000_000)
+        self.assertEqual(account["spent_microusd"], 1_000_000)
+        self.assertEqual(account["reserved_microusd"], 2_500_000)
+
+    def test_continuing_unknown_rental_never_rotates_and_keeps_its_reservation(self):
+        self.configure_continuing_service()
+        self.provider.uncertain = self.provider.unknown = True
+        self.submit()
+        for _ in range(15):
+            self.tick()
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(self.controller.sequence, 1)
+        self.assertEqual(self.provider.destroys, [])
+        rows = self.repo.list_instance_intents(pool=self.config.pool)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "creation_unknown")
+        self.assertEqual(self.repo.get_budget("finite-budget")["reserved_microusd"], 2_000_000)
+
+    def test_continuing_window_and_existing_wait_deadline_do_not_renew_at_restart(self):
+        self.configure_continuing_service()
+        scope, job = self.submit()
+        with self.repo.engine.connect() as conn:
+            before = dict(conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == job["id"])).mappings().one())
+        self.now = self.config.hard_deadline
+        self.controller = OnDemandController(self.repo, self.settings, self.config,
+            provider=self.provider, boot_factory=HeartbeatBoot)
+        self.controller.initialize()
+        status = self.controller.tick()
+        self.assertTrue(status["drained"])
+        self.assertEqual(self.provider.creates, [])
+        with self.repo.engine.connect() as conn:
+            after = dict(conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == job["id"])).mappings().one())
+        self.assertEqual(after["deadline"], before["deadline"])
+        self.assertEqual(after["approval_id"], before["approval_id"])
+        self.assertEqual(self.repo.get_job(scope, job["id"])["id"], job["id"])
+
+    def test_service_json_roundtrip_and_changed_authority_cannot_adopt_old_receipt(self):
+        from studio_platform.on_demand_scaler import read_config
+        self.configure_continuing_service()
+        raw = json_config(self.config)
+        self.assertEqual(request_hash(raw), self.config.fingerprint())
+        path = self.root/"service-roundtrip.json"
+        path.write_text(json.dumps(raw))
+        path.chmod(0o600)
+        self.assertEqual(read_config(path).fingerprint(), self.config.fingerprint())
+        self.assertEqual(json_config(cycle_config(self.config, 1000))["service_policy"], self.config.service_policy)
+        changed = replace(self.config, service_policy={**self.config.service_policy, "authorization_id": "changed"})
+        with self.assertRaisesRegex(ScalerError, "configuration_changed"):
+            verified_service_receipt(changed)
+
+    def test_legacy_json_omits_new_defaults_and_keeps_same_historical_hash(self):
+        raw = json_config(self.config)
+        for field in ("service_policy", "execution_backend", "engine_manifest_digest"):
+            self.assertNotIn(field, raw)
+        self.assertEqual(request_hash(raw), self.config.fingerprint())
+        with self.assertRaises(ScalerError):
+            replace(self.config, max_cycles=None)
+
     def test_multimodal_one_use_approval_uses_both_recipes_without_renting_before_user_job(self):
         from studio_platform.qualification_profiles import MULTIMODAL_PROFILE, MULTIMODAL_INPUT_LIMITS
         value = json.loads(json.dumps(self.value))
