@@ -181,6 +181,8 @@ class FiniteConfig:
                 or any(not isinstance(v, str) or not IDENTIFIER.fullmatch(v) for v in self.budget_account_ids)):
             raise ScalerError("finite_existing_budget_ids_required")
         try:
+            from .service_policy import service_member_ids
+            member_ids = service_member_ids(self)
             policy = ScalePolicy(**self.scale_policy)
             recommend([], [], [], now=self.created_at, policy=policy)
             launches = [LaunchSpec(**v) for v in self.launches]
@@ -189,7 +191,7 @@ class FiniteConfig:
                     or not 1 <= policy.max_instances <= 2 or policy.max_physical_gpus != policy.max_instances
                     or policy.new_instance_slots != 1 or policy.new_instance_physical_gpus != 1
                     or not policy.approved_remaining_microusd or not policy.instance_reservation_microusd
-                    or len(launches) != policy.max_instances or len(manifests) != len(launches)
+                    or len(launches) != (1 if member_ids else policy.max_instances) or len(manifests) != len(launches)
                     or len({v.offer_id for v in launches}) != len(launches)):
                 raise ValueError
             for launch, manifest in zip(launches, manifests):
@@ -745,6 +747,32 @@ class FiniteController:
         except Exception:
             return False
 
+    def _capacity_decision(self, instances, actions, stopping):
+        c = self.config
+        used = {a["launch_spec"]["offer_id"] for a in actions.values()}
+        launch = next((LaunchSpec(**v) for v in c.launches if v["offer_id"] not in used), None)
+        demands, slots = ([], []) if stopping else self._observations(instances)
+        with self.repo.engine.connect() as conn:
+            cycle = conn.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == c.capacity_approval_id)).first()
+        if not stopping and cycle is None and not instances:
+            # Reject out-of-scope cold waiters rather than financing them.
+            from .repository import capacity_waiters
+            with self.repo.engine.connect() as conn:
+                outside = conn.execute(select(jobs.c.id).join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
+                    capacity_waiters.c.approval_id == c.capacity_approval_id,
+                    capacity_waiters.c.state == "waiting_capacity", ~self.scope_filter()).limit(1)).first()
+            if outside:
+                raise ScalerError("finite_cold_waiter_scope_mismatch")
+            decision = self.cold.tick(self.leader_id, c.capacity_approval_id)
+        else:
+            policy = replace(ScalePolicy(**c.scale_policy), approved_remaining_microusd=self.remaining_budget(),
+                max_instances=0 if stopping or launch is None else c.scale_policy["max_instances"],
+                max_physical_gpus=0 if stopping or launch is None else c.scale_policy["max_physical_gpus"])
+            decision = self.scaler.tick(self.leader_id, c.scope, c.pool, demands, slots, policy=policy,
+                launch=None if stopping else launch, budget_account_ids=c.budget_account_ids,
+                before_create=self.create_allowed)
+        return decision
+
     def tick(self):
         c = self.config
         lease = self.scaler.acquire(c.pool, self.leader_id)
@@ -768,28 +796,7 @@ class FiniteController:
             self._close_unsubmitted()
         # Reconcile old provider operations even after stop/revocation. dry_run
         # is deliberately NOT used as a stop switch: it disables cleanup too.
-        used = {a["launch_spec"]["offer_id"] for a in actions.values()}
-        launch = next((LaunchSpec(**v) for v in c.launches if v["offer_id"] not in used), None)
-        demands, slots = ([], []) if stopping else self._observations(instances)
-        with self.repo.engine.connect() as conn:
-            cycle = conn.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == c.capacity_approval_id)).first()
-        if not stopping and cycle is None and not instances:
-            # Reject out-of-scope cold waiters rather than financing them.
-            from .repository import capacity_waiters
-            with self.repo.engine.connect() as conn:
-                outside = conn.execute(select(jobs.c.id).join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
-                    capacity_waiters.c.approval_id == c.capacity_approval_id,
-                    capacity_waiters.c.state == "waiting_capacity", ~self.scope_filter()).limit(1)).first()
-            if outside:
-                raise ScalerError("finite_cold_waiter_scope_mismatch")
-            decision = self.cold.tick(self.leader_id, c.capacity_approval_id)
-        else:
-            policy = replace(ScalePolicy(**c.scale_policy), approved_remaining_microusd=self.remaining_budget(),
-                max_instances=0 if stopping or launch is None else c.scale_policy["max_instances"],
-                max_physical_gpus=0 if stopping or launch is None else c.scale_policy["max_physical_gpus"])
-            decision = self.scaler.tick(self.leader_id, c.scope, c.pool, demands, slots, policy=policy,
-                launch=None if stopping else launch, budget_account_ids=c.budget_account_ids,
-                before_create=self.create_allowed)
+        decision = self._capacity_decision(instances, actions, stopping)
         self._sync_provider_preparation()
         stopping = self.stopping()
         if not stopping and self._capacity_advance_allowed():

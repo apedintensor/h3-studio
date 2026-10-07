@@ -186,7 +186,7 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
         recipe_ids, policy_hash, qualification_evidence_id, qualification_expires_at,
         quote_expires_at, expires_at, launch, scale_policy, budget_scope,
         budget_account_ids, enabled=False, backend="comfy-worker", engine_manifest_digest="", output_delivery="",
-        pool_members=None):
+        pool_members=None, pool_controller=None):
     """Operator-only immutable approval. Revoke separately; never mutate its quote.
 
     This is not a public API and does not reserve/create an instance. Legacy
@@ -197,6 +197,8 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
         _safe_id(value)
     _engine_identity(dict(backend=backend, engine_manifest_digest=engine_manifest_digest, output_delivery=output_delivery))
     members = pool_member_ids({"pool_members": pool_members}) if pool_members is not None else ()
+    if pool_controller is not None and (not members or pool_controller != "continuing-two-members-v1"):
+        raise ValueError("capacity_pool_controller_invalid")
     if members and (not isinstance(scale_policy, ScalePolicy)
             or scale_policy.max_instances != 2 or scale_policy.max_physical_gpus != 2
             or scale_policy.new_instance_slots != 1 or scale_policy.new_instance_physical_gpus != 1):
@@ -236,7 +238,8 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
         **(dict(backend=backend, engine_manifest_digest=engine_manifest_digest)
             if backend == "wangp-worker" else {}),
         **(dict(output_delivery=output_delivery) if output_delivery else {}),
-        **({"pool_members": {"version": 1, "member_ids": list(members)}} if members else {})))
+        **({"pool_members": {"version": 1, "member_ids": list(members)}} if members else {}),
+        **({"pool_controller": pool_controller} if pool_controller is not None else {})))
     digest = request_hash(payload)
     try:
         with repo.transaction() as connection:
@@ -426,7 +429,10 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
             raise Conflict("capacity_transfer_grants_missing")
         old, new = grants[previous_id], grants[next_id]
         a, b = old["payload"], new["payload"]
-        if pool_member_ids(a) or pool_member_ids(b):
+        member_transfer = bool(pool_member_ids(a) or pool_member_ids(b))
+        if member_transfer and (pool_member_ids(a) != pool_member_ids(b)
+                or a.get("pool_controller") != "continuing-two-members-v1"
+                or b.get("pool_controller") != "continuing-two-members-v1"):
             raise Conflict("capacity_pool_transfer_not_implemented")
         exact = ("tenant_id", "pool", "model_id", "configuration_id", "recipe_ids", "policy_hash",
                  "qualification_evidence_id", "qualification_expires_at", "quote_expires_at",
@@ -436,9 +442,19 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
                 or old["enabled"] != 0 or new["enabled"] != 1 or any(a[k] != b[k] for k in exact)
                 or new["expires_at"] <= repo.clock()):
             raise Conflict("capacity_transfer_grant_identity_mismatch")
-        cycle = conn.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == previous_id)).mappings().one()
         rows = list(conn.execute(select(instance_intents).where(instance_intents.c.pool == a["pool"])).mappings())
-        if (not any(row["id"] == cycle["intent_id"] and row["state"] == "destroyed" for row in rows)
+        if member_transfer:
+            bindings = list(conn.execute(select(capacity_pool_members).where(
+                capacity_pool_members.c.approval_id == previous_id)).mappings())
+            if (not bindings or any(r["approval_hash"] != old["approval_hash"]
+                    or r["member_id"] not in pool_member_ids(a) for r in bindings)
+                    or any(repo._instance_billing(conn, row)["billing_status"] != "settled" for row in rows)):
+                raise Conflict("capacity_pool_transfer_obligations_unsettled")
+            old_ids = {r["intent_id"] for r in bindings}
+        else:
+            cycle = conn.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == previous_id)).mappings().one()
+            old_ids = {cycle["intent_id"]}
+        if (not old_ids <= {row["id"] for row in rows if row["state"] == "destroyed"}
                 or any(row["state"] != "destroyed" for row in rows)):
             raise Conflict("capacity_transfer_old_instance_not_removed")
         workers = list(conn.execute(select(registered_workers).where(registered_workers.c.pool == a["pool"])
@@ -462,7 +478,17 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
             execution = job["execution_plan"]
             existing = conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == jid)).mappings().first()
             if execution.get("capacity_approval_id") == next_id and existing and existing["approval_id"] == next_id:
+                if member_transfer and (execution.get("capacity_binding") != "pool-members-v1"
+                        or execution.get("capacity_approval_hash") != new["approval_hash"]
+                        or existing["approval_hash"] != new["approval_hash"] or existing["intent_id"] is not None):
+                    raise Conflict("capacity_pool_transfer_binding_mismatch")
                 continue  # Idempotent recovery after the transaction committed.
+            if member_transfer and (execution.get("capacity_binding") != "pool-members-v1"
+                    or execution.get("capacity_approval_id") != previous_id
+                    or execution.get("capacity_approval_hash") != old["approval_hash"]
+                    or existing is None or existing["approval_id"] != previous_id
+                    or existing["approval_hash"] != old["approval_hash"] or existing["intent_id"] is not None):
+                raise Conflict("capacity_pool_transfer_binding_mismatch")
             if (not proven_unsubmitted_capacity_job(conn, job) or execution.get("policy_hash") != a["policy_hash"]
                     or execution.get("capacity_approval_id") not in (None, previous_id)
                     or execution.get("capacity_approval_id") == previous_id
