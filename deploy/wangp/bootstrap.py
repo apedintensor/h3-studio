@@ -144,6 +144,7 @@ def install(config, slot_key, token_file, *, launch=True):
     started = False
     manifest_digest = None
     last_phase = "checking_package"
+    failure_diagnostics = {}
 
     def status(phase, **fields):
         nonlocal last_phase
@@ -152,8 +153,11 @@ def install(config, slot_key, token_file, *, launch=True):
                  "manifest_digest": manifest_digest, "engine_manifest_digest": manifest_digest,
                  "state": "booting", "inference_verified": False, **fields}
         temporary = status_path.with_suffix(status_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
-        temporary.chmod(0o600)
+        with temporary.open("w", encoding="utf-8") as target:
+            temporary.chmod(0o600)
+            target.write(json.dumps(value, sort_keys=True))
+            target.flush()
+            os.fsync(target.fileno())
         temporary.replace(status_path)
         return value
 
@@ -167,7 +171,8 @@ def install(config, slot_key, token_file, *, launch=True):
         source = base / "platform"
         extract(bundle, source, maximum=MAX_SOURCE)
         sys.path.insert(0, str(source))
-        from studio_platform.runtime_hosts.wangp_environment import canonical, digest, validate_lock, verify_source, system_packages, regular_file
+        from studio_platform.runtime_hosts.wangp_environment import (canonical, digest, validate_lock,
+            verify_source, system_packages, regular_file, system_package_diagnostics)
         from studio_platform.inference.wangp_contract import EngineManifest
         from studio_platform.runtime_hosts.wangp_session import config_for_model_root
         manifest = EngineManifest.from_dict(json.loads(Path(config["manifest_path"]).read_text(encoding="utf-8")))
@@ -202,8 +207,11 @@ def install(config, slot_key, token_file, *, launch=True):
             status("system_package_install")
             subprocess.run(["dpkg", "--install", *deb_files], check=True, capture_output=True,
                            env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+        status("system_package_verification")
         observed_system = system_packages()
         if any(observed_system.get(name) != version for name, version in lock["system_packages"].items()):
+            failure_diagnostics["system_package_diagnostics"] = system_package_diagnostics(
+                lock["system_packages"], observed_system)
             raise ValueError("system_package_mismatch")
         verify_source(runtime, lock)
         requirements = dependency / "requirements.lock"
@@ -321,9 +329,11 @@ def install(config, slot_key, token_file, *, launch=True):
         raise ValueError("runtime_readiness_timeout")
     except Exception as error:
         allowed = isinstance(error, ValueError) and re.fullmatch(r"[a-z0-9_]{1,100}", str(error))
+        error_type = type(error).__name__ if type(error) in (ValueError, TypeError, OSError, FileNotFoundError,
+            PermissionError, TimeoutError, subprocess.CalledProcessError, subprocess.TimeoutExpired) else "SetupError"
         return status("runtime_start_unknown" if started else "setup_failed", state="unknown" if started else "failed",
-                      failed_phase=last_phase,
-                      code=str(error) if allowed else "bootstrap_operation_failed")
+                      failed_phase=last_phase, failure_phase=last_phase, error_type=error_type,
+                      code=str(error) if allowed else "bootstrap_operation_failed", **failure_diagnostics)
 
 
 def main(argv=None):

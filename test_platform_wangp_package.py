@@ -78,6 +78,57 @@ class PackageTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "system_mismatch"):
                     env.verify_environment(self.lock)
 
+    def test_package_mismatch_diagnostics_are_bounded_and_exclude_untrusted_fields(self):
+        expected = {"libtest"+str(i): "1.0" for i in range(25)}
+        diagnostic = env.system_package_diagnostics(expected, {"libtest0": "1.1", "extra-package": "2.0"})
+        self.assertEqual(diagnostic["total"], 25)
+        self.assertTrue(diagnostic["truncated"])
+        self.assertEqual(len(diagnostic["mismatches"]), 16)
+        self.assertEqual(diagnostic["mismatches"][0], {"package": "libtest0", "expected": "1.0", "observed": "1.1"})
+        self.assertIsNone(diagnostic["mismatches"][1]["observed"])
+        value = {"total": 3, "truncated": False, "log": "SECRET", "mismatches": [
+            {"package": "libc6:amd64", "expected": "2.35-0ubuntu3.8", "observed": "2.35-0ubuntu3.9", "url": "SECRET"},
+            {"package": "https://private.invalid/?token=SECRET", "expected": "1.0", "observed": None},
+            {"package": "openssl", "expected": "3.0.2", "observed": "SECRET_TOKEN"}]}
+        safe = env.safe_system_package_diagnostics(value)
+        self.assertEqual(len(safe["mismatches"]), 1)
+        self.assertTrue(safe["truncated"])
+        self.assertNotIn("SECRET", json.dumps(safe))
+        for total in (-1, True, 10001, "3"):
+            self.assertIsNone(env.safe_system_package_diagnostics({**value, "total": total}))
+
+    def test_bootstrap_retains_actual_system_failure_phase_and_versions_without_start(self):
+        value = self.config()
+        for key in ("source_bundle_path", "dependency_artifact_path"):
+            Path(value[key]).write_bytes(b"synthetic fixture")
+        value["source_bundle_sha256"] = env.sha_file(value["source_bundle_path"])
+        value["dependency_artifact_sha256"] = env.sha_file(value["dependency_artifact_path"])
+        manifest = json.loads((ROOT/"deploy/wangp/manifest.json").read_text())
+        manifest.update(runtime_digest_kind="sixnine-environment-lock-sha256", runtime_digest=env.digest(self.lock))
+        Path(value["manifest_path"]).write_text(json.dumps(manifest), encoding="utf-8")
+        def unpack(archive, directory, **kwargs):
+            directory.mkdir()
+            if directory.name == "dependencies":
+                runtime = directory/"upstream"
+                runtime.mkdir()
+                (runtime/".sixnine-environment.json").write_bytes(env.canonical(self.lock))
+        with patch.object(bootstrap.platform, "system", return_value="Linux"), \
+                patch.object(bootstrap.platform, "python_version", return_value=env.PYTHON), \
+                patch.object(bootstrap.sys, "path", list(bootstrap.sys.path)), \
+                patch.object(bootstrap, "extract", side_effect=unpack), \
+                patch.object(env, "system_packages", return_value={"libc6:amd64": "2.36-10"}), \
+                patch.object(bootstrap.subprocess, "run") as run, \
+                patch.object(bootstrap.subprocess, "Popen") as popen, patch.object(bootstrap, "download") as download:
+            result = bootstrap.install(value, "test-slot", str(self.root/"token"))
+        self.assertEqual((result["state"], result["code"], result["error_type"]),
+                         ("failed", "system_package_mismatch", "ValueError"))
+        self.assertEqual(result["failure_phase"], "system_package_verification")
+        self.assertEqual(result["phase"], "setup_failed")
+        self.assertEqual(result["system_package_diagnostics"], {"total": 1, "truncated": False,
+            "mismatches": [{"package": "libc6:amd64", "expected": "2.36-9", "observed": "2.36-10"}]})
+        self.assertEqual(json.loads(Path(value["status_path"]).read_text()), result)
+        run.assert_not_called(); popen.assert_not_called(); download.assert_not_called()
+
     def test_nested_vendor_metadata_does_not_change_wheel_identity(self):
         wheel = self.root / "example.whl"
         with zipfile.ZipFile(wheel, "w") as archive:

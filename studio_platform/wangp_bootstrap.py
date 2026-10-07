@@ -15,7 +15,7 @@ import stat
 import threading
 import time
 
-from .lium_bootstrap import BootError, SSHHost, REMOTE_ROOT
+from .lium_bootstrap import BootError, SSHHost, REMOTE_ROOT, safe_bootstrap_diagnosis
 from .control import WorkerSpec
 from .fleet import SlotConfig
 from .inference.wangp_contract import EngineManifest, HostReadiness
@@ -136,6 +136,7 @@ class WanGPSSHHost(SSHHost):
     def upload(self, files):
         if set(files) != SOURCE_NAMES:
             raise BootError('wangp_boot_source_set_invalid')
+        self._capture_system_observation()
         self.run("from pathlib import Path; import json; Path('/workspace/h3-studio').mkdir(parents=True,exist_ok=True); print(json.dumps({'ok':True}))")
         with self.client.open_sftp() as sftp:
             for name, data in files.items():
@@ -150,6 +151,53 @@ class WanGPSSHHost(SSHHost):
         dependency = dependency_source(self.config, json.loads(files['wangp-runtime.json']))
         if dependency is not None:
             self._upload_dependency(*dependency)
+
+    def inspect_system_packages(self):
+        """Read-only pre-upload inventory; no package installation or admission."""
+        from .runtime_hosts.wangp_environment import PACKAGE_NAME_PATTERN, PACKAGE_VERSION_PATTERN, MAX_SYSTEM_PACKAGES
+        value = self.run('''import json,subprocess
+raw=subprocess.run(['dpkg-query','-W','-f=${binary:Package}\\t${Version}\\n'],check=True,capture_output=True,text=True,timeout=10).stdout
+if len(raw)>2097152: raise ValueError('inventory_too_large')
+rows=raw.splitlines()
+print(json.dumps({'packages':dict(line.split('\\t',1) for line in rows[:10000]),'total':len(rows),'truncated':len(rows)>10000}))
+''', limit=2*1024**2, timeout=20)
+        packages, total = value.get('packages'), value.get('total')
+        if not isinstance(packages, dict) or type(total) is not int or not 0 <= total <= MAX_SYSTEM_PACKAGES:
+            raise BootError('system_package_observation_invalid')
+        safe = {name: version for name, version in list(packages.items())[:MAX_SYSTEM_PACKAGES]
+                if isinstance(name, str) and re.fullmatch(PACKAGE_NAME_PATTERN, name)
+                and isinstance(version, str) and re.fullmatch(PACKAGE_VERSION_PATTERN, version)}
+        if total < len(safe):
+            raise BootError('system_package_observation_invalid')
+        return {'packages': dict(sorted(safe.items())), 'total': total,
+                'truncated': value.get('truncated') is True or total > len(safe)}
+
+    def _capture_system_observation(self):
+        """Keep the first safe inventory on CPU before transferring dependencies."""
+        from .lium_provider import _uuid
+        instance_id = self.coordinates.get('instance_id')
+        _uuid(instance_id)
+        directory = self.config.work_dir/'os-observations'
+        if directory.is_symlink():
+            raise BootError('system_package_observation_path_invalid')
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = directory/(instance_id+'.json')
+        if target.is_symlink():
+            raise BootError('system_package_observation_path_invalid')
+        if target.exists():
+            return  # Preserve the original pre-upload observation on reconnect.
+        record = {'version': 1, 'instance_id': instance_id, 'observed_at': time.time()}
+        try:
+            record.update(state='observed', **self.inspect_system_packages())
+        except Exception:
+            # Observation is diagnostic only. Do not turn it into a new
+            # readiness criterion or include exception text/SSH coordinates.
+            record.update(state='unavailable', code='system_package_observation_failed')
+        with target.open('x', encoding='utf-8') as destination:
+            target.chmod(0o600)
+            json.dump(record, destination, sort_keys=True)
+            destination.flush()
+            os.fsync(destination.fileno())
 
     @contextmanager
     def _transfer_sftp(self, deadline):
@@ -308,7 +356,7 @@ with (root/'sixnine-bootstrap.lock').open('a') as lock:
 '''.replace('IDENTITY', repr(identity)))
 
     def report(self):
-        return self.run('''import json,subprocess
+        report = self.run('''import json,subprocess
 from pathlib import Path
 root=Path('/workspace/h3-studio')
 def read(name):
@@ -317,15 +365,20 @@ def read(name):
  if p.is_symlink() or p.stat().st_size>4194304: raise ValueError('untrusted_report')
  return json.loads(p.read_text())
 s=read('setup-status.json')
-out={k:s.get(k) for k in ('state','phase','error_code','runtime_verified','engine_manifest_digest','source_revision','runtime')}
+out={k:s.get(k) for k in ('state','phase','error_code','error_type','runtime_verified','engine_manifest_digest','source_revision','runtime','system_package_diagnostics')}
 out['error_code']=s.get('error_code',s.get('code'))
-out['failure_phase']=s.get('phase')
+out['failure_phase']=s.get('failure_phase',s.get('failed_phase',s.get('phase')))
 out['identity']=read('sixnine-bootstrap-identity.json')
 if out['state']=='ready':
  rows=subprocess.check_output(['nvidia-smi','--query-gpu=uuid,memory.total,name','--format=csv,noheader,nounits'],text=True).strip().splitlines()
  out['gpus']=[{'uuid':x.split(',')[0].strip(),'memory_mib':int(x.split(',')[1].strip()),'name':','.join(x.split(',')[2:]).strip()} for x in rows]
 print(json.dumps(out))
 ''')
+        if report.get('state') == 'failed':
+            diagnosis = safe_bootstrap_diagnosis(report)
+            report.pop('system_package_diagnostics', None)
+            report.update(diagnosis)
+        return report
 
     def preparation_idle_report(self):
         return self.run('''import json,re,time
