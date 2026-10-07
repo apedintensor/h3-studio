@@ -31,6 +31,7 @@ CAPACITY_WAIT_CODES = {
     "provider_configuring_ssh": "capacity_provider_configuring_ssh",
     "provider_preparation_timeout": "capacity_provider_preparation_timeout",
     "provider_preparation_failed": "capacity_provider_preparation_failed",
+    "provider_ttl_unconfirmed": "capacity_provider_ttl_unconfirmed",
     "gpu_busy": "capacity_gpu_busy",
     "searching": "capacity_searching_gpu",
     "bootstrap_repair_required": "capacity_bootstrap_repair_required",

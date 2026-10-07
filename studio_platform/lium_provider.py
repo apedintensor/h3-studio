@@ -279,6 +279,97 @@ class LiumProvider:
         except Exception:
             raise LiumError("lium_rent_journal_unconfirmed") from None
 
+    def _ttl_observation(self, tag, instance_id, ttl):
+        detail = self._request("GET", "pods/"+_uuid(instance_id))
+        try:
+            if (not isinstance(detail, dict) or _uuid(detail.get("id")) != instance_id
+                    or self._name(detail) != _pod_name(tag) or detail.get("status") not in ("PENDING", "RUNNING")):
+                raise ValueError
+            created_raw, removed_raw = detail["created_at"], detail.get("removal_scheduled_at")
+            if not isinstance(created_raw, str) or len(created_raw) > 80:
+                raise ValueError
+            created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            naive = created.tzinfo is None
+            created_at = _timestamp(created_raw, assume_utc=naive)
+            if abs(created_at-ttl["created_at"]) > 300 or created_at > self.clock()+300:
+                raise ValueError
+            removed_at = None
+            if removed_raw is not None:
+                if not isinstance(removed_raw, str) or len(removed_raw) > 80:
+                    raise ValueError
+                parsed = datetime.fromisoformat(removed_raw.replace("Z", "+00:00"))
+                if (parsed.tzinfo is None) != naive:
+                    raise ValueError
+                removed_at = _timestamp(removed_raw, assume_utc=naive)
+                if removed_at <= created_at:
+                    raise ValueError
+            hours = detail.get("termination_hours")
+            if not (type(hours) is int and hours == ttl["requested_hours"] or hours is None and removed_at is not None):
+                raise ValueError
+            if ttl["instance_id"] is not None and (ttl["instance_id"] != instance_id
+                    or ttl["provider_created_at"] != created_at):
+                raise ValueError
+            return detail, created_at, removed_at
+        except (KeyError, TypeError, ValueError, LiumError, OverflowError):
+            raise LiumError("lium_absolute_ttl_unconfirmed") from None
+
+    def _ensure_absolute_ttl(self, tag, instance_id):
+        """Bound new rents only; legacy markers never acquire inferred authority.
+
+        Unknown schedule POSTs are GET-only thereafter. One acknowledged and
+        verified pending schedule may be shortened again at the RUNNING
+        transition. A second overwrite remains a visible operator hold.
+        """
+        marker = self._journal_read(tag)
+        if not marker or "absolute_ttl" not in marker:
+            return None
+        try:
+            with self._journal.ttl_lock(tag):
+                marker = self._journal_read(tag)
+                if marker["phase"] not in {"post_started", "confirmed"}:
+                    raise ValueError
+                if marker.get("instance_id", instance_id) != instance_id:
+                    raise ValueError
+                ttl = marker["absolute_ttl"]
+                detail, created, removed = self._ttl_observation(tag, instance_id, ttl)
+                ttl["instance_id"], ttl["provider_created_at"] = instance_id, created
+                if removed is not None:
+                    ttl["effective_deadline"] = min(ttl["effective_deadline"], removed)
+                if ttl["effective_deadline"] <= self.clock():
+                    raise ValueError
+                safe = removed is not None and removed <= ttl["effective_deadline"]
+                if safe:
+                    if ttl["attempts"]:
+                        ttl["attempts"][-1]["confirmed"] = True
+                    self._journal.update_ttl(tag, ttl)
+                    return detail
+                previous = ttl["attempts"][-1] if ttl["attempts"] else None
+                if previous and (len(ttl["attempts"]) != 1 or not previous["acknowledged"]
+                        or not previous["confirmed"] or previous["status"] != "PENDING" or detail["status"] != "RUNNING"):
+                    raise ValueError
+                # The lock and fsynced intent precede the only allowed request.
+                ttl["attempts"].append({"target": ttl["effective_deadline"], "started_at": self.clock(),
+                    "status": detail["status"], "acknowledged": False, "confirmed": False})
+                self._journal.update_ttl(tag, ttl)
+                self._request("POST", "pods/"+instance_id+"/schedule-removal", payload={
+                    "removal_scheduled_at": datetime.fromtimestamp(ttl["effective_deadline"], timezone.utc).isoformat()})
+                ttl["attempts"][-1]["acknowledged"] = True
+                self._journal.update_ttl(tag, ttl)
+                detail, _, removed = self._ttl_observation(tag, instance_id, ttl)
+                if removed is None or removed > ttl["effective_deadline"]:
+                    raise ValueError
+                ttl["effective_deadline"] = min(ttl["effective_deadline"], removed)
+                ttl["attempts"][-1]["confirmed"] = True
+                self._journal.update_ttl(tag, ttl)
+                return detail
+        except Exception:
+            raise LiumError("lium_absolute_ttl_unconfirmed") from None
+
+    def create_for_intent(self, tag, launch, *, hard_deadline, intent_created_at):
+        """Optional coordinator hook; only original DB time can bind a new TTL."""
+        return self.create(tag, launch, hard_deadline=hard_deadline,
+            intent_created_at=intent_created_at if self._journal is not None else None)
+
     def _select_offer(self, manifest):
         # Selection is opt-in operator policy. Model, template, count, TTL and
         # money reservation stay unchanged. Recheck inventory at actual create.
@@ -549,10 +640,11 @@ class LiumProvider:
         """
         if not self.execution_allowed(tag, instance_id):
             raise LiumError("lium_rental_contract_requires_reconciliation")
+        ttl_detail = self._ensure_absolute_ttl(_uuid(tag), _uuid(instance_id))
         pod = self._exact_pod(tag, instance_id)
         if pod is None or str(pod.get("status", "")).upper() != "RUNNING":
             raise LiumError("lium_pod_not_running_for_bootstrap")
-        detail = self._request("GET", "pods/"+_uuid(instance_id))
+        detail = ttl_detail if ttl_detail is not None else self._request("GET", "pods/"+_uuid(instance_id))
         try:
             if not isinstance(detail, dict) or _uuid(detail.get("id")) != _uuid(instance_id):
                 raise ValueError
@@ -589,9 +681,16 @@ class LiumProvider:
         if (type(maximum_hours) is not int or not 1 <= maximum_hours <= 4
                 or type(local_created_at) not in (int, float) or not math.isfinite(local_created_at)):
             raise LiumError("lium_invalid_lifetime_bound")
+        marker = self._journal_read(_uuid(tag))
+        ttl_detail = None
+        if marker and "absolute_ttl" in marker:
+            ttl = marker["absolute_ttl"]
+            if ttl["created_at"] != local_created_at or ttl["requested_hours"] > maximum_hours:
+                raise LiumError("lium_absolute_ttl_unconfirmed")
+            ttl_detail = self._ensure_absolute_ttl(tag, _uuid(instance_id))
         if self._exact_pod(tag, instance_id) is None:
             raise LiumError("lium_lifetime_not_confirmed")
-        detail = self._request("GET", "pods/"+_uuid(instance_id))
+        detail = ttl_detail if ttl_detail is not None else self._request("GET", "pods/"+_uuid(instance_id))
         try:
             if (not isinstance(detail, dict) or _uuid(detail.get("id")) != _uuid(instance_id)
                     or self._name(detail) != _pod_name(tag)):
@@ -639,7 +738,7 @@ class LiumProvider:
         return {"physical_gpus": manifest.gpu_count, "slots": manifest.execution_slots,
                 "ttl_cap_reservation_microusd": cap}
 
-    def create(self, tag, launch: LaunchSpec, *, hard_deadline):
+    def create(self, tag, launch: LaunchSpec, *, hard_deadline, intent_created_at=None):
         if not self.enabled:
             raise LiumError("lium_provider_disabled")
         tag = _uuid(tag)
@@ -648,6 +747,9 @@ class LiumProvider:
         # this tag. An expired manifest must not create a zero-charge marker.
         manifest = self._manifest(launch)
         now = self.clock()
+        if intent_created_at is not None and (self._journal is None or type(intent_created_at) not in (int, float)
+                or not math.isfinite(intent_created_at) or not 0 <= intent_created_at <= now):
+            raise LiumError("lium_invalid_intent_creation_time")
         if (isinstance(hard_deadline, bool) or not isinstance(hard_deadline, (float, int))
                 or not math.isfinite(hard_deadline)):
             raise LiumError("lium_invalid_deadline")
@@ -678,7 +780,16 @@ class LiumProvider:
                 self._journal_write(tag, "not_submitted")
                 raise LiumNotSubmitted("lium_launch_approval_expired")
             post_executor = None if manifest.server_side_selection else selected_offer
-            self._journal_write(tag, "post_started", executor_id=post_executor)
+            ttl = None
+            if intent_created_at is not None:
+                deadline = min(intent_created_at+hours*3600, hard_deadline)
+                if deadline <= now+self._ttl_margin:
+                    self._journal_write(tag, "not_submitted")
+                    raise LiumNotSubmitted("lium_insufficient_original_ttl_window")
+                ttl = {"version": 1, "created_at": intent_created_at, "hard_deadline": hard_deadline,
+                    "requested_hours": hours, "deadline": deadline, "effective_deadline": deadline,
+                    "instance_id": None, "provider_created_at": None, "attempts": []}
+            self._journal_write(tag, "post_started", executor_id=post_executor, absolute_ttl=ttl)
             self._submitted_tags.add(tag)
             payload = {
                 "pod_name": name, "template_id": manifest.template_id,
@@ -706,6 +817,10 @@ class LiumProvider:
                     self._journal_write(tag, "quarantined", executor_id=post_executor, instance_id=instance)
                     raise
             self._journal_write(tag, "confirmed", executor_id=post_executor, instance_id=instance)
+            try:
+                self._ensure_absolute_ttl(tag, instance)
+            except LiumError:
+                pass  # Paid identity remains acknowledged; reconciliation retries GET, never rent.
             return ProviderFact("starting", instance)
 
     def reconcile(self, tag, instance_id=None):
@@ -724,6 +839,10 @@ class LiumProvider:
             instance_id = marker["instance_id"]
         pod = self._exact_pod(tag, instance_id)
         if pod is not None:
+            try:
+                self._ensure_absolute_ttl(tag, _uuid(pod["id"]))
+            except LiumError:
+                pass  # Readiness/lifetime/SSH remain gated by the same durable bound.
             return self._running_fact(tag, pod)
         if instance_id is not None:
             statement = self._removed_statement(tag, instance_id)

@@ -836,8 +836,10 @@ class FiniteController:
                         "bootstrap_failed", "fleet_recovery_required", "fleet_attention_required",
                         "staging_failed", "staging_cancelled", "staging_recovery_required"):
                     self._boot_failure(row, boot_status[intent])
-            except Exception:
-                boot_status[intent] = {"state": "boot_observation_unconfirmed"}
+            except Exception as exc:
+                from .lium_provider import LiumError
+                boot_status[intent] = {"state": "provider_ttl_unconfirmed" if isinstance(exc, LiumError)
+                    and str(exc) == "lium_absolute_ttl_unconfirmed" else "boot_observation_unconfirmed"}
         reason = decision.get("reason")
         if not stopping:
             if (any(row["state"] == "creation_unknown" for row in instances)
@@ -845,6 +847,8 @@ class FiniteController:
                 reason = "creation_needs_reconciliation"
             elif any(v.get("state") == "configuring_ssh" for v in boot_status.values()):
                 reason = "provider_configuring_ssh"
+            elif any(v.get("state") == "provider_ttl_unconfirmed" for v in boot_status.values()):
+                reason = "provider_ttl_unconfirmed"
             elif any(v.get("state") == "provider_preparing" for v in boot_status.values()):
                 reason = "provider_preparing"
             elif any(row["state"] == "starting" for row in instances):
