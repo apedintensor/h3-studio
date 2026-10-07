@@ -28,17 +28,19 @@ from .storage import LocalObjectStore, StorageError, S3ObjectStore
 from .storage_config import S3StorageConfig, R2_CREDENTIAL_FIELDS, load_storage_credentials
 from .source_snapshot import source_snapshot, validate_source_ref
 from .http_limits import (ADMISSION_SCOPE_KEY, BodyLimitMiddleware, UploadAdmission,
-                         RequestAdmission, RequestAdmissionMiddleware, admission_rejected)
+                         RequestAdmission, RequestAdmissionMiddleware, admission_rejected, is_asset_upload)
 from .execution_policy import ExecutionPolicies
 from .render_plans import RECIPE as RENDER_RECIPE, compile_render, validate_render_source
 from .agent_discovery import PUBLIC_PATHS as AGENT_PUBLIC_PATHS, DISCOVERY_LINK
 from .frontend import FRONTEND_CONTRACT, STATIC_CACHE_SCOPE_KEY, is_public_frontend
+from .generation_admission import GenerationAdmission, reject_managed
 
 COOKIE = "sixnine_session"
 TERMINAL = {"succeeded", "failed", "cancelled"}
 
 
-def create_app(settings: Settings, *, repository=None, storage=None):
+def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_hooks=None,
+               assistant=None, assistant_enabled=False):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     repo = repository or Repository(settings.database_url)
     repo.create_schema()
@@ -63,9 +65,13 @@ def create_app(settings: Settings, *, repository=None, storage=None):
 
     @asynccontextmanager
     async def lifespan(app):
-        yield
-        if repository is None:
-            repo.close()
+        await app.state.quick_chat_recovery.start()
+        try:
+            yield
+        finally:
+            await app.state.quick_chat_recovery.close()
+            if repository is None:
+                repo.close()
 
     app = FastAPI(title="Sixnine video platform", version="1.0.0-dev", lifespan=lifespan)
     app.add_middleware(BodyLimitMiddleware, project_bytes=settings.max_project_bytes,
@@ -176,7 +182,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
                 return JSONResponse({"detail": "无效访问域名"}, status_code=400)
         elif host.split(":")[0] not in {"localhost", "127.0.0.1", "testserver"}:
             return JSONResponse({"detail": "本地服务仅支持loopback入口"}, status_code=400)
-        maximum = settings.max_upload_bytes + 1024*1024 if request.url.path == "/v1/assets" else settings.max_project_bytes
+        maximum = settings.max_upload_bytes + 1024*1024 if is_asset_upload(request.url.path) else settings.max_project_bytes
         length = request.headers.get("content-length")
         if length and (len(length) > 20 or not length.isascii() or not length.isdigit() or int(length) > maximum):
             return JSONResponse({"detail": "请求体超过限制"}, status_code=413)
@@ -230,7 +236,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         if downloading and (not lease.acquire("downloads")
                 or not lease.acquire("owner_downloads", principal.owner)):
             return admission_rejected()
-        uploading = request.method == "POST" and request.url.path == "/v1/assets" and principal is not None
+        uploading = request.method == "POST" and is_asset_upload(request.url.path) and principal is not None
         if uploading and not upload_admission.acquire(principal.owner):
             return JSONResponse({"detail": "同时上传的文件已达到上限，请等当前上传完成再重试"}, status_code=429,
                                 headers={"Retry-After": "3"})
@@ -309,7 +315,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         principal = request.state.principal
         allowed = ((None if principal.all_projects else principal.project_ids) if "projects:read" in principal.scopes else ()) if principal.machine else None
         values = repo.list_documents(project_scope(principal), "project", limit=limit, offset=offset,
-                                     allowed_ids=allowed, summary=True)
+                                     allowed_ids=allowed, summary=True, exclude_managed=True)
         return {"projects": [{"id": v["document_id"], "title": v["payload"]["title"],
                               "version": v["version"], "updated_at": v["updated_at"]}
                 for v in values if principal.allows(v["document_id"], "projects:read")]}
@@ -331,6 +337,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
                     f"{settings.tenant_id}:{principal.owner}:{principal.actor_id}:{idempotency_key}").hex
             project = empty_project(values)
         validate_project(project, settings.max_project_bytes)
+        reject_managed(project)
         return app.state.guided.mutate(principal, project["id"], project, idempotency_key, create=True)
 
     @app.get("/v1/projects/{project_id}")
@@ -342,8 +349,9 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         principal = request.state.principal
         if principal.machine and not principal.allows(project_id, "projects:write"):
             raise HTTPException(403, "保存故事需要projects:write授权")
-        authorized_project(principal, project_id, "projects:write")
+        reject_managed(authorized_project(principal, project_id, "projects:write")["payload"])
         project = validate_project(body.get("project"), settings.max_project_bytes)
+        reject_managed(project)
         if project["id"] != project_id or type(body.get("expected_version")) is not int:
             raise HTTPException(422, "需要匹配的项目ID与版本")
         return app.state.guided.save(principal, project_id, project, body["expected_version"])
@@ -454,6 +462,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         principal = request.state.principal
         project_id = body.get("client_ref", {}).get("project_id") if isinstance(body.get("client_ref"), dict) else None
         project = authorized_project(principal, project_id, "jobs:write")["payload"]
+        reject_managed(project)
         return plan_response(principal, body, project)
 
     def plan_response(principal, body, project):
@@ -499,6 +508,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
             raise ValueError("生成能力已变化，请刷新后重新预检")
         authorized_project(principal, project_id, "projects:read")
         record = authorized_project(principal, project_id, "jobs:write")
+        reject_managed(record["payload"])
         if record["version"] != body["expected_version"]:
             raise Conflict("document_version_conflict")
         return generation_admission.preflight(principal, record["payload"], shot_id,
@@ -543,6 +553,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         principal = request.state.principal
         project_id = body.get("client_ref", {}).get("project_id") if isinstance(body.get("client_ref"), dict) else None
         project = authorized_project(principal, project_id, "jobs:write")["payload"]
+        reject_managed(project)
         compiled, timeline, blockers, warnings = compile_render(body, project,
             lambda entity, kind: resolve_render_source(principal, project_id, entity, kind))
         compiled["render_blockers"] = blockers
@@ -568,11 +579,11 @@ def create_app(settings: Settings, *, repository=None, storage=None):
                     or compiled.get("server_source_hash") != source_snapshot(project, ref["shot_id"])):
                 raise Conflict("shot_version_conflict")
 
-    from .generation_admission import GenerationAdmission
     generation_admission = GenerationAdmission(repo=repo, assets=asset_service, settings=settings,
         policies=execution_policies, scope=scope, authorized_project=authorized_project,
         owned_plan=owned_plan, plan_response=plan_response, check_source=check_plan_source,
         capabilities_provider=lambda: capabilities(settings))
+    app.state.generation_admission = generation_admission
 
     def create_from_plan(principal, plan_id, idempotency_key, initial_status=None):
         return generation_admission.create(principal, plan_id, idempotency_key,
@@ -647,6 +658,22 @@ def create_app(settings: Settings, *, repository=None, storage=None):
     app.state.create_from_plan = create_from_plan
     app.state.enqueue_planned = enqueue_planned
     app.state.public_job = public_job
+    from .quick_chat import QuickChatHooks
+    from .quick_chat_routes import register_routes as register_quick_chat_routes
+    def quick_public_job(principal, job_id):
+        return public_job(owned_job(principal, job_id))
+
+    def quick_cancel(principal, job_id):
+        job = owned_job(principal, job_id, "jobs:write")
+        return public_job(repo.request_cancel(scope(principal, job["project_id"]), job_id))
+
+    hooks = quick_chat_hooks or QuickChatHooks(preflight=generation_admission.preflight,
+        create_planned=generation_admission.create_planned, enqueue=lambda p, j: generation_admission.enqueue(p, j, business=True),
+        public_job=quick_public_job, cancel=quick_cancel, refresh_planned=generation_admission.refresh_planned)
+    register_quick_chat_routes(app, hooks=hooks, assistant=assistant,
+        assistant_enabled=assistant_enabled)
+    from .quick_chat_recovery import QuickChatRecovery
+    app.state.quick_chat_recovery = QuickChatRecovery(app.state.quick_chat)
     from .batches import register_routes
     register_routes(app)
     from .guided import register_routes as register_guided_routes

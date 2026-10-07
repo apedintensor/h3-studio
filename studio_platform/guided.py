@@ -604,7 +604,8 @@ def register_routes(app):
     @app.post("/v1/projects/{project_id}/actions")
     def actions(project_id: str, request: Request, body: dict, idempotency_key: str | None = Header(None)):
         p = request.state.principal
-        app.state.authorized_project(p, project_id, "projects:write")
+        from .generation_admission import reject_managed
+        reject_managed(app.state.authorized_project(p, project_id, "projects:write")["payload"])
         return service.mutate(p, project_id, body, idempotency_key)
 
     @app.post("/v1/projects/{project_id}/entities", status_code=201)

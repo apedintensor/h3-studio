@@ -1,0 +1,1250 @@
+"""Durable chat-native creation. Provider calls only through explicit hooks.
+
+The project/shot document is an execution projection, never a second editable
+source. All state uses the platform database; no timers, fake replies or GPUs.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import base64
+import copy
+import hashlib
+import io
+import json
+import secrets
+import uuid
+
+from sqlalchemy import Column, Float, Integer, JSON, MetaData, String, Table, UniqueConstraint, insert, select, update
+
+from .auth import Principal
+from .capabilities import RECIPES, VERSION
+from .generation_draft import input_entries, prepare_patch, configure, validate_controls_patch, validate_range
+from .guided import empty_project, new_entity, now_iso
+from .project_validation import ID, validate_project
+from .project_activity import append_activity
+from .repository import Conflict, NotFound, Scope, BudgetExceeded, canonical, request_hash, documents, jobs, attempts, artifacts
+
+
+MODELS = {"gemini-3.8-flash": "Gemini 3.8 Flash", "gemma-4-31b-it": "Gemma 4 31B IT"}
+DEFAULT_MODEL = "gemini-3.8-flash"
+EMPTY_INPUTS = {"first_frame": None, "last_frame": None, "images": [], "videos": [], "audios": [], "guides": []}
+DEFAULT_SETTINGS = {"recipe_id": "h3-base-fl2va-v1", "controls": {"duration": 5, "resolution": "480P"}, "copies": 1}
+metadata = MetaData()
+objects = Table("platform_quick_chat_objects", metadata,
+    Column("id", String(80), primary_key=True), Column("tenant", String(200), nullable=False),
+    Column("owner", String(200), nullable=False), Column("session_id", String(80), nullable=False),
+    Column("kind", String(40), nullable=False), Column("parent_id", String(80)),
+    Column("business_key", String(200)), Column("version", Integer, nullable=False),
+    Column("payload", JSON, nullable=False), Column("created_at", Float, nullable=False),
+    Column("updated_at", Float, nullable=False),
+    UniqueConstraint("tenant", "owner", "kind", "business_key"))
+operations = Table("platform_quick_chat_operations", metadata,
+    Column("tenant", String(200), primary_key=True), Column("owner", String(200), primary_key=True),
+    Column("namespace", String(200), primary_key=True), Column("key", String(160), primary_key=True),
+    Column("fingerprint", String(64), nullable=False), Column("object_id", String(80), nullable=False),
+    Column("created_at", Float, nullable=False))
+events = Table("platform_quick_chat_events", metadata,
+    Column("id", String(80), primary_key=True), Column("tenant", String(200), nullable=False),
+    Column("owner", String(200), nullable=False), Column("session_id", String(80), nullable=False),
+    Column("seq", Integer, nullable=False), Column("type", String(60), nullable=False),
+    Column("resource_id", String(80), nullable=False), Column("actor_id", String(200), nullable=False),
+    Column("created_at", Float, nullable=False), UniqueConstraint("tenant", "owner", "session_id", "seq"))
+
+
+class QuickChatError(Exception):
+    def __init__(self, code, message, status=409, *, retryable=False):
+        self.code, self.message, self.status, self.retryable = code, message, status, retryable
+        super().__init__(code)
+
+
+@dataclass
+class QuickChatHooks:
+    preflight: object
+    create_planned: object
+    enqueue: object
+    public_job: object
+    cancel: object
+    refresh_planned: object = None
+
+
+def fields(body, allowed, required=()):
+    if not isinstance(body, dict) or set(body)-set(allowed) or not set(required) <= set(body):
+        raise QuickChatError("invalid_request", "请求字段不符合创作契约。", 422)
+    return canonical(body)
+
+
+def key_check(key):
+    if not isinstance(key, str) or not ID.fullmatch(key):
+        raise QuickChatError("invalid_idempotency_key", "请提供稳定的1–160字符Idempotency-Key。", 422)
+
+
+def settings_check(value):
+    fields(value, {"recipe_id", "controls", "copies"}, {"recipe_id", "controls", "copies"})
+    if value["recipe_id"] not in RECIPES or type(value["copies"]) is not int or not 1 <= value["copies"] <= 4:
+        raise QuickChatError("invalid_settings", "生成方式或份数无效。", 422)
+    validate_controls_patch(value["controls"])
+    return canonical(value)
+
+
+def model_check(value):
+    if value not in MODELS:
+        raise QuickChatError("model_not_allowed", "请选择准确的已接入模型ID；不会自动换模型。", 422)
+    return value
+
+
+def cursor_encode(principal, session_id, boundary, direction):
+    value = {"owner": principal.owner, "session": session_id, "boundary": boundary, "direction": direction}
+    return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).decode().rstrip("=")
+
+
+def cursor_decode(value, principal, session_id, direction):
+    try:
+        if not isinstance(value, str) or len(value) > 1024:
+            raise ValueError()
+        obj = json.loads(base64.urlsafe_b64decode(value+"="*((-len(value)) % 4)))
+        if (set(obj) != {"owner", "session", "boundary", "direction"} or obj["owner"] != principal.owner
+                or obj["session"] != session_id or obj["direction"] != direction):
+            raise ValueError()
+        return obj["boundary"]
+    except Exception:
+        raise QuickChatError("invalid_cursor", "分页位置无效，请重新加载记录。", 422) from None
+
+
+class QuickChatService:
+    def __init__(self, repository, assets, settings, storage, *, hooks=None, assistant=None, assistant_enabled=False):
+        self.repo, self.assets, self.settings, self.storage = repository, assets, settings, storage
+        self.tenant, self.hooks = settings.tenant_id, hooks
+        self.assistant, self.assistant_enabled = assistant, assistant_enabled
+        with repository.transaction() as conn:
+            if repository.engine.dialect.name == "postgresql":
+                conn.exec_driver_sql("SELECT pg_advisory_xact_lock(685939796868749721)")
+            metadata.create_all(conn)
+
+    def _where(self, principal, ident, session_id=None, kind=None):
+        clauses = [objects.c.tenant == self.tenant, objects.c.owner == principal.owner, objects.c.id == ident]
+        if session_id is not None:
+            clauses.append(objects.c.session_id == session_id)
+        if kind is not None:
+            clauses.append(objects.c.kind == kind)
+        return clauses
+
+    def _get(self, conn, principal, ident, session_id=None, kind=None, *, lock=False):
+        statement = select(objects).where(*self._where(principal, ident, session_id, kind))
+        row = self.repo._locked(conn, statement) if lock else conn.execute(statement).mappings().first()
+        if row is None:
+            raise NotFound("quick_chat_resource_not_found")
+        return dict(row)
+
+    def _new(self, conn, principal, session_id, kind, payload, *, ident=None, parent=None, business=None):
+        now = self.repo.clock()
+        row = dict(id=ident or kind+"-"+uuid.uuid4().hex, tenant=self.tenant, owner=principal.owner,
+            session_id=session_id, kind=kind, parent_id=parent, business_key=business, version=1,
+            payload=canonical(payload), created_at=now, updated_at=now)
+        conn.execute(insert(objects).values(**row))
+        return row
+
+    def _put(self, conn, row, payload, *, bump=False):
+        values = dict(payload=canonical(payload), updated_at=self.repo.clock(), version=row["version"]+int(bump))
+        conn.execute(update(objects).where(objects.c.id == row["id"]).values(**values))
+        row.update(values)
+        return row
+
+    def _access(self, principal, session_id, *scopes, conn=None, lock=False):
+        if conn is None:
+            with self.repo.engine.connect() as read:
+                return self._access(principal, session_id, *scopes, conn=read)
+        row = self._get(conn, principal, session_id, session_id, "session", lock=lock)
+        if any(not principal.allows(row["payload"]["project_id"], scope) for scope in scopes):
+            raise NotFound("quick_chat_session_not_found")
+        return row
+
+    def _replay(self, conn, principal, namespace, key, body):
+        key_check(key)
+        row = conn.execute(select(operations).where(operations.c.tenant == self.tenant,
+            operations.c.owner == principal.owner, operations.c.namespace == namespace, operations.c.key == key)).mappings().first()
+        if row:
+            if row["fingerprint"] != request_hash(body):
+                raise QuickChatError("idempotency_conflict", "同一操作Key不能使用不同内容。")
+            return row["object_id"]
+
+    def _remember(self, conn, principal, namespace, key, body, ident):
+        conn.execute(insert(operations).values(tenant=self.tenant, owner=principal.owner, namespace=namespace,
+            key=key, fingerprint=request_hash(body), object_id=ident, created_at=self.repo.clock()))
+
+    def _event(self, conn, principal, session, event_type, resource_id):
+        payload = copy.deepcopy(session["payload"])
+        payload["latest_seq"] += 1
+        conn.execute(insert(events).values(id="event-"+uuid.uuid4().hex, tenant=self.tenant, owner=principal.owner,
+            session_id=session["id"], seq=payload["latest_seq"], type=event_type, resource_id=resource_id,
+            actor_id=principal.actor_id, created_at=self.repo.clock()))
+        self._put(conn, session, payload)
+        return payload["latest_seq"]
+
+    @staticmethod
+    def _version(row, expected):
+        if type(expected) is not int or expected != row["version"]:
+            raise QuickChatError("version_conflict", "内容已被修改；请保留本地草稿并读取当前版本。")
+
+    @staticmethod
+    def _effective_bindings(bindings, recipe_id):
+        mode = RECIPES[recipe_id]
+        values = []
+        for binding in bindings:
+            incompatible = ((mode == "fl" and binding["slot"] in {"images", "videos", "audios"})
+                or (mode == "ref" and binding["slot"] in {"first_frame", "last_frame"}))
+            enabled = binding["enabled"] and not incompatible
+            values.append({**copy.deepcopy(binding), "requested_enabled": binding["enabled"], "enabled": enabled,
+                "inactive_reason": "mode_incompatible" if binding["enabled"] and incompatible else None if enabled else "not_selected"})
+        return values
+
+    @staticmethod
+    def _inputs(bindings, recipe_id=None):
+        if recipe_id is not None:
+            bindings = QuickChatService._effective_bindings(bindings, recipe_id)
+        result = copy.deepcopy(EMPTY_INPUTS)
+        for item in bindings:
+            if not item["enabled"]:
+                continue
+            slot = item["slot"]
+            value = {"media_id" if slot == "guides" else "asset_id": item["asset_id"]}
+            for field in (("time_seconds", "use_audio", "source_range") if slot == "guides" else
+                          ("purpose", "source_range", "include_audio") if slot == "videos" else
+                          () if slot in {"first_frame", "last_frame"} else ("purpose", "source_range")):
+                if field in item:
+                    value[field] = item[field]
+            if slot in {"first_frame", "last_frame"}:
+                if result[slot] is not None:
+                    raise QuickChatError("reference_conflict", "首帧和尾帧分别只能使用一张图片。", 422)
+                result[slot] = value
+            else:
+                result[slot].append(value)
+        input_entries(result)
+        return result
+
+    def _session_public(self, row):
+        p = row["payload"]
+        return {"id": row["id"], "title": p["title"], "version": row["version"], "model_id": p["model_id"],
+            "next_settings": p["next_settings"], "input_refs": self._inputs(p["bindings"], p["next_settings"]["recipe_id"]),
+            "latest_seq": p["latest_seq"], "web_url": "/quick-chat?session="+row["id"],
+            "created_at": row["created_at"], "updated_at": row["updated_at"]}
+
+    def create_session(self, principal, body, key):
+        fields(body, {"title", "model_id"})
+        key_check(key)
+        if principal.machine and not (principal.all_projects and all(s in principal.scopes
+                for s in ("projects:create", "projects:read", "projects:write"))):
+            raise QuickChatError("insufficient_scope", "创建会话需要本人全部项目的创作权限。", 403)
+        title = body.get("title", "新的创作")
+        if not isinstance(title, str) or not title.strip() or len(title) > 160:
+            raise QuickChatError("invalid_title", "会话标题须为1–160字符。", 422)
+        model = model_check(body.get("model_id", DEFAULT_MODEL))
+        with self.repo.transaction() as conn:
+            if self.repo.engine.dialect.name == "postgresql":
+                conn.exec_driver_sql("SELECT pg_advisory_xact_lock(685939796868749722)")
+            prior = self._replay(conn, principal, "session-create", key, body)
+            if prior:
+                return {"session": self._session_public(self._access(principal, prior, "projects:read", conn=conn))}
+            ident = "session-"+uuid.uuid4().hex
+            project = empty_project({"id": "chat-workspace-"+uuid.uuid4().hex, "title": title, "workspace": "freestyle"})
+            project["integration_kind"] = "quick_chat"
+            project["journey"].update(integration_kind="quick_chat", quickChatSessionId=ident)
+            validate_project(project, self.settings.max_project_bytes)
+            conn.execute(insert(documents).values(tenant_id=self.tenant, owner_id=principal.owner, project_id="__projects",
+                kind="project", document_id=project["id"], payload=project, version=1, updated_at=self.repo.clock()))
+            append_activity(conn, tenant_id=self.tenant, principal=principal, project_id=project["id"], version=1,
+                occurred_at=self.repo.clock(), before=None, after=project, event_type="project.created")
+            session = self._new(conn, principal, ident, "session", {"title": title, "model_id": model,
+                "project_id": project["id"], "next_settings": DEFAULT_SETTINGS, "bindings": [], "latest_seq": 0,
+                "active_turn_id": None}, ident=ident)
+            self._remember(conn, principal, "session-create", key, body, ident)
+            return {"session": self._session_public(session)}
+
+    def get_session(self, principal, session_id):
+        return {"session": self._session_public(self._access(principal, session_id, "projects:read"))}
+
+    def list_sessions(self, principal, *, limit=20, cursor=None):
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise QuickChatError("invalid_limit", "分页大小须为1–50。", 422)
+        boundary = cursor_decode(cursor, principal, "__sessions", "older") if cursor else None
+        stmt = select(objects).where(objects.c.tenant == self.tenant, objects.c.owner == principal.owner, objects.c.kind == "session")
+        if boundary:
+            if not isinstance(boundary, list) or len(boundary) != 2:
+                raise QuickChatError("invalid_cursor", "分页位置无效。", 422)
+            from sqlalchemy import or_, and_
+            stmt = stmt.where(or_(objects.c.created_at < boundary[0], and_(objects.c.created_at == boundary[0], objects.c.id < boundary[1])))
+        # Filter before pagination; do not let inaccessible rows create empty pages.
+        if principal.machine:
+            if "projects:read" not in principal.scopes:
+                return {"sessions": [], "limit": limit, "has_more": False, "next_cursor": None}
+            if not principal.all_projects:
+                stmt = stmt.where(objects.c.payload["project_id"].as_string().in_(principal.project_ids))
+        with self.repo.engine.connect() as conn:
+            rows = [dict(r) for r in conn.execute(stmt.order_by(objects.c.created_at.desc(), objects.c.id.desc()).limit(limit+1)).mappings()]
+        values = [{k: v for k, v in self._session_public(row).items() if k not in {"input_refs", "next_settings"}} for row in rows[:limit]]
+        return {"sessions": values, "limit": limit, "has_more": len(rows)>limit,
+            "next_cursor": cursor_encode(principal, "__sessions", [rows[limit-1]["created_at"], rows[limit-1]["id"]], "older") if len(rows)>limit else None}
+
+    def patch_session(self, principal, session_id, body, key):
+        fields(body, {"expected_version", "title", "model_id", "next_settings"}, {"expected_version"})
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "projects:write", conn=conn, lock=True)
+            prior = self._replay(conn, principal, "session-patch:"+session_id, key, body)
+            if prior:
+                return {"session": self._session_public(session)}
+            self._version(session, body["expected_version"])
+            p = copy.deepcopy(session["payload"])
+            if "title" in body:
+                if not isinstance(body["title"], str) or not body["title"].strip() or len(body["title"])>160:
+                    raise QuickChatError("invalid_title", "会话标题无效。", 422)
+                p["title"] = body["title"]
+            if "model_id" in body:
+                p["model_id"] = model_check(body["model_id"])
+            if "next_settings" in body:
+                p["next_settings"] = settings_check(body["next_settings"])
+            self._put(conn, session, p, bump=True)
+            self._event(conn, principal, session, "session.updated", session_id)
+            self._remember(conn, principal, "session-patch:"+session_id, key, body, session_id)
+            return {"session": self._session_public(session)}
+
+    def upload(self, principal, session_id, source, filename, client_asset_id):
+        session = self._access(principal, session_id, "assets:write")
+        value = self.assets.upload(principal.owner, session["payload"]["project_id"], source, filename, client_asset_id=client_asset_id)
+        return {**value, "session_id": session_id}
+
+    def _asset(self, principal, session, asset_id):
+        if not principal.allows(session["payload"]["project_id"], "assets:read"):
+            raise NotFound("asset_not_found")
+        value = self.assets.get(principal.owner, asset_id, session["payload"]["project_id"])
+        if value["status"] != "ready":
+            raise QuickChatError("reference_not_ready", "素材尚未校验完成；请恢复同一上传收据。")
+        return value
+
+    def materials(self, principal, session_id):
+        session = self._access(principal, session_id, "projects:read", "assets:read")
+        catalog = {v["asset_id"]: v for v in self.assets.list(principal.owner, session["payload"]["project_id"])}
+        bindings = [{**b, "asset": catalog.get(b["asset_id"])} for b in session["payload"]["bindings"]]
+        bound = {b["asset_id"] for b in bindings}
+        for asset_id, asset in catalog.items():
+            if asset_id not in bound:
+                bindings.append({"binding_id": "binding-"+uuid.uuid5(uuid.NAMESPACE_URL, session_id+":"+asset_id).hex,
+                    "version": 0, "asset_id": asset_id, "kind": asset["kind"],
+                    "slot": {"image": "images", "video": "videos", "audio": "audios"}[asset["kind"]],
+                    "purpose": {"image": "reference", "video": "motion", "audio": "audio"}[asset["kind"]],
+                    "enabled": False, "asset": asset})
+        recipe = session["payload"]["next_settings"]["recipe_id"]
+        effective = self._effective_bindings(bindings, recipe)
+        for binding, participation in zip(bindings, effective):
+            binding.update(effective_enabled=participation["enabled"], inactive_reason=participation["inactive_reason"])
+        return {"bindings": bindings, "session_version": session["version"], "active_recipe_id": recipe,
+            "input_refs": self._inputs(session["payload"]["bindings"], recipe)}
+
+    def put_materials(self, principal, session_id, body, key):
+        fields(body, {"expected_version", "bindings"}, {"expected_version", "bindings"})
+        session = self._access(principal, session_id, "projects:read", "projects:write", "assets:read")
+        if not isinstance(body["bindings"], list) or len(body["bindings"]) > 100:
+            raise QuickChatError("invalid_bindings", "材料选择最多100个条目。", 422)
+        prepared, seen = [], set()
+        for item in body["bindings"]:
+            fields(item, {"binding_id", "version", "asset_id", "kind", "slot", "purpose", "enabled", "source_range", "include_audio", "time_seconds", "use_audio"},
+                {"binding_id", "version", "asset_id", "kind", "slot", "enabled"})
+            if not isinstance(item["binding_id"], str) or not ID.fullmatch(item["binding_id"]) or item["binding_id"] in seen:
+                raise QuickChatError("invalid_bindings", "素材引用ID重复或无效。", 422)
+            if type(item["version"]) is not int or item["version"] < 0 or type(item["enabled"]) is not bool:
+                raise QuickChatError("invalid_bindings", "素材引用版本或参与状态无效。", 422)
+            value = self._asset(principal, session, item["asset_id"])
+            if value["kind"] != item["kind"] or item["slot"] not in EMPTY_INPUTS:
+                raise QuickChatError("invalid_bindings", "素材种类与上传收据不匹配。", 422)
+            seen.add(item["binding_id"])
+            # Validate syntax and type even for a currently disabled reference.
+            candidate = {**item, "enabled": True}
+            refs = self._inputs([candidate])
+            prepare_patch({"inputs": refs}, lambda _ident: self._source(value))
+            prepared.append(canonical(item))
+        self._inputs(prepared)
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "projects:write", "assets:read", conn=conn, lock=True)
+            namespace = "materials:"+session_id
+            prior = self._replay(conn, principal, namespace, key, body)
+            if not prior:
+                self._version(session, body["expected_version"])
+                old = {v["binding_id"]: v for v in session["payload"]["bindings"]}
+                values = []
+                for value in prepared:
+                    existing = old.pop(value["binding_id"], None)
+                    if value["version"] != (existing["version"] if existing else 0):
+                        raise QuickChatError("version_conflict", "素材引用已变化，请重新加载。")
+                    if existing and existing["asset_id"] != value["asset_id"]:
+                        raise QuickChatError("reference_conflict", "同一引用ID不能更换原始素材。")
+                    values.append({**value, "version": value["version"]+1})
+                values.extend({**v, "enabled": False, "version": v["version"]+1} for v in old.values())
+                p = {**session["payload"], "bindings": values}
+                self._put(conn, session, p, bump=True)
+                self._event(conn, principal, session, "materials.updated", session_id)
+                self._remember(conn, principal, namespace, key, body, session_id)
+        return self.materials(principal, session_id)
+
+    @staticmethod
+    def _source(asset):
+        return {"type": asset["kind"], "title": asset["file_name"], "data": {
+            "fileId": "cloud_asset_"+asset["asset_id"], "cloudAssetId": asset["asset_id"],
+            "cloudContentPath": "/v1/assets/"+asset["asset_id"]+"/content", "fileName": asset["file_name"],
+            "mime": asset["mime"], "metadata": asset["metadata"], "missingFile": False, "source": "upload"}}
+
+    def _card_snapshot(self, principal, session, body):
+        settings_check({k: body[k] for k in ("recipe_id", "controls", "copies")})
+        if not isinstance(body["prompt"], str) or not body["prompt"].strip() or len(body["prompt"])>12000:
+            raise QuickChatError("invalid_prompt", "任务卡需要1–12000字符的完整提示词。", 422)
+        sources, provenance = {}, []
+        for slot, entry, ident in input_entries(body["inputs"]):
+            # Card inputs are an independent explicit snapshot. Uploading a
+            # receipt to this session is sufficient; enabling next-turn
+            # bindings is not required and is never done as a side effect.
+            asset = self._asset(principal, session, ident)
+            sources[ident] = self._source(asset)
+            provenance.append({"asset_id": ident, "sha256": asset["original"]["sha256"],
+                "source_range": entry.get("source_range"), "slot": slot})
+        prepare_patch(body, lambda ident: sources[ident])
+        inputs = {**copy.deepcopy(EMPTY_INPUTS), **canonical(body["inputs"])}
+        # Intent may be incomplete, but mixing ordinary FL/REF references is never silently fixed.
+        if RECIPES[body["recipe_id"]] == "fl" and any(inputs[k] for k in ("images", "videos", "audios")):
+            raise QuickChatError("reference_conflict", "首尾帧方式不能同时使用普通参考。", 422)
+        if RECIPES[body["recipe_id"]] == "ref" and (inputs["first_frame"] or inputs["last_frame"]):
+            raise QuickChatError("reference_conflict", "全能参考方式不能同时指定首尾帧。", 422)
+        snapshot = {k: canonical(body[k]) for k in ("prompt", "recipe_id", "controls", "copies")}
+        snapshot.update(inputs=inputs, title=body.get("title", "我的视频"), provenance=provenance)
+        if not isinstance(snapshot["title"], str) or not snapshot["title"].strip() or len(snapshot["title"])>160:
+            raise QuickChatError("invalid_title", "卡片标题须为1–160字符。", 422)
+        return snapshot, sources
+
+    def _create_revision(self, conn, principal, session, card, snapshot, sources, source_revision=None):
+        project_scope = Scope(self.tenant, principal.owner, "__projects")
+        where = (self.repo._scope(documents, project_scope), documents.c.kind == "project",
+                 documents.c.document_id == session["payload"]["project_id"])
+        project_row = self.repo._locked(conn, select(documents).where(*where))
+        if project_row is None or project_row["payload"].get("integration_kind") != "quick_chat":
+            raise QuickChatError("projection_changed", "内部执行容器身份不匹配，未创建任务。")
+        project = copy.deepcopy(project_row["payload"])
+        scene = next(e for e in project["entities"] if e["type"] == "scene")
+        revision_id = "revision-"+uuid.uuid4().hex
+        version = card["version"] if card["payload"].get("current_revision_id") is None else card["version"]+1
+        explicit = snapshot["controls"].get("seed")
+        seeds = [str((int(explicit)+i) % (1 << 64)) if explicit is not None else str(secrets.randbits(64)) for i in range(snapshot["copies"])]
+        digest = request_hash({"snapshot": snapshot, "seeds": seeds})
+        items = []
+        for index, seed in enumerate(seeds):
+            item_id = "item-"+uuid.uuid5(uuid.NAMESPACE_URL, revision_id+":"+str(index)).hex
+            shot_id = "shot-"+uuid.uuid5(uuid.NAMESPACE_URL, item_id).hex
+            shot = new_entity(project, {"id": shot_id, "type": "shot", "parentId": scene["id"],
+                "title": snapshot["title"]+f" · {index+1}", "data": {"seconds": snapshot["controls"].get("duration", 5),
+                    "prompt": snapshot["prompt"], "quickChatProjection": {"session_id": session["id"],
+                        "revision_id": revision_id, "item_id": item_id, "requested_input_hash": digest}}})
+            configure(project, {"shot_id": shot_id, "recipe_id": snapshot["recipe_id"], "prompt": snapshot["prompt"],
+                "controls": {**snapshot["controls"], "seed": seed}, "inputs": snapshot["inputs"]}, sources)
+            from .source_snapshot import source_snapshot
+            items.append({"id": item_id, "index": index, "seed": seed, "shot_id": shot_id,
+                "projection_hash": source_snapshot(project, shot_id)})
+        project["updatedAt"] = now_iso()
+        validate_project(project, self.settings.max_project_bytes)
+        conn.execute(update(documents).where(*where).values(payload=project, version=project_row["version"]+1, updated_at=self.repo.clock()))
+        append_activity(conn, tenant_id=self.tenant, principal=principal, project_id=project["id"], version=project_row["version"]+1,
+            occurred_at=self.repo.clock(), before=project_row["payload"], after=project,
+            actions=[{"op": "entity.create", "entity": {"id": v["shot_id"]}} for v in items], event_type="project.edited")
+        revision = self._new(conn, principal, session["id"], "revision", {**snapshot, "card_id": card["id"],
+            "version": version, "turn_id": card["payload"].get("turn_id"), "source_revision_id": source_revision,
+            "input_hash": digest, "requested_input_hash": digest, "items": items}, ident=revision_id, parent=card["id"],
+            business=card["id"]+":"+str(version))
+        self._put(conn, card, {**card["payload"], "current_revision_id": revision_id, "title": snapshot["title"]},
+            bump=card["payload"].get("current_revision_id") is not None)
+        self._event(conn, principal, session, "card.created" if version == 1 else "card.revised", revision_id)
+        return revision
+
+    def save_card(self, principal, session_id, body, key, *, card_id=None):
+        allowed = {"title", "prompt", "recipe_id", "controls", "inputs", "copies", "turn_id", "source_revision_id", "expected_card_version"}
+        fields(body, allowed, {"prompt", "recipe_id", "controls", "inputs", "copies"})
+        session = self._access(principal, session_id, "projects:read", "projects:write")
+        namespace = "card:"+(card_id or session_id)
+        # Authorize before replay. A replay need not re-resolve changed references.
+        with self.repo.engine.connect() as conn:
+            prior = self._replay(conn, principal, namespace, key, body)
+        if prior:
+            revision = self.get_revision(principal, session_id, prior)
+            return {"card": self.get_card(principal, session_id, revision["card_id"]), "revision": revision}
+        snapshot, sources = self._card_snapshot(principal, session, body)
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "projects:write", conn=conn, lock=True)
+            prior = self._replay(conn, principal, namespace, key, body)
+            if prior:
+                revision = self._get(conn, principal, prior, session_id, "revision")
+            else:
+                if body.get("turn_id"):
+                    self._get(conn, principal, body["turn_id"], session_id, "turn")
+                if body.get("source_revision_id"):
+                    self._get(conn, principal, body["source_revision_id"], session_id, "revision")
+                if card_id:
+                    card = self._get(conn, principal, card_id, session_id, "card", lock=True)
+                    self._version(card, body.get("expected_card_version"))
+                else:
+                    card = self._new(conn, principal, session_id, "card", {"title": snapshot["title"],
+                        "turn_id": body.get("turn_id"), "current_revision_id": None})
+                revision = self._create_revision(conn, principal, session, card, snapshot, sources, body.get("source_revision_id"))
+                self._remember(conn, principal, namespace, key, body, revision["id"])
+        return {"card": self.get_card(principal, session_id, revision["payload"]["card_id"]),
+                "revision": self.get_revision(principal, session_id, revision["id"])}
+
+    def get_revision(self, principal, session_id, revision_id):
+        self._access(principal, session_id, "projects:read")
+        with self.repo.engine.connect() as conn:
+            row = self._get(conn, principal, revision_id, session_id, "revision")
+        return {**row["payload"], "id": row["id"], "created_at": row["created_at"],
+            "web_url": "/quick-chat?session="+session_id+"&revision="+row["id"]}
+
+    def get_card(self, principal, session_id, card_id):
+        self._access(principal, session_id, "projects:read")
+        with self.repo.engine.connect() as conn:
+            card = self._get(conn, principal, card_id, session_id, "card")
+            rows = conn.execute(select(objects.c.id, objects.c.payload, objects.c.created_at).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id, objects.c.kind == "revision",
+                objects.c.parent_id == card_id).order_by(objects.c.created_at, objects.c.id).limit(100)).mappings()
+            summaries = [{"id": r["id"], "version": r["payload"]["version"], "created_at": r["created_at"],
+                "input_hash": r["payload"]["input_hash"]} for r in rows]
+        return {**card["payload"], "id": card_id, "version": card["version"], "revisions": summaries,
+            "web_url": "/quick-chat?session="+session_id+"&card="+card_id}
+
+    def _projection(self, principal, session, revision, item):
+        scope = Scope(self.tenant, principal.owner, "__projects")
+        record = self.repo.get_document(scope, "project", session["payload"]["project_id"])
+        from .source_snapshot import source_snapshot
+        if (record["payload"].get("integration_kind") != "quick_chat"
+                or source_snapshot(record["payload"], item["shot_id"]) != item["projection_hash"]):
+            raise QuickChatError("projection_changed", "执行投影与保存版本不一致；没有提交或覆盖任务。")
+        return record["payload"]
+
+    def preflight(self, principal, session_id, revision_id, body, key):
+        fields(body, {"capabilities_version", "revision_hash", "item_ids", "retry_of_execution_id"}, {"capabilities_version", "revision_hash"})
+        if body["capabilities_version"] != VERSION:
+            raise QuickChatError("preflight_stale", "生成能力已更新，请重新加载后预检。")
+        session = self._access(principal, session_id, "projects:read", "jobs:write")
+        revision = self.get_revision(principal, session_id, revision_id)
+        if body["revision_hash"] != revision["input_hash"]:
+            raise QuickChatError("revision_hash_conflict", "任务卡内容校验不匹配。")
+        selected = body.get("item_ids", [i["id"] for i in revision["items"]])
+        if not isinstance(selected, list) or not selected or len(set(selected)) != len(selected) or set(selected)-{i["id"] for i in revision["items"]}:
+            raise QuickChatError("invalid_item_selection", "请选择这个版本中的不同生成项。", 422)
+        namespace = "preflight:"+revision_id
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "jobs:write", conn=conn, lock=True)
+            prior = self._replay(conn, principal, namespace, key, body)
+            if prior:
+                record = self._get(conn, principal, prior, session_id, "preflight")
+            else:
+                existing = conn.execute(select(objects).where(objects.c.tenant == self.tenant, objects.c.owner == principal.owner,
+                    objects.c.kind == "submission", objects.c.business_key == revision_id)).mappings().first()
+                if existing:
+                    for item_id in selected:
+                        live = self._get(conn, principal, item_id, session_id, "item")
+                        self._safe_unexecuted_or_failed(conn, principal, live, allow_failed=True)
+                record = self._new(conn, principal, session_id, "preflight", {"revision_id": revision_id,
+                    "revision_hash": revision["input_hash"], "status": "checking", "items": [{"item_id": i["id"],
+                        "index": i["index"], "seed": i["seed"], "plan": None, "error_code": None} for i in revision["items"] if i["id"] in selected],
+                    "retry_of_execution_id": body.get("retry_of_execution_id"), "expires_at": None}, parent=revision_id)
+                self._remember(conn, principal, namespace, key, body, record["id"])
+        if self.hooks is None:
+            raise QuickChatError("execution_adapter_unavailable", "执行预检尚未配置。", 503)
+        for index, entry in enumerate(record["payload"]["items"]):
+            if entry["plan"] or entry["error_code"]:
+                continue
+            item = next(i for i in revision["items"] if i["id"] == entry["item_id"])
+            try:
+                project = self._projection(principal, session, revision, item)
+                plan = self.hooks.preflight(principal, project, item["shot_id"])
+                digest = request_hash({"effective_request": plan.get("effective_request"), "output_spec": plan.get("output_spec"),
+                    "request_hash": plan.get("request_hash"), "plan_id": plan["plan_id"]})
+                value = {**entry, "plan": canonical(plan), "resolved_execution_hash": digest}
+            except (ValueError, Conflict, BudgetExceeded, QuickChatError) as exc:
+                value = {**entry, "error_code": exc.code if isinstance(exc, QuickChatError) else "preflight_rejected"}
+                # Only audited static validation text becomes public detail.
+                # Other exceptions may contain private input, paths or provider
+                # diagnostics; never serialize their arguments or str(exc).
+                if isinstance(exc, ValueError) and exc.args == (
+                        "Reference video exceeds the output length; increase duration or explicitly trim the reference",):
+                    value.update(error_code="reference_video_exceeds_output",
+                        error_message="参考视频比输出时长长，请增加生成时长或选取更短片段。")
+            with self.repo.transaction() as conn:
+                current = self._get(conn, principal, record["id"], session_id, "preflight", lock=True)
+                items = copy.deepcopy(current["payload"]["items"])
+                if items[index]["plan"] is None and not items[index]["error_code"]:
+                    items[index] = value
+                    self._put(conn, current, {**current["payload"], "items": items})
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "jobs:write", conn=conn, lock=True)
+            current = self._get(conn, principal, record["id"], session_id, "preflight", lock=True)
+            p = current["payload"]
+            if p["status"] == "checking":
+                plans = [i["plan"] for i in p["items"] if i["plan"]]
+                ready = len(plans) == len(p["items"]) and all(v["status"] == "ready" for v in plans)
+                p = {**p, "status": "ready" if ready else "blocked",
+                    "expires_at": min((v["expires_at"] for v in plans), default=self.repo.clock()),
+                    "estimate_available": len(plans) == len(p["items"]) and all(
+                        v.get("estimate", {}).get("cost_microusd") is not None for v in plans),
+                    "estimate": {"currency": "USD", "cost_microusd": sum((v.get("estimate", {}).get("cost_microusd") or 0) for v in plans),
+                        "kind": "budget_reservation", "final_bill": False}}
+                self._put(conn, current, p)
+                self._event(conn, principal, session, "preflight.completed", current["id"])
+        return self.get_preflight(principal, session_id, record["id"])
+
+    def get_preflight(self, principal, session_id, ident):
+        self._access(principal, session_id, "projects:read", "jobs:write")
+        with self.repo.engine.connect() as conn:
+            row = self._get(conn, principal, ident, session_id, "preflight")
+        stale = row["payload"].get("expires_at") is not None and row["payload"]["expires_at"] <= self.repo.clock()
+        return {**row["payload"], "id": ident, "created_at": row["created_at"],
+            "stale": stale, "stale_reason": "expired" if stale else None}
+
+    def _check_preflight(self, conn, principal, session_id, ident, revision_id, item_ids):
+        row = self._get(conn, principal, ident, session_id, "preflight")
+        p = row["payload"]
+        if (p["revision_id"] != revision_id or p["status"] != "ready" or p["expires_at"] <= self.repo.clock()
+                or {i["item_id"] for i in p["items"]} != set(item_ids)):
+            raise QuickChatError("preflight_stale", "请对指定生成项重新预检并确认费用。")
+        return p
+
+    def _execution(self, conn, principal, session_id, item, plan_id, *, retry_of=None):
+        business = "retry:"+retry_of if retry_of else "initial:"+item["id"]
+        execution = self._new(conn, principal, session_id, "execution", {"item_id": item["id"],
+            "plan_id": plan_id, "job_id": None, "status": "pending_admission", "error_code": None,
+            "retry_of_execution_id": retry_of, "actor_id": principal.actor_id}, parent=item["id"], business=business)
+        self._put(conn, item, {**item["payload"], "current_execution_id": execution["id"], "cancel_requested": False})
+        return execution
+
+    def submit(self, principal, session_id, revision_id, body, key):
+        fields(body, {"preflight_id", "revision_hash", "confirmed"}, {"preflight_id", "revision_hash", "confirmed"})
+        if body["confirmed"] is not True:
+            raise QuickChatError("confirmation_required", "请明确确认这份预检和整批费用。", 422)
+        revision = self.get_revision(principal, session_id, revision_id)
+        if body["revision_hash"] != revision["input_hash"]:
+            raise QuickChatError("revision_hash_conflict", "任务卡校验不匹配。")
+        namespace = "submit:"+revision_id
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "jobs:write", conn=conn, lock=True)
+            prior = self._replay(conn, principal, namespace, key, body)
+            existing = conn.execute(select(objects).where(objects.c.tenant == self.tenant, objects.c.owner == principal.owner,
+                objects.c.kind == "submission", objects.c.business_key == revision_id)).mappings().first()
+            if existing:
+                submission = dict(existing)
+                if not prior:
+                    self._remember(conn, principal, namespace, key, body, submission["id"])
+            else:
+                p = self._check_preflight(conn, principal, session_id, body["preflight_id"], revision_id, [i["id"] for i in revision["items"]])
+                submission = self._new(conn, principal, session_id, "submission", {"revision_id": revision_id,
+                    "preflight_id": body["preflight_id"], "actor_id": principal.actor_id, "cancel_requested": False},
+                    parent=revision_id, business=revision_id)
+                for entry in revision["items"]:
+                    item = self._new(conn, principal, session_id, "item", {**entry, "revision_id": revision_id,
+                        "submission_id": submission["id"], "current_execution_id": None}, ident=entry["id"], parent=submission["id"])
+                    plan = next(v["plan"] for v in p["items"] if v["item_id"] == item["id"])
+                    self._execution(conn, principal, session_id, item, plan["plan_id"])
+                self._remember(conn, principal, namespace, key, body, submission["id"])
+                self._event(conn, principal, session, "submission.confirmed", submission["id"])
+        if not existing or prior:
+            self._admit(principal, session_id, submission["id"])
+        return self.get_submission(principal, session_id, submission["id"])
+
+    def _admit(self, principal, session_id, submission_id, selected=None, *, allow_blocked=False):
+        session = self._access(principal, session_id, "jobs:write")
+        if self.hooks is None:
+            raise QuickChatError("execution_adapter_unavailable", "执行入口尚未配置；确认记录保留。", 503)
+        with self.repo.engine.connect() as conn:
+            submission = self._get(conn, principal, submission_id, session_id, "submission")
+            items = [dict(r) for r in conn.execute(select(objects).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id, objects.c.kind == "item",
+                objects.c.parent_id == submission_id)).mappings()]
+        for item in items:
+            if selected is not None and item["id"] not in selected:
+                continue
+            # Cancellation is a durable obligation, checked on both sides of
+            # job creation. The queue CAS handles a cancel/enqueue race once
+            # the job is linked; never mark a linked job falsely cancelled.
+            with self.repo.transaction() as conn:
+                latest_submission = self._get(conn, principal, submission_id, session_id, "submission", lock=True)
+                item = self._get(conn, principal, item["id"], session_id, "item", lock=True)
+                execution = self._get(conn, principal, item["payload"]["current_execution_id"], session_id, "execution", lock=True)
+                cancel_requested = latest_submission["payload"]["cancel_requested"] or item["payload"].get("cancel_requested", False)
+                if cancel_requested and not execution["payload"]["job_id"]:
+                    self._put(conn, execution, {**execution["payload"], "status": "cancelled"})
+                    continue
+            if execution["payload"]["status"] not in ({"pending_admission", "admission_blocked"} if allow_blocked else {"pending_admission"}):
+                continue
+            try:
+                p = execution["payload"]
+                job = self.hooks.create_planned(principal, p["plan_id"], execution["id"]) if not p["job_id"] else self.repo.get_job_for_owner(self.tenant, principal.owner, p["job_id"])
+                with self.repo.transaction() as conn:
+                    latest = self._get(conn, principal, submission_id, session_id, "submission", lock=True)
+                    current_item = self._get(conn, principal, item["id"], session_id, "item", lock=True)
+                    current = self._get(conn, principal, execution["id"], session_id, "execution", lock=True)
+                    if current["payload"]["job_id"] not in (None, job["id"]):
+                        raise QuickChatError("execution_identity_conflict", "已保存的任务身份不一致。")
+                    self._put(conn, current, {**current["payload"], "job_id": job["id"]})
+                    cancel_requested = latest["payload"]["cancel_requested"] or current_item["payload"].get("cancel_requested", False)
+                if cancel_requested:
+                    job = self.hooks.cancel(principal, job["id"])
+                elif job["status"] in {"planned", "blocked"}:
+                    try:
+                        job = self.hooks.enqueue(principal, job)
+                    except Conflict:
+                        job = self.repo.get_job_for_owner(self.tenant, principal.owner, job["id"])
+                        if job["status"] in {"planned", "blocked"}:
+                            raise
+                with self.repo.transaction() as conn:
+                    current = self._get(conn, principal, execution["id"], session_id, "execution", lock=True)
+                    self._put(conn, current, {**current["payload"], "status": "admitted", "error_code": None})
+            except (Conflict, BudgetExceeded, ValueError, QuickChatError) as error:
+                code = error.code if isinstance(error, QuickChatError) else "budget_exceeded" if isinstance(error, BudgetExceeded) else "admission_blocked"
+                with self.repo.transaction() as conn:
+                    current = self._get(conn, principal, execution["id"], session_id, "execution", lock=True)
+                    self._put(conn, current, {**current["payload"], "status": "admission_blocked", "error_code": code})
+
+    def get_submission(self, principal, session_id, submission_id):
+        self._access(principal, session_id, "projects:read", "jobs:read")
+        with self.repo.engine.connect() as conn:
+            row = self._get(conn, principal, submission_id, session_id, "submission")
+            children = [dict(r) for r in conn.execute(select(objects).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id, objects.c.kind == "item",
+                objects.c.parent_id == submission_id)).mappings()]
+            executions = [dict(r) for r in conn.execute(select(objects).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id, objects.c.kind == "execution",
+                objects.c.parent_id.in_([c["id"] for c in children]))).mappings()]
+        values = []
+        for child in sorted(children, key=lambda r: r["payload"]["index"]):
+            history = [{**r["payload"], "id": r["id"], "created_at": r["created_at"]} for r in executions if r["parent_id"] == child["id"]]
+            current = next(e for e in history if e["id"] == child["payload"]["current_execution_id"])
+            job = self.hooks.public_job(principal, current["job_id"]) if current["job_id"] and self.hooks else None
+            status = job["status"] if job else current["status"]
+            if current["status"] in {"unknown", "recovery_hold"}:
+                status = current["status"]
+            if job and status in {"planned", "blocked"} and current["error_code"]:
+                status = "admission_blocked"
+            retryable, resumable = False, False
+            if principal.allows(self._access(principal, session_id)["payload"]["project_id"], "jobs:write"):
+                try:
+                    with self.repo.engine.connect() as conn:
+                        safe_execution, safe_job = self._safe_unexecuted_or_failed(conn, principal, child, allow_failed=True, lock=False)
+                    retryable = bool(safe_job and safe_job["status"] in {"failed", "cancelled"})
+                    resumable = (not row["payload"]["cancel_requested"] and not child["payload"].get("cancel_requested", False)
+                        and safe_execution["payload"]["status"] in {"pending_admission", "admission_blocked"}
+                        and (safe_job is None or safe_job["status"] in {"planned", "blocked"}))
+                except (QuickChatError, Conflict, NotFound):
+                    pass
+            values.append({**child["payload"], "id": child["id"], "status": status,
+                "error_code": (job or {}).get("error_code") or current["error_code"], "job_id": current["job_id"],
+                "job": job, "executions": history, "retryable": retryable, "resume_admission_available": resumable})
+        states = [v["status"] for v in values]
+        terminal = {"succeeded", "failed", "cancelled"}
+        status = "completed" if states and all(s == "succeeded" for s in states) else (
+            "finished_with_issues" if states and all(s in terminal for s in states) else "active")
+        return {**row["payload"], "id": submission_id, "items": values, "status": status,
+            "counts": {s: states.count(s) for s in sorted(set(states))}, "created_at": row["created_at"],
+            "updated_at": max([row["updated_at"], *((i["job"] or {}).get("updated_at", row["updated_at"]) for i in values)]),
+            "web_url": "/quick-chat?session="+session_id+"&submission="+submission_id}
+
+    def _safe_unexecuted_or_failed(self, conn, principal, item, *, allow_failed=False, lock=True):
+        execution = self._get(conn, principal, item["payload"]["current_execution_id"], item["session_id"], "execution", lock=lock)
+        p = execution["payload"]
+        if p["status"] in {"unknown", "recovery_hold"}:
+            raise QuickChatError("upstream_stop_unconfirmed", "恢复后的执行须先对账；不会根据缺失job ID再次生成。")
+        if not p["job_id"]:
+            if p["status"] not in {"pending_admission", "admission_blocked", "cancelled"}:
+                raise QuickChatError("upstream_stop_unconfirmed", "此项执行状态需核验；不会再次生成。")
+            return execution, None
+        job = self.repo._job(conn, p["job_id"], Scope(self.tenant, principal.owner,
+            self._get(conn, principal, item["session_id"], item["session_id"], "session")["payload"]["project_id"]), lock=lock)
+        history = conn.execute(select(attempts).where(attempts.c.job_id == job["id"])).mappings().all()
+        current_id = job.get("current_attempt_id")
+        current = next((a for a in history if a["id"] == current_id), None)
+        if current_id is not None and (current is None or job["attempt_no"] < 1
+                or current["number"] != job["attempt_no"]):
+            # An orphan reference remains an obligation even when recovered
+            # summary counters are empty or another historical row is stopped.
+            raise QuickChatError("upstream_stop_unconfirmed", "当前执行身份须先核验；不会再次生成。")
+        safe_unsubmitted = (job["status"] in {"planned", "blocked", "cancelled"} and not job["attempt_no"] and not history)
+        safe_failed = (allow_failed and job["status"] in {"failed", "cancelled"}
+            and len(history) >= job["attempt_no"] and all(a["upstream_stopped"] == 1 for a in history))
+        if job.get("lease_worker_id") or job.get("lease_expires_at") is not None or not (safe_unsubmitted or safe_failed):
+            raise QuickChatError("upstream_stop_unconfirmed", "只能恢复未执行项或已证明停止的失败项。")
+        return execution, job
+
+    def retry(self, principal, session_id, submission_id, item_id, body, key):
+        fields(body, {"retry_of_execution_id", "fresh_preflight_id", "confirmed"}, {"retry_of_execution_id", "fresh_preflight_id", "confirmed"})
+        if body["confirmed"] is not True:
+            raise QuickChatError("confirmation_required", "请确认此份重试预留费用。", 422)
+        namespace = "retry:"+item_id
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "jobs:write", conn=conn, lock=True)
+            submission = self._get(conn, principal, submission_id, session_id, "submission", lock=True)
+            item = self._get(conn, principal, item_id, session_id, "item", lock=True)
+            if item["parent_id"] != submission_id:
+                raise NotFound("item_not_found")
+            prior = self._replay(conn, principal, namespace, key, body)
+            source = self._get(conn, principal, body["retry_of_execution_id"], session_id, "execution")
+            if source["parent_id"] != item_id:
+                raise NotFound("execution_not_found")
+            existing = conn.execute(select(objects).where(objects.c.tenant == self.tenant, objects.c.owner == principal.owner,
+                objects.c.kind == "execution", objects.c.business_key == "retry:"+source["id"])).mappings().first()
+            if existing:
+                if not prior:
+                    self._remember(conn, principal, namespace, key, body, existing["id"])
+            else:
+                if item["payload"]["current_execution_id"] != source["id"]:
+                    raise QuickChatError("version_conflict", "此份已经有新的执行，请加载当前状态。")
+                if submission["payload"]["cancel_requested"]:
+                    raise QuickChatError("submission_cancelled", "整批已取消，请另建卡片版本；不会恢复已取消批次。")
+                execution, job = self._safe_unexecuted_or_failed(conn, principal, item, allow_failed=True)
+                if job is None or job["status"] not in {"failed", "cancelled"}:
+                    raise QuickChatError("use_resume_admission", "未准入项请恢复原项，不重新生成。")
+                preflight = self._check_preflight(conn, principal, session_id, body["fresh_preflight_id"],
+                    item["payload"]["revision_id"], [item_id])
+                if preflight.get("retry_of_execution_id") != source["id"]:
+                    raise QuickChatError("preflight_stale", "此预检不属于要重试的原执行。")
+                new = self._execution(conn, principal, session_id, item, preflight["items"][0]["plan"]["plan_id"], retry_of=execution["id"])
+                self._remember(conn, principal, namespace, key, body, new["id"])
+                self._event(conn, principal, session, "item.retry_requested", submission_id)
+        self._admit(principal, session_id, submission_id, [item_id])
+        return self.get_submission(principal, session_id, submission_id)
+
+    def resume_admission(self, principal, session_id, submission_id, body, key):
+        fields(body, {"item_ids", "fresh_preflight_id", "confirmed"}, {"item_ids", "fresh_preflight_id", "confirmed"})
+        if body["confirmed"] is not True or not isinstance(body["item_ids"], list) or not body["item_ids"] or len(set(body["item_ids"])) != len(body["item_ids"]):
+            raise QuickChatError("invalid_item_selection", "请明确确认要恢复的不同未准入项。", 422)
+        refresh = []
+        namespace = "resume:"+submission_id
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "jobs:write", conn=conn, lock=True)
+            submission = self._get(conn, principal, submission_id, session_id, "submission", lock=True)
+            if submission["payload"]["cancel_requested"]:
+                raise QuickChatError("cancel_requested", "已取消批次不能恢复准入；请创建新版本。")
+            prior = self._replay(conn, principal, namespace, key, body)
+            if not prior:
+                preflight = self._check_preflight(conn, principal, session_id, body["fresh_preflight_id"], submission["payload"]["revision_id"], body["item_ids"])
+                for item_id in body["item_ids"]:
+                    item = self._get(conn, principal, item_id, session_id, "item", lock=True)
+                    if item["parent_id"] != submission_id:
+                        raise NotFound("item_not_found")
+                    execution, job = self._safe_unexecuted_or_failed(conn, principal, item)
+                    if item["payload"].get("cancel_requested", False):
+                        raise QuickChatError("cancel_requested", "此项已取消，未恢复准入。")
+                    if job and job["status"] not in {"planned", "blocked"}:
+                        raise QuickChatError("use_failed_item_retry", "已取消项请使用单份重试。")
+                    plan_id = next(i["plan"]["plan_id"] for i in preflight["items"] if i["item_id"] == item_id)
+                    payload = {**execution["payload"], "resume_plan_id": plan_id, "status": "pending_admission", "error_code": None}
+                    if not job:
+                        payload["plan_id"] = plan_id
+                        payload["resume_plan_id"] = None
+                    elif execution["payload"].get("resume_plan_id"):
+                        raise QuickChatError("admission_resume_active", "原恢复命令尚未对账，请先查看或恢复该命令；不会叠加另一份计划。")
+                    self._put(conn, execution, payload)
+                self._remember(conn, principal, namespace, key, body, submission_id)
+                self._event(conn, principal, session, "submission.admission_resumed", submission_id)
+            for item_id in body["item_ids"]:
+                item = self._get(conn, principal, item_id, session_id, "item")
+                execution = self._get(conn, principal, item["payload"]["current_execution_id"], session_id, "execution")
+                if execution["payload"].get("resume_plan_id") and execution["payload"]["job_id"]:
+                    refresh.append(execution)
+        blocked = set()
+        for execution in refresh:
+            if not self.hooks or self.hooks.refresh_planned is None:
+                raise QuickChatError("preflight_stale", "此原计划已过期，安全刷新尚未配置；任务保留。")
+            p = execution["payload"]
+            try:
+                self.hooks.refresh_planned(principal, p["job_id"], p["resume_plan_id"])
+            except (Conflict, BudgetExceeded, ValueError, QuickChatError):
+                with self.repo.transaction() as conn:
+                    current = self._get(conn, principal, execution["id"], session_id, "execution", lock=True)
+                    if current["payload"].get("resume_plan_id") == p["resume_plan_id"]:
+                        self._put(conn, current, {**current["payload"], "resume_plan_id": None,
+                            "status": "admission_blocked", "error_code": "admission_refresh_blocked"})
+                blocked.add(p["item_id"])
+                continue
+            with self.repo.transaction() as conn:
+                current = self._get(conn, principal, execution["id"], session_id, "execution", lock=True)
+                if current["payload"].get("resume_plan_id") == p["resume_plan_id"]:
+                    self._put(conn, current, {**current["payload"], "plan_id": p["resume_plan_id"], "resume_plan_id": None})
+        self._admit(principal, session_id, submission_id, [i for i in body["item_ids"] if i not in blocked])
+        return self.get_submission(principal, session_id, submission_id)
+
+    def cancel(self, principal, session_id, submission_id, body, key):
+        fields(body, {"item_ids"})
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "jobs:write", conn=conn, lock=True)
+            submission = self._get(conn, principal, submission_id, session_id, "submission", lock=True)
+            items = [dict(r) for r in conn.execute(select(objects).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id, objects.c.kind == "item", objects.c.parent_id == submission_id)).mappings()]
+            selected = body.get("item_ids", [i["id"] for i in items])
+            if not isinstance(selected, list) or not selected or set(selected)-{i["id"] for i in items}:
+                raise QuickChatError("invalid_item_selection", "取消项不属于此批次。", 422)
+            prior = self._replay(conn, principal, "cancel:"+submission_id, key, body)
+            if not prior:
+                if set(selected) == {i["id"] for i in items}:
+                    self._put(conn, submission, {**submission["payload"], "cancel_requested": True})
+                for item in items:
+                    if item["id"] in selected:
+                        self._put(conn, item, {**item["payload"], "cancel_requested": True})
+                self._remember(conn, principal, "cancel:"+submission_id, key, body, submission_id)
+                self._event(conn, principal, session, "submission.cancel_requested", submission_id)
+            executions = [self._get(conn, principal, i["payload"]["current_execution_id"], session_id, "execution") for i in items if i["id"] in selected]
+        for execution in executions:
+            if execution["payload"]["job_id"]:
+                self.hooks.cancel(principal, execution["payload"]["job_id"])
+            else:
+                with self.repo.transaction() as conn:
+                    current = self._get(conn, principal, execution["id"], session_id, "execution", lock=True)
+                    self._put(conn, current, {**current["payload"], "status": "cancelled"})
+        return self.get_submission(principal, session_id, submission_id)
+
+    def create_turn(self, principal, session_id, body, key):
+        fields(body, {"expected_version", "text", "model_id", "assistant_mode", "create_card"}, {"expected_version", "text", "model_id"})
+        if not isinstance(body["text"], str) or not body["text"].strip() or len(body["text"])>16000:
+            raise QuickChatError("invalid_text", "请输入1–16000字符。", 422)
+        model = model_check(body["model_id"])
+        mode = body.get("assistant_mode", "assist")
+        if mode not in {"none", "assist", "discuss"}:
+            raise QuickChatError("invalid_assistant_mode", "助手方式无效。", 422)
+        create_card = body.get("create_card", False)
+        if type(create_card) is not bool or create_card and mode != "none":
+            raise QuickChatError("invalid_card_creation", "直接创建任务卡须明确使用assistant_mode=none、create_card=true。", 422)
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "projects:write", conn=conn, lock=True)
+            if mode != "none" and principal.machine and not principal.allows(session["payload"]["project_id"], "assistant:run"):
+                raise QuickChatError("insufficient_scope", "文本调用需要独立assistant:run授权；仍可直接保存任务卡。", 403)
+            prior = self._replay(conn, principal, "turn:"+session_id, key, body)
+            if prior:
+                turn = self._get(conn, principal, prior, session_id, "turn")
+            else:
+                self._version(session, body["expected_version"])
+                if mode != "none" and session["payload"]["active_turn_id"]:
+                    raise QuickChatError("assistant_run_active", "上一轮助手仍在运行或待核验，请先查看原记录。")
+                latest_card = conn.execute(select(events.c.resource_id).where(events.c.tenant == self.tenant,
+                    events.c.owner == principal.owner, events.c.session_id == session_id,
+                    events.c.type.in_(["card.created", "card.revised"])).order_by(events.c.seq.desc()).limit(1)).scalar_one_or_none()
+                active_bindings = self._effective_bindings(session["payload"]["bindings"], session["payload"]["next_settings"]["recipe_id"])
+                payload = {"text": body["text"], "model_id": model, "assistant_mode": mode,
+                    "input_refs": self._inputs(active_bindings), "next_settings": session["payload"]["next_settings"],
+                    "bindings": active_bindings, "input_exclusions": [{"binding_id": b["binding_id"], "asset_id": b["asset_id"],
+                        "reason": b["inactive_reason"]} for b in active_bindings if b["inactive_reason"]],
+                    "status": "recorded" if mode == "none" else "pending",
+                    "reply": None, "error_code": None, "card_id": None, "context_revision_id": latest_card,
+                    "assistant_run": {"id": "run-"+uuid.uuid4().hex,
+                        "status": "recorded" if mode == "none" else "pending", "usage": {}, "media_input_manifest": [], "fence": 0}}
+                turn = self._new(conn, principal, session_id, "turn", payload)
+                seq = self._event(conn, principal, session, "turn.created", turn["id"])
+                self._put(conn, turn, {**payload, "seq": seq})
+                if create_card:
+                    # The explicit no-assistant command stores the turn and its
+                    # first card atomically, using exactly the frozen inputs and
+                    # settings. No preflight, provider or queue operation occurs.
+                    snapshot, sources = self._card_snapshot(principal, session, {
+                        **payload["next_settings"], "prompt": payload["text"],
+                        "title": payload["text"].strip()[:40], "inputs": payload["input_refs"]})
+                    card = self._new(conn, principal, session_id, "card", {
+                        "title": snapshot["title"], "turn_id": turn["id"], "current_revision_id": None})
+                    self._create_revision(conn, principal, session, card, snapshot, sources)
+                    self._put(conn, turn, {**turn["payload"], "card_id": card["id"]})
+                self._put(conn, session, {**session["payload"], "model_id": model,
+                    "active_turn_id": turn["id"] if mode != "none" else session["payload"]["active_turn_id"]}, bump=True)
+                self._remember(conn, principal, "turn:"+session_id, key, body, turn["id"])
+        if not prior and mode != "none":
+            self._run_assistant(principal, session_id, turn["id"])
+        return self.get_turn(principal, session_id, turn["id"])
+
+    def _run_assistant(self, principal, session_id, turn_id):
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "projects:write", conn=conn, lock=True)
+            turn = self._get(conn, principal, turn_id, session_id, "turn", lock=True)
+            if turn["payload"]["status"] != "pending":
+                return
+            p = copy.deepcopy(turn["payload"])
+            if not self.assistant_enabled or self.assistant is None:
+                p.update(status="failed", error_code="assistant_disabled")
+                p["assistant_run"]["status"] = "failed"
+                self._put(conn, turn, p)
+                self._put(conn, session, {**session["payload"], "active_turn_id": None})
+                self._event(conn, principal, session, "assistant.failed", turn_id)
+                return
+            p["status"] = p["assistant_run"]["status"] = "running"
+            p["assistant_run"].update(started_at=self.repo.clock(), fence=1)
+            self._put(conn, turn, p)
+            previous = [dict(r) for r in conn.execute(select(objects).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id, objects.c.kind == "turn",
+                objects.c.payload["seq"].as_integer() < p["seq"], objects.c.payload["reply"].as_string().is_not(None))
+                .order_by(objects.c.payload["seq"].as_integer().desc()).limit(20)).mappings()]
+            previous.reverse()
+        messages = []
+        for old in previous:
+            if old["payload"].get("reply"):
+                messages.extend([{"role": "user", "text": old["payload"]["text"]}, {"role": "model", "text": old["payload"]["reply"]}])
+        messages.append({"role": "user", "text": p["text"]})
+        try:
+            if (any(b["enabled"] and b.get("source_range") for b in p["bindings"])
+                    and not principal.allows(session["payload"]["project_id"], "assets:write")):
+                raise QuickChatError("insufficient_scope", "助手使用选段需要assets:write以创建受限派生收据；未请求上游。", 403)
+            if len(previous) > 19 or sum(len(m["text"]) for m in messages) > 45000 or any(len(m["text"])>16000 for m in messages):
+                raise QuickChatError("context_limit", "已到完整上下文上限；输入已保存，未调用模型。请另开创作或显式整理上下文。", 422)
+            related = self.get_revision(principal, session_id, p["context_revision_id"]) if p.get("context_revision_id") else None
+            lineage = []
+            parent = related.get("source_revision_id") if related else None
+            for _ in range(4):
+                if not parent:
+                    break
+                value = self.get_revision(principal, session_id, parent)
+                lineage.append({k: value.get(k) for k in ("id", "card_id", "version", "source_revision_id", "input_hash")})
+                parent = value.get("source_revision_id")
+            context = {"owner": principal.owner, "session_id": session_id, "turn_id": turn_id, "bindings": p["bindings"], "inputs": p["input_refs"],
+                "history_turn_ids": [r["id"] for r in previous if r["payload"].get("reply")], "assistant_mode": p["assistant_mode"],
+                "related_card": related, "lineage": lineage, "input_exclusions": p.get("input_exclusions", []),
+                "assets": {b["asset_id"]: self._asset(principal, session, b["asset_id"]) for b in p["bindings"] if b["enabled"]}}
+            def record_manifest(manifest):
+                with self.repo.transaction() as conn:
+                    current = self._get(conn, principal, turn_id, session_id, "turn", lock=True)
+                    if current["payload"]["status"] != "running" or current["payload"]["assistant_run"]["fence"] != 1:
+                        raise QuickChatError("assistant_run_fenced", "原调用已被恢复流程隔离，未再次提交。")
+                    payload = copy.deepcopy(current["payload"])
+                    payload["assistant_run"].update(media_input_manifest=canonical(manifest),
+                        context_turn_ids=context["history_turn_ids"], context_revision_id=p.get("context_revision_id"),
+                        context_revision_hash=related.get("input_hash") if related else None, context_lineage=lineage,
+                        input_exclusions=context["input_exclusions"],
+                        request_prepared_at=self.repo.clock())
+                    self._put(conn, current, payload)
+            context["record_manifest"] = record_manifest
+            # Even a text-only adapter receives a durable context receipt.
+            record_manifest([])
+            result = self.assistant.complete(p["model_id"], messages, context, p["next_settings"])
+            if (not isinstance(result, dict) or not isinstance(result.get("reply"), str) or not result["reply"].strip()
+                    or len(result["reply"])>24000):
+                raise QuickChatError("assistant_invalid_response", "助手响应格式无效，原输入已保留。", 502)
+            proposal = result.get("card")
+            prepared = None
+            if proposal and p["assistant_mode"] != "discuss":
+                fields(proposal, {"title", "prompt", "controls", "recipe_id", "inputs", "copies"}, {"prompt"})
+                inherited = ({k: related[k] for k in ("recipe_id", "controls", "copies")} if related else copy.deepcopy(p["next_settings"]))
+                try:
+                    controls_patch = proposal.get("controls", {})
+                    validate_controls_patch(controls_patch)
+                except (ValueError, TypeError):
+                    raise QuickChatError("assistant_invalid_response", "助手建议参数无效，未创建卡片。", 502) from None
+                inherited["controls"] = {**inherited["controls"], **controls_patch}
+                proposed_inputs = proposal.get("inputs", p["input_refs"])
+                active_ids = {ident for _, _, ident in input_entries(p["input_refs"])}
+                if any(ident not in active_ids for _, _, ident in input_entries(proposed_inputs)):
+                    raise QuickChatError("reference_conflict", "助手不能启用用户本轮未选择的素材；未创建卡片。", 422)
+                prepared = self._card_snapshot(principal, session, {**inherited, **{k: v for k, v in proposal.items() if k != "controls"},
+                    "inputs": proposed_inputs, "prompt": proposal["prompt"], "title": proposal.get("title", related["title"] if related else "我的视频")})
+            with self.repo.transaction() as conn:
+                session = self._access(principal, session_id, "projects:read", "projects:write", conn=conn, lock=True)
+                turn = self._get(conn, principal, turn_id, session_id, "turn", lock=True)
+                if turn["payload"]["status"] != "running" or turn["payload"]["assistant_run"]["fence"] != 1:
+                    return
+                p = copy.deepcopy(turn["payload"])
+                p.update(status="completed", reply=result["reply"], error_code=None)
+                p["assistant_run"].update(status="completed", completed_at=self.repo.clock(),
+                    usage=canonical(result.get("usage", {})), media_input_manifest=canonical(result.get("media_input_manifest", [])),
+                    context_turn_ids=context["history_turn_ids"])
+                if prepared:
+                    card = self._new(conn, principal, session_id, "card", {"title": prepared[0]["title"], "turn_id": turn_id, "current_revision_id": None})
+                    self._create_revision(conn, principal, session, card, *prepared, source_revision=p.get("context_revision_id"))
+                    p["card_id"] = card["id"]
+                self._put(conn, turn, p)
+                self._put(conn, session, {**session["payload"], "active_turn_id": None})
+                self._event(conn, principal, session, "assistant.completed", turn_id)
+        except Exception as error:
+            code = getattr(error, "code", "assistant_invalid_response" if isinstance(error, ValueError) else "assistant_call_unknown")
+            unknown = code in {"upstream_timeout", "connection_failed", "assistant_call_unknown"}
+            with self.repo.transaction() as conn:
+                session = self._access(principal, session_id, "projects:write", conn=conn, lock=True)
+                turn = self._get(conn, principal, turn_id, session_id, "turn", lock=True)
+                if turn["payload"]["status"] != "running" or turn["payload"]["assistant_run"]["fence"] != 1:
+                    return
+                p = copy.deepcopy(turn["payload"])
+                p.update(status="unknown" if unknown else "failed", error_code="assistant_call_unknown" if unknown else code)
+                p["assistant_run"].update(status=p["status"], error_code=p["error_code"], completed_at=self.repo.clock())
+                self._put(conn, turn, p)
+                if not unknown:
+                    self._put(conn, session, {**session["payload"], "active_turn_id": None})
+                self._event(conn, principal, session, "assistant.unknown" if unknown else "assistant.failed", turn_id)
+
+    def get_turn(self, principal, session_id, turn_id):
+        self._access(principal, session_id, "projects:read")
+        with self.repo.engine.connect() as conn:
+            row = self._get(conn, principal, turn_id, session_id, "turn")
+        return {k: v for k, v in {**row["payload"], "id": turn_id, "created_at": row["created_at"]}.items() if k != "bindings"}
+
+    def acknowledge_unknown(self, principal, session_id, turn_id, body, key):
+        fields(body, {"acknowledged"}, {"acknowledged"})
+        if body["acknowledged"] is not True:
+            raise QuickChatError("acknowledgement_required", "请明确承认原调用可能已经执行或计费。", 422)
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "projects:read", "projects:write", conn=conn, lock=True)
+            turn = self._get(conn, principal, turn_id, session_id, "turn", lock=True)
+            prior = self._replay(conn, principal, "ack:"+turn_id, key, body)
+            if not prior:
+                if turn["payload"]["status"] != "unknown":
+                    raise QuickChatError("assistant_not_unknown", "只有未知调用需要此确认。")
+                p = copy.deepcopy(turn["payload"])
+                p["assistant_run"].update(acknowledged_at=self.repo.clock(), acknowledged_by=principal.actor_id,
+                    fence=p["assistant_run"]["fence"]+1)
+                self._put(conn, turn, p)
+                if session["payload"]["active_turn_id"] == turn_id:
+                    self._put(conn, session, {**session["payload"], "active_turn_id": None}, bump=True)
+                self._remember(conn, principal, "ack:"+turn_id, key, body, turn_id)
+                self._event(conn, principal, session, "assistant.unknown_acknowledged", turn_id)
+        return self.get_turn(principal, session_id, turn_id)
+
+    def recover_assistant_runs(self, *, older_than_s=180):
+        """Explicit startup reconciliation; never called by GET, never posts upstream."""
+        with self.repo.transaction() as conn:
+            rows = [dict(r) for r in conn.execute(select(objects).where(objects.c.tenant == self.tenant,
+                objects.c.kind == "turn", objects.c.payload["status"].as_string().in_(["running", "pending"]),
+                objects.c.updated_at < self.repo.clock()-older_than_s).order_by(objects.c.updated_at, objects.c.id).limit(100)).mappings()]
+            recovered = 0
+            for row in rows:
+                principal = Principal(row["owner"], "quick-chat-recovery")
+                # Lock in the same session -> turn order as normal writes;
+                # a late response or another recovery worker may have won.
+                session = self._get(conn, principal, row["session_id"], row["session_id"], "session", lock=True)
+                row = self._get(conn, principal, row["id"], row["session_id"], "turn", lock=True)
+                if row["payload"]["status"] not in {"pending", "running"} or row["updated_at"] >= self.repo.clock()-older_than_s:
+                    continue
+                p = copy.deepcopy(row["payload"])
+                p["status"] = "unknown" if p["status"] == "running" else "failed"
+                p["error_code"] = "assistant_call_unknown" if p["status"] == "unknown" else "assistant_interrupted_before_call"
+                p["assistant_run"].update(status=p["status"], error_code=p["error_code"], fence=p["assistant_run"]["fence"]+1)
+                self._put(conn, row, p)
+                if p["status"] == "failed":
+                    if session["payload"].get("active_turn_id") == row["id"]:
+                        self._put(conn, session, {**session["payload"], "active_turn_id": None}, bump=True)
+                self._event(conn, principal, session, "assistant.recovered", row["id"])
+                recovered += 1
+            return recovered
+
+    def timeline(self, principal, session_id, *, limit=20, cursor=None, direction="older"):
+        session = self._access(principal, session_id, "projects:read")
+        if type(limit) is not int or not 1 <= limit <= 50 or direction not in {"older", "newer"}:
+            raise QuickChatError("invalid_pagination", "分页方向或大小无效。", 422)
+        boundary = cursor_decode(cursor, principal, session_id, direction) if cursor else (0 if direction == "newer" else 2147483647)
+        if type(boundary) is not int or boundary < 0:
+            raise QuickChatError("invalid_cursor", "分页位置无效。", 422)
+        stmt = select(events).where(events.c.tenant == self.tenant, events.c.owner == principal.owner,
+            events.c.session_id == session_id, events.c.seq < boundary if direction == "older" else events.c.seq > boundary)
+        with self.repo.engine.connect() as conn:
+            rows = [dict(r) for r in conn.execute(stmt.order_by(events.c.seq.desc() if direction == "older" else events.c.seq).limit(limit+1)).mappings()]
+        selected = rows[:limit]
+        values = []
+        for event in sorted(selected, key=lambda e: e["seq"]):
+            ident, kind = event["resource_id"], event["type"]
+            if kind.startswith("turn.") or kind.startswith("assistant."):
+                record = self.get_turn(principal, session_id, ident)
+            elif kind.startswith("card."):
+                record = self.get_revision(principal, session_id, ident)
+            elif kind.startswith("preflight."):
+                record = self.get_preflight(principal, session_id, ident) if principal.allows(session["payload"]["project_id"], "jobs:write") else {"id": ident, "requires_scope": "jobs:write"}
+            elif kind.startswith("submission.") or kind.startswith("item."):
+                record = self.get_submission(principal, session_id, ident) if principal.allows(session["payload"]["project_id"], "jobs:read") else {"id": ident, "requires_scope": "jobs:read"}
+            elif kind.startswith("result_import."):
+                record = self.get_result_import(principal, session_id, ident)
+            else:
+                record = self._session_public(session)
+            values.append({k: event[k] for k in ("id", "seq", "type", "actor_id", "created_at")}|{"record": record})
+        return {"events": values, "limit": limit, "has_more": len(rows)>limit,
+            "next_cursor": cursor_encode(principal, session_id, selected[-1]["seq"], direction) if len(rows)>limit else None,
+            "latest_seq": session["payload"]["latest_seq"],
+            "after_cursor": cursor_encode(principal, session_id, max((r["seq"] for r in selected), default=session["payload"]["latest_seq"]), "newer")}
+
+    def result_import(self, principal, session_id, body, key):
+        fields(body, {"source_artifact_id", "purpose", "source_range"}, {"source_artifact_id"})
+        session = self._access(principal, session_id, "projects:read", "assets:write", "jobs:read")
+        with self.repo.engine.connect() as conn:
+            row = conn.execute(select(artifacts.c.id, artifacts.c.job_id, artifacts.c.metadata, jobs.c.project_id,
+                jobs.c.status, jobs.c.execution_plan).join(jobs, artifacts.c.job_id == jobs.c.id).where(
+                artifacts.c.id == body["source_artifact_id"], jobs.c.tenant_id == self.tenant, jobs.c.owner_id == principal.owner)).mappings().first()
+        if row is None or not principal.allows(row["project_id"], "jobs:read") or row["status"] != "succeeded":
+            raise NotFound("artifact_not_found")
+        value = row["metadata"]
+        if value.get("kind") not in {"image", "video", "audio"} or value.get("validated") is not True:
+            raise QuickChatError("reference_not_ready", "产物尚未验证为可用媒体。")
+        if row["execution_plan"].get("backend") == "mock":
+            raise QuickChatError("simulated_artifact", "模拟占位不能作为真实参考素材。", 422)
+        if body.get("source_range"):
+            validate_range(body["source_range"])
+        namespace = "import:"+session_id
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "assets:write", "jobs:read", conn=conn, lock=True)
+            prior = self._replay(conn, principal, namespace, key, body)
+            if prior:
+                record = self._get(conn, principal, prior, session_id, "import")
+            else:
+                record = self._new(conn, principal, session_id, "import", {"source_artifact_id": row["id"],
+                    "source_job_id": row["job_id"], "source_sha256": value["sha256"], "source_range": body.get("source_range"),
+                    "purpose": body.get("purpose", "reference"), "status": "pending", "asset_id": None, "error_code": None})
+                self._remember(conn, principal, namespace, key, body, record["id"])
+                self._event(conn, principal, session, "result_import.created", record["id"])
+        if record["payload"]["status"] == "ready":
+            return self.get_result_import(principal, session_id, record["id"])
+        # Reconcile uploads by stable client asset identity, including lost response.
+        client_id = "chat-result-"+record["id"]
+        existing = next((a for a in self.assets.list(principal.owner, session["payload"]["project_id"])
+            if a.get("client_asset_id") == client_id), None)
+        try:
+            if existing:
+                imported = self.assets.public(self.assets.get(principal.owner, existing["asset_id"])) if existing["status"] == "ready" else self.assets.resume(principal.owner, existing["asset_id"])
+            else:
+                size = value.get("size_bytes")
+                if type(size) is not int or not 0 < size <= self.assets.max_bytes:
+                    raise QuickChatError("result_too_large", "产物超过素材导入限制。", 422)
+                # Stream through a checksum reader; no unbounded memory or external URL.
+                with self.storage.open(value["object_key"]) as source:
+                    out = io.BytesIO() if size <= 4*1024*1024 else None
+                    import tempfile
+                    with (out or tempfile.TemporaryFile()) as checked:
+                        digest, count = hashlib.sha256(), 0
+                        while True:
+                            chunk = source.read(min(1024*1024, size-count+1))
+                            if not chunk:
+                                break
+                            count += len(chunk)
+                            if count > size:
+                                raise QuickChatError("result_integrity_failed", "产物大小校验失败。")
+                            digest.update(chunk)
+                            checked.write(chunk)
+                        if count != size or digest.hexdigest() != value["sha256"]:
+                            raise QuickChatError("result_integrity_failed", "产物校验失败，未创建参考素材。")
+                        checked.seek(0)
+                        suffix = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp",
+                            "video/mp4": ".mp4", "audio/flac": ".flac", "audio/x-flac": ".flac",
+                            "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/mpeg": ".mp3"}.get(value.get("content_type", value.get("mime")))
+                        if not suffix:
+                            raise QuickChatError("result_media_unsupported", "产物已验证的媒体格式尚未接入素材导入。", 422)
+                        imported = self.assets.upload(principal.owner, session["payload"]["project_id"], checked,
+                            "result"+suffix, client_asset_id=client_id)
+            if imported["status"] != "ready":
+                raise QuickChatError("reference_not_ready", "导入素材仍在处理，请恢复原收据。")
+            # Preserve the original receipt and immutable selection intent.
+            # Derivation occurs at reference preflight, where the selected
+            # range is already part of the card hash. This import is therefore
+            # replay-safe even if the response is lost after upload completes.
+            if body.get("source_range"):
+                source_duration = imported.get("metadata", {}).get("source_duration")
+                if type(source_duration) not in (int, float) or body["source_range"]["end"] > source_duration:
+                    raise QuickChatError("invalid_source_range", "导入片段超出已验证素材时长。", 422)
+            with self.repo.transaction() as conn:
+                current = self._get(conn, principal, record["id"], session_id, "import", lock=True)
+                self._put(conn, current, {**current["payload"], "status": "ready", "asset_id": imported["asset_id"],
+                    "original_asset_id": imported["asset_id"], "error_code": None})
+        except Exception as error:
+            code = error.code if isinstance(error, QuickChatError) else "result_import_unknown"
+            with self.repo.transaction() as conn:
+                current = self._get(conn, principal, record["id"], session_id, "import", lock=True)
+                self._put(conn, current, {**current["payload"], "status": "unknown" if code == "result_import_unknown" else "failed", "error_code": code})
+        return self.get_result_import(principal, session_id, record["id"])
+
+    def get_result_import(self, principal, session_id, ident):
+        self._access(principal, session_id, "projects:read", "assets:read")
+        with self.repo.engine.connect() as conn:
+            row = self._get(conn, principal, ident, session_id, "import")
+        return {**row["payload"], "id": ident, "created_at": row["created_at"]}
