@@ -16,6 +16,10 @@ FORMAT = "sixnine-wangp-environment-v1"
 PYTHON = "3.11.14"
 REVISION = "0e58385fbde7ff102d276e4a9e490845de76b4ea"
 REQUIREMENTS_SHA = "a9c4b97e100095e17302d27a2b8e35e5ec4b476a322ab2ed366cd30de97cc970"
+PACKAGE_NAME_PATTERN = r"[a-z0-9][a-z0-9+.-]{0,99}(?::[a-z0-9-]{1,20})?"
+PACKAGE_VERSION_PATTERN = r"[0-9][A-Za-z0-9.+:~\-]{0,99}"
+MAX_SYSTEM_PACKAGES = 10000
+MAX_PACKAGE_MISMATCHES = 16
 
 
 def canonical(value):
@@ -74,6 +78,37 @@ def system_packages():
     result = subprocess.run(["dpkg-query", "-W", "-f=${binary:Package}\t${Version}\n"],
                             check=True, capture_output=True, text=True)
     return dict(sorted(line.split("\t", 1) for line in result.stdout.splitlines()))
+
+
+def safe_system_package_diagnostics(value):
+    """Finite field/length whitelist for untrusted remote package diagnostics."""
+    if not isinstance(value, dict) or not isinstance(value.get("mismatches"), list):
+        return None
+    total = value.get("total")
+    if type(total) is not int or not 0 <= total <= MAX_SYSTEM_PACKAGES:
+        return None
+    rows = []
+    for item in value["mismatches"][:MAX_PACKAGE_MISMATCHES]:
+        if not isinstance(item, dict):
+            continue
+        name, expected, observed = (item.get(k) for k in ("package", "expected", "observed"))
+        if (not isinstance(name, str) or not re.fullmatch(PACKAGE_NAME_PATTERN, name)
+                or not isinstance(expected, str) or not re.fullmatch(PACKAGE_VERSION_PATTERN, expected)
+                or observed is not None and (not isinstance(observed, str)
+                    or not re.fullmatch(PACKAGE_VERSION_PATTERN, observed)) or expected == observed):
+            continue
+        rows.append({"package": name, "expected": expected, "observed": observed})
+    if total < len(rows):
+        return None
+    return {"mismatches": rows, "total": total,
+            "truncated": value.get("truncated") is True or total > len(rows)}
+
+
+def system_package_diagnostics(expected, observed):
+    mismatches = [{"package": name, "expected": version, "observed": observed.get(name)}
+                  for name, version in sorted(expected.items()) if observed.get(name) != version]
+    return safe_system_package_diagnostics({"mismatches": mismatches[:MAX_PACKAGE_MISMATCHES],
+        "total": len(mismatches), "truncated": len(mismatches) > MAX_PACKAGE_MISMATCHES})
 
 
 def validate_lock(lock):

@@ -304,6 +304,23 @@ class BootTests(ledger.LedgerCase):
         self.assertEqual(len(diagnosis["failure_details"]), 5)
         self.assertNotIn("SECRET", json.dumps(diagnosis))
 
+    def test_system_package_diagnostics_survive_cpu_restart_and_node_destruction(self):
+        self.host.state = "failed"
+        packages = {"total": 1, "truncated": False, "mismatches": [
+            {"package": "openssl", "expected": "3.0.2-0ubuntu1.18", "observed": "3.0.2-0ubuntu1.20", "log": "SECRET"}]}
+        self.host.patch = {"phase": "setup_failed", "failure_phase": "system_package_verification",
+            "error_code": "system_package_mismatch", "error_type": "ValueError", "system_package_diagnostics": packages}
+        result = self.tick(self.controller())
+        self.assertEqual(result["failure_phase"], "system_package_verification")
+        self.assertEqual(result["error_type"], "ValueError")
+        self.assertEqual(result["system_package_diagnostics"]["total"], 1)
+        self.repo.update_instance(self.intent["id"], "draining")
+        self.repo.update_instance(self.intent["id"], "destroying")
+        self.repo.update_instance(self.intent["id"], "destroyed", destruction_confirmed=True)
+        self.assertEqual(self.controller().status(self.intent["id"]), result)
+        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertEqual((self.host.starts, self.backend.submissions), (1, 0))
+
 
 class SSHInspectionTests(unittest.TestCase):
     """Execute the actual inspection scripts against temporary fake procfs."""
