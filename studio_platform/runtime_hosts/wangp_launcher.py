@@ -15,7 +15,10 @@ from ..inference.wangp_contract import EngineManifest
 from ..inference.wangp_factory import read_document
 from .wangp import WanGPHost
 from .wangp_http import StagedInputs, create_app, private_token_file
-from .wangp_receipts import ReceiptJournal, checked_directory
+from .wangp_receipts import (
+    ReceiptJournal, checked_directory, VERIFICATION_RECEIPT, read_verification_receipt, write_verification_receipt,
+)
+
 
 
 class PendingSession:
@@ -140,6 +143,7 @@ def main(argv=None):
         evidence = verify_runtime(args.runtime_root, args.config, args.manifest, args.model_root)
         if evidence.get("manifest_digest") != manifest.digest:
             raise ValueError("wangp_verified_manifest_changed")
+        write_verification_receipt(state, host, evidence)
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         # Upstream console output is not an authorized channel for user prompts.

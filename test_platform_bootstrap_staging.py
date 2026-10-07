@@ -296,6 +296,9 @@ class RemotePrestartProofTests(unittest.TestCase):
                 marker.unlink()
             (proc/'1'/'cmdline').write_bytes(b'python\0-m\0studio_platform.runtime_hosts.wangp_launcher\0')
             self.assertEqual(observe()['runtime_process_count'], 1)
+            (proc/'1'/'cmdline').write_bytes(b'python\0-m\0studio_platform.runtime_hosts.wangp_download\0')
+            self.assertEqual(observe()['bootstrap_process_count'], 1)
+            self.assertEqual(observe()['runtime_process_count'], 0)
             (proc/'1'/'cmdline').unlink()
             self.assertFalse(observe()['process_visibility_complete'])
 

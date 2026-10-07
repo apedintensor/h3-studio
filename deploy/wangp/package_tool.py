@@ -32,6 +32,7 @@ PRIVATE_FILES = (
     "studio_platform/runtime_hosts/wangp_session.py", "studio_platform/runtime_hosts/wangp_http.py",
     "studio_platform/runtime_hosts/wangp_launcher.py", "studio_platform/runtime_hosts/wangp_environment.py",
     "studio_platform/runtime_hosts/wangp_system_restore.py",
+    "studio_platform/runtime_hosts/wangp_download.py",
     "deploy/wangp/probe_gpu.py",
 )
 

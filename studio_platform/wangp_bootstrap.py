@@ -437,7 +437,8 @@ try:
   with (proc/pid/'cmdline').open('rb') as f: raw=f.read(1048577)
   if len(raw)>1048576: raise ValueError('unconfirmed')
   args=raw.split(b'\\0')
-  bootstrap+=int(any(a==b'wangp-bootstrap.py' or a.endswith(b'/wangp-bootstrap.py') for a in args))
+  bootstrap+=int(any(a==b'wangp-bootstrap.py' or a.endswith(b'/wangp-bootstrap.py') for a in args)
+                 or b'studio_platform.runtime_hosts.wangp_download' in args)
   runtime+=int(b'studio_platform.runtime_hosts.wangp_launcher' in args)
  listening=False
  for name in ('tcp','tcp6'):

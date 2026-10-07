@@ -70,6 +70,8 @@ The queue keeps lease fences and original attempt identity across reconcile/coll
 
 Capacity has its own persistent instance-intent states (`reserved`, `creating`, `creation_unknown`, `starting`, `ready`, `busy`, `draining`, `destroying`, `destroyed`). Uncertain deletion remains `destroying` with evidence pending; a diagnostics counter named `destroy_unknown` is not an implemented persisted transition. Rental unknowns are not job unknowns and have their own evidence/reconciler. Empty provider inventory, failed status or an accepted DELETE does not settle costs or prove an ambiguous creation was never accepted.
 
+An operator Lium manifest may set `min_download_mbps` to a positive finite number. It is absent by default; old configuration documents and fingerprints remain unchanged. The explicit floor goes to Lium's executor-list filter or both dry-run and actual rent-by-spec payloads, with no fallback that lowers it. Lium excludes missing or insufficient trusted measurements; no matching inventory retains `capacity_no_matching_gpu`, while an unconfirmed inventory check is distinct. This is a provider-measured host bandwidth constraint, not guaranteed Hugging Face transfer speed or permission to enable a new operating configuration. See the [official network-filter contract](https://docs.lium.io/developers/executor-interconnect) and [rent-by-spec parameters](https://docs.lium.io/developers/quickstart).
+
 Provider preparation has a separate, opt-in operating timeout: `provider_preparation_timeout_s` (120–7200 seconds; absent/null keeps historical behavior and hashes). It measures from the original instance intent's creation, not the latest observation or controller restart, and is unrelated to the `cold_start_s` scheduling estimate. The existing rental receipt ledger commits `awaiting_provider` before creation and irreversibly commits `bootstrap_started` before any boot/SSH work. Only that positive unused proof, fresh exact-owned `PENDING` timeout or `FAILED`/`STOPPED` facts, and locked checks excluding workers, attempts and runtime evidence permit `retiring_unused`. The original approval closes atomically before deletion; ambiguous deletion reconciles once without replay. Service rollover preserves accepted job IDs, requests, original wait deadlines and reservations, and waits for confirmed removal and billing settlement before replacement. Provider status alone never proves idle. Legacy intents without this receipt require explicit controlled adoption; absent files do not make them eligible. Enabling this policy does not migrate an existing service fingerprint or authorize cloud work.
 
 New Lium rentals created through the coordinator with a durable rent journal freeze an absolute TTL before the rent POST: the earlier of the original instance-intent creation plus the actual requested hours and its approved hard deadline. An exact pod observation then schedules this bound once; observed earlier deadlines are retained. The same private rent marker records schedule intent before POST and verification afterwards. An unknown POST is GET-only and may need operator recovery. Only an acknowledged, verified pending schedule permits one separately journaled shortening when the provider transitions to RUNNING and overwrites it. TTL checks gate initial lifetime/SSH entry, exposing `capacity_provider_ttl_unconfirmed` when that gate fails; they never renew the rental from readiness time. Cached ProductionBoot receipts continue enforcing the shorter database deadline. This does not continuously re-attest the provider schedule after a host is connected. Existing unbound markers retain strict read-only lifetime checks and gain no inferred scheduling authority. This source behavior is not provider-side compare-and-swap or a guarantee against independent external schedule writers.
@@ -124,6 +126,28 @@ later phases reconcile the original remote marker and never replay setup.
 Preparation cancellation is cooperative and may wait for a bounded in-flight
 SSH operation. Pending transfer is not child-exit or upstream-idle evidence;
 staging failure retains original accepted backlog and accounting for repair.
+
+Model transfer runs only after the pinned environment/import checks, in one owned
+Linux child using the already locked Hugging Face SDK. The manifest's exact file
+allowlist and full revisions, official endpoint and explicit public `token=False`
+remain fixed. Two file workers, a bounded SDK retry per file, parent/child elapsed
+deadlines, disk/cache guards and parent-death termination bound preparation; SDK
+partials never authorize a second bootstrap or job submission. Only safe completed
+file/byte counts and static errors enter status. Native SDK logs are discarded,
+and the child must be stopped/reaped before local preparation can be idle.
+Transfer completion does not certify model bytes: the launcher acquires exclusive
+journal/slot ownership, then performs full source/configuration/environment and
+model size/hash verification before Session initialization or HTTP readiness.
+Normal bootstrap launches that process once without a preceding duplicate
+`--verify-only`; explicit standalone verification remains available. Its private,
+atomic verification receipt binds manifest, slot, PID and host incarnation. The
+same authenticated readiness incarnation must confirm an idle runtime. Receipts
+never bypass verification in a new process; stale/mismatched evidence or startup
+uncertainty cannot authorize another start. The existing launch deadline and
+bootstrap marker remain binding, with verification and initialization shown as
+separate preparation phases. Model-transfer speed, native
+Xet interruption reuse and cross-instance model caching are not offline acceptance
+claims. See [the runtime preparation guide](deploy/wangp/README.md#bounded-public-model-transfer).
 
 Continuing single-slot operation is an explicit `service_policy`, validated
 against the existing scope, absolute window, budget ceiling and idle interval.
