@@ -126,10 +126,14 @@ class QueuedTaskBootTests(LedgerCase):
         self.assertEqual(self.host.starts, 1)
         self.assertEqual(self.backend.submissions, 0)
         self.boot = self.make_boot()
-        result = self.boot.tick(self.intent["id"])
+        with patch("studio_platform.queued_task_runner.read_verification_summary") as evidence:
+            result = self.boot.tick(self.intent["id"])
+        evidence.assert_not_called()
         self.assertEqual(result["state"], "fleet_recovery_required")
         self.assertFalse(result["generation_verified"])
         self.assertIsNone(self.boot.fleet)
+        self.assertFalse(self.boot.children_done())
+        self.assertEqual(len(self.workers()), 1)
         self.assertEqual(self.host.starts, 1)
 
     def test_old_pending_smoke_cannot_be_reclassified_as_runtime_ready(self):
@@ -212,22 +216,32 @@ class QueuedTaskBootTests(LedgerCase):
         self.assertEqual(slot.call_count, 1)
         self.assertEqual(self.backend.submissions, 0)
 
-    def test_invalid_or_unreadable_real_evidence_quarantines_instead_of_silent_wait(self):
+    def _assert_real_evidence_quarantines(self, failure):
         self.start()
-        for failure in (ValueError("synthetic private detail"), OSError("synthetic private detail")):
-            with patch("studio_platform.queued_task_runner.read_verification_summary", side_effect=failure):
-                # Fresh controllers cannot launch a second worker: their
-                # retained fleet requires recovery. Proof failure still must
-                # surface a bounded attention result rather than disappear.
-                boot = self.make_boot()
-                result = boot.tick(self.intent["id"])
-            self.assertEqual(result["state"], "fleet_attention_required")
-            self.assertEqual(result["error_code"], "finite_real_task_evidence_unconfirmed")
-            self.assertTrue(result["runtime_quarantined"])
-            self.assertFalse(result["generation_verified"])
-            self.assertTrue(boot._stopping)
-            self.assertNotIn("private detail", json.dumps(result))
+        # This controller owns the still-running child. A reconstructed
+        # controller must stop earlier at the separate fleet-recovery guard.
+        children = dict(self.boot.fleet.children)
+        with patch("studio_platform.queued_task_runner.read_verification_summary", side_effect=failure) as evidence:
+            result = self.boot.tick(self.intent["id"])
+        evidence.assert_called_once()
+        self.assertEqual(result["state"], "fleet_attention_required")
+        self.assertEqual(result["error_code"], "finite_real_task_evidence_unconfirmed")
+        self.assertTrue(result["runtime_quarantined"])
+        self.assertFalse(result["generation_verified"])
+        self.assertTrue(self.boot._stopping)
+        self.assertEqual(self.boot.fleet.children, children)
+        self.assertFalse(self.boot.children_done())
+        for worker_id in children:
+            self.assertEqual(WorkerControl(self.repo).get(worker_id)["drain_requested"], 1)
+        self.assertEqual(self.host.starts, 1)
+        self.assertNotIn("private detail", json.dumps(result))
         self.assertEqual(self.backend.submissions, 0)
+
+    def test_invalid_real_evidence_quarantines_instead_of_silent_wait(self):
+        self._assert_real_evidence_quarantines(ValueError("synthetic private detail"))
+
+    def test_unreadable_real_evidence_quarantines_instead_of_silent_wait(self):
+        self._assert_real_evidence_quarantines(OSError("synthetic private detail"))
 
     def test_child_restart_does_not_clear_persisted_drain_when_evidence_write_failed(self):
         self.start()
