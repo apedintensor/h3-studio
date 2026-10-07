@@ -330,5 +330,6 @@ inventory.json
 !studio_platform/agent_connect.py
 !studio_platform/agent_connect_routes.py
 !tools/agent_connect.py
+!tools/run_quick_chat_preview.py
 !skills/sixnine-yingxu/scripts/connect.py
 !AGENT-CONNECT-CONTRACT.md
