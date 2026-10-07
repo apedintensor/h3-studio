@@ -45,7 +45,10 @@ BOOT_FAILURE_CODES = frozenset({"InternalSetupFailure", "SubprocessTimeout", "Su
     "verification_receipt_mismatch", "gpu_observation_invalid", "single_gpu_recipe_required",
     "private_token_invalid", "runtime_process_exited", "runtime_readiness_timeout",
     "python31114_linux_required", "python311_linux_required", "bootstrap_configuration_invalid",
-    "system_deb_mismatch", "runtime_import_probe_failed", "runtime_import_receipt_mismatch"})
+    "system_deb_mismatch", "runtime_import_probe_failed", "runtime_import_receipt_mismatch",
+    "system_restore_manifest_invalid", "system_restore_package_invalid", "system_restore_lock_conflict",
+    "system_restore_package_mismatch", "system_restore_extra_file", "system_restore_unrecognized_drift",
+    "system_restore_deb_metadata_mismatch", "system_restore_verification_failed", "system_restore_package_audit_failed"})
 BOOT_FAILURE_TYPES = frozenset({"SetupError", "RuntimeError", "ValueError", "TypeError", "OSError",
     "FileNotFoundError", "PermissionError", "ImportError", "ModuleNotFoundError", "TimeoutError",
     "ConnectionError", "CalledProcessError", "TimeoutExpired", "HTTPError", "HTTPStatusError",
@@ -56,7 +59,7 @@ BOOT_PHASES = frozenset({"preflight", "clone_comfy", "fetch_comfy", "pin_comfy",
     "download_preflight", "download_file", "weights_ready", "start_comfy", "comfy_ready", "failed", "download",
     "checking_package", "dependency_download", "dependency_unpack", "dependency_install", "model_download",
     "runtime_verification", "runtime_start", "runtime_ready", "runtime_start_unknown", "setup_failed",
-    "system_package_install", "system_package_verification", "runtime_imports"})
+    "system_package_install", "system_package_restore", "system_package_verification", "runtime_imports"})
 
 
 def _static(value, allowed, fallback):
@@ -85,7 +88,7 @@ def safe_bootstrap_diagnosis(value):
             bounded.append(entry)
         if bounded:
             diagnosis["failure_details"] = bounded
-    if diagnosis["error_code"] == "system_package_mismatch":
+    if diagnosis["error_code"] in {"system_package_mismatch", "system_restore_unrecognized_drift", "system_restore_verification_failed"}:
         from .runtime_hosts.wangp_environment import safe_system_package_diagnostics
         packages = safe_system_package_diagnostics(value.get("system_package_diagnostics"))
         if packages is not None:

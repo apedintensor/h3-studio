@@ -273,6 +273,39 @@ example is still needed before claiming qualified last-frame fidelity.
 
 ## Checks and remaining gates
 
+### Optional repair for measured provider SSH package drift
+
+The provider's [pinned SSH bootstrap](https://github.com/Datura-ai/lium-io/blob/ec31b1ecd9b5f4d594d88d7c1c8ecbfa7cdd7228/neurons/validators/src/services/assets/sshd_bootstrap.sh#L140-L175)
+can install `openssh-server` after the base image starts. A disposable CPU replay
+of that operation on the pinned PyTorch base upgraded `libsystemd0` from
+`249.11-0ubuntu3.12` to `249.11-0ubuntu3.22`; replaying the original 199 dependency
+archives left this one mismatch against the unchanged 425-package environment.
+This reproduction does not establish the contents of an already deleted host.
+
+For this exact side effect, an operator can include a finite local repair kit:
+
+```sh
+python deploy/wangp/package_tool.py source-bundle --output wangp-package.tar.gz \
+  --os-restore-kit /path/to/verified-kit --environment-lock /path/to/original-environment-lock.json
+```
+
+The kit contains `manifest.json` and six official amd64 archives from the signed
+[Ubuntu snapshot](https://snapshot.ubuntu.com/ubuntu/20250101T000000Z/):
+`libsystemd0`, `systemd`, `libnss-systemd`, `libpam-systemd`, `systemd-sysv`, and
+`systemd-timesyncd`, all at `249.11-0ubuntu3.12`. Their exact names, sizes and SHA256
+values are pinned in `wangp_system_restore.py`. The kit is private deployment
+material; do not commit binaries. Its manifest binds the original environment
+digest and base image, and the approved source-bundle SHA binds the complete kit.
+
+Bootstrap accepts only the measured `.22` family or a partially restored `.12`
+family, rejects unrelated environment differences, and validates every archive
+before installing the complete dependency closure. It does not fetch packages
+or run `apt install` on the GPU. It then requires the original environment pins,
+`dpkg --audit`, dependency consistency, and `sshd -t`. A matching original
+environment is unchanged. This is an exact repair, not a weaker lock, new model,
+new environment identity, or proof of GPU inference. A different drift requires
+diagnosis and a separately reviewed repair or a new qualified runtime identity.
+
 `test_platform_wangp_compiler.py` and `test_platform_wangp_session.py` use isolated
 fake Session objects/files only. They cover control rejection, immutable identities,
 role mapping, uint64 seeds, cancellation intent, both outputs, collection retry,

@@ -207,6 +207,17 @@ def install(config, slot_key, token_file, *, launch=True):
             status("system_package_install")
             subprocess.run(["dpkg", "--install", *deb_files], check=True, capture_output=True,
                            env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+        restore_kit = source / "system-restore"
+        if restore_kit.exists():
+            from studio_platform.runtime_hosts.wangp_system_restore import restore_system
+            status("system_package_restore")
+            try:
+                restore_system(restore_kit, lock)
+            except ValueError as error:
+                if str(error) in {"system_restore_unrecognized_drift", "system_restore_verification_failed"}:
+                    failure_diagnostics["system_package_diagnostics"] = system_package_diagnostics(
+                        lock["system_packages"], system_packages())
+                raise
         status("system_package_verification")
         observed_system = system_packages()
         if any(observed_system.get(name) != version for name, version in lock["system_packages"].items()):
