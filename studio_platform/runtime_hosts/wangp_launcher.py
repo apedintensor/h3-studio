@@ -1,0 +1,164 @@
+"""Explicit private engine entry point; importing it is inert.
+
+Provisioning, authorization windows and rental budgets remain controller-owned.
+This process accepts no cloud credentials and never rents or downloads a model.
+"""
+import argparse
+from contextlib import redirect_stderr, redirect_stdout
+import json
+import math
+import os
+from pathlib import Path
+import time
+
+from ..inference.wangp_contract import EngineManifest
+from ..inference.wangp_factory import read_document
+from .wangp import WanGPHost
+from .wangp_http import StagedInputs, create_app, private_token_file
+from .wangp_receipts import ReceiptJournal, checked_directory
+
+
+class PendingSession:
+    def __init__(self):
+        self.delegate = None
+
+    def is_idle(self):
+        return self.delegate is not None and self.delegate.is_idle() is True
+
+    def submit_task(self, settings):
+        if self.delegate is None:
+            raise ValueError("wangp_runtime_not_initialized")
+        return self.delegate.submit_task(settings)
+
+    def close_when_idle(self):
+        if self.delegate is None:
+            raise ValueError("wangp_runtime_not_initialized")
+        return self.delegate.close_when_idle()
+
+
+def shutdown_owned_host(host, session, *, grace_seconds=180, terminate=None,
+                        clock=time.monotonic, sleeper=time.sleep):
+    """Keep the process lock until the runtime is closed or the process dies.
+
+    Stopping HTTP is not evidence of GPU stop. Never cancel or erase receipts:
+    normal completion gets a grace period; an uncertain runtime requires whole
+    process termination, which also releases its OS-owned journal lock.
+    """
+    if type(grace_seconds) not in (int, float) or not math.isfinite(grace_seconds) or not 0 < grace_seconds <= 3600:
+        raise ValueError("wangp_invalid_shutdown_grace")
+    if session is None:
+        host.close()  # The upstream initialization was never entered.
+        return
+    def terminate_process():
+        (terminate or os._exit)(1)
+        # A test hook or broken termination primitive must not fall through
+        # to host.close. Production os._exit does not return.
+        raise RuntimeError("wangp_process_termination_required")
+
+    deadline = clock() + grace_seconds
+    while True:
+        try:
+            if session.is_idle() is True:
+                session.close_when_idle()
+                host.close()
+                return
+        except (KeyboardInterrupt, SystemExit):
+            terminate_process()
+        except Exception:
+            # A close/idle error is uncertainty, not permission to release the
+            # slot. Retain the same ownership until the process is terminated.
+            pass
+        remaining = deadline - clock()
+        if remaining <= 0:
+            terminate_process()
+        try:
+            sleeper(min(.25, remaining))
+        except (KeyboardInterrupt, SystemExit):
+            terminate_process()
+
+
+def resolve_inputs(prepared, inputs):
+    settings = prepared.settings
+    handles = {item.handle: item for item in prepared.inputs}
+    used = set()
+    for field in ("image_start", "image_end"):
+        handle = settings.get(field)
+        if handle is not None:
+            if handle not in handles:
+                raise ValueError("wangp_unbound_input_handle")
+            settings[field] = str(inputs.image_path(handles[handle]))
+            used.add(handle)
+    if used != set(handles):
+        raise ValueError("wangp_unused_input_handle")
+    return settings
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Explicit pinned private WanGP slot")
+    for name in ("runtime-root", "config", "manifest", "model-root", "state-dir", "token-file"):
+        parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--slot-key", required=True)
+    parser.add_argument("--port", type=int, default=8199)
+    parser.add_argument("--shutdown-grace-seconds", type=float, default=180)
+    parser.add_argument("--create-journal", action="store_true",
+                        help="Only a new authorized slot; fails if a journal already exists")
+    parser.add_argument("--verify-only", action="store_true")
+    args = parser.parse_args(argv)
+    if any(not getattr(args, name).is_absolute() for name in (
+            "runtime_root", "config", "manifest", "model_root", "state_dir", "token_file")):
+        parser.error("explicit absolute paths required")
+    if not 1024 <= args.port <= 65535:
+        parser.error("invalid private port")
+    if not math.isfinite(args.shutdown_grace_seconds) or not 0 < args.shutdown_grace_seconds <= 3600:
+        parser.error("invalid shutdown grace")
+    host = None
+    session_initialization_started = False
+    pending = None
+    try:
+        from .wangp_session import create_session, verify_runtime
+        manifest = EngineManifest.from_dict(read_document(args.manifest))
+        if manifest.document.get("synthetic"):
+            raise ValueError("wangp_synthetic_manifest_forbidden")
+        if args.verify_only:
+            evidence = verify_runtime(args.runtime_root, args.config, args.manifest, args.model_root)
+            if evidence.get("manifest_digest") != manifest.digest:
+                raise ValueError("wangp_verified_manifest_changed")
+            print(json.dumps({"state": "runtime_files_verified", **evidence}))
+            return 0
+        token = private_token_file(args.token_file)
+        state = checked_directory(args.state_dir, create=args.create_journal)
+        journal = ReceiptJournal(state / "operations.sqlite3", slot_key=args.slot_key,
+                                  manifest_digest=manifest.digest, create=args.create_journal)
+        output = checked_directory(state / "upstream-output", create=True)
+        inputs = StagedInputs(state / "inputs")
+        pending = PendingSession()
+        # Acquire durable host ownership BEFORE importing/loading the upstream
+        # runtime; a competing process cannot load a second copy into this slot.
+        host = WanGPHost(session=pending, journal=journal, manifest=manifest,
+                         output_root=output, sealed_root=state / "sealed-output",
+                         settings_resolver=lambda prepared: resolve_inputs(prepared, inputs))
+        evidence = verify_runtime(args.runtime_root, args.config, args.manifest, args.model_root)
+        if evidence.get("manifest_digest") != manifest.digest:
+            raise ValueError("wangp_verified_manifest_changed")
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        # Upstream console output is not an authorized channel for user prompts.
+        with open(os.devnull, "w") as quiet, redirect_stdout(quiet), redirect_stderr(quiet):
+            session_initialization_started = True
+            pending.delegate = create_session(args.runtime_root, args.config, output)
+            import uvicorn
+            uvicorn.run(create_app(host, inputs, token=token), host="127.0.0.1", port=args.port,
+                        workers=1, access_log=False, log_level="critical", proxy_headers=False)
+        return 0
+    except Exception:
+        print(json.dumps({"state": "wangp_runtime_start_failed"}))
+        return 1
+    finally:
+        if host is not None:
+            with open(os.devnull, "w") as quiet, redirect_stdout(quiet), redirect_stderr(quiet):
+                shutdown_owned_host(host, pending if session_initialization_started else None,
+                                    grace_seconds=args.shutdown_grace_seconds)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

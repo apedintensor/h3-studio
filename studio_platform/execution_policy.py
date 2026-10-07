@@ -10,12 +10,13 @@ from dataclasses import dataclass
 import json
 import math
 import os
+import re
 from pathlib import Path
 import stat
 import string
 
 from .capabilities import MODEL, RECIPES
-from .control import WorkerControl
+from .control import WorkerControl, REAL_GPU_BACKENDS
 from .repository import BudgetExceeded, NotFound, identifier, request_hash
 from .qualification_profiles import (FL50_PROFILE, MULTIMODAL_PROFILE, QUEUED_TASK_PROFILE,
     RUNTIME_PROFILES, MULTIMODAL_INPUT_LIMITS, PROFILE_RECIPES)
@@ -37,11 +38,16 @@ def positive(value, maximum):
 
 def validate_policy(value):
     """Reject ambiguous/misspelled operator settings rather than broadening them."""
-    if not isinstance(value, dict) or set(value) != FIELDS:
+    if not isinstance(value, dict) or not FIELDS <= set(value) or set(value) - FIELDS - {"engine_manifest_digest"}:
         raise ValueError("Invalid execution policy fields")
-    if (value["id"] != POLICY or value["model_id"] != MODEL or value["backend"] != "comfy-worker"
+    if (value["id"] != POLICY or value["model_id"] != MODEL or value["backend"] not in REAL_GPU_BACKENDS
             or type(value["enabled"]) is not bool):
         raise ValueError("Invalid execution policy identity")
+    if value["backend"] == "wangp-worker":
+        if not isinstance(value.get("engine_manifest_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", value["engine_manifest_digest"]):
+            raise ValueError("Explicit engine manifest required")
+    elif "engine_manifest_digest" in value:
+        raise ValueError("Unexpected engine manifest for legacy policy")
     for field in ("revision", "pool", "configuration_id"):
         identifier(value[field])
     recipes = value["recipe_ids"]
@@ -106,6 +112,10 @@ def validate_policy(value):
     # decoder tiling/export parameters remain visible and are never overridden.
     controls = envelope["controls"]
     required_controls = {"sampler_name", "scheduler", "video_decode", "audio_decode", "encoder_device", "ref_image_size"}
+    if value["backend"] == "wangp-worker":
+        # The first WanGP recipe has no generic reference-image resizing
+        # control. Do not require a fabricated Comfy default in its snapshot.
+        required_controls.remove("ref_image_size")
     if not isinstance(controls, dict) or set(controls) != required_controls:
         raise ValueError("Explicit execution control families required")
     if any(not isinstance(options, list) or not options or any(not isinstance(x, str) or len(x)>80 for x in options) for options in controls.values()):
@@ -175,7 +185,7 @@ def input_envelope_blockers(compiled, limits):
     if limits is None:
         return []
     request, assets = compiled["request"], compiled["assets"]
-    inputs, guides = request["inputs"], request["guides"]
+    inputs, guides = request["inputs"], request.get("guides", [])
     blockers = []
     kinds = {"image": set(inputs["images"]), "video": set(inputs["videos"]), "audio": set(inputs["audios"])}
     metadata = {}
@@ -297,7 +307,7 @@ class ExecutionPolicies:
             base.update(pool="mock", expected_runtime_s=1, quote_known=True, enabled=True, admission_state="queued")
             return Admission(base, 0, now+900,
                 {"currency": "USD", "cost_microusd": 0, "source": "mock", "kind": "simulation"})
-        if backend != "comfy-worker":
+        if backend not in REAL_GPU_BACKENDS:
             base["blockers"].append("尚未接入此执行方式")
             return Admission(base, 0, now+900, unknown)
         try:
@@ -306,6 +316,9 @@ class ExecutionPolicies:
             policy = None
         if policy is None:
             base["blockers"].append("缺少有效的执行池验收与费用策略，暂不发起生成")
+            return Admission(base, 0, now+900, unknown)
+        if policy["backend"] != backend:
+            base["blockers"].append("执行策略与所选引擎不一致，请等待匹配配置")
             return Admission(base, 0, now+900, unknown)
         qualification, envelope = policy["qualification"], policy["envelope"]
         quote = reservation_for_duration(policy, compiled["output_spec"]["actual_duration"])
@@ -334,8 +347,9 @@ class ExecutionPolicies:
             blockers.append(f"当前采样 {request['steps']} 步；执行池最多接受 {envelope['max_steps']:g} 步")
         if refs > envelope["max_reference_files"]:
             blockers.append(f"当前使用 {refs} 份参考文件；执行池最多接受 {envelope['max_reference_files']} 份，素材仍可保存")
-        if len(request["guides"]) > envelope["max_guides"]:
-            blockers.append(f"当前使用 {len(request['guides'])} 个时间锚点；执行池最多接受 {envelope['max_guides']} 个")
+        guides = request.get("guides", [])
+        if len(guides) > envelope["max_guides"]:
+            blockers.append(f"当前使用 {len(guides)} 个时间锚点；执行池最多接受 {envelope['max_guides']} 个")
         if request["generate_audio"] and not envelope["allow_audio"]:
             blockers.append("当前执行池尚未开放声音生成，请保留设置或明确关闭生成声音")
         if (request["inputs"]["first_frame"] or request["inputs"]["last_frame"]) and not envelope["allow_first_last"]:
@@ -364,7 +378,8 @@ class ExecutionPolicies:
         approval, cold_latest_start = None, None
         if not blockers:
             capacity = self.control.pool_status(policy["pool"], model_id=policy["model_id"],
-                configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend)
+                configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend,
+                **({"engine_manifest_digest": policy["engine_manifest_digest"]} if backend == "wangp-worker" else {}))
         if not blockers and capacity["ready"] + capacity["busy"] == 0:
             # Only an independently approved, current launch can admit a wait.
             # Empty approvals / gates=0 retain the original blocked behavior.
@@ -399,6 +414,8 @@ class ExecutionPolicies:
             qualification_expires_at=qualification["expires_at"], quote_expires_at=quote["expires_at"],
             registered_healthy_slots=capacity["ready"]+capacity["busy"])
         base["admission_state"] = "blocked" if blockers else "waiting_capacity" if approval else "queued"
+        if backend == "wangp-worker":
+            base["engine_manifest_digest"] = policy["engine_manifest_digest"]
         if approval:
             base.update(capacity_approval_id=approval["id"], capacity_approval_hash=approval["approval_hash"])
         expiry = min(now+900, latest_start) if not blockers else now+900
@@ -422,7 +439,9 @@ class ExecutionPolicies:
         current = self.evaluate(plan["request"], scope, previous["fingerprint"])
         if (not previous.get("enabled") or not current.execution["enabled"]
                 or previous.get("policy_hash") != current.execution.get("policy_hash")
-                or previous.get("backend") != current.execution["backend"]):
+                or previous.get("backend") != current.execution["backend"]
+                or previous.get("backend") == "wangp-worker"
+                   and previous.get("engine_manifest_digest") != current.execution.get("engine_manifest_digest")):
             from .repository import Conflict
             raise Conflict("execution_policy_changed_or_unavailable")
         if previous.get("capacity_approval_id") and not self._capacity_reference_current(previous, scope.tenant_id):
@@ -432,6 +451,8 @@ class ExecutionPolicies:
 
     def capacity_approval_current(self, payload):
         """Pure current operator-file check; safe inside a ledger transaction."""
+        # Cold-start approval/boot currently has the pinned Comfy contract.
+        # WanGP warm slots work independently; no Comfy approval can rent for it.
         if not self.settings.generation_enabled or self.settings.execution_backend != "comfy-worker":
             return False
         try:
@@ -439,7 +460,7 @@ class ExecutionPolicies:
             if policy is None:
                 return False
             now, qualification, quote = self.repo.clock(), policy["qualification"], policy["reservation"]
-            return bool(policy["enabled"] and request_hash(policy) == payload["policy_hash"]
+            return bool(policy["backend"] == "comfy-worker" and policy["enabled"] and request_hash(policy) == payload["policy_hash"]
                 and policy["model_id"] == payload["model_id"] and policy["pool"] == payload["pool"]
                 and policy["configuration_id"] == payload["configuration_id"]
                 and set(payload["recipe_ids"]) <= set(policy["recipe_ids"])
@@ -490,7 +511,7 @@ class ExecutionPolicies:
             return False
         if self.settings.execution_backend == "mock":
             return True
-        if self.settings.execution_backend != "comfy-worker":
+        if self.settings.execution_backend not in REAL_GPU_BACKENDS:
             return False
         try:
             policy = read_policy(self.settings.execution_policy_file)
@@ -500,7 +521,9 @@ class ExecutionPolicies:
             quote = reservation_for_duration(policy,
                 job.get("request", {}).get("output_spec", {}).get("actual_duration"))
             now = self.repo.clock()
-            return bool(policy["enabled"] and execution.get("policy_hash") == request_hash(policy)
+            return bool(policy["backend"] == self.settings.execution_backend
+                and (policy["backend"] != "wangp-worker" or execution.get("engine_manifest_digest") == policy["engine_manifest_digest"])
+                and policy["enabled"] and execution.get("policy_hash") == request_hash(policy)
                 and qualification["status"] in {"accepted", "runtime_required"}
                 and qualification["verified_at"] <= now < qualification["expires_at"]
                 and now < quote["expires_at"]

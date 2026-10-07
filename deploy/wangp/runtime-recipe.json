@@ -1,0 +1,33 @@
+{
+  "status": "candidate-not-a-full-lock",
+  "python": "3.11.14",
+  "cuda_recipe": "12.8.1",
+  "torch": "2.10.0+cu128",
+  "torchvision": "0.25.0+cu128",
+  "torchaudio": "2.10.0+cu128",
+  "diffusers": "0.36.0",
+  "transformers": "4.54.0",
+  "numpy": "2.1.2",
+  "optimum-quanto": "0.2.7",
+  "comfy-kitchen": "0.2.35",
+  "attention": "sdpa",
+  "compile": false,
+  "kernel_precision": "strict",
+  "requirements_source": "requirements.txt at source_revision",
+  "requirements_sha256": "a9c4b97e100095e17302d27a2b8e35e5ec4b476a322ab2ed366cd30de97cc970",
+  "full_dependency_lock": "pending-first-authorized-image-build",
+  "image_digest": "unqualified",
+  "driver_minimum": "not verified; record actual CUDA compatibility on selected host",
+  "startup": "studio_platform.runtime_hosts.wangp_session.verify_runtime then create_session; dedicated private one-slot host",
+  "unresolved": [
+    "Transitive package versions and wheel hashes",
+    "NVIDIA image digest and real driver/toolkit compatibility",
+    "FFmpeg and libsndfile package versions",
+    "Per-host measured RAM/VRAM/disk headroom and coldstart/inference",
+    "All required imports under actual GPU image"
+  ],
+  "sources": [
+    "https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/Dockerfile#L1-L43",
+    "https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/docs/INSTALLATION.md#L5-L25"
+  ]
+}

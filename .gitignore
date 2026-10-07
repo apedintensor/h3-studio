@@ -275,3 +275,23 @@ inventory.json
 !REUSE-AND-MIGRATION-DECISION.zh-CN.md
 !UNIFIED-API-CONTRACT-EXAMPLES.draft.json
 !GENERATION-RELIABILITY-ARCHITECTURE.zh-CN.md
+
+# Reviewed WanGP integration source; no weights, credentials or execution state.
+!studio_platform/generation_admission.py
+!studio_platform/inference/wangp.py
+!studio_platform/inference/wangp_contract.py
+!studio_platform/inference/wangp_compiler.py
+!studio_platform/inference/wangp_http.py
+!studio_platform/inference/wangp_factory.py
+!studio_platform/runtime_hosts/
+!studio_platform/runtime_hosts/__init__.py
+!studio_platform/runtime_hosts/wangp.py
+!studio_platform/runtime_hosts/wangp_receipts.py
+!studio_platform/runtime_hosts/wangp_session.py
+!studio_platform/runtime_hosts/wangp_http.py
+!studio_platform/runtime_hosts/wangp_launcher.py
+!deploy/wangp/
+!deploy/wangp/README.md
+!deploy/wangp/manifest.json
+!deploy/wangp/runtime-recipe.json
+!WANGP-INTEGRATION-RESULT.md

@@ -455,7 +455,9 @@ def create_app(settings: Settings, *, repository=None, storage=None):
 
     def plan_response(principal, body, project):
         project_id = project["id"]
-        compiled, fingerprint = compile_request(body, lambda asset_id: asset_service.model_snapshot(principal.owner, project_id, asset_id))
+        compiled, fingerprint = compile_request(body,
+            lambda asset_id: asset_service.model_snapshot(principal.owner, project_id, asset_id),
+            backend=settings.execution_backend)
         ref = compiled["client_ref"]
         if not validate_source_ref(project, ref):
             raise Conflict("shot_version_conflict")
@@ -485,7 +487,7 @@ def create_app(settings: Settings, *, repository=None, storage=None):
 
     @app.post("/v1/projects/{project_id}/shots/{shot_id}/generation-plans", status_code=201)
     def saved_generation_plan(project_id: str, shot_id: str, request: Request, body: dict):
-        from .generation_draft import fields, plan_body
+        from .generation_draft import fields
         principal = request.state.principal
         fields(body, {"expected_version", "capabilities_version"}, "草稿预检")
         if type(body.get("expected_version")) is not int or body["expected_version"] < 1:
@@ -496,26 +498,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         record = authorized_project(principal, project_id, "jobs:write")
         if record["version"] != body["expected_version"]:
             raise Conflict("document_version_conflict")
-        def derive(ident, start, end):
-            authorized_project(principal, project_id, "assets:write")
-            asset_service.get(principal.owner, ident, project_id)
-            value = asset_service.derive(principal.owner, ident, start, end)
-            if value["status"] != "ready":
-                raise Conflict("asset_not_ready")
-            return value["asset_id"]
-        # Permission is required only if there are media receipts. The saved
-        # project contains no authority to access another owner's object.
-        from .generation_draft import read_draft
-        draft, _ = read_draft(record["payload"], shot_id)
-        if any(draft["inputs"].values()):
-            authorized_project(principal, project_id, "assets:read")
-        payload = plan_body(record["payload"], shot_id, capabilities(settings), derive)
-        # CPU derivation may take time; do not produce a plan from a now-stale
-        # snapshot or let concurrent edits be mistaken for the submitted draft.
-        latest = authorized_project(principal, project_id, "jobs:write")
-        if latest["version"] != body["expected_version"]:
-            raise Conflict("document_version_conflict")
-        return plan_response(principal, payload, latest["payload"])
+        return generation_admission.preflight(principal, record["payload"], shot_id,
+                                              expected_version=body["expected_version"])
 
     def resolve_render_source(principal, project_id, entity, kind):
         data = entity.get("data", {})
@@ -581,32 +565,18 @@ def create_app(settings: Settings, *, repository=None, storage=None):
                     or compiled.get("server_source_hash") != source_snapshot(project, ref["shot_id"])):
                 raise Conflict("shot_version_conflict")
 
+    from .generation_admission import GenerationAdmission
+    generation_admission = GenerationAdmission(repo=repo, assets=asset_service, settings=settings,
+        policies=execution_policies, scope=scope, authorized_project=authorized_project,
+        owned_plan=owned_plan, plan_response=plan_response, check_source=check_plan_source,
+        capabilities_provider=lambda: capabilities(settings))
+
     def create_from_plan(principal, plan_id, idempotency_key, initial_status=None):
-        plan = owned_plan(principal, plan_id)
-        # A lost HTTP response can be retried after editing the shot. The original
-        # immutable task still belongs to this key; let the ledger compare hashes.
-        existing = repo.lookup_job_by_idempotency(scope(principal, plan["project_id"]), idempotency_key)
-        if existing:
-            return repo.create_job(scope(principal, plan["project_id"]), plan_id, idempotency_key)
-        project = authorized_project(principal, plan["project_id"], "jobs:write")["payload"]
-        check_plan_source(project, plan["request"])
-        execution = plan["execution_plan"]
-        enabled_setting = settings.render_enabled if plan["request"]["recipe_id"] == RENDER_RECIPE else settings.generation_enabled
-        ready = enabled_setting and execution.get("enabled") and execution.get("quote_known")
-        status = initial_status or (execution.get("admission_state", "queued") if ready else "blocked")
-        if status in {"queued", "planned", "waiting_capacity"} and not ready:
-            status = "blocked"
-        task_scope = scope(principal, plan["project_id"])
-        budgets = execution_policies.ensure_current(plan, task_scope) if ready else ()
-        return repo.create_job(task_scope, plan_id, idempotency_key, initial_status=status, budget_account_ids=budgets)
+        return generation_admission.create(principal, plan_id, idempotency_key,
+                                           initial_status=initial_status)
 
     def enqueue_planned(principal, job):
-        task_scope = scope(principal, job["project_id"])
-        plan = owned_plan(principal, job["plan_id"])
-        project = authorized_project(principal, job["project_id"], "jobs:write")["payload"]
-        check_plan_source(project, plan["request"])
-        budgets = execution_policies.ensure_current(plan, task_scope)
-        return repo.enqueue(task_scope, job["id"], budget_account_ids=budgets)
+        return generation_admission.enqueue(principal, job)
 
     @app.post("/v1/jobs", status_code=202)
     def create_job(request: Request, body: dict, idempotency_key: str = Header(..., alias="Idempotency-Key")):
