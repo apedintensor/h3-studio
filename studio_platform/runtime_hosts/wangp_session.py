@@ -233,7 +233,10 @@ class PinnedWanGPSession:
             if not self.is_idle():
                 raise NotReady("wangp_session_busy")
             # Pristine computed defaults, not mutable GUI defaults/previous-job state.
-            values = self.session.get_default_settings("minimax_h3_fl2va")
+            model = settings.get("model_type", "minimax_h3_fl2va")
+            if model not in {"minimax_h3_fl2va", "minimax_h3_ref2va"}:
+                raise ValueError("wangp_session_model_unsupported")
+            values = self.session.get_default_settings(model)
             values.update(copy.deepcopy(dict(settings)))
             job = self.session.submit_task(values)
             return _SessionHandle(job, self.output_root, self.audio_writer, self.worker_alive, self.quiesce)

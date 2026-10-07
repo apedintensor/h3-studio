@@ -1,0 +1,176 @@
+{
+  "protocol_version": "wangp-private-v1",
+  "engine": "wangp",
+  "source_revision": "0e58385fbde7ff102d276e4a9e490845de76b4ea",
+  "compiler_id": "sixnine-h3-ref2va-bf16-50-smallrefs-v1",
+  "profile_id": "h3-ref2va-bf16-50-sdpa-p4-smallrefs-v1",
+  "runtime_digest": "a9c4b97e100095e17302d27a2b8e35e5ec4b476a322ab2ed366cd30de97cc970",
+  "runtime_digest_kind": "upstream-requirements-source-sha256-not-installed-environment",
+  "memory_profile": "mmgp-profile-4",
+  "kernel_profile": "sdpa-strict-no-compile",
+  "topology": {
+    "slots": 1,
+    "gpus": 1
+  },
+  "synthetic": false,
+  "inference_qualified": false,
+  "source_repository": "https://github.com/deepbeepmeep/Wan2GP",
+  "components": {
+    "transformer": {
+      "repository": "DeepBeepMeep/MiniMax-H3",
+      "revision": "adc81ccb71352192214d83d5fafb9487e860be39",
+      "precision": "bf16",
+      "files": [
+        {
+          "path": "MiniMax-H3-Ref2VA_bf16.safetensors",
+          "size_bytes": 66280486944,
+          "sha256": "ca877ed2b1bf72cfda76fe38117832544d6c0530abcfb9463e114cd767a39516"
+        }
+      ]
+    },
+    "text_encoder": {
+      "repository": "DeepBeepMeep/MiniMax-H3",
+      "revision": "adc81ccb71352192214d83d5fafb9487e860be39",
+      "precision": "bf16-layer50",
+      "files": [
+        {
+          "path": "Qwen3-VL-32B-Instruct/Qwen3-VL-32B-Instruct-layer50_bf16.safetensors",
+          "size_bytes": 51506305568,
+          "sha256": "a91ca0cc41bead2e62d8fc044a3ffdbd9487daa7c8997f697049990c7178e0a6"
+        },
+        {
+          "path": "Qwen3-VL-32B-Instruct/config.json",
+          "size_bytes": 1474,
+          "git_blob_sha1": "29e925092dee9f14278c53e7e7d876cea8a997bc"
+        },
+        {
+          "path": "Qwen3-VL-32B-Instruct/preprocessor_config.json",
+          "size_bytes": 390,
+          "git_blob_sha1": "2ea84a437d448ff71b08df68fdd949d5cc4ebb64"
+        },
+        {
+          "path": "Qwen3-VL-32B-Instruct/tokenizer.json",
+          "size_bytes": 7032403,
+          "git_blob_sha1": "c6cc1014128b19d1fc46b1d30a23e3b1d35db421"
+        },
+        {
+          "path": "Qwen3-VL-32B-Instruct/tokenizer_config.json",
+          "size_bytes": 11004,
+          "git_blob_sha1": "5e463a18949779b8a38a03f0a6d9089094970eed"
+        },
+        {
+          "path": "Qwen3-VL-32B-Instruct/vocab.json",
+          "size_bytes": 2776833,
+          "git_blob_sha1": "4783fe10ac3adce15ac8f358ef5462739852c569"
+        }
+      ]
+    },
+    "video_vae": {
+      "repository": "DeepBeepMeep/MiniMax-H3",
+      "revision": "adc81ccb71352192214d83d5fafb9487e860be39",
+      "precision": "fp16",
+      "files": [
+        {
+          "path": "MiniMax-H3-video_vae_fp16.safetensors",
+          "size_bytes": 5207806512,
+          "sha256": "455010492bb59a9cc7b8f1ee23905b22a10079f89490adbf820a1728efcaea6b"
+        }
+      ]
+    },
+    "audio_vae": {
+      "repository": "DeepBeepMeep/MiniMax-H3",
+      "revision": "adc81ccb71352192214d83d5fafb9487e860be39",
+      "precision": "fp32",
+      "files": [
+        {
+          "path": "MiniMax-H3-audio_vae_fp32.safetensors",
+          "size_bytes": 605429308,
+          "sha256": "37dddc2f3e6d5d5139d823d5ea283bbf304dadcb885b1ccda818aa13dade5ea2"
+        }
+      ]
+    },
+    "latent_upscaler": {
+      "repository": "DeepBeepMeep/MiniMax-H3",
+      "revision": "adc81ccb71352192214d83d5fafb9487e860be39",
+      "precision": "bf16",
+      "files": [
+        {
+          "path": "minimax_h3/minimax_h3_latent_upscaler_3d_bf16.safetensors",
+          "size_bytes": 690592992,
+          "sha256": "4f57821f5837f32f7142b67d815606dbd7550f194e5c769f7d6c3f83b146a5e6"
+        }
+      ]
+    }
+  },
+  "runtime_recipe": {
+    "python": "3.11.14",
+    "cuda_recipe": "12.8.1",
+    "torch": "2.10.0+cu128",
+    "torchvision": "0.25.0+cu128",
+    "torchaudio": "2.10.0+cu128",
+    "diffusers": "0.36.0",
+    "transformers": "4.54.0",
+    "numpy": "2.1.2",
+    "optimum-quanto": "0.2.7",
+    "comfy-kitchen": "0.2.35",
+    "attention": "sdpa",
+    "compile": false,
+    "kernel_precision": "strict",
+    "requirements_source": "requirements.txt at source_revision",
+    "requirements_sha256": "a9c4b97e100095e17302d27a2b8e35e5ec4b476a322ab2ed366cd30de97cc970",
+    "full_dependency_lock": "pending-first-authorized-image-build",
+    "image_digest": "unqualified",
+    "driver_minimum": "not verified; record actual CUDA compatibility on selected host",
+    "startup": "owned launcher verifies source, environment and all model hashes before Session/readiness; candidate still lacks installed-environment qualification"
+  },
+  "input_envelope": {
+    "mode": "ref",
+    "qualification_only": true,
+    "max_images": 1,
+    "max_videos": 1,
+    "max_audios": 1,
+    "max_reference_files": 3,
+    "guides": 0,
+    "first_last": false,
+    "max_reference_pixels": 399360,
+    "max_reference_edge": 832,
+    "min_reference_edge": 256,
+    "video": "explicit 2--3s selected source; normalized 24fps/56 or73frames; no audio track",
+    "audio": "explicit 2--3s source; normalized PCM_s16le WAV32kHz stereo; requires at least one image/video",
+    "output": "5 requested seconds;832x480;124nativeframes at24fps",
+    "reject_unsupported": "no upstream aggregate trimming, soundtrack extraction, extra references or first/last frames"
+  },
+  "execution_controls": {
+    "steps": 50,
+    "transformer_quantization": "bf16",
+    "text_encoder_quantization": "bf16",
+    "sample_solver": "euler",
+    "guidance": 1,
+    "phases": 1,
+    "video_shift": 12,
+    "audio_shift": 3,
+    "video_decode": "tiled",
+    "video_tile_size": 256,
+    "video_overlap": 64,
+    "video_clip_length": 17,
+    "audio_decode": "normal",
+    "audio_generation": true,
+    "encoder_device": "MMGP profile4-managed; not forced CPU",
+    "temporal_upsampling": false,
+    "spatial_upsampling": false,
+    "cache": false,
+    "prompt_enhancer": false,
+    "lora": false
+  },
+  "outputs": {
+    "raw_video": "mp4 h264 (upstream libx264_8 means CRF10), AAC128 stereo32kHz, fullnative frames",
+    "raw_audio": "WAV IEEE float32 stereo32kHz from API artifact, not AAC reconstruction",
+    "delivery": "explicit REF policy requires native-frames-v1 and all124frames; this candidate alone does not enable generation admission"
+  },
+  "evidence": {
+    "date": "2026-10-08",
+    "model_metadata": "https://huggingface.co/api/models/DeepBeepMeep/MiniMax-H3/revision/adc81ccb71352192214d83d5fafb9487e860be39?blobs=true",
+    "handler": "https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/models/minimax_h3/minimax_h3_handler.py",
+    "note": "Offline source/mapping candidate only. No weights downloaded, inference executed, or BF16 mixed-reference memory/disk envelope qualified. Production admission requires a separately reviewed locked manifest and explicit REF configuration/policy."
+  }
+}

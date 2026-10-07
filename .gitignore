@@ -284,6 +284,7 @@ inventory.json
 !studio_platform/inference/wangp.py
 !studio_platform/inference/wangp_contract.py
 !studio_platform/inference/wangp_compiler.py
+!studio_platform/inference/wangp_ref_compiler.py
 !studio_platform/inference/wangp_http.py
 !studio_platform/inference/wangp_factory.py
 !studio_platform/runtime_hosts/
@@ -296,6 +297,7 @@ inventory.json
 !deploy/wangp/
 !deploy/wangp/README.md
 !deploy/wangp/manifest.json
+!deploy/wangp/manifest-ref2va-candidate.json
 !deploy/wangp/runtime-recipe.json
 !WANGP-INTEGRATION-RESULT.md
 

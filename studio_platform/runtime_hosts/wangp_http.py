@@ -7,18 +7,22 @@ from dataclasses import asdict
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
 import tempfile
 import uuid
+from fractions import Fraction
+import subprocess
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..inference.wangp_contract import InputDescriptor, PreparedRequest
 from ..storage import LocalObjectStore
+from ..media_process import run_media_process
 
 
 def private_token_file(path):
@@ -77,14 +81,13 @@ class StagedInputs:
             pass
         self.resolve(descriptor)
 
-    def image_path(self, descriptor):
+    def image_path(self, descriptor, *, reference=False):
         """Expose inspected normalized PNG bytes under a runtime-safe extension.
 
         WanGP rejects extensionless inputs. The public asset service supplies
         normalized PNGs; this copy preserves their hash and never re-encodes.
         """
         from PIL import Image
-        from .wangp_receipts import checked_directory, checked_reader, sync_directory
         if descriptor.kind != "image":
             raise ValueError("wangp_image_input_required")
         self.resolve(descriptor)
@@ -93,9 +96,72 @@ class StagedInputs:
             if (picture.format != "PNG" or getattr(picture, "n_frames", 1) != 1
                     or not 256 <= picture.width <= 5760 or not 256 <= picture.height <= 5760):
                 raise ValueError("wangp_normalized_png_required")
+            if reference:
+                self._reference_dimensions(picture.width, picture.height)
             picture.verify()
-        folder = checked_directory(self.root / "typed-images", create=True)
-        final = folder / (descriptor.sha256 + ".png")
+        return self._typed_copy(descriptor, "images", ".png")
+
+    @staticmethod
+    def _reference_dimensions(width, height):
+        if (type(width) is not int or type(height) is not int or min(width, height) < 256
+                or max(width, height) > 832 or width * height > 832*480 or not .4 <= width/height <= 2.5):
+            raise ValueError("wangp_ref_qualification_pixels_exceeded")
+
+    def _probe_reference(self, descriptor, kind):
+        if descriptor.kind != kind:
+            raise ValueError("wangp_typed_input_kind_mismatch")
+        path = self.resolve(descriptor)
+        # Force a local demuxer, suppress all diagnostic/media text, and inspect
+        # the actual hash-bound object rather than trusting uploaded metadata.
+        args = ["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe",
+                "-f", "mov" if kind == "video" else "wav"]
+        if kind == "video":
+            args += ["-enable_drefs", "0", "-use_absolute_path", "0", "-count_frames"]
+        args += ["-max_streams", "4", "-show_entries",
+                 "stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,nb_read_frames,duration,sample_rate,channels:format=duration",
+                 "-of", "json", str(path)]
+        try:
+            result = run_media_process(args, check=True, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=20, memory_bytes=512*1024**2)
+            if len(result.stdout) > 16384:
+                raise ValueError()
+            value = json.loads(result.stdout)
+            streams = value["streams"]
+            if not isinstance(streams, list) or len(streams) != 1 or streams[0]["codec_type"] != kind:
+                raise ValueError()
+            return streams[0], value.get("format", {})
+        except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError):
+            raise ValueError("wangp_ref_media_probe_rejected") from None
+
+    def video_path(self, descriptor):
+        stream, _ = self._probe_reference(descriptor, "video")
+        try:
+            self._reference_dimensions(stream["width"], stream["height"])
+            count = int(stream["nb_read_frames"])
+            duration = float(stream["duration"])
+            if (stream["codec_name"] != "h264" or count not in (56, 73)
+                    or Fraction(stream["avg_frame_rate"]) != 24 or Fraction(stream["r_frame_rate"]) != 24
+                    or not math.isfinite(duration) or abs(duration-count/24) > .00001):
+                raise ValueError()
+        except (ValueError, KeyError, TypeError, ZeroDivisionError, OverflowError):
+            raise ValueError("wangp_ref_normalized_silent_video_required") from None
+        return self._typed_copy(descriptor, "videos", ".mp4")
+
+    def audio_path(self, descriptor):
+        stream, info = self._probe_reference(descriptor, "audio")
+        try:
+            if (stream["codec_name"] != "pcm_s16le" or int(stream["sample_rate"]) != 32000
+                    or stream["channels"] != 2 or not 2 <= float(info["duration"]) <= 3):
+                raise ValueError()
+        except (ValueError, KeyError, TypeError, OverflowError):
+            raise ValueError("wangp_ref_normalized_audio_required") from None
+        return self._typed_copy(descriptor, "audios", ".wav")
+
+    def _typed_copy(self, descriptor, plural, extension):
+        from .wangp_receipts import checked_directory, checked_reader, sync_directory
+        key = self.key(descriptor)
+        folder = checked_directory(self.root / ("typed-" + plural), create=True)
+        final = folder / (descriptor.sha256 + extension)
         if not final.exists():
             temporary = folder / (uuid.uuid4().hex + ".part")
             try:
