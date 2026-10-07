@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tempfile
 import uuid
@@ -149,6 +150,13 @@ def create_app(host, inputs, *, token):
 
     @app.post("/v1/operations")
     async def submit(request: Request):
+        incarnation = request.headers.get("x-wangp-incarnation")
+        if incarnation is not None and (not re.fullmatch(r"[0-9a-f]{32}", incarnation)
+                or incarnation != getattr(host, "incarnation", None)):
+            # WanGPHost's incarnation is immutable for its process lifetime.
+            # This admission precondition closes the readiness/POST race;
+            # reads of old durable receipts remain available after restart.
+            return JSONResponse({"error": "wangp_runtime_incarnation_mismatch"}, status_code=409)
         try:
             length = int(request.headers.get("content-length", "0"))
             if not 0 < length <= 2 * 1024**2:

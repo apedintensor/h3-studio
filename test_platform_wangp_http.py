@@ -28,15 +28,16 @@ class FakeHost:
     def __init__(self):
         self.calls = 0
         self.receipt = None
+        self.incarnation = "a" * 32
 
     def readiness(self):
-        return HostReadiness("2" * 64, "slot-test", "incarnation-test", True)
+        return HostReadiness("2" * 64, "slot-test", self.incarnation, True)
 
     def submit(self, value):
         self.calls += 1
         self.receipt = OperationReceipt(value.operation_id, value.job_id, value.attempt_tag,
             value.request_hash, value.manifest_digest, value.identity_digest,
-            "slot-test", "incarnation-test", "running", True)
+            "slot-test", self.incarnation, "running", True)
         return self.receipt
 
     def inspect(self, identity):
@@ -60,6 +61,7 @@ class HTTPTests(unittest.TestCase):
                 headers=dict(request.headers), content=request.read())
             return httpx.Response(response.status_code, content=response.content,
                                   headers=dict(response.headers))
+        self.dispatch = dispatch
         self.transport = HTTPWanGPTransport("http://127.0.0.1:8199", TOKEN,
                                             transport=httpx.MockTransport(dispatch))
         self.addCleanup(self.transport.close)
@@ -78,6 +80,43 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(self.transport.inspect(value.operation_id), receipt)
         self.assertTrue(self.transport.cancel(value.operation_id))
         self.assertEqual(self.host.calls, 1)
+
+    def bound_transport(self, incarnation):
+        transport = HTTPWanGPTransport("http://127.0.0.1:8199", TOKEN,
+            transport=httpx.MockTransport(self.dispatch), expected_incarnation=incarnation)
+        self.addCleanup(transport.close)
+        return transport
+
+    def test_bound_submit_checks_epoch_at_server_before_dispatch(self):
+        transport = self.bound_transport(self.host.incarnation)
+        self.assertEqual(transport.submit(prepared()).incarnation, self.host.incarnation)
+        self.assertEqual(self.host.calls, 1)
+
+    def test_replacement_after_readiness_cannot_dispatch_but_old_receipt_remains_readable(self):
+        transport = self.bound_transport(self.host.incarnation)
+        original = transport.submit(prepared())
+        observed = transport.readiness()
+        self.host.incarnation = "b" * 32  # Replacement at the same private endpoint.
+        self.assertNotEqual(observed.incarnation, self.host.incarnation)
+        # Even a rejected POST remains conservatively uncertain to the client:
+        # it cannot disprove a previously accepted response lost on the network.
+        with self.assertRaises(SubmissionUncertain):
+            transport.submit(prepared())
+        self.assertEqual(self.host.calls, 1)
+        self.assertEqual(transport.inspect(original.operation_id), original)
+        self.assertTrue(transport.cancel(original.operation_id))
+
+    def test_wrong_or_malformed_epoch_is_rejected_without_returning_identity(self):
+        for value in ("b" * 32, "invalid-epoch", "", "a" * 33):
+            with self.subTest(length=len(value)):
+                response = self.client.post("/v1/operations", json=asdict(prepared()), headers={
+                    "Authorization": "Bearer " + TOKEN, "X-Wangp-Incarnation": value})
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(response.json(), {"error": "wangp_runtime_incarnation_mismatch"})
+                self.assertEqual(self.host.calls, 0)
+        for value in (False, "invalid-epoch", "", "a" * 33):
+            with self.assertRaisesRegex(ValueError, "invalid_runtime_incarnation"):
+                HTTPWanGPTransport("http://127.0.0.1:8199", TOKEN, expected_incarnation=value)
 
     def test_invalid_input_is_rejected_before_host_dispatch(self):
         value = asdict(prepared())
