@@ -256,6 +256,14 @@
       "depends_on": [
         "A4"
       ]
+    },
+    "C4": {
+      "number": 47,
+      "node_id": "I_kwDOU6TGZc8AAAABVu6jSg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/47",
+      "title": "[C4] Enforce the actual AWS release caller account",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_RA7k",
+      "depends_on": []
     }
   },
   "views": {
