@@ -503,7 +503,7 @@ class Repository:
         preflighted against a fresh cold-start approval; it is never silently
         queued onto a destroyed instance or changed into a different purchase.
         """
-        if (execution.get("backend") != "comfy-worker" or execution.get("enabled") is not True
+        if (execution.get("backend") not in {"comfy-worker", "wangp-worker"} or execution.get("enabled") is not True
                 or execution.get("admission_state") == "waiting_capacity"):
             return
         stopping = set(connection.execute(select(instance_intents.c.provider, instance_intents.c.provider_instance_id)
@@ -518,7 +518,9 @@ class Repository:
             spec = worker["spec"]
             if (worker["state"] in ("ready", "leased", "busy", "reconciling") and not worker["drain_requested"]
                     and worker["expires_at"] > now and (worker["provider"], worker["instance_id"]) not in stopping
-                    and spec.get("backend") == "comfy-worker"
+                    and spec.get("backend") == execution.get("backend")
+                    and (execution.get("backend") != "wangp-worker"
+                         or spec.get("engine_manifest_digest") == execution.get("engine_manifest_digest"))
                     and spec.get("configuration_id") == execution.get("configuration_id")
                     and spec.get("model_id") == compiled.get("request", compiled).get("model")
                     and compiled.get("recipe_id") in spec.get("recipe_ids", ())):

@@ -6,6 +6,7 @@ worker owns two physical devices but executes only one job at a time.
 """
 from dataclasses import asdict, dataclass
 import math
+import re
 
 from sqlalchemy import and_, case, insert, select, update
 
@@ -17,6 +18,7 @@ from .repository import (
 
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
+REAL_GPU_BACKENDS = frozenset({"comfy-worker", "wangp-worker"})
 
 
 @dataclass(frozen=True)
@@ -30,12 +32,18 @@ class WorkerSpec:
     model_id: str
     configuration_id: str
     backend: str = "comfy-worker"
+    engine_manifest_digest: str = ""
 
     def __post_init__(self):
         for value in (self.worker_id, self.pool, self.provider, self.instance_id, self.model_id, self.configuration_id):
             identifier(value)
-        if self.backend not in {"mock", "comfy-worker", "cpu-render"}:
+        if self.backend not in {"mock", "cpu-render", *REAL_GPU_BACKENDS}:
             raise ValueError("invalid_worker_backend")
+        if self.backend == "wangp-worker":
+            if not isinstance(self.engine_manifest_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", self.engine_manifest_digest):
+                raise ValueError("explicit_engine_manifest_required")
+        elif self.engine_manifest_digest != "":
+            raise ValueError("unexpected_engine_manifest")
         if (not isinstance(self.physical_gpu_ids, tuple) or (not self.physical_gpu_ids and self.backend != "cpu-render")
             or len(set(self.physical_gpu_ids)) != len(self.physical_gpu_ids)
             or len(self.physical_gpu_ids) > 8):
@@ -57,6 +65,14 @@ class WorkerSpec:
             raise ValueError("real_worker_requires_recipe_bindings")
         for recipe in self.recipe_ids:
             identifier(recipe)
+
+
+def worker_spec_payload(spec):
+    """Keep historical registration hashes unchanged; bind new engines explicitly."""
+    value = asdict(spec)
+    if spec.backend != "wangp-worker":
+        value.pop("engine_manifest_digest")
+    return canonical(value)
 
 
 class WorkerControl:
@@ -89,7 +105,7 @@ class WorkerControl:
                 and previous.upstream_task_id is None)
 
     def pool_status(self, pool, *, model_id, configuration_id, recipe_id=None,
-                    backend="comfy-worker"):
+                    backend="comfy-worker", engine_manifest_digest=None):
         """Read-only readiness of exact operator-bound slots, not a GPU probe.
 
         An expired registration is reported as unknown without modifying its
@@ -100,8 +116,11 @@ class WorkerControl:
             identifier(value)
         if recipe_id is not None:
             identifier(recipe_id)
-        if backend not in {"mock", "comfy-worker", "cpu-render"}:
+        if backend not in {"mock", "cpu-render", *REAL_GPU_BACKENDS}:
             raise ValueError("invalid_worker_backend")
+        if backend == "wangp-worker" and (not isinstance(engine_manifest_digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", engine_manifest_digest)):
+            raise ValueError("explicit_engine_manifest_required")
         now = self.repo.clock()
         counts = {state: 0 for state in ("ready", "busy", "unknown", "registered", "draining", "retired")}
         matched = 0
@@ -114,6 +133,7 @@ class WorkerControl:
                 spec = row["spec"]
                 if (spec["backend"] != backend or spec["model_id"] != model_id
                     or spec["configuration_id"] != configuration_id
+                    or backend == "wangp-worker" and spec.get("engine_manifest_digest") != engine_manifest_digest
                     or recipe_id is not None and recipe_id not in spec["recipe_ids"]):
                     continue
                 matched += 1
@@ -137,7 +157,7 @@ class WorkerControl:
 
     def register(self, spec: WorkerSpec):
         """Operator assigns concrete provider/instance/device identities, not users."""
-        payload = canonical(asdict(spec))
+        payload = worker_spec_payload(spec)
         digest = request_hash(payload)
         repo = self.repo
         with repo.transaction() as connection:
@@ -153,7 +173,7 @@ class WorkerControl:
                 registered_devices.c.gpu_id.in_(spec.physical_gpu_ids)).with_for_update()).mappings())
             if any(row["state"] != "released" for row in bindings):
                 raise Conflict("physical_gpu_already_owned")
-            if spec.backend == "comfy-worker":
+            if spec.backend in REAL_GPU_BACKENDS:
                 usage = repo._global_usage(connection)
                 key = (spec.provider, spec.instance_id)
                 existing_count = sum(1 for r in connection.execute(select(registered_devices).where(
@@ -191,6 +211,20 @@ class WorkerControl:
                     connection.execute(insert(registered_devices).values(provider=spec.provider,
                         instance_id=spec.instance_id, gpu_id=gpu_id, **values))
             return row
+
+    def require_recovery_binding(self, spec):
+        """Validate an existing obligation without registering/reviving a slot."""
+        if spec.backend not in REAL_GPU_BACKENDS:
+            raise Conflict("recovery_requires_real_engine")
+        worker = self.get(spec.worker_id)
+        if (worker["spec_hash"] != request_hash(worker_spec_payload(spec))
+                or worker["state"] == "retired" or not worker["current_job_id"]):
+            raise Conflict("recovery_worker_binding_required")
+        with self.repo.engine.connect() as connection:
+            job = self.repo._job(connection, worker["current_job_id"])
+            if not self.matches(worker, job):
+                raise Conflict("recovery_worker_binding_conflict")
+        return worker
 
     def mark_ready(self, worker_id, *, upstream_idle_confirmed=False):
         if not upstream_idle_confirmed:
@@ -231,6 +265,8 @@ class WorkerControl:
             return False
         if spec["backend"] == "mock":
             return spec["provider"] == "mock" and spec["model_id"] == "SIMULATION"
+        if spec["backend"] == "wangp-worker" and execution.get("engine_manifest_digest") != spec.get("engine_manifest_digest"):
+            return False
         return (effective.get("model") == spec["model_id"]
                 and execution.get("configuration_id") == spec["configuration_id"])
 
@@ -277,6 +313,8 @@ class WorkerControl:
                     jobs.c.request["request"]["model"].as_string()), else_=jobs.c.request["model"].as_string())
                 bindings.extend((model == spec["model_id"],
                     jobs.c.execution_plan["configuration_id"].as_string() == spec["configuration_id"]))
+            if spec["backend"] == "wangp-worker":
+                bindings.append(jobs.c.execution_plan["engine_manifest_digest"].as_string() == spec["engine_manifest_digest"])
             if purpose == "generate":
                 deadlines = list(connection.execute(select(instance_intents.c.hard_deadline).where(
                     instance_intents.c.provider == worker["provider"],

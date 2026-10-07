@@ -66,6 +66,18 @@ def capabilities(settings):
                     "minimum_aspect_ratio": .4, "maximum_aspect_ratio": 2.5,
                     "description": "自定义宽高须为32的倍数，总面积不超过768×1344，宽高比0.4–2.5"},
                 "source": {"comfyui_revision": COMFY_COMMIT}} for key, mode in RECIPES.items()]
+    if settings.execution_backend == "wangp-worker":
+        from .inference.wangp_compiler import control_schema as wangp_controls
+        from .inference.wangp_contract import UPSTREAM_REVISION
+        for recipe in recipes:
+            supported = recipe["mode"] == "fl"
+            recipe.update(implemented=supported, enabled=settings.generation_enabled and supported,
+                controls=wangp_controls() if supported else {},
+                validation_level="implementation_only_not_gpu_qualified",
+                source={"wangp_revision": UPSTREAM_REVISION})
+            if supported:
+                recipe["limits"] = {**LIMITS, "max_images": 0, "max_videos": 0,
+                    "max_audios": 0, "max_total_files": 2, "max_guides": 0}
     for recipe in recipes:
         recipe["execution_support"] = {
             "status": "disabled" if offline else "simulation" if settings.execution_backend == "mock" else "unavailable",
@@ -73,7 +85,7 @@ def capabilities(settings):
                 "当前为模拟流程，不代表真实模型生成。" if settings.execution_backend == "mock" else
                 "当前执行范围尚未确认；模型支持的输入不代表已在此云端开放。",
             "capacity_checked": False, "preflight_required": True}
-    if settings.generation_enabled and settings.execution_backend == "comfy-worker":
+    if settings.generation_enabled and settings.execution_backend in {"comfy-worker", "wangp-worker"}:
         # Public operational defaults are separate from model defaults. Never
         # serialize the operator policy (budget identities/pool bindings), and
         # never modify compile_request or a caller's explicitly chosen values.
@@ -84,18 +96,23 @@ def capabilities(settings):
         except ValueError:
             policy = None
         now = time.time()
-        if (policy and policy["enabled"] and policy["qualification"]["status"] in {"accepted", "runtime_required"}
+        if (policy and policy["enabled"] and policy["backend"] == settings.execution_backend
+                and policy["qualification"]["status"] in {"accepted", "runtime_required"}
                 and policy["qualification"]["verified_at"] <= now < policy["qualification"]["expires_at"]
                 and now + policy["reservation"]["expected_runtime_s"] <
                     min(policy["qualification"]["expires_at"], policy["reservation"]["expires_at"])):
             envelope = policy["envelope"]["controls"]
             preset = {field: value for field, value in (("encoder_device", "cpu"), ("video_decode", "tiled"))
                 if envelope[field] == [value]}
-            available = [recipe["label"] for recipe in recipes if recipe["id"] in policy["recipe_ids"]]
+            if settings.execution_backend == "wangp-worker":
+                preset = {}
+            available_recipes = [recipe for recipe in recipes
+                                 if recipe["implemented"] and recipe["id"] in policy["recipe_ids"]]
+            available = [recipe["label"] for recipe in available_recipes]
             runtime_required = policy["qualification"]["status"] == "runtime_required"
             queued_task_validation = policy["qualification"].get("profile") == QUEUED_TASK_PROFILE
             for recipe in recipes:
-                qualified = recipe["id"] in policy["recipe_ids"]
+                qualified = recipe["implemented"] and recipe["id"] in policy["recipe_ids"]
                 recipe["execution_support"] = {
                     "status": ("runtime_required" if runtime_required else "qualified") if qualified else "not_qualified",
                     "reason": ("可提交，GPU完成启动检查后直接执行队列中的真实任务；成功结果直接交付，失败会反馈原因并暂停该工作机接新任务。仍需预检账户额度与容量窗口。" if queued_task_validation else
@@ -105,7 +122,7 @@ def capabilities(settings):
                     "capacity_checked": False, "preflight_required": True,
                     "runtime_verification_required": runtime_required,
                     "verification_method": "queued_user_task" if queued_task_validation else "startup_suite" if runtime_required else "historical_qualification",
-                    "available_recipe_ids": list(policy["recipe_ids"]),
+                    "available_recipe_ids": [item["id"] for item in available_recipes],
                     "expires_at": min(policy["qualification"]["expires_at"], policy["reservation"]["expires_at"])
                         - policy["reservation"]["expected_runtime_s"]}
                 if qualified:
@@ -154,7 +171,7 @@ def capabilities(settings):
                       "音频分块不可用；快速VDN和外部API没有暗中替代原版模型。"]}
 
 
-def compile_request(body: dict, resolve_asset):
+def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
     """Validate immutable inputs without loading weights or accessing providers."""
     permitted = {"client_ref", "recipe_id", "capabilities_version", "prompt", "inputs", "controls",
                  "execution_policy_id", "client_edit"}
@@ -186,7 +203,11 @@ def compile_request(body: dict, resolve_asset):
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
         raise ValueError("请输入1至12000字符的单镜提示词")
     controls = copy.deepcopy(body.get("controls", {}))
-    if not isinstance(controls, dict) or set(controls) - set(control_schema()):
+    if backend == "wangp-worker":
+        from .inference.wangp_compiler import control_schema as selected_schema
+    else:
+        selected_schema = control_schema
+    if not isinstance(controls, dict) or set(controls) - set(selected_schema()):
         raise ValueError("控制项包含未支持的字段")
     for field in ("audio_tile_size", "audio_overlap"):
         if field in controls:
@@ -232,7 +253,11 @@ def compile_request(body: dict, resolve_asset):
     if "guides" in raw_inputs:
         if "guides" in controls:
             raise ValueError("时间锚点不能重复在inputs和controls中定义")
-        controls["guides"] = raw_inputs["guides"]
+        # Saved drafts include an empty guide region. It is an absence of
+        # conditioning, not a request for a control unsupported by WanGP.
+        # Nonempty or malformed values must still be rejected, never dropped.
+        if backend != "wangp-worker" or raw_inputs["guides"] != []:
+            controls["guides"] = raw_inputs["guides"]
     if not isinstance(controls.get("guides", []), list) or len(controls.get("guides", [])) > LIMITS["max_guides"]:
         raise ValueError("时间锚点必须是数组")
     ids = [*inputs["images"], *inputs["videos"], *inputs["audios"],
@@ -253,11 +278,15 @@ def compile_request(body: dict, resolve_asset):
     if type(request["duration"]) is not int or type(request["generate_audio"]) is not bool:
         raise ValueError("生成时长须为整数秒，声音开关须为布尔值")
     spec = native_output_spec(request)
-    validated = validate_controls(request, metadata, spec)
-    request.update(validated)
-    request["seed"] = str(request["seed"])
-    # Offline graph construction exercises the same pinned H3 input validator.
-    build_workflow(request, metadata, {key: key + "." + {"image": "png", "video": "mp4", "audio": "wav"}[metadata[key]["kind"]] for key in metadata})
+    if backend == "wangp-worker":
+        from .inference.wangp_compiler import normalize_request
+        request = normalize_request(request, metadata, spec)
+    else:
+        validated = validate_controls(request, metadata, spec)
+        request.update(validated)
+        request["seed"] = str(request["seed"])
+        # Offline graph construction exercises the historical pinned validator.
+        build_workflow(request, metadata, {key: key + "." + {"image": "png", "video": "mp4", "audio": "wav"}[metadata[key]["kind"]] for key in metadata})
     normalized = {"recipe_id": recipe, "capabilities_version": VERSION, "client_ref": ref,
                   "request": request, "output_spec": spec, "assets": assets,
                   "client_edit": body.get("client_edit", {}),

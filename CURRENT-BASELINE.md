@@ -1,7 +1,8 @@
 # Sixnine implementation and production baseline
 
 Source/workflow refreshed: 2026-10-07 Australia/Sydney.
-Last production observation: 2026-10-06, 22:20–22:25 Australia/Sydney (UTC+11); not rechecked by the audit-remediation batch.
+Last public health/provider inventory observation: 2026-10-07, 11:23 Australia/Sydney (UTC+11).
+Last container/ledger/controller observation: 2026-10-06, 22:20–22:25 Australia/Sydney; those details were not rechecked by the WanGP integration batch.
 Work item: [A1 #10](https://github.com/apedintensor/h3-studio/issues/10).
 This is a dated baseline, not a live status page or permission to operate GPUs.
 
@@ -10,6 +11,7 @@ This is a dated baseline, not a live status page or permission to operate GPUs.
 | Surface | Observed identity | Evidence / limits |
 |---|---|---|
 | Accepted generation foundation | `f51a90567227910cc2f30c55a8cb19b953d3d7a2` (PR #17) | A1/A2/B2 merged; not production-released. Read GitHub for subsequent source-only integration commits. |
+| WanGP integration source | D1/D2 checkpoint in `WANGP-INTEGRATION-RESULT.md` | Durable adapter/host and configured-slot routing implemented and tested offline. Pinned real image, on-demand boot integration and B3 real-generation proof remain incomplete; not production-released. |
 | Running production API image tag | `sixnine-platform:73ca224970ffdfae30e1bc7d99c50b2c96ce91af` | Read-only Docker inspection through official AWS MCP/SSM. |
 | Running image configuration digest | `sha256:9cda5689e60064ec2f6269b469274824f704f13186707fa5c6f2dc11f1a35ac2` | Docker image ID; do not confuse this with an OCI manifest/index digest. |
 | Frontend compatibility label | `sixnine-web-v1` | Fresh `/healthz`; this is not an independently verified frontend build SHA. |
@@ -19,6 +21,12 @@ This is a dated baseline, not a live status page or permission to operate GPUs.
 Unpublished source has a remote preservation branch; it differs from both accepted main and production. Use isolated worktrees and coordinate G1/G2 before changing its API/auth/repository/admission. Source-only preservation does not back up user media or production databases. The audit-remediation batch changes no service, cloud instance, budget or production deployment.
 
 ## Last observed production facts (2026-10-06)
+
+Read-only refresh on 2026-10-07 at 00:23 UTC confirmed public health/capabilities HTTP 200,
+authentication ready, generation/backend/render still disabled, Lium inventory empty,
+and the recorded previous pod absent. Official AWS MCP confirmed the known CPU host
+running and SSM online. No bill settlement, database read, image inspection or service
+change occurred in this refresh; the dated ledger/container details below remain historical.
 
 Official AWS MCP confirmed the known Singapore CPU host is running and managed through SSM. App and PostgreSQL containers were healthy. The finite GPU controller `sixnine-ondemand-duration-20261005.service` was inactive/dead with successful exit status 0.
 

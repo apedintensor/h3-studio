@@ -61,6 +61,7 @@ class Settings:
     frontend_release_dir: Path | None = None
     execution_policy_file: Path | None = None
     render_enabled: bool = False
+    recovery_backends: tuple[str, ...] = ()
 
     def __post_init__(self):
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
@@ -91,8 +92,13 @@ class Settings:
             if (local.scheme != "http" or local.hostname not in {"localhost", "127.0.0.1"}
                     or local.username or local.password or local.path or local.query or local.fragment):
                 raise ValueError("Local UI origins must be exact loopback HTTP origins")
-        if self.execution_backend not in {"disabled", "mock", "comfy-worker"}:
+        if self.execution_backend not in {"disabled", "mock", "comfy-worker", "wangp-worker"}:
             raise ValueError("Unsupported execution backend")
+        if (not isinstance(self.recovery_backends, tuple)
+                or any(not isinstance(value, str) for value in self.recovery_backends)
+                or len(set(self.recovery_backends)) != len(self.recovery_backends)
+                or any(value not in {"comfy-worker", "wangp-worker"} for value in self.recovery_backends)):
+            raise ValueError("Recovery backends must explicitly name real engines")
         if self.generation_enabled and self.execution_backend == "disabled":
             raise ValueError("Generation requires an explicitly configured backend")
         if self.storage_provider not in {"local", "r2", "s3", "hippius"}:
@@ -122,4 +128,5 @@ class Settings:
             frontend_release_dir=Path(os.environ["SIXNINE_FRONTEND_RELEASE_DIR"]) if os.environ.get("SIXNINE_FRONTEND_RELEASE_DIR") else None,
             execution_policy_file=Path(os.environ["SIXNINE_EXECUTION_POLICY_FILE"]) if os.environ.get("SIXNINE_EXECUTION_POLICY_FILE") else None,
             render_enabled=os.environ.get("SIXNINE_RENDER_ENABLED", "0") == "1",
+            recovery_backends=tuple(x.strip() for x in os.environ.get("SIXNINE_RECOVERY_BACKENDS", "").split(",") if x.strip()),
         )

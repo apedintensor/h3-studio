@@ -22,6 +22,8 @@
 !studio_platform/*.py
 !studio_platform/inference/
 !studio_platform/inference/*.py
+!studio_platform/runtime_hosts/
+!studio_platform/runtime_hosts/*.py
 !yingxu/
 !yingxu/package.json
 !yingxu/package-lock.json
