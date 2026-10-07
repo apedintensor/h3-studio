@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import types
@@ -23,6 +24,24 @@ TEST_TOKEN = "synthetic-launcher-test-token-" + "x" * 32
 
 
 class WanGPLaunchTests(unittest.TestCase):
+    def test_bootstrap_receipt_reader_imports_without_runtime_environment(self):
+        # Bootstrap uses the provider's base Python, not the locked runtime venv.
+        script = """
+import sys
+class NoOptionalPackages:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'fastapi', 'httpx', 'torch', 'sqlalchemy', 'uvicorn', 'pydantic', 'requests'}:
+            raise AssertionError('optional dependency imported by bootstrap receipt reader')
+sys.meta_path.insert(0, NoOptionalPackages())
+from studio_platform.runtime_hosts.wangp_receipts import VERIFICATION_RECEIPT, read_verification_receipt
+assert VERIFICATION_RECEIPT == 'runtime-verification.json'
+assert callable(read_verification_receipt)
+"""
+        checked = subprocess.run([sys.executable, "-S", "-c", script],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=15)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stdout, "")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -136,16 +155,22 @@ class WanGPLaunchTests(unittest.TestCase):
         def verify(*args):
             check_owned()
             events.append("verify")
-            return {"manifest_digest": self.manifest.digest}
+            return {"manifest_digest": self.manifest.digest, "inference_verified": False}
 
         def session(*args):
             check_owned()
             events.append("session")
+            receipt = wangp_launcher.read_verification_receipt(self.state, manifest_digest=self.manifest.digest,
+                slot_key="slot-test", pid=os.getpid())
+            self.assertFalse(receipt["evidence"]["inference_verified"])
             return types.SimpleNamespace(is_idle=lambda: True, close_when_idle=lambda: events.append("session-closed"))
 
         def app(host, inputs, token):
             hosts.append(host)
             self.assertEqual(token, TEST_TOKEN)
+            receipt = wangp_launcher.read_verification_receipt(self.state, manifest_digest=self.manifest.digest,
+                slot_key="slot-test", pid=os.getpid(), incarnation=host.incarnation)
+            self.assertEqual(receipt["incarnation"], host.incarnation)
             self.assertFalse(host.readiness().idle)
             current = host.inspect(original.operation_id)
             self.assertEqual(current.state, "unknown")
@@ -173,6 +198,64 @@ class WanGPLaunchTests(unittest.TestCase):
         self.assertTrue(journal.has_obligations())
         journal.acquire_host()
         journal.release_host()
+
+    def test_new_launcher_rehashes_and_old_receipt_cannot_bypass_failed_check(self):
+        from studio_platform.runtime_hosts import wangp_session
+        journal = self.journal(create=True)
+        host = types.SimpleNamespace(manifest=self.manifest, journal=journal, incarnation="a"*32)
+        old = wangp_launcher.write_verification_receipt(self.state, host,
+            {"manifest_digest": self.manifest.digest, "inference_verified": False})
+        with patch.object(wangp_session, "verify_runtime", side_effect=ValueError("wangp_component_hash_mismatch")) as verify, \
+                patch.object(wangp_session, "create_session") as session, \
+                patch.object(wangp_launcher, "create_app") as app, redirect_stdout(io.StringIO()):
+            self.assertEqual(wangp_launcher.main(self.argv), 1)
+        verify.assert_called_once()
+        session.assert_not_called()
+        app.assert_not_called()
+        self.assertEqual(wangp_launcher.read_verification_receipt(self.state, manifest_digest=self.manifest.digest,
+            slot_key="slot-test", pid=os.getpid()), old)
+        with self.assertRaisesRegex(ValueError, "receipt_mismatch"):
+            wangp_launcher.read_verification_receipt(self.state, manifest_digest=self.manifest.digest,
+                slot_key="slot-test", pid=os.getpid(), incarnation="b"*32)
+
+    def test_receipt_write_failure_never_initializes_session_and_retains_journal(self):
+        from studio_platform.runtime_hosts import wangp_session
+        with patch.object(wangp_session, "verify_runtime", return_value={
+                "manifest_digest": self.manifest.digest, "inference_verified": False}) as verify, \
+                patch.object(wangp_launcher.os, "replace", side_effect=OSError("synthetic IO failure")), \
+                patch.object(wangp_session, "create_session") as session, \
+                patch.object(wangp_launcher, "create_app") as app, redirect_stdout(io.StringIO()):
+            self.assertEqual(wangp_launcher.main(self.argv + ["--create-journal"]), 1)
+        verify.assert_called_once()
+        session.assert_not_called()
+        app.assert_not_called()
+        self.assertTrue((self.state / "operations.sqlite3").exists())
+        self.assertFalse((self.state / wangp_launcher.VERIFICATION_RECEIPT).exists())
+        self.assertEqual(list(self.state.glob(".runtime-verification-*.tmp")), [])
+        journal = self.journal()
+        journal.acquire_host()  # Failure before Session released the owned slot.
+        journal.release_host()
+
+    def test_private_receipt_rejects_wrong_identity_and_failed_write_preserves_old_bytes(self):
+        journal = self.journal(create=True)
+        host = types.SimpleNamespace(manifest=self.manifest, journal=journal, incarnation="a"*32)
+        evidence = {"manifest_digest": self.manifest.digest, "inference_verified": False}
+        original = wangp_launcher.write_verification_receipt(self.state, host, evidence)
+        path = self.state / wangp_launcher.VERIFICATION_RECEIPT
+        before = path.read_bytes()
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        for change in ({"pid": os.getpid()+1}, {"slot_key": "other"}, {"manifest_digest": "0"*64},
+                       {"incarnation": "b"*32}):
+            expected = dict(manifest_digest=self.manifest.digest, slot_key="slot-test", pid=os.getpid(), incarnation="a"*32)
+            expected.update(change)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "receipt_mismatch"):
+                wangp_launcher.read_verification_receipt(self.state, **expected)
+        with patch.object(wangp_launcher.os, "replace", side_effect=OSError("synthetic IO failure")), self.assertRaises(OSError):
+            wangp_launcher.write_verification_receipt(self.state, host, evidence)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(list(self.state.glob(".runtime-verification-*.tmp")), [])
+        self.assertEqual(original["evidence"], evidence)
 
     def test_shutdown_waits_for_runtime_and_closes_before_releasing_host(self):
         now, events = [0], []

@@ -3,9 +3,11 @@ import copy
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -135,6 +137,144 @@ class PackageTests(unittest.TestCase):
             archive.writestr("setuptools-84.0.0.dist-info/METADATA", "Name: setuptools\nVersion: 84.0.0\n")
             archive.writestr("setuptools/_vendor/example-1.0.dist-info/METADATA", "Name: example\nVersion: 1.0\n")
         self.assertEqual(package.wheel_metadata(wheel)["Name"], "setuptools")
+
+    def prepared_import_fixture(self):
+        value = self.config()
+        prepared = self.root / "prepared"
+        dependency = prepared / "dependencies"
+        runtime = dependency / "upstream"
+        runtime.mkdir(parents=True)
+        (runtime / "wgp.py").write_bytes(b"# pinned source\n")
+        requirements = dependency / "requirements.lock"
+        requirements.write_bytes(b"# synthetic locked fixture\n")
+        self.lock["requirements_lock_sha256"] = env.sha_file(requirements)
+        wheels = dependency / "wheels"
+        wheels.mkdir()
+        wheel = wheels / self.lock["wheels"][0]["file"]
+        wheel.write_bytes(b"x")
+        self.lock["wheels"][0]["sha256"] = env.sha_file(wheel)
+        (runtime / ".sixnine-environment.json").write_bytes(env.canonical(self.lock))
+        value.update(prepared_root=str(prepared), dependency_artifact_path="")
+        Path(value["source_bundle_path"]).write_bytes(b"synthetic source fixture")
+        value["source_bundle_sha256"] = env.sha_file(value["source_bundle_path"])
+        manifest = json.loads((ROOT / "deploy/wangp/manifest.json").read_text())
+        manifest.update(runtime_digest_kind="sixnine-environment-lock-sha256", runtime_digest=env.digest(self.lock))
+        Path(value["manifest_path"]).write_text(json.dumps(manifest), encoding="utf-8")
+        imported = {"state": "imports_verified", "environment_lock_sha256": env.digest(self.lock),
+                    "inference_verified": False}
+        return value, imported
+
+    def test_model_transfer_failure_cannot_reach_runtime_verification_or_launch(self):
+        from studio_platform.runtime_hosts import wangp_download
+        value, imported = self.prepared_import_fixture()
+        with patch.object(bootstrap.platform, "system", return_value="Linux"), \
+                patch.object(bootstrap.platform, "python_version", return_value=env.PYTHON), \
+                patch.object(bootstrap.sys, "path", list(bootstrap.sys.path)), \
+                patch.object(bootstrap, "extract", side_effect=lambda _, directory, **kw: directory.mkdir()), \
+                patch.object(env, "system_packages", return_value=self.lock["system_packages"]), \
+                patch.object(bootstrap.subprocess, "run", return_value=SimpleNamespace(returncode=0,
+                    stdout=json.dumps(imported))) as run, \
+                patch.object(bootstrap.subprocess, "Popen") as launch, \
+                patch.object(wangp_download, "run_download", side_effect=ValueError("model_download_timeout")) as transfer:
+            result = bootstrap.install(value, "test-slot", str(self.root / "token"))
+        self.assertEqual((result["state"], result["failure_phase"], result["code"]),
+                         ("failed", "model_download", "model_download_timeout"))
+        transfer.assert_called_once()
+        self.assertEqual(transfer.call_args.args[2], value["manifest_path"])
+        self.assertEqual(run.call_count, 2)  # pip check and inert mocked import probe only
+        launch.assert_not_called()
+        self.assertFalse(Path(value["config_path"]).exists())
+        self.assertTrue((Path(value["install_root"]) / "wangp-bootstrap-started.json").exists())
+
+    def bootstrap_after_download(self, *, launch=True, receipt="valid", ready_incarnation="a"*32):
+        from studio_platform.inference.wangp_contract import EngineManifest
+        from studio_platform.runtime_hosts import wangp_download, wangp_launcher
+        value, imported = self.prepared_import_fixture()
+        manifest = EngineManifest.from_dict(json.loads(Path(value["manifest_path"]).read_text()))
+        token = self.root / "token"
+        token.write_text("synthetic-private-bootstrap-token-" + "x"*32)
+        token.chmod(0o600)
+        child = SimpleNamespace(pid=os.getpid(), poll=lambda: None)
+        evidence = {"manifest_digest": manifest.digest, "inference_verified": False}
+
+        def command(args, **kwargs):
+            if args[0] == "nvidia-smi":
+                return SimpleNamespace(stdout="GPU-test123, 141000\n")
+            return SimpleNamespace(returncode=0, stdout=json.dumps(evidence if "--verify-only" in args else imported))
+
+        def start(args, **kwargs):
+            self.assertNotIn("--verify-only", args)
+            self.assertIn("--create-journal", args)
+            if receipt != "missing":
+                state = Path(args[args.index("--state-dir")+1])
+                state.mkdir()
+                host = SimpleNamespace(manifest=manifest, journal=SimpleNamespace(slot_key="test-slot"), incarnation="a"*32)
+                wangp_launcher.write_verification_receipt(state, host, evidence)
+                if receipt == "wrong-pid":
+                    path = state / wangp_launcher.VERIFICATION_RECEIPT
+                    document = json.loads(path.read_text())
+                    document["pid"] += 1
+                    path.write_text(json.dumps(document))
+            return child
+
+        ready = {"manifest_digest": manifest.digest, "slot_key": "test-slot", "idle": True,
+                 "incarnation": ready_incarnation}
+        actual_fstat = os.fstat
+        token_identity = (token.stat().st_dev, token.stat().st_ino)
+        def token_fstat(fd):
+            info = actual_fstat(fd)
+            # The production bootstrap is Linux-only. Windows chmod does not
+            # model POSIX read bits; synthesize only this fixture token's mode.
+            if os.name == "nt" and (info.st_dev, info.st_ino) == token_identity:
+                return SimpleNamespace(st_nlink=info.st_nlink, st_mode=info.st_mode & ~0o077)
+            return info
+        with patch.object(bootstrap.platform, "system", return_value="Linux"), \
+                patch.object(bootstrap.platform, "python_version", return_value=env.PYTHON), \
+                patch.object(bootstrap.sys, "path", list(bootstrap.sys.path)), \
+                patch.object(bootstrap, "extract", side_effect=lambda _, directory, **kw: directory.mkdir()), \
+                patch.object(env, "system_packages", return_value=self.lock["system_packages"]), \
+                patch.object(bootstrap.subprocess, "run", side_effect=command) as runs, \
+                patch.object(bootstrap.subprocess, "Popen", side_effect=start) as starts, \
+                patch.object(bootstrap, "urlopen", side_effect=lambda *a, **kw: io.BytesIO(json.dumps(ready).encode())), \
+                patch.object(bootstrap.time, "monotonic", side_effect=[0, 1, 901]), \
+                patch.object(bootstrap.time, "sleep"), \
+                patch.object(bootstrap.os, "fstat", side_effect=token_fstat), \
+                patch.object(wangp_download, "run_download"):
+            result = bootstrap.install(value, "test-slot", str(token), launch=launch)
+        return result, runs, starts, value
+
+    def test_normal_bootstrap_starts_once_without_a_separate_full_verification(self):
+        result, runs, starts, value = self.bootstrap_after_download()
+        self.assertEqual(result["state"], "ready")
+        self.assertTrue(result["runtime_verified"])
+        starts.assert_called_once()
+        self.assertEqual(len(runs.call_args_list), 3)  # pip check, GPU import probe, GPU observation.
+        self.assertFalse(any("--verify-only" in call.args[0] for call in runs.call_args_list))
+        self.assertFalse((Path(value["install_root"]) / "runtime-verification.json").exists())
+
+    def test_nonlaunch_verification_remains_explicit_and_cannot_start_runtime(self):
+        result, runs, starts, value = self.bootstrap_after_download(launch=False)
+        self.assertEqual(result["state"], "verified_not_started")
+        self.assertEqual(sum("--verify-only" in call.args[0] for call in runs.call_args_list), 1)
+        starts.assert_not_called()
+        self.assertTrue((Path(value["install_root"]) / "runtime-verification.json").exists())
+        self.assertFalse((Path(value["install_root"]) / "slot-state").exists())
+
+    def test_ready_endpoint_without_the_current_child_receipt_remains_unknown(self):
+        result, runs, starts, value = self.bootstrap_after_download(receipt="missing")
+        self.assertEqual((result["state"], result["code"]), ("unknown", "runtime_readiness_timeout"))
+        starts.assert_called_once()
+        self.assertTrue((Path(value["install_root"]) / "wangp-bootstrap-started.json").exists())
+
+    def test_wrong_child_receipt_cannot_be_consumed_or_trigger_a_relaunch(self):
+        result, _, starts, _ = self.bootstrap_after_download(receipt="wrong-pid")
+        self.assertEqual((result["state"], result["code"]), ("unknown", "verification_receipt_mismatch"))
+        starts.assert_called_once()
+
+    def test_receipt_without_matching_live_incarnation_is_not_ready(self):
+        result, _, starts, _ = self.bootstrap_after_download(ready_incarnation="b"*32)
+        self.assertEqual((result["state"], result["code"]), ("unknown", "runtime_readiness_timeout"))
+        starts.assert_called_once()
 
     def test_environment_lock_is_bound_before_source_or_package_verification(self):
         (self.source / ".sixnine-environment.json").write_bytes(env.canonical(self.lock))
