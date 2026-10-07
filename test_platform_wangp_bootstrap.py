@@ -5,10 +5,11 @@ import json
 import socket
 import socketserver
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from studio_platform.inference.wangp_contract import EngineManifest, HostReadiness
 from studio_platform.lium_bootstrap import BootConfig, BootController, BootError
@@ -149,6 +150,82 @@ class Host:
 
 
 class SSHRecoveryTests(unittest.TestCase):
+    def command_host(self, *, never_ack=False):
+        from studio_platform.lium_bootstrap import SSHHost
+
+        class Channel:
+            def __init__(self):
+                self.closed = threading.Event()
+                self.commands = []
+                self.output = b'{"ok":true}'
+                self.stderr = b'synthetic diagnostic; must not become a response'
+                self.io_timeout = None
+
+            def settimeout(self, value):
+                self.io_timeout = value
+
+            def exec_command(self, command):
+                self.commands.append(command)
+                if never_ack:
+                    # A broken guard fails this test after two seconds instead
+                    # of hanging the test runner indefinitely.
+                    if not self.closed.wait(2):
+                        raise AssertionError('Command ACK wait was never interrupted')
+                    raise EOFError('Synthetic channel closed before server ACK')
+
+            def close(self):
+                self.closed.set()
+
+            def exit_status_ready(self):
+                return True
+
+            def recv_ready(self):
+                return bool(self.output)
+
+            def recv_stderr_ready(self):
+                return bool(self.stderr)
+
+            def recv(self, maximum):
+                value, self.output = self.output[:maximum], self.output[maximum:]
+                return value
+
+            def recv_stderr(self, maximum):
+                value, self.stderr = self.stderr[:maximum], self.stderr[maximum:]
+                return value
+
+            def recv_exit_status(self):
+                return 0
+
+        channel = Channel()
+        transport = SimpleNamespace(open_session=Mock(return_value=channel))
+        host = SSHHost.__new__(SSHHost)
+        host.client = SimpleNamespace(get_transport=lambda: transport)
+        host.ensure_connected = Mock()
+        host.start = Mock(side_effect=AssertionError('Command transport must never launch a runtime'))
+        return host, channel, transport
+
+    def test_command_without_server_ack_times_out_without_replay_or_launch(self):
+        host, channel, transport = self.command_host(never_ack=True)
+        started = time.monotonic()
+        with self.assertRaisesRegex(BootError, 'bootstrap_ssh_command_timeout'):
+            host.run('print("offline")', timeout=.1)
+        self.assertLess(time.monotonic()-started, 1.5)
+        self.assertTrue(channel.closed.is_set())
+        self.assertEqual(len(channel.commands), 1)
+        transport.open_session.assert_called_once()
+        self.assertTrue(0 < transport.open_session.call_args.kwargs['timeout'] <= .1)
+        host.start.assert_not_called()
+
+    def test_command_reads_json_and_discards_stderr_with_bounded_channel(self):
+        host, channel, transport = self.command_host()
+        self.assertEqual(host.run('print("offline")', timeout=1), {'ok': True})
+        self.assertTrue(channel.closed.is_set())
+        self.assertTrue(0 < channel.io_timeout <= 1)
+        self.assertEqual(len(channel.commands), 1)
+        transport.open_session.assert_called_once()
+        self.assertTrue(0 < transport.open_session.call_args.kwargs['timeout'] <= 1)
+        host.start.assert_not_called()
+
     def test_existing_tunnel_reuses_pinned_connection_without_replaying_start(self):
         from studio_platform.lium_bootstrap import SSHHost
         import tempfile

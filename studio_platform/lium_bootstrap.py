@@ -191,14 +191,41 @@ class SSHHost:
 
     def run(self, script, *, limit=4*1024*1024, timeout=25):
         channel = None
+        timer = None
+        deadline = None
+        expired = threading.Event()
+
+        def remaining():
+            value = deadline-time.monotonic()
+            if value <= 0 or expired.is_set():
+                raise BootError("bootstrap_ssh_command_timeout")
+            return value
+
+        def expire():
+            expired.set()
+            # exec_command waits for a server ACK without consulting the
+            # channel I/O timeout. Closing this channel wakes that wait. The
+            # remote command outcome stays unknown; never replay it here.
+            try:
+                channel.close()
+            except Exception:
+                pass
+
         try:
+            if type(timeout) not in (int, float) or not 0 < timeout < float('inf'):
+                raise BootError("bootstrap_ssh_command_timeout_invalid")
             self.ensure_connected()
-            channel = self.client.get_transport().open_session(timeout=15)
+            deadline = time.monotonic()+timeout
+            channel = self.client.get_transport().open_session(timeout=min(15, timeout, remaining()))
+            channel.settimeout(min(timeout, remaining()))
+            timer = threading.Timer(min(timeout, remaining()), expire)
+            timer.daemon = True
+            timer.start()
             channel.exec_command("python3 -c "+shlex.quote(script))
-            output, started = bytearray(), time.monotonic()
+            remaining()
+            output = bytearray()
             while not channel.exit_status_ready() or channel.recv_ready() or channel.recv_stderr_ready():
-                if time.monotonic()-started > timeout:
-                    raise BootError("bootstrap_ssh_command_timeout")
+                remaining()
                 if channel.recv_ready():
                     output.extend(channel.recv(65536))
                     if len(output) > limit:
@@ -208,14 +235,21 @@ class SSHHost:
                 time.sleep(.02)
             if channel.recv_exit_status() != 0:
                 raise BootError("bootstrap_remote_command_failed")
+            remaining()
             return json.loads(output)
         except BootError:
             raise
         except Exception:
+            if expired.is_set() or deadline is not None and time.monotonic() >= deadline:
+                raise BootError("bootstrap_ssh_command_timeout") from None
             raise BootError("bootstrap_remote_response_unconfirmed") from None
         finally:
-            if channel is not None:
-                channel.close()
+            try:
+                if channel is not None:
+                    channel.close()
+            finally:
+                if timer is not None:
+                    timer.cancel()
 
     def upload(self, files):
         self.run("from pathlib import Path; import json; Path('/workspace/h3-studio').mkdir(parents=True,exist_ok=True); print(json.dumps({'ok':True}))")
