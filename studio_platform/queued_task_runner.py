@@ -37,7 +37,16 @@ def _id(value):
 
 def _identity(value):
     value = canonical(value)
-    if not isinstance(value, dict) or set(value) != _IDENTITY_FIELDS or value["qualification_profile"] != QUEUED_TASK_PROFILE:
+    if not isinstance(value, dict):
+        raise ValueError("queued_task_evidence_identity_invalid")
+    fields = _IDENTITY_FIELDS
+    if "backend" in value or "engine_manifest_digest" in value:
+        fields = fields | {"backend", "engine_manifest_digest"}
+        if (value.get("backend") != "wangp-worker"
+                or not isinstance(value.get("engine_manifest_digest"), str)
+                or not _SHA.fullmatch(value["engine_manifest_digest"])):
+            raise ValueError("queued_task_evidence_engine_invalid")
+    if set(value) != fields or value["qualification_profile"] != QUEUED_TASK_PROFILE:
         raise ValueError("queued_task_evidence_identity_invalid")
     for field in ("intent_id", "instance_id", "configuration_id"):
         _id(value[field])
@@ -164,8 +173,12 @@ class QueuedTaskRunner(DrainSafeRunner):
         # model/runtime/operator source or a malformed prior receipt.
         previous = _load(self.qualification_evidence_file, self.evidence_identity)
         super().__init__(*args, **kwargs)
-        if self.backend.kind != "comfy-worker":
+        if self.backend.kind != self.evidence_identity.get("backend", "comfy-worker"):
             raise ValueError("queued_task_requires_real_gpu_backend")
+        if (self.backend.kind == "wangp-worker"
+                and getattr(getattr(self.backend, "manifest", None), "digest", None)
+                    != self.evidence_identity["engine_manifest_digest"]):
+            raise ValueError("queued_task_backend_manifest_conflict")
         if previous is not None and previous["failures"]:
             self._stop_new.set()  # A process restart is not failure recovery.
 
@@ -175,13 +188,19 @@ class QueuedTaskRunner(DrainSafeRunner):
     def run_once(self, worker_id, pool):
         worker = self.control.get(worker_id)
         spec = worker["spec"]
-        if (spec["backend"] != "comfy-worker" or worker["instance_id"] != self.evidence_identity["instance_id"]
-                or spec["configuration_id"] != self.evidence_identity["configuration_id"]):
-            raise ValueError("queued_task_worker_identity_conflict")
+        self._check_worker(worker)
         previous = _load(self.qualification_evidence_file, self.evidence_identity)
         if previous is not None and (previous["worker_id"] != worker_id or previous["model_id"] != spec["model_id"]):
             raise ValueError("queued_task_worker_evidence_conflict")
         return super().run_once(worker_id, pool)
+
+    def _check_worker(self, worker):
+        spec, identity = worker["spec"], self.evidence_identity
+        if (spec["backend"] != identity.get("backend", "comfy-worker")
+                or spec.get("engine_manifest_digest", "") != identity.get("engine_manifest_digest", "")
+                or worker["instance_id"] != identity["instance_id"]
+                or spec["configuration_id"] != identity["configuration_id"]):
+            raise ValueError("queued_task_worker_identity_conflict")
 
     def stopped(self):
         try:
@@ -263,13 +282,13 @@ class QueuedTaskRunner(DrainSafeRunner):
     def _record_evidence(self, worker, job_id):
         spec = worker["spec"]
         identity = self.evidence_identity
-        if worker["instance_id"] != identity["instance_id"] or spec["configuration_id"] != identity["configuration_id"]:
-            raise ValueError("queued_task_worker_identity_conflict")
+        self._check_worker(worker)
         with self.repo.engine.connect() as connection:
             job = dict(connection.execute(select(jobs).where(jobs.c.id == job_id)).mappings().one())
             attempt = connection.execute(select(attempts).where(attempts.c.id == job["current_attempt_id"],
                 attempts.c.job_id == job_id, attempts.c.worker_id == worker["id"])).mappings().first()
-            if attempt is None:
+            if (attempt is None or not self.control.matches(worker, job)
+                    or attempt["number"] != job["attempt_no"]):
                 raise ValueError("queued_task_attempt_identity_conflict")
             output_rows = list(connection.execute(select(artifacts).where(artifacts.c.job_id == job_id,
                 artifacts.c.attempt_id == attempt["id"])).mappings()) if job["status"] == "succeeded" else []

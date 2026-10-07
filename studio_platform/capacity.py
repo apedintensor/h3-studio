@@ -37,10 +37,31 @@ def _future(value, now):
     return type(value) in (float, int) and math.isfinite(value) and now < value <= 1e12
 
 
+def _engine_identity(payload):
+    """Missing engine fields denote the immutable historical Comfy approval."""
+    backend = payload.get("backend", "comfy-worker")
+    digest = payload.get("engine_manifest_digest", "")
+    if backend == "wangp-worker":
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("capacity_engine_manifest_required")
+    elif backend != "comfy-worker" or digest != "":
+        raise ValueError("invalid_capacity_engine")
+    return backend, digest
+
+
+def _matches_engine(payload, binding):
+    try:
+        backend, digest = _engine_identity(payload)
+        return (binding.get("backend") == backend
+            and binding.get("engine_manifest_digest", "") == digest)
+    except (ValueError, AttributeError, TypeError):
+        return False
+
+
 def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configuration_id,
         recipe_ids, policy_hash, qualification_evidence_id, qualification_expires_at,
         quote_expires_at, expires_at, launch, scale_policy, budget_scope,
-        budget_account_ids, enabled=False):
+        budget_account_ids, enabled=False, backend="comfy-worker", engine_manifest_digest=""):
     """Operator-only immutable approval. Revoke separately; never mutate its quote.
 
     This is not a public API and does not reserve/create an instance. A new
@@ -48,6 +69,7 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
     """
     for value in (approval_id, tenant_id, pool, model_id, configuration_id, qualification_evidence_id):
         _safe_id(value)
+    _engine_identity(dict(backend=backend, engine_manifest_digest=engine_manifest_digest))
     now = repo.clock()
     if (type(enabled) is not bool or not isinstance(launch, LaunchSpec)
             or not isinstance(scale_policy, ScalePolicy) or not isinstance(budget_scope, Scope)
@@ -77,7 +99,9 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
         qualification_evidence_id=qualification_evidence_id,
         qualification_expires_at=qualification_expires_at, quote_expires_at=quote_expires_at,
         expires_at=expires_at, launch=asdict(launch), scale_policy=asdict(scale_policy),
-        budget_scope=asdict(budget_scope), budget_account_ids=sorted(budget_account_ids)))
+        budget_scope=asdict(budget_scope), budget_account_ids=sorted(budget_account_ids),
+        **(dict(backend=backend, engine_manifest_digest=engine_manifest_digest)
+            if backend == "wangp-worker" else {})))
     digest = request_hash(payload)
     try:
         with repo.transaction() as connection:
@@ -168,7 +192,7 @@ def admit_waiter(repo, connection, scope, job, plan):
             or p["model_id"] != request.get("request", {}).get("model")
             or request.get("recipe_id") not in p["recipe_ids"]
             or p["configuration_id"] != execution.get("configuration_id")
-            or execution.get("backend") != "comfy-worker" or execution.get("enabled") is not True
+            or not _matches_engine(p, execution) or execution.get("enabled") is not True
             or execution.get("quote_known") is not True
             or p["qualification_evidence_id"] != execution.get("qualification_evidence_id")
             or job["attempt_no"] or job.get("current_attempt_id")):
@@ -229,9 +253,17 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
     ledger state and its children must have naturally exited. Shared capacity,
     worker and job locks exclude an old claim/POST racing this handoff.
     """
-    if (children_done_confirmed is not True or allowed_owners != ["superdan", "supervan"]
+    if (children_done_confirmed is not True
+            or not isinstance(allowed_owners, (list, tuple)) or not 1 <= len(allowed_owners) <= 4096
+            or any(not isinstance(owner, str) for owner in allowed_owners)
+            or len(set(allowed_owners)) != len(allowed_owners)
             or previous_id == next_id or type(limit) is not int or not 1 <= limit <= 4096):
         raise Conflict("capacity_transfer_requires_confirmed_retirement")
+    try:
+        for owner in allowed_owners:
+            _safe_id(owner)
+    except ValueError:
+        raise Conflict("capacity_transfer_requires_confirmed_retirement") from None
     with repo.transaction() as conn:
         repo._lock_capacity(conn)
         grants = {r["id"]: dict(r) for r in conn.execute(select(capacity_approvals).where(
@@ -243,7 +275,9 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
         exact = ("tenant_id", "pool", "model_id", "configuration_id", "recipe_ids", "policy_hash",
                  "qualification_evidence_id", "qualification_expires_at", "quote_expires_at",
                  "budget_scope", "budget_account_ids")
-        if (a["tenant_id"] != "sixnine" or old["enabled"] != 0 or new["enabled"] != 1 or any(a[k] != b[k] for k in exact)
+        if (old["tenant_id"] != a["tenant_id"] or new["tenant_id"] != b["tenant_id"]
+                or _engine_identity(a) != _engine_identity(b)
+                or old["enabled"] != 0 or new["enabled"] != 1 or any(a[k] != b[k] for k in exact)
                 or new["expires_at"] <= repo.clock()):
             raise Conflict("capacity_transfer_grant_identity_mismatch")
         cycle = conn.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == previous_id)).mappings().one()
@@ -279,7 +313,7 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
                         and execution.get("capacity_approval_hash") != old["approval_hash"]
                     or existing and existing["approval_id"] != previous_id
                     or existing and existing["approval_hash"] != old["approval_hash"]
-                    or execution.get("backend") != "comfy-worker" or execution.get("enabled") is not True
+                    or not _matches_engine(a, execution) or execution.get("enabled") is not True
                     or execution.get("qualification_evidence_id") != a["qualification_evidence_id"]
                     or job["request"].get("recipe_id") not in b["recipe_ids"]
                     or job["request"].get("request", {}).get("model") != b["model_id"]):
@@ -442,6 +476,8 @@ class ColdStartCoordinator:
                     continue
                 if not self._valid(grant):
                     reason = "capacity_approval_expired_or_revoked"
+                elif not _matches_engine(grant["payload"], job["execution_plan"]):
+                    reason = "capacity_plan_approval_mismatch"
                 elif waiter["deadline"] <= self.repo.clock():
                     reason = "capacity_wait_deadline_expired"
                 elif self.activation_guard(job) is not True:
@@ -481,7 +517,7 @@ class ColdStartCoordinator:
                     registered_workers.c.drain_requested == 0, registered_workers.c.expires_at > self.repo.clock())
                     .order_by(registered_workers.c.id).limit(128)).mappings()
                 p = grant["payload"]
-                match = next((w for w in candidates if w["spec"]["backend"] == "comfy-worker"
+                match = next((w for w in candidates if _matches_engine(p, w["spec"])
                     and w["spec"]["model_id"] == p["model_id"] and w["spec"]["configuration_id"] == p["configuration_id"]
                     and job["request"]["recipe_id"] in w["spec"]["recipe_ids"]
                     and (intent is None or w["provider"] == intent["provider"]

@@ -451,16 +451,16 @@ class ExecutionPolicies:
 
     def capacity_approval_current(self, payload):
         """Pure current operator-file check; safe inside a ledger transaction."""
-        # Cold-start approval/boot currently has the pinned Comfy contract.
-        # WanGP warm slots work independently; no Comfy approval can rent for it.
-        if not self.settings.generation_enabled or self.settings.execution_backend != "comfy-worker":
+        if not self.settings.generation_enabled or self.settings.execution_backend not in REAL_GPU_BACKENDS:
             return False
         try:
             policy = read_policy(self.settings.execution_policy_file)
             if policy is None:
                 return False
             now, qualification, quote = self.repo.clock(), policy["qualification"], policy["reservation"]
-            return bool(policy["backend"] == "comfy-worker" and policy["enabled"] and request_hash(policy) == payload["policy_hash"]
+            from .capacity import _matches_engine
+            return bool(policy["backend"] == self.settings.execution_backend and _matches_engine(payload, policy)
+                and policy["enabled"] and request_hash(policy) == payload["policy_hash"]
                 and policy["model_id"] == payload["model_id"] and policy["pool"] == payload["pool"]
                 and policy["configuration_id"] == payload["configuration_id"]
                 and set(payload["recipe_ids"]) <= set(policy["recipe_ids"])
