@@ -27,6 +27,37 @@ from test_platform_repository import LedgerCase
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "CPU media utilities required")
 class WanGPAPITests(LedgerCase):
+    def test_saved_draft_empty_regions_work_but_unsupported_controls_are_preserved(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            app = create_app(Settings(Path(temporary), auth_mode="local-test",
+                database_url=self.url, execution_backend="wangp-worker"), repository=self.repo)
+            with TestClient(app) as client:
+                client.post("/api/auth/login", json={"username": "superdan"}).raise_for_status()
+                for index, controls in enumerate(({}, {"video_temporal_size": 128}, {"ref_image_size": "max"})):
+                    with self.subTest(controls=controls):
+                        ident = "draft-" + str(index)
+                        client.post("/v1/projects", json={"project": project(ident)}).raise_for_status()
+                        edit = client.post(f"/v1/projects/{ident}/actions", json={
+                            "expected_version": 1, "actions": [{"op": "shot.configure_generation",
+                            "shot_id": "shot-one", "prompt": "Synthetic saved draft",
+                            "controls": controls}]})
+                        self.assertEqual(edit.status_code, 200, edit.text)
+                        prefix = f"/v1/projects/{ident}/shots/shot-one"
+                        before = client.get(prefix + "/generation-draft").json()
+                        self.assertEqual(before["draft"]["inputs"]["guides"], [])
+                        result = client.post(prefix + "/generation-plans", json={"expected_version": 2})
+                        if controls:
+                            self.assertEqual(result.status_code, 422, result.text)
+                        else:
+                            self.assertEqual(result.status_code, 201, result.text)
+                            self.assertEqual(result.json()["effective_request"]["backend"], "wangp-local")
+                            self.assertNotIn("guides", result.json()["effective_request"])
+                        self.assertEqual(client.get(prefix + "/generation-draft").json(), before)
+                # Explicit guide conditioning still fails, even though empty
+                # draft regions are accepted. No input resolution is attempted.
+                invalid = generation_request("draft-0", inputs={"guides": ["invalid"]})
+                self.assertEqual(client.post("/v1/generation-plans", json=invalid).status_code, 422)
+
     def test_confirm_once_collect_original_and_download_owner_isolated_outputs(self):
         self.now = time.time()
         with tempfile.TemporaryDirectory() as temporary:

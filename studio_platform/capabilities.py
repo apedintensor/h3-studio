@@ -253,7 +253,11 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
     if "guides" in raw_inputs:
         if "guides" in controls:
             raise ValueError("时间锚点不能重复在inputs和controls中定义")
-        controls["guides"] = raw_inputs["guides"]
+        # Saved drafts include an empty guide region. It is an absence of
+        # conditioning, not a request for a control unsupported by WanGP.
+        # Nonempty or malformed values must still be rejected, never dropped.
+        if backend != "wangp-worker" or raw_inputs["guides"] != []:
+            controls["guides"] = raw_inputs["guides"]
     if not isinstance(controls.get("guides", []), list) or len(controls.get("guides", [])) > LIMITS["max_guides"]:
         raise ValueError("时间锚点必须是数组")
     ids = [*inputs["images"], *inputs["videos"], *inputs["audios"],

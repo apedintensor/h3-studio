@@ -67,6 +67,9 @@ claiming last-frame fidelity.
   WanGP receipt/host/transport and release-contract tests passed locally.
 - Follow-up compiler/Session/launcher/API checks passed after integration fixes.
   HTTP and launcher checks include the typed-input and process-shutdown fixes.
+- Final saved-draft review found and fixed empty guide-region rejection and
+  silent omission of explicit controls unsupported by the selected engine.
+  20 draft/API regression tests passed; incompatible drafts remain unchanged.
 - A CPU-media integration test exercises HTTP plan/confirm/replay, the existing
   queue, injected WanGP Session, immutable receipts, artifact validation/download
   and cross-owner denial. It submits once and retrieves both video and audio.

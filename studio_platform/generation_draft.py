@@ -367,6 +367,9 @@ def plan_body(project, shot_id, capabilities, derive):
     shot = shot_entity(project, shot_id)
     saved = draft["controls"]
     fields(saved, control_schema(), "已保存的生成控制")
+    # Changing engines must not silently discard a user's explicit controls.
+    # Keep the draft unchanged so the caller can choose compatible settings.
+    fields(saved, recipe["controls"], "当前配方不支持的已保存生成控制")
     controls = {}
     preset = recipe.get("deployment_preset", {})
     for key, schema in recipe["controls"].items():
