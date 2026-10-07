@@ -104,6 +104,18 @@ B2 extracted the Comfy seam in [PR #17](https://github.com/apedintensor/h3-studi
 
 Before WanGP activation, immutable execution configuration/attempt binding must identify engine code revision, image identity, compiler/recipe version, full component model revisions/precision and slot topology. Preserve old accepted Comfy bindings for reconcile/collect after new-task routing changes. One global backend switch cannot perform this migration safely.
 
+The WanGP queued-task policy may explicitly admit first/last image slots with
+`allow_first_last: true` and an aggregate `max_reference_files` of 0–2. With that
+switch off the aggregate cap must remain zero. First/last images still undergo
+the same owner/project checks, immutable asset snapshot, aggregate count and
+inspected image-pixel limits. Ordinary image/video/audio references, reference
+video sound and guides remain disabled in this recipe; raising the aggregate
+cap does not enable REF. This policy validation and owned-upload admission
+coverage are not real first/last-frame fidelity evidence. The first live proof
+remains text-to-video; image-guided qualification and the selected native output
+contract require their own actual artifacts before a parity claim. No existing
+operator policy or accepted job is changed automatically.
+
 The WanGP cold path extends the existing controller and capacity ledger. Its
 approval, waiter, worker slot and attempt bind the same backend and manifest
 digest. The private client also pins the runtime incarnation; generation POSTs
