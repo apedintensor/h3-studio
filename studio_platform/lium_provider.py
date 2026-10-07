@@ -150,6 +150,7 @@ class LiumManifest:
     minimum_ram_gib: int = 0
     minimum_disk_gib: int = 0
     require_docker_in_docker: bool = False
+    min_download_mbps: float | None = None
 
     def __post_init__(self):
         _safe_id(self.configuration_id), _safe_id(self.model_id)
@@ -191,6 +192,14 @@ class LiumManifest:
                 or self.server_side_selection and (self.executor_id or len(self.compatible_gpu_names) != 1
                                                     or len(self.allowed_countries) > 1)):
             raise LiumError("lium_invalid_server_selector")
+        if self.min_download_mbps is not None:
+            try:
+                valid = (type(self.min_download_mbps) in (int, float)
+                    and math.isfinite(self.min_download_mbps) and self.min_download_mbps > 0)
+            except OverflowError:
+                valid = False
+            if not valid:
+                raise LiumError("lium_invalid_download_floor")
 
 
 @dataclass(frozen=True)
@@ -390,6 +399,10 @@ class LiumProvider:
             self._validate_spec_response(response, manifest, dry_run=True)
             return _uuid(response["selected_executor"]["id"])
         route = "executors?available=true" if manifest.compatible_gpu_names else "executors"
+        if manifest.min_download_mbps is not None:
+            # Lium applies its trusted telemetry precedence and excludes missing
+            # measurements. Do not infer speed from a differently shaped field.
+            route += ("&" if "?" in route else "?") + "min_download_mbps=" + str(manifest.min_download_mbps)
         rows = self._rows(route)
         candidates = []
         for row in rows:
@@ -453,6 +466,8 @@ class LiumProvider:
             value["min_disk_gb"] = manifest.minimum_disk_gib
         if manifest.require_docker_in_docker:
             value["docker_in_docker"] = True
+        if manifest.min_download_mbps is not None:
+            value["min_download_mbps"] = manifest.min_download_mbps
         return value
 
     @staticmethod
