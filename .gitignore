@@ -333,3 +333,8 @@ inventory.json
 !tools/run_quick_chat_preview.py
 !skills/sixnine-yingxu/scripts/connect.py
 !AGENT-CONNECT-CONTRACT.md
+
+# Explicit encrypted business-backup copies; no backup data or receipts.
+!studio_platform/backup_remote.py
+!studio_platform/backup_remote_cli.py
+!BACKUP-OFFDEVICE.md
