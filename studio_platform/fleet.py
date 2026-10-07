@@ -158,7 +158,7 @@ def read_config(path):
         spec_fields = {"worker_id", "pool", "provider", "instance_id", "physical_gpu_ids", "recipe_ids", "model_id", "configuration_id", "backend"}
         for item in value["slots"]:
             required = spec_fields | {"enabled", "endpoint", "allowed_origins", "comfy_revision", "confirmed_idle"}
-            optional = {"engine_manifest_digest", "recovery_only", "runtime_config_file"}
+            optional = {"engine_manifest_digest", "recovery_only", "runtime_config_file", "output_delivery"}
             if not isinstance(item, dict) or not required <= set(item) or set(item) - required - optional:
                 raise ValueError("invalid_fleet_slot_fields")
             if value["version"] == 1 and (item["backend"] == "wangp-worker"
@@ -167,6 +167,7 @@ def read_config(path):
                 raise ValueError("new_engine_or_recovery_requires_fleet_v2")
             spec = {key: item[key] for key in spec_fields}
             spec["engine_manifest_digest"] = item.get("engine_manifest_digest", "")
+            spec["output_delivery"] = item.get("output_delivery", "")
             for key in ("physical_gpu_ids", "recipe_ids", "allowed_origins"):
                 if not isinstance(item[key], list):
                     raise ValueError("fleet_bindings_must_be_arrays")

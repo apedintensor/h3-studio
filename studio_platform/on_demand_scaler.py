@@ -69,6 +69,8 @@ def json_config(config):
         value.pop("authorization_extension_s")
     if value.get("service_policy") is None:
         value.pop("service_policy", None)
+    if not value.get("output_delivery"):
+        value.pop("output_delivery", None)
     if value.get("execution_backend", "comfy-worker") == "comfy-worker":
         value.pop("execution_backend", None)
         value.pop("engine_manifest_digest", None)
@@ -206,6 +208,8 @@ class ServiceCycle(FiniteController):
         policy = read_policy(self.settings.execution_policy_file)
         engine = ({"backend": c.execution_backend, "engine_manifest_digest": c.engine_manifest_digest}
                   if getattr(c, "execution_backend", "comfy-worker") == "wangp-worker" else {})
+        if c.output_delivery:
+            engine["output_delivery"] = c.output_delivery
         self.repo.approve_capacity(c.capacity_approval_id, tenant_id=c.tenant, pool=c.pool,
             model_id=MODEL, configuration_id=c.configuration_id, recipe_ids=list(c.recipe_ids),
             policy_hash=c.execution_policy_sha256, qualification_evidence_id=c.qualification_evidence_id,
@@ -312,6 +316,8 @@ class ServiceCycle(FiniteController):
             "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
         if getattr(self.config, "execution_backend", "comfy-worker") == "wangp-worker":
             identity.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
+        if self.config.output_delivery:
+            identity["output_delivery"] = self.config.output_delivery
         return identity
 
     def _boot_failure(self, intent, state):

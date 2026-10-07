@@ -61,6 +61,29 @@ class EngineCapacityTests(capacity_fixture.CapacityTests):
         comfy = ExecutionPolicies(replace(self.settings, execution_backend="comfy-worker"), self.repo)
         self.assertFalse(comfy.capacity_approval_current(approved["payload"]))
 
+    def test_native_delivery_cold_approval_requires_exact_exporter_capability(self):
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        self.use_wangp()
+        self.value.update(output_delivery=NATIVE_DELIVERY, recipe_ids=["h3-base-fl2va-v1"])
+        self.write()
+        old = self.approve_wangp()
+        self.assertFalse(self.policies.capacity_approval_current(old["payload"]))
+        self.assertFalse(self.policies.evaluate(self.compiled, self.scope, self.fingerprint).execution["enabled"])
+        self.repo.set_capacity_approval_enabled(old["id"], enabled=False)
+        new = self.approve_wangp(approval_id="native-grant", output_delivery=NATIVE_DELIVERY)
+        self.assertTrue(self.policies.capacity_approval_current(new["payload"]))
+        self.assertEqual(new["payload"]["output_delivery"], NATIVE_DELIVERY)
+        admission = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertTrue(admission.execution["enabled"], admission.execution)
+        self.assertEqual(admission.execution["delivery_spec"]["frame_count"], 124)
+        self.assertEqual(admission.execution["admission_state"], "waiting_capacity")
+        malformed = {**admission.execution, "output_delivery": ""}
+        plan = self.repo.create_plan(self.scope, self.compiled, malformed,
+            expires_at=admission.expires_at, estimated_cost_microusd=admission.cost)
+        with self.assertRaisesRegex(Conflict, "capacity_plan_approval_mismatch"):
+            self.repo.create_job(self.scope, plan["id"], "wrong-exporter", initial_status="waiting_capacity",
+                budget_account_ids=admission.execution["budget_account_ids"])
+
     def test_waiter_rejects_forged_plan_engine_and_manifest_without_reservation(self):
         self.use_wangp()
         self.approve_wangp()

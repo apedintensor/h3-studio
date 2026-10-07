@@ -73,7 +73,12 @@ class ArtifactWriter:
             raise ArtifactWritePending("artifact_tenant_mismatch")
         for value in (job["owner_id"], job["id"], attempt_id, tag):
             _part(value)
-        return _hash([self.tenant, job["owner_id"], job["id"], attempt_id]), _hash([job["request"], tag])
+        from .inference.outputs import delivery_spec
+        delivery = delivery_spec(job)
+        fingerprint = [job["request"], tag]
+        if delivery is not None:
+            fingerprint.append(delivery)
+        return _hash([self.tenant, job["owner_id"], job["id"], attempt_id]), _hash(fingerprint)
 
     def get(self, job, attempt_id, tag):
         ident, fingerprint = self._identity(job, attempt_id, tag)
@@ -162,8 +167,13 @@ class ArtifactWriter:
                 raise IntegrityError("artifact_staging_path_mismatch")
             size, sha = self._digest(expected)
             allowed = {"width", "height", "duration_s", "fps", "has_audio"}
+            from .inference.outputs import delivery_spec, validate_delivery_evidence, NATIVE_EVIDENCE_FIELDS
+            delivery = delivery_spec(job)
+            if delivery is not None:
+                allowed |= NATIVE_EVIDENCE_FIELDS
             if not isinstance(evidence, dict) or set(evidence)-allowed:
                 raise IntegrityError("artifact_evidence_invalid")
+            validate_delivery_evidence(job, evidence, kind)
             role.update(size_bytes=size, sha256=sha, evidence=evidence,
                         key=validate_key(f'owners/{record["owner"]}/assets/{tag}/result.' + ("mp4" if kind == "video" else "flac")))
             record["roles"][kind] = role
