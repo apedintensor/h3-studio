@@ -5,6 +5,7 @@ Updated: 2026-10-08 (Australia/Sydney). This is the GitHub workflow entry point.
 ## Planning and execution have distinct sources of truth
 
 - [PROJECT-PLAN.md](PROJECT-PLAN.md) provides the English architecture and A–H work-package entry point. Local detailed research may be indexed by `PLANNING-INDEX.zh-CN.md`; local-only documents are not assumed to exist on GitHub or in a fresh clone.
+- [DECISIONS.md](DECISIONS.md) records durable choices, reasons and revisit conditions; the plan defines direction and contracts define required behavior. A decision being accepted does not mean its implementation or deployment has passed acceptance. Use the dated baseline for observed state and issues/PRs for execution progress.
 - Current repository specifications, contracts, and approved UX define the intended behavior and invariants. Issues link to them instead of duplicating the architecture. Label proposals, implemented behavior, local verification, and production evidence separately.
 - Keep durable contracts, decisions and operating instructions in versioned documents. Keep batch progress, claims, acceptance receipts and outstanding work in the issue/PR, with links to the applicable document revision. Update `CURRENT-BASELINE.md` when an accepted change alters its dated overview; do not create another status document for every batch.
 - GitHub Issues and the Project track ownership, progress, dependencies, blockers, and acceptance evidence. Resolve the actual repository, Project, fields, and work-package issue links through [workflow/project.json](workflow/project.json). Do not create a parallel board or duplicate task from memory.
@@ -14,9 +15,11 @@ Updated: 2026-10-08 (Australia/Sydney). This is the GitHub workflow entry point.
 
 ## Start a new session
 
-Read **applicable AGENTS → PROJECT-PLAN → this workflow → the assigned issue, its parent work package, and relevant specification**. Expand only the contracts, code, and evidence needed for that task. Local sessions may also consult `PLANNING-INDEX.zh-CN.md` for detailed historical research. Do not load every historical report as current guidance.
+Read **applicable AGENTS → PROJECT-PLAN → DECISIONS → this workflow → the assigned issue, its parent work package, and relevant specification**. Expand only the contracts, code, and evidence needed for that task. Local sessions may also consult `PLANNING-INDEX.zh-CN.md` for detailed historical research. Do not load every historical report as current guidance.
 
 Use `workflow/project.json` to locate the actual remote work items. Read the latest claim, comments, PRs, dependencies, and status before proceeding. A screenshot or a past chat saying “done” does not replace these records. Reconcile discrepancies rather than assuming the current production state.
+
+Check the latest remote main revision and compare relevant guidance with the active branch before relying on it. Read newer documents through the remote or another worktree if needed; do not switch, reset or overwrite a preserved checkout to make its documents look current. Record the revisions compared and any unresolved difference in the claim/handoff. If the remote is unavailable, state that freshness is unverified and follow the bounded-work rule below.
 
 This entry point depends on project context. **A completely new session outside this project does not automatically know this repository or board.** The user must provide a repository, issue, or Project link, or open the project. A shared board also does not authorize a session to message other sessions automatically.
 
@@ -24,7 +27,7 @@ For a session without project context, paste:
 
 ```text
 Continue work in https://github.com/apedintensor/h3-studio.
-Read AGENTS.md, PROJECT-PLAN.md, WORKFLOW.md, and workflow/project.json.
+Read AGENTS.md, PROJECT-PLAN.md, DECISIONS.md, WORKFLOW.md, and workflow/project.json.
 Check the Project, current claims, and dependencies; pick the highest-priority Ready task
 unless I assign a specific issue. Claim a bounded scope before editing and leave a handoff.
 Preserve other sessions' changes and existing operational limits. Use English on GitHub.
@@ -69,6 +72,12 @@ Claim / resume
 Every work item has one explicit integration owner. Parallel sessions use bounded child tasks with coordinated scopes and separate branches/worktrees; do not develop on shared main. Separate worktrees do not eliminate contract conflicts. Commit only owned changes, except an explicitly authorized source-preservation batch that records whose unfinished work it protects.
 
 Readiness applies to the next bounded scope. A dependency issue can remain open if the exact capability needed for that scope has already been delivered and verified: link its revision/evidence, record the remaining dependency gate, and explain why it does not block this scope. Do not silently remove the dependency or describe the whole parent as accepted. Missing required capabilities mean `Backlog` with `Blocked: Yes`, a reason and the next action. `Ready` does not grant production or paid-operation authority.
+
+## Keep durable decisions consistent
+
+Record a material, lasting product, architecture or operating-policy choice in `DECISIONS.md`, with a stable ID, status, source, reason and revisit condition. Routine button text, small UI adjustments and batch progress stay in their specification or issue; they do not each need a decision entry. Use the record format there and distinguish the original decision date from the date it was recorded; use unknown when the original date is not evidenced.
+
+The same PR updates the decision record and affected plan/contract in place. Remove or revise conflicting current guidance instead of appending another paragraph that silently overrides it. When a choice changes, retain the old ID and mark its supersession with a link to the replacement; Git preserves previous wording. Historical receipts remain dated evidence. If an affected document belongs to another branch/repository, coordinate its matching change and link both revisions before calling the documentation aligned. An unresolved mismatch stays explicit, not a competing source of authority.
 
 ## Agent-managed integration and source protection
 

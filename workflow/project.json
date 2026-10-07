@@ -246,6 +246,16 @@
         "A3",
         "D1"
       ]
+    },
+    "A5": {
+      "number": 31,
+      "node_id": "I_kwDOU6TGZc8AAAABVpCtrg",
+      "url": "https://github.com/apedintensor/h3-studio/issues/31",
+      "title": "[A5] Consolidate durable decisions and clarify document authority",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_LEGY",
+      "depends_on": [
+        "A4"
+      ]
     }
   },
   "views": {

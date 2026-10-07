@@ -2,7 +2,8 @@
 
 ## Start here
 
-- Read `PROJECT-PLAN.md`, `WORKFLOW.md`, `workflow/project.json`, then the assigned issue, parent, latest claim and relevant specification. Use the existing Sixnine Platform Delivery Project: https://github.com/users/apedintensor/projects/2.
+- Read `PROJECT-PLAN.md`, `DECISIONS.md`, `WORKFLOW.md`, `workflow/project.json`, then the assigned issue, parent, latest claim and relevant specification. Check the latest main revision and whether this branch's guidance is stale without switching/resetting a preserved checkout. Use the existing Sixnine Platform Delivery Project: https://github.com/users/apedintensor/projects/2.
+- `DECISIONS.md` records durable choices and their reasons, not implementation or release status. A material decision change updates its stable record and the affected plan/contract in the same PR; replace conflicting current wording instead of appending an override. Routine UI details need no separate decision.
 - `CURRENT-BASELINE.md` is the single dated source/production overview. It is not a live status endpoint. Replace its observations when rechecked; keep old evidence in Git and issue handoffs, not dated status paragraphs here.
 - Read `GENERATION-CONTRACT.md` before changing admission, workers, engine routing or recovery. Code/tests establish implementation; exact receipts establish deployment and real inference.
 - English is used for GitHub issues, PRs, comments and current workflow guidance. Chinese research is indexed by `PLANNING-INDEX.zh-CN.md`; it does not override the accepted English plan.

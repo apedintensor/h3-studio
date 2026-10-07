@@ -1,7 +1,8 @@
 # Generation lifecycle and compatibility contract
 
 Version: **generation-contract-v1**, frozen 2026-10-06 for A2 ([#11](https://github.com/apedintensor/h3-studio/issues/11)).
-Baseline: [CURRENT-BASELINE.md](CURRENT-BASELINE.md). Direction: [PROJECT-PLAN.md](PROJECT-PLAN.md).
+Baseline: [CURRENT-BASELINE.md](CURRENT-BASELINE.md). Direction: [PROJECT-PLAN.md](PROJECT-PLAN.md). Decision rationale: [DECISIONS.md](DECISIONS.md).
+Source-status wording reviewed against PR #25 / merge `d8c811db79683507a959d3260cdf99b072d0022e` on 2026-10-08; the v1 API and recovery semantics are unchanged. This editorial review is not a production observation.
 This is the binding contract for incremental B/C/D work. “Required” below is an acceptance condition, not a claim that every future engine is implemented. Existing narrower queue/worker/fleet/storage contracts remain applicable. Material semantic changes require updating this version and its issue before implementation.
 
 ## 1. One business API and ledger
@@ -25,7 +26,7 @@ Keep current IDs and field types. Recipe IDs, model IDs, configuration IDs, engi
 | `GET /v1/jobs/{job_id}/artifacts`, artifact content/download | Stable artifact IDs, kind/MIME/size/hash/metadata and authenticated content routes; Range support remains. | Artifact delivery |
 | Existing batch routes | Batch/item identities and common job admission; no competing engine batch queue. | Generation batches |
 
-The local, unpublished `/v1/quick-chat/sessions/...` routes add session/turn/card/revision/submission/item/execution identities above the same job ledger. `GenerationAdmission` already exists locally; B1 must reconcile that extraction rather than create a duplicate. Hidden project/shot projections are internal compatibility mappings, not separately editable sources.
+The preserved, not-yet-merged `/v1/quick-chat/sessions/...` routes add session/turn/card/revision/submission/item/execution identities above the same job ledger; see [G1 #20](https://github.com/apedintensor/h3-studio/issues/20), [G2 #21](https://github.com/apedintensor/h3-studio/issues/21) and draft [PR #23](https://github.com/apedintensor/h3-studio/pull/23). Shared draft preflight, confirmation and enqueue through `GenerationAdmission` are merged in [PR #25](https://github.com/apedintensor/h3-studio/pull/25). Explicit access/plan/read extraction and preserved Quick Chat parity remain [B1 #12](https://github.com/apedintensor/h3-studio/issues/12); do not create a duplicate admission authority. Hidden project/shot projections are internal compatibility mappings, not separately editable sources.
 
 Public jobs retain `id`, `status`, `phase`, `request_hash`, `error_code`, `plan_id`, `project_id`, `client_ref`, `recipe_id`, `effective_request`, `simulation`, `result` and `artifacts`. Today `phase` mirrors status. Future progress details are additive; do not replace old strings with a new incompatible enum or silently return a different envelope.
 
@@ -85,7 +86,7 @@ Preserve `Outcome.state`, optional `task_id` and optional integer micro-USD cost
 
 `prepare` may validate/stage inputs, but must not start inference. `submit` is called only after durable intent. `reconcile`/`poll` never trigger another inference. `fetch` only retrieves the existing attempt's artifacts. Idle confirmation is evidence for a currently empty matching engine; it is not proof of full model coverage or successful H3 inference.
 
-B2 extracts the current Comfy implementation without changing defaults, backend enums, model controls or queue rules. It keeps old imports for callers and both CPU/mock paths. It does not yet solve mixed-engine routing.
+B2 extracted the Comfy seam in [PR #17](https://github.com/apedintensor/h3-studio/pull/17), preserving its existing imports, defaults, controls, queue rules and CPU/mock paths. [PR #25](https://github.com/apedintensor/h3-studio/pull/25) subsequently added configured-slot/attempt engine binding and original-engine recovery with offline evidence. Engine-bound cold approvals, bootstrap/readiness and reconnect integration remain [D2 #22](https://github.com/apedintensor/h3-studio/issues/22); configured routing alone is not a production migration.
 
 Before WanGP activation, immutable execution configuration/attempt binding must identify engine code revision, image identity, compiler/recipe version, full component model revisions/precision and slot topology. Preserve old accepted Comfy bindings for reconcile/collect after new-task routing changes. One global backend switch cannot perform this migration safely.
 
@@ -97,9 +98,11 @@ The existing exports are MP4/H.264, 24 fps, and independent FLAC for audio-enabl
 
 On a process restart, an existing collection receipt resumes the same publication. A download, transcode, storage or database failure cannot cause a new generation. GPU scratch files cannot be discarded before durable output/obligation handling permits shutdown. Unknown final supplier billing keeps its reservation independently of video delivery.
 
-## 7. WanGP acceptance requirements (D, not yet implemented)
+## 7. WanGP acceptance requirements and implementation boundary
 
 User authorization obtained on 2026-10-06. Pinned research revision: `deepbeepmeep/Wan2GP@0e58385fbde7ff102d276e4a9e490845de76b4ea`. Use the upstream headless Session API behind a private adapter; keep upstream unchanged where practical. Do not adopt its UI/shared login/MCP in-memory queue as our account or job system.
+
+[D1 #18](https://github.com/apedintensor/h3-studio/issues/18) is accepted within its offline adapter/receipt scope. PR #25 implements a bounded Base FL2VA compiler, protected host/transport and configured routing; full runtime locking, cold-start integration and real output verification remain #22 and [B3 #16](https://github.com/apedintensor/h3-studio/issues/16). REF qualification is [D4 #29](https://github.com/apedintensor/h3-studio/issues/29): keeping Comfy recovery does not imply automatic REF-to-Comfy routing for new requests. Request-duration ranges do not by themselves establish the executable or publicly enabled envelope.
 
 - Pin dependencies and every model component independently; an upstream `resolve/main` URL is not a frozen weight version.
 - Use one active inference per isolated slot initially. Two replicas differ from tensor parallelism.
@@ -107,7 +110,7 @@ User authorization obtained on 2026-10-06. Pinned research revision: `deepbeepme
 - Same attempt+hash replays/reconciles; a conflicting hash fails. A crash between dispatch intent and acknowledgement stays unknown. A missing in-memory Session job after restart never authorizes replay. Do not promise exactly-once inference across process/network failures.
 - Preserve all requested controls or reject before starting. Current platform controls cannot silently map to upstream defaults, ignored controls, automatic trimming, quantization, or different steps/samplers. Publish a tested intersection first; unsupported controls remain explicit.
 - Verify first/last-frame versus omni-reference exclusions, reference counts/selected durations and audio behavior. Source support, adapter mapping, hardware qualification and current enablement are separate facts.
-- Fix backend-specific capacity guards, endpoint uniqueness and recovery routing before adding a production backend enum. A new name must not bypass physical GPU limits.
+- Every GPU backend must retain engine identity, capacity guards, endpoint uniqueness and original-attempt recovery routing. Adding an enum or passing configured-slot tests cannot bypass physical GPU limits or the remaining production activation gates.
 
 ## 8. Acceptance matrix
 

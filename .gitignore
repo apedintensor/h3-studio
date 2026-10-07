@@ -295,3 +295,6 @@ inventory.json
 !deploy/wangp/manifest.json
 !deploy/wangp/runtime-recipe.json
 !WANGP-INTEGRATION-RESULT.md
+
+# Durable decision rationale only; no operational state or credentials.
+!DECISIONS.md

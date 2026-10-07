@@ -7,6 +7,7 @@ It describes implementation direction, not a claim of deployment, current health
 
 Start a work session with [WORKFLOW.md](WORKFLOW.md) and the work-package index in [workflow/project.json](workflow/project.json).
 Use the actual GitHub issues linked there; A–H below are parent work packages, not a second issue-numbering system.
+Accepted choices and their rationale are indexed in [DECISIONS.md](DECISIONS.md); this plan describes the resulting direction. Source-level wording was reconciled on 2026-10-08 against merged PR #25/#30, without a new production observation.
 
 ## 1. North star
 
@@ -26,12 +27,12 @@ The following is a source-code and historical-record baseline, not a fresh produ
 |---|---|---|
 | Business backend | `platform_app.py` / `studio_platform` implement authentication, assets, plans, jobs, budgets, and recovery. | Clear application-service boundaries and explicit compatibility contracts. |
 | Public generation | Historical receipts contain successful Comfy-based generation, download, and result integration. | Recheck current deployment and authorization; prove the new policy end to end. |
-| Quick Chat | Local `/quick-chat` and `/v1/quick-chat/` integration exists, with sessions, turns, bindings, revisions, and submissions. | User-approved local UX and real generation integration before release. |
+| Quick Chat | `/quick-chat` and `/v1/quick-chat/` integration is preserved in draft PR #23, with sessions, turns, bindings, revisions, and submissions; it is not merged into this main baseline. | User-approved local UX and real generation integration before release. |
 | Quick Chat deployment | The isolated preview is local; generation and assistant execution are disabled there. | Do not describe local integration as released or currently generating. |
 | Accounts | Ownership and PAT controls exist, but the account directory is fixed to `superdan` and `supervan`. | A real user directory, explicit identity migration, and later team membership. |
 | Assets | Private storage, validation, and recovery exist; staging and locks depend on one host. | Cross-host staging, operation leases, backup, and a tested object-store migration. |
 | GPU control | On-demand orchestration reuses finite-controller logic with single-node and finite-cycle constraints. | Separate continuing service policy from test policy; then implement node isolation and redundancy. |
-| Engines | A Comfy baseline has historical evidence. The user selected WanGP as the target runtime on 2026-10-06 and confirmed its authorization. | Integrate upstream WanGP behind an adapter; validate each recipe, topology, control envelope and recovery behavior before switching. |
+| Engines | A Comfy baseline has historical evidence. WanGP was selected on 2026-10-06; PR #25 supplies offline adapter/receipt acceptance and partial compiler/transport/configured-routing implementation. | Complete the pinned runtime and cold-start integration; validate each recipe, topology, control envelope and recovery behavior before switching. |
 
 Historical budgets, service deadlines, successful jobs, and deployment receipts do not establish today's available capacity.
 No plan, issue, restart, or configuration change renews an expired operating window or resets accumulated costs.
@@ -43,10 +44,10 @@ Preserve account ownership, API credentials, existing IDs, accepted requests, re
 Extract interfaces and replace individual implementations where there is a measurable benefit.
 Do not create a parallel `backend_v2`, duplicate job database, or dual-write generation authority.
 
-The first extraction points are:
+The incremental boundaries are:
 
-- Application services: move generation admission and plan orchestration out of HTTP assembly closures.
-- Engine adapters: extract Comfy compilation, submission, reconciliation, cancellation, and output normalization from the generic worker.
+- Application services: retain the shared preflight/confirmation/enqueue merged in PR #25; complete explicit access/plan/read interfaces and preserved Quick Chat parity in #12.
+- Engine adapters: preserve the Comfy seam extracted in PR #17 and extend engine integration through the same worker contract; PR #25 adds the first offline WanGP slice.
 - Runtime policy: separate finite acceptance limits from continuing on-demand service rules while retaining the rental ledger.
 - Storage and identity: address their specific scaling constraints without changing existing ownership semantics implicitly.
 
@@ -118,8 +119,8 @@ vLLM-Omni is an alternative with its own serving limits; ordinary vLLM support i
 Diffusers' H3 ModularPipeline is a research/custom-service option that still needs service lifecycle and recovery implementation.
 External H3 APIs are explicit provider choices after validation, never silent substitutions for unknown self-hosted executions.
 
-Before selecting a new engine, freeze source SHA, image digest, dependency versions, model revision, precision, and exact recipe.
-The switching gate must demonstrate:
+Before qualifying and activating an engine recipe for new production jobs, freeze source SHA, image digest, dependency versions, model revision, precision, and exact recipe. Selecting a target runtime can precede that qualification.
+The switching gate for the explicitly advertised recipe/control scope must demonstrate:
 
 - Advertised text, first/last-frame, image/video/audio reference, and advanced-control coverage for the exact version.
 - A joint envelope for dimensions, frames, reference encoding budget, per-slot concurrency, CPU RAM, disk, and GPU memory.
@@ -129,6 +130,7 @@ The switching gate must demonstrate:
 - New-task routing and rollback while old jobs stay bound to their original engine and recipe.
 
 Do not silently discard references, shorten videos, change precision, or ignore unsupported controls.
+The initial text-only Base proof does not qualify REF or last-frame fidelity. Comfy's retained recovery/rollback path is not an automatic fallback for new REF requests; any such routing needs its own explicit contract and acceptance. Supported request ranges, qualified execution envelopes and currently enabled public capabilities remain separate facts.
 Quantized or distilled variants are separate quality profiles; their speed does not prove full Base capability parity.
 An execution slot may use one or several GPUs. Two single-GPU replicas are different from one tensor-parallel two-GPU slot.
 A first/last-frame-only node and a reference-only node do not provide redundancy for either individual capability.
@@ -194,7 +196,7 @@ Existing unpublished scenario work is tracked as G1 #20 (Quick Chat) and G2 #21 
 
 ## 10. Documentation, issue, and status authority
 
-This plan holds architectural direction. The active issue-linked specification holds the batch's accepted behavior and acceptance criteria.
+[DECISIONS.md](DECISIONS.md) records durable choices, rationale and supersession; this plan holds their architectural direction. Active contracts specify required behavior; issue acceptance criteria specify the bounded delivery proof. Update corresponding current text when a decision changes instead of accumulating contradictory override paragraphs.
 GitHub issues hold work status and current ownership; [workflow/project.json](workflow/project.json) indexes the Project, fields, packages, and initial issue links.
 [WORKFLOW.md](WORKFLOW.md) defines claiming work, handoff, review, testing, and release coordination.
 Code and observed evidence establish implemented behavior; disagreements with accepted requirements are defects or explicit decisions to resolve.
