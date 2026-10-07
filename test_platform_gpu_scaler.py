@@ -126,6 +126,13 @@ class FiniteComposeTests(unittest.TestCase):
 
 
 class FiniteControlTests(unittest.TestCase):
+    def test_provider_preparation_timeout_is_explicit_bounded_host_configuration(self):
+        original = on_demand_configuration()
+        self.assertTrue(scaler.on_demand_config({**original, 'provider_preparation_timeout_s': 1800}))
+        for invalid in (True, 0, -1, 119, 7201, 1800.0, float('nan'), '1800'):
+            with self.subTest(invalid=invalid), self.assertRaises(release.ReleaseError):
+                scaler.on_demand_config({**original, 'provider_preparation_timeout_s': invalid})
+
     def test_on_demand_requires_exact_owner_pair_and_single_gpu_idle_policy(self):
         config = on_demand_configuration()
         self.assertTrue(scaler.on_demand_config(config))

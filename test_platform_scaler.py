@@ -48,6 +48,83 @@ class FakeProvider:
 
 
 class ScalerTests(LedgerCase):
+    def test_disabled_preparation_preserves_historical_receipt_and_action_payloads(self):
+        from studio_platform.repository import scaler_receipts
+        row = self.create()
+        self.provider.facts[row['id']] = ProviderFact('starting', row['provider_instance_id'],
+            provider_status='PENDING', preparation_stage='configuring_ssh')
+        self.now += 121
+        self.tick(demands=[])
+        with self.repo.engine.connect() as conn:
+            payloads = list(conn.execute(select(scaler_receipts.c.facts).where(
+                scaler_receipts.c.intent_id == row['id'])).scalars())
+            payloads.append(conn.execute(select(scaler_actions.c.last_observation).where(
+                scaler_actions.c.intent_id == row['id'])).scalar_one())
+        for payload in payloads:
+            self.assertNotIn('provider_status', payload)
+            self.assertNotIn('preparation_stage', payload)
+        self.assertEqual(self.provider.destroys, [])
+
+    def timed_preparation(self):
+        self.scaler = ScaleCoordinator(self.repo, provider=self.provider, enabled=True,
+            preparation_timeout_s=120, preparation_binding='a'*64,
+            unused_preparation_guard=lambda conn, intent: True)
+        def committed_before_post(tag):
+            from studio_platform.repository import scaler_receipts
+            with self.repo.engine.connect() as conn:
+                phase = conn.execute(select(scaler_receipts.c.facts).where(
+                    scaler_receipts.c.intent_id == tag,
+                    scaler_receipts.c.operation == 'provider_preparation')).scalar_one()
+            self.assertEqual(phase['phase'], 'awaiting_provider')
+        self.provider.on_create = committed_before_post
+        row = self.create()
+        self.provider.facts[row['id']] = ProviderFact('starting', row['provider_instance_id'], provider_status='PENDING')
+        return row
+
+    def test_preparation_guard_checks_age_freshness_instance_worker_and_default_opt_out(self):
+        row = self.timed_preparation()
+        self.now += 119
+        self.tick()
+        self.assertEqual(self.provider.destroys, [])
+        control, spec = self.ready_instance(row)
+        # A worker record contradicts unused proof, even after it is retired.
+        control.retire(spec.worker_id, upstream_idle_confirmed=True)
+        with self.repo.transaction() as conn:
+            conn.execute(update(instance_intents).where(instance_intents.c.id == row['id']).values(state='starting'))
+        self.now += 2
+        self.tick()
+        self.assertEqual(self.provider.destroys, [])
+
+    def test_crash_after_retirement_marker_before_delete_never_replays_or_starts(self):
+        row = self.timed_preparation()
+        self.now += 121
+        class Crash(BaseException): pass
+        original = self.scaler._call
+        def call(intent, operation, **kwargs):
+            if operation == 'destroy': raise Crash()
+            return original(intent, operation, **kwargs)
+        with patch.object(self.scaler, '_call', side_effect=call), self.assertRaises(Crash):
+            self.tick()
+        self.assertEqual(self.repo.list_instance_intents()[0]['state'], 'destroying')
+        self.now += 61
+        self.tick(leader='replacement')
+        lease = self.scaler.acquire('scale-test', 'replacement')
+        self.assertFalse(self.scaler.claim_bootstrap(lease, row['id']))
+        self.assertEqual(self.provider.destroys, [])
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(self.repo.get_budget('owner-budget')['reserved_microusd'], 100_000)
+
+    def test_committed_bootstrap_claim_refuses_later_failed_status_retirement(self):
+        row = self.timed_preparation()
+        self.provider.facts[row['id']] = ProviderFact('running', row['provider_instance_id'])
+        self.now += 121
+        self.tick()
+        lease = self.scaler.acquire('scale-test', 'leader')
+        self.assertTrue(self.scaler.claim_bootstrap(lease, row['id']))
+        self.provider.facts[row['id']] = ProviderFact('starting', row['provider_instance_id'], provider_status='FAILED')
+        self.tick(demands=[])
+        self.assertEqual(self.provider.destroys, [])
+
     def setUp(self):
         super().setUp()
         self.provider = FakeProvider()

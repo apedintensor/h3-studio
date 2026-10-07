@@ -71,6 +71,8 @@ def json_config(config):
         value.pop("service_policy", None)
     if not value.get("output_delivery"):
         value.pop("output_delivery", None)
+    if value.get("provider_preparation_timeout_s") is None:
+        value.pop("provider_preparation_timeout_s", None)
     if value.get("execution_backend", "comfy-worker") == "comfy-worker":
         value.pop("execution_backend", None)
         value.pop("engine_manifest_digest", None)
@@ -152,6 +154,53 @@ class ServiceCycle(FiniteController):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.scaler.unsubmitted_retirement_guard = self._preparation_retirement_allowed
+        self.scaler.unused_preparation_guard = self._unused_provider_preparation
+
+    def provider_retirement(self):
+        rows, _ = self._managed()
+        with self.repo.engine.connect() as conn:
+            for row in rows:
+                value = self.scaler.preparation(conn, row)
+                if value and value["phase"] == "retiring_unused":
+                    return value
+        return None
+
+    def _unused_provider_preparation(self, conn, intent):
+        """Called under leader/capacity/action locks, before durable retirement.
+
+        The awaiting_provider receipt, committed before rental creation, is the
+        positive start barrier. Missing files alone can never create that proof.
+        """
+        if (not getattr(self, "preserve_rollover", lambda: False)()
+                or intent["id"] in self.boots or intent["pool"] != self.config.pool):
+            return False
+        cycle = conn.execute(select(capacity_cycles).where(
+            capacity_cycles.c.approval_id == self.config.capacity_approval_id)).mappings().first()
+        grant = conn.execute(select(capacity_approvals).where(
+            capacity_approvals.c.id == self.config.capacity_approval_id)).mappings().first()
+        if not cycle or cycle["intent_id"] != intent["id"] or not grant or not grant["enabled"]:
+            return False
+        # A conflicting historical/bootstrap footprint requires explicit recovery.
+        for path in (self.config.work_dir/"boot"/intent["id"],
+                     self.config.work_dir/("lifetime-"+intent["id"]+".json")):
+            if path.exists() or path.is_symlink():
+                return False
+        pending = list(conn.execute(select(jobs).where(jobs.c.pool == self.config.pool,
+            jobs.c.status.not_in(("succeeded", "failed", "cancelled", "planned", "blocked")))
+            .order_by(jobs.c.id).with_for_update().limit(4097)).mappings())
+        if (len(pending) > 4096 or any(j["execution_plan"].get("capacity_approval_id") != grant["id"]
+                or not proven_unsubmitted_capacity_job(conn, j) for j in pending)):
+            return False
+        # Freeze new admissions atomically with the start fence and destroy intent.
+        conn.execute(update(capacity_approvals).where(capacity_approvals.c.id == grant["id"]).values(enabled=0))
+        return True
+
+    def _sync_provider_preparation(self):
+        value = self.provider_retirement()
+        if value is not None:
+            self.request_rollover()
+            self._expire_held_waiters()
+            self.cold.record_wait_reason(self.config.capacity_approval_id, value["reason"])
 
     def _preparation_retirement_allowed(self, conn, intent):
         hold = self.preparation_hold()
@@ -381,9 +430,12 @@ class ServiceCycle(FiniteController):
                     "error_code": "capacity_wait_deadline_expired"})
 
     def _close_unsubmitted(self):
-        if ((self.preparation_hold() or (self.config.work_dir/"rollover.flag").exists())
+        if ((self.preparation_hold() or self.provider_retirement() or (self.config.work_dir/"rollover.flag").exists())
                 and getattr(self, "preserve_rollover", lambda: False)()):
             self.repo.set_capacity_approval_enabled(self.config.capacity_approval_id, enabled=False)
+            if self.provider_retirement():
+                self._expire_held_waiters()
+                self.cold.record_wait_reason(self.config.capacity_approval_id, self.provider_retirement()["reason"])
             if self.preparation_hold():
                 if self.preparation_hold()["reason"] == "bootstrap_repair_required":
                     self._expire_held_waiters()
@@ -468,6 +520,8 @@ class OnDemandController:
         if (not value["instances"] or not value["all_destroyed"] or value["active_jobs_truncated"]
                 or not all(b.children_done() for b in self.current.boots.values())):
             return False
+        if self.current.provider_retirement() and value["billing_pending"]:
+            return False  # Provider DELETE uncertainty and outstanding charges retain this cycle.
         # An inventory race must not consume all approved cycles in one tight
         # loop. No-rent attempts retain the same job during this bounded pause.
         rows, _ = self.current._managed()
@@ -513,6 +567,7 @@ class OnDemandController:
         # A failed qualification or explicit grant revocation ends the service.
         # Only our durable TTL-rollover marker authorizes preserving backlog
         # and opening a replacement cycle under the original service budget.
+        self.current._sync_provider_preparation()
         if (self.current.stopping() and not self.current.preparation_hold()
                 and not (self.current.config.work_dir/"rollover.flag").exists()):
             self.request_drain()

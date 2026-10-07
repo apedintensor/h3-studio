@@ -61,6 +61,8 @@ class ProviderFact:
     idle_confirmed: bool = False
     idle_since: float | None = None
     absence_confirmed: bool = False
+    provider_status: str | None = None
+    preparation_stage: str | None = None
 
     def __post_init__(self):
         if self.state not in {"unknown", "not_created", "starting", "running", "destroyed"}:
@@ -78,6 +80,9 @@ class ProviderFact:
         if self.state == "not_created" and (not self.absence_confirmed or self.instance_id is not None
                                             or self.actual_cost_microusd != 0):
             raise ValueError("authoritative_not_created_proof_required")
+        if (self.provider_status not in (None, "PENDING", "FAILED", "STOPPED", "RUNNING")
+                or self.preparation_stage not in (None, "provider_preparing", "configuring_ssh")):
+            raise ValueError("invalid_provider_preparation_fact")
 
 
 class ProviderProtocol(Protocol):
@@ -112,13 +117,128 @@ class LeaderLease:
 
 class ScaleCoordinator:
     def __init__(self, repository, *, provider=None, enabled=False, leader_seconds=60,
-                 min_observation_s=15, unsubmitted_retirement_guard=None):
+                 min_observation_s=15, unsubmitted_retirement_guard=None,
+                 preparation_timeout_s=None, preparation_binding=None, unused_preparation_guard=None):
         if (type(enabled) is not bool or not math.isfinite(leader_seconds) or not 0 < leader_seconds <= 3600
             or not math.isfinite(min_observation_s) or not 0 < min_observation_s <= 3600):
             raise ValueError("invalid_scaler_settings")
         self.repo, self.provider, self.enabled = repository, provider or DisabledProvider(), enabled
         self.leader_seconds, self.min_observation_s = leader_seconds, min_observation_s
         self.unsubmitted_retirement_guard = unsubmitted_retirement_guard or (lambda conn, intent: False)
+        if preparation_timeout_s is not None and (type(preparation_timeout_s) is not int
+                or not 120 <= preparation_timeout_s <= 7200
+                or not isinstance(preparation_binding, str) or not re.fullmatch(r"[0-9a-f]{64}", preparation_binding)):
+            raise ValueError("invalid_provider_preparation_policy")
+        self.preparation_timeout_s, self.preparation_binding = preparation_timeout_s, preparation_binding
+        self.unused_preparation_guard = unused_preparation_guard or (lambda conn, intent: False)
+
+    def preparation(self, connection, intent):
+        """Read one irreversible lifecycle from the existing rental receipt ledger.
+
+        No receipt means historical/unbound, not proof that bootstrap never ran.
+        The action row serializes all phase changes; timestamps never reset age.
+        """
+        rows = list(connection.execute(select(scaler_receipts.c.facts).where(
+            scaler_receipts.c.intent_id == intent["id"],
+            scaler_receipts.c.operation == "provider_preparation")).scalars())
+        if not rows:
+            return None
+        if self.preparation_timeout_s is None or len(rows) > 2:
+            raise Conflict("provider_preparation_binding_mismatch")
+        phases = {}
+        for row in rows:
+            if (not isinstance(row, dict) or row.get("version") != 1
+                    or row.get("intent_id") != intent["id"] or row.get("created_at") != intent["created_at"]
+                    or row.get("timeout_s") != self.preparation_timeout_s
+                    or row.get("binding") != self.preparation_binding
+                    or row.get("phase") not in {"awaiting_provider", "bootstrap_started", "retiring_unused"}
+                    or row["phase"] in phases):
+                raise Conflict("provider_preparation_receipt_invalid")
+            phases[row["phase"]] = row
+        if "awaiting_provider" not in phases:
+            raise Conflict("provider_preparation_receipt_invalid")
+        value = phases.get("retiring_unused", phases.get("bootstrap_started", phases["awaiting_provider"]))
+        if value["phase"] != "awaiting_provider" and value.get("instance_id") != intent["provider_instance_id"]:
+            raise Conflict("provider_preparation_instance_mismatch")
+        return value
+
+    def _preparation_receipt(self, connection, intent, phase, **extra):
+        value = {"version": 1, "intent_id": intent["id"], "created_at": intent["created_at"],
+            "timeout_s": self.preparation_timeout_s, "binding": self.preparation_binding,
+            "phase": phase, **extra}
+        connection.execute(insert(scaler_receipts).values(id=str(uuid.uuid4()), intent_id=intent["id"],
+            operation="provider_preparation", observed_at=self.repo.clock(), facts=canonical(value)))
+        return value
+
+    def claim_bootstrap(self, lease, intent_id):
+        """Fence preparation BEFORE any SSH/bootstrap side effect, including uploads."""
+        if self.preparation_timeout_s is None:
+            return True
+        with self.repo.transaction() as connection:
+            self._leader(connection, lease)
+            self.repo._lock_capacity(connection)
+            row = self.repo._locked(connection, select(instance_intents).where(instance_intents.c.id == intent_id))
+            action = self.repo._locked(connection, select(scaler_actions).where(scaler_actions.c.intent_id == intent_id))
+            if row is None or action is None:
+                raise Conflict("provider_preparation_intent_unconfirmed")
+            phase = self.preparation(connection, row)
+            if phase is None:
+                raise Conflict("provider_preparation_legacy_adoption_required")
+            if (row["pool"] != lease.pool or row["state"] not in {"starting", "ready", "busy"}
+                    or action["destroy_started_at"] is not None or phase["phase"] == "retiring_unused"):
+                return False
+            if phase["phase"] == "bootstrap_started":
+                return True
+            now = self.repo.clock()
+            fact = ProviderFact(**action["last_observation"]) if action["last_observation"] else ProviderFact("unknown")
+            if (action["last_observed_at"] is None or not 0 <= now-action["last_observed_at"] <= 30
+                    or fact.state != "running" or fact.instance_id != row["provider_instance_id"]):
+                return False
+            self._preparation_receipt(connection, row, "bootstrap_started", instance_id=row["provider_instance_id"])
+            return True
+
+    def _retire_unused_preparation(self, lease, intent):
+        if self.preparation_timeout_s is None:
+            return
+        destroy = False
+        with self.repo.transaction() as connection:
+            self._leader(connection, lease)
+            self.repo._lock_capacity(connection)
+            row = self.repo._locked(connection, select(instance_intents).where(instance_intents.c.id == intent["id"]))
+            action = self.repo._locked(connection, select(scaler_actions).where(scaler_actions.c.intent_id == row["id"]))
+            if action is None:
+                return
+            phase = self.preparation(connection, row)
+            if (phase is None or phase["phase"] != "awaiting_provider" or row["state"] != "starting"
+                    or not row["provider_instance_id"] or action["destroy_started_at"] is not None):
+                return
+            now = self.repo.clock()
+            fact = ProviderFact(**action["last_observation"]) if action["last_observation"] else ProviderFact("unknown")
+            fresh = action["last_observed_at"] is not None and 0 <= now-action["last_observed_at"] <= 30
+            failed = fact.provider_status in {"FAILED", "STOPPED"}
+            expired = fact.provider_status == "PENDING" and now-row["created_at"] >= self.preparation_timeout_s
+            if (not fresh or fact.state != "starting" or fact.instance_id != row["provider_instance_id"]
+                    or not (failed or expired)):
+                return
+            if connection.execute(select(registered_workers.c.id).where(
+                    registered_workers.c.provider == row["provider"],
+                    registered_workers.c.instance_id == row["provider_instance_id"])).first():
+                return
+            # Application guard additionally proves exact cycle scope, no attempts,
+            # and no runtime evidence. Status PENDING/STOPPED alone is never idle.
+            if self.unused_preparation_guard(connection, dict(row)) is not True:
+                return
+            reason = "provider_preparation_failed" if failed else "provider_preparation_timeout"
+            self._preparation_receipt(connection, row, "retiring_unused", instance_id=row["provider_instance_id"],
+                reason=reason, provider_status=fact.provider_status, observed_at=action["last_observed_at"])
+            self.repo.update_instance(row["id"], "draining", connection=connection)
+            self.repo.update_instance(row["id"], "destroying", connection=connection)
+            connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == row["id"])
+                .values(destroy_started_at=now))
+            destroy = True
+        if destroy:
+            fact, at = self._call(intent, "destroy")
+            self._apply(lease, intent["id"], fact, at)
 
     def acquire(self, pool, leader_id):
         """CAS leader; an expired lease grants a new fence, never frees capacity."""
@@ -163,8 +283,15 @@ class ScaleCoordinator:
         now = self.repo.clock()
         with self.repo.transaction() as connection:
             connection.execute(insert(scaler_receipts).values(id=str(uuid.uuid4()), intent_id=intent_id,
-                operation=operation, observed_at=now, facts=canonical(asdict(fact))))
+                operation=operation, observed_at=now, facts=canonical(self._fact_payload(fact))))
         return fact, now
+
+    def _fact_payload(self, fact):
+        value = asdict(fact)
+        for key in ("provider_status", "preparation_stage"):
+            if self.preparation_timeout_s is None or value[key] is None:
+                value.pop(key)
+        return value
 
     def _call(self, intent, operation, *, launch=None, before_create=None):
         tag = intent["id"]
@@ -218,7 +345,7 @@ class ScaleCoordinator:
             elif fact.state == "unknown" and row["state"] == "creating":
                 self.repo.update_instance(intent_id, "creation_unknown", connection=connection)
             connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == intent_id).values(
-                last_observation=canonical(asdict(fact)), last_observed_at=observed_at))
+                last_observation=canonical(self._fact_payload(fact)), last_observed_at=observed_at))
         self._retire_confirmed_idle(intent_id)
 
     def _retire_confirmed_idle(self, intent_id):
@@ -375,7 +502,19 @@ class ScaleCoordinator:
                     if self._action(intent["id"]):
                         self._reconcile(lease, intent)
                 for intent in self._active(pool):
+                    self._retire_unused_preparation(lease, intent)
+                for intent in self._active(pool):
                     self._drain_or_destroy(lease, intent, policy)
+                # This cycle owns one preparation attempt. A fresh service cycle
+                # may replace it only after its caller verifies removal/billing.
+                with self.repo.engine.connect() as connection:
+                    retiring = connection.execute(select(scaler_receipts.c.intent_id).join(instance_intents,
+                        instance_intents.c.id == scaler_receipts.c.intent_id).where(instance_intents.c.pool == pool,
+                        scaler_receipts.c.operation == "provider_preparation",
+                        scaler_receipts.c.facts["binding"].as_string() == self.preparation_binding,
+                        scaler_receipts.c.facts["phase"].as_string() == "retiring_unused")).first()
+                if retiring:
+                    return {"state": "provider_preparation_retiring"}
             active = self._active(pool)
             spec = asdict(launch) if launch else None
             digest = request_hash({"policy": asdict(policy), "launch": spec, "budget_account_ids": sorted(set(budget_account_ids)),
@@ -440,6 +579,8 @@ class ScaleCoordinator:
                     budget_account_ids=budget_account_ids, dry_run=False, provider=launch.provider, connection=connection)
                 connection.execute(insert(scaler_actions).values(intent_id=intent["id"], pool=pool,
                     launch_spec=canonical(spec), create_started_at=now))
+                if self.preparation_timeout_s is not None:
+                    self._preparation_receipt(connection, intent, "awaiting_provider")
                 self.repo.update_instance(intent["id"], "creating", connection=connection)
                 # Optional pure application linkage commits with the sole
                 # create intent and reservations. Never call a provider here.

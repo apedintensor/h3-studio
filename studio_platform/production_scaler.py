@@ -113,8 +113,12 @@ class FiniteConfig:
     engine_manifest_digest: str = ""
     service_policy: dict | None = None
     output_delivery: str = ""
+    provider_preparation_timeout_s: int | None = None
 
     def __post_init__(self):
+        if self.provider_preparation_timeout_s is not None and (type(self.provider_preparation_timeout_s) is not int
+                or not 120 <= self.provider_preparation_timeout_s <= 7200):
+            raise ScalerError("invalid_provider_preparation_timeout")
         from .inference.outputs import validate_delivery_policy
         validate_delivery_policy(self.execution_backend, self.output_delivery)
         if self.execution_backend not in {"comfy-worker", "wangp-worker"}:
@@ -236,6 +240,8 @@ class FiniteConfig:
             value.pop("service_policy")
         if not self.output_delivery:
             value.pop("output_delivery")
+        if self.provider_preparation_timeout_s is None:
+            value.pop("provider_preparation_timeout_s")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
@@ -419,7 +425,9 @@ def verify_identity_files(config):
 class FiniteController:
     def __init__(self, repo, settings, config, *, provider, scaler=None, boot_factory=None):
         self.repo, self.settings, self.config, self.provider = repo, settings, config, provider
-        self.scaler = scaler or ScaleCoordinator(repo, provider=provider, enabled=True, leader_seconds=180)
+        self.scaler = scaler or ScaleCoordinator(repo, provider=provider, enabled=True, leader_seconds=180,
+            preparation_timeout_s=config.provider_preparation_timeout_s,
+            preparation_binding=config.fingerprint())
         self.policies = ExecutionPolicies(settings, repo)
         self.cold = ColdStartCoordinator(repo, scaler=self.scaler, enabled=True,
             approval_guard=self.approval_current, activation_guard=self.job_allowed)
@@ -693,6 +701,10 @@ class FiniteController:
         """Finite runs stop; on-demand preparation recovery may preserve backlog."""
         self.request_drain()
 
+    def _sync_provider_preparation(self):
+        """Service cycles override this to retain backlog before capacity advance."""
+        pass
+
     def _bootstrap_start_allowed(self, intent_id, lease):
         """Fence upload completion before remote setup; never acquire ownership here."""
         from .repository import capacity_waiters
@@ -726,6 +738,7 @@ class FiniteController:
         lease = self.scaler.acquire(c.pool, self.leader_id)
         if lease is None:
             return {"phase": "not_leader", "drained": False}
+        self._sync_provider_preparation()
         instances, actions = self._managed()
         stopping = self.stopping()
         if not stopping:
@@ -765,6 +778,8 @@ class FiniteController:
             decision = self.scaler.tick(self.leader_id, c.scope, c.pool, demands, slots, policy=policy,
                 launch=None if stopping else launch, budget_account_ids=c.budget_account_ids,
                 before_create=self.create_allowed)
+        self._sync_provider_preparation()
+        stopping = self.stopping()
         if not stopping:
             self.cold.advance_once(c.capacity_approval_id)
         instances, _ = self._managed()
@@ -784,6 +799,20 @@ class FiniteController:
                 continue
             if not row["provider_instance_id"]:
                 continue
+            if c.provider_preparation_timeout_s is not None:
+                with self.repo.engine.connect() as conn:
+                    preparation = self.scaler.preparation(conn, row)
+                if preparation is None:
+                    boot_status[intent] = {"state": "provider_preparation_legacy_adoption_required"}
+                    continue
+                if preparation["phase"] == "retiring_unused":
+                    boot_status[intent] = {"state": preparation["reason"]}
+                    continue
+                if preparation["phase"] == "awaiting_provider" and not self.scaler.claim_bootstrap(lease, intent):
+                    action = self.scaler._action(intent)
+                    stage = (action.get("last_observation") or {}).get("preparation_stage")
+                    boot_status[intent] = {"state": stage or "provider_preparing"}
+                    continue
             execution_allowed = getattr(self.provider, "execution_allowed", None)
             if callable(execution_allowed) and not execution_allowed(intent, row["provider_instance_id"]):
                 # A contradicting paid response retains identity/reservation
@@ -814,6 +843,10 @@ class FiniteController:
             if (any(row["state"] == "creation_unknown" for row in instances)
                     or any(v.get("state") == "rental_contract_requires_reconciliation" for v in boot_status.values())):
                 reason = "creation_needs_reconciliation"
+            elif any(v.get("state") == "configuring_ssh" for v in boot_status.values()):
+                reason = "provider_configuring_ssh"
+            elif any(v.get("state") == "provider_preparing" for v in boot_status.values()):
+                reason = "provider_preparing"
             elif any(row["state"] == "starting" for row in instances):
                 reason = "gpu_starting"
             elif any(row["state"] in ("ready", "busy") for row in instances):
