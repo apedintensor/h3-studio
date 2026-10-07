@@ -11,6 +11,7 @@ body:
         PROJECT-PLAN.md is the English architecture and A–H work-package entry point.
         Use English on GitHub. Find the existing project and work-package issues in workflow/project.json; avoid duplicate work.
         Link existing specifications instead of copying the architecture. Never include credentials, connection codes, private prompts, user media, or signed URLs.
+        Record blockers immediately and triage other material discoveries before merge/handoff. Reuse an issue where possible; fixed small in-scope bugs need no separate task.
   - type: dropdown
     id: work-package
     attributes:
@@ -19,7 +20,7 @@ body:
         - A — Baseline and contracts
         - B — Minimum generation loop
         - C — Failure recovery
-        - D — Native engine comparison
+        - D — WanGP runtime integration
         - E — Dual-GPU redundancy
         - F — Object storage and recovery
         - G — Scenario integration
@@ -31,10 +32,11 @@ body:
     id: outcome
     attributes:
       label: Outcome
-      description: Describe the concrete problem and the desired behavior.
+      description: Describe the desired behavior and whether this is a confirmed defect, a risk to verify, or an unimplemented capability. State impact and priority.
       placeholder: |
         Current behavior:
         Expected behavior:
+        Impact / priority:
         Out of scope:
     validations:
       required: true
@@ -42,18 +44,19 @@ body:
     id: references
     attributes:
       label: Specification and dependencies
-      description: Link the parent issue, relevant existing specification or contract, and blocking issues. State unresolved decisions explicitly.
+      description: Link the parent/specification and required dependency capabilities. An open issue can deliver a sufficient capability for this bounded scope; link its evidence and retain the remaining gate. Missing required dependencies mean Backlog / Blocked.
       placeholder: |
         Parent work package:
         Specification / approved UX:
-        Dependencies:
+        Required capability / dependency issue / evidence revision:
+        Remaining gate or unresolved decision:
     validations:
       required: true
   - type: textarea
     id: scope
     attributes:
       label: Change boundary
-      description: Identify modules/files, shared contracts, and compatibility constraints. Claim the work in a comment before editing.
+      description: Identify files, contracts and compatibility. Claim with session, branch/worktree and base revision before editing; preserve existing feature checkouts. Parent rollup does not establish an active claim.
       placeholder: |
         Modules / files:
         Shared API / data / execution contracts:
@@ -64,10 +67,12 @@ body:
     id: acceptance
     attributes:
       label: Acceptance criteria
-      description: Use observable outcomes and specify the verification environment. Local verification and production release are separate.
+      description: Define observable outcomes and environment. At handoff assess each as pass/partial/unverified/fail with exact evidence and revision; only pass checks a box. Split composite criteria without removing requirements. Link unresolved follow-ups.
       placeholder: |
         - [ ] ...
         Verification environment:
+        Evidence / exact revision (on acceptance):
+        Remaining condition / follow-up issue (on handoff):
         Release expectation: Not required / Not released / separate release issue
     validations:
       required: true
@@ -77,3 +82,8 @@ body:
       label: Operating boundary
       description: Mention any required GPU, paid API, production, migration, or cleanup operations and their existing authorization. Creating this issue does not authorize them.
       placeholder: Offline/local only, or the exact authorized operational scope and unresolved limits.
+  - type: markdown
+    attributes:
+      value: |
+        At acceptance, record independent reviewer/session, scope, limitations, findings, fixes and re-review where material changes require it; technical review is not automatically full AC acceptance. No mandatory human PR review.
+        On explicit claim release, set Project Session to Unclaimed. Use Ready only when the next scope's dependencies are satisfied; record missing required dependencies as Backlog / Blocked. Do not infer release from inactivity.

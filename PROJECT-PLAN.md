@@ -186,7 +186,9 @@ Work that needs its applicable production authorization and controls:
 The batch receipt records commit/image/profile, environment, job/attempt identity, phase timing, artifact validation, and rental reconciliation.
 Do not combine this batch with a story-model rewrite, wholesale storage migration, accelerated-model rollout, or hosting-platform migration.
 
-The missing transition is explicit: D1 #18 supplies an offline adapter/receipt; D2 #22 supplies pinned real control mapping, attempt-bound routing, capacity guards and protected host/bootstrap. Only then can #16 prove a real public WanGP path, with #12/#14/#15 compatibility and recovery gates. Start with one recipe/slot; broader redundancy does not block that slice.
+The missing transition is explicit: D1 #18 is accepted offline in PR #25; D2 #22 has partial compilation, transport, attempt-bound routing and capacity guards, but still needs the full runtime lock and on-demand bootstrap/recovery. Only then can #16 prove a real public WanGP path, with #12/#14/#15 compatibility and recovery gates. Start with one recipe/slot; broader redundancy does not block that slice.
+
+Follow-up scopes from that integration: D3 #27 resolves last-frame/delivered-duration fidelity; C3 #28 reconciles historical supplier charges and retained reservations; D4 #29 expands and qualifies REF inputs. The first B3 text-to-video proof does not claim those broader controls. Read exact readiness and claims on GitHub; a completed source milestone does not satisfy a real-runtime gate.
 
 Existing unpublished scenario work is tracked as G1 #20 (Quick Chat) and G2 #21 (Agent Connect), preserved separately from main. B1 must coordinate its existing admission extraction rather than rebuilding it. Canonical frontend/mock are versioned in private `apedintensor/sixnine-design`; their local paths and generated-release relationship are unchanged.
 
