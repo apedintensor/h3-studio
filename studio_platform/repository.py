@@ -253,6 +253,14 @@ capacity_waiters = Table("platform_capacity_waiters", metadata,
 Index("platform_capacity_waiters_pending", capacity_waiters.c.approval_id, capacity_waiters.c.state,
       capacity_waiters.c.created_at)
 
+# Opt-in pool approvals only. Membership is immutable, not another rental ledger.
+capacity_pool_members = Table("platform_capacity_pool_members", metadata,
+    Column("approval_id", String(200), ForeignKey("platform_capacity_approvals.id"), primary_key=True),
+    Column("member_id", String(200), primary_key=True),
+    Column("approval_hash", String(64), nullable=False),
+    Column("intent_id", String(36), ForeignKey("platform_instance_intents.id"), unique=True, nullable=False),
+    Column("created_at", Float, nullable=False))
+
 
 class Repository:
     def __init__(self, database_url, *, clock=time.time):
@@ -933,6 +941,10 @@ class Repository:
         """Trusted operator only; creates an immutable approval, not a cloud instance."""
         from .capacity import approve_capacity
         return approve_capacity(self, approval_id, **kwargs)
+
+    def reserve_capacity_member(self, approval_id, member_id, *, connection=None):
+        from .capacity import reserve_capacity_member
+        return reserve_capacity_member(self, approval_id, member_id, connection=connection)
 
     def set_capacity_approval_enabled(self, approval_id, *, enabled):
         if type(enabled) is not bool:

@@ -342,7 +342,8 @@ def verify_policy(config, settings):
         limits = envelope.get("input_limits", {})
         if (envelope["controls"] != controls or envelope["max_pixels"] > 1344*768
                 or envelope["max_steps"] != 50 or envelope["max_duration_seconds"] > 362/24
-                or envelope["max_reference_files"] != 0 or envelope["max_guides"] != 0
+                or envelope["max_reference_files"] > (2 if envelope["allow_first_last"] else 0)
+                or envelope["max_guides"] != 0
                 or any(limits.get(key) != 0 for key in ("max_images", "max_videos", "max_audios"))
                 or limits.get("guide_kinds") != [] or limits.get("guide_recipe_ids") != []
                 or limits.get("allow_video_audio") is not False
@@ -454,7 +455,8 @@ class FiniteController:
 
     def approval_current(self, payload):
         c = self.config
-        return bool(not self.stopping() and payload["tenant_id"] == c.tenant and payload["pool"] == c.pool
+        return bool("pool_members" not in payload and not self.stopping()
+            and payload["tenant_id"] == c.tenant and payload["pool"] == c.pool
             and payload["configuration_id"] == c.configuration_id and payload["recipe_ids"] == list(c.recipe_ids)
             and payload["policy_hash"] == c.execution_policy_sha256
             and payload["budget_scope"] == asdict(c.scope)

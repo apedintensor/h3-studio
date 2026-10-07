@@ -366,8 +366,10 @@ class WorkerControl:
                     bindings.append(jobs.c.expected_runtime_s < remaining)
             if job_filter is not None:
                 bindings.append(job_filter)
+            from .capacity import capacity_member_claim_allowed
             claim = self.queue.claim(worker_id, pool, purpose=purpose, lease_seconds=lease_seconds,
                 connection=connection, job_filter=and_(*bindings), validator=lambda job: self.matches(worker, job)
+                    and (purpose != "generate" or capacity_member_claim_allowed(self.repo, connection, job, worker))
                     and (job_allowed is None or job_allowed(job) is True))
             if claim is None:
                 return None
