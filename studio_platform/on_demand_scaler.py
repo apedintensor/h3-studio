@@ -245,8 +245,7 @@ class ServiceCycle(FiniteController):
         if self.config.qualification_profile != QUEUED_TASK_PROFILE:
             return False
         directory = self.config.work_dir/"boot"/intent["id"]
-        expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
-            "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+        expected = self._bootstrap_identity(intent)
         evidence = json.loads((directory/"bootstrap-state.json").read_text())
         if (evidence.get("identity") != expected
                 or evidence.get("qualification_profile") != QUEUED_TASK_PROFILE
@@ -307,6 +306,14 @@ class ServiceCycle(FiniteController):
         if reason == "queued_task_repair_required":
             self.hold_queued_task_backlog()
 
+    def _bootstrap_identity(self, intent):
+        """Match the boot receipt without weakening historical Comfy identity."""
+        identity = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+            "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+        if getattr(self.config, "execution_backend", "comfy-worker") == "wangp-worker":
+            identity.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
+        return identity
+
     def _boot_failure(self, intent, state):
         if self.config.qualification_profile == QUEUED_TASK_PROFILE and state.get("state") in {
                 "fleet_attention_required", "fleet_recovery_required"}:
@@ -324,8 +331,7 @@ class ServiceCycle(FiniteController):
         path = self.config.work_dir/"boot"/intent["id"]/"bootstrap-state.json"
         try:
             evidence = json.loads(path.read_text())
-            expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
-                "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+            expected = self._bootstrap_identity(intent)
             boot = self.boots[intent["id"]]
             if (evidence.get("identity") != expected or evidence.get("phase") != "bootstrap_failed"
                     or evidence.get("smoke_submission_started") is not None or getattr(boot, "fleet", None) is not None
