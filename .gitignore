@@ -333,3 +333,7 @@ inventory.json
 !tools/run_quick_chat_preview.py
 !skills/sixnine-yingxu/scripts/connect.py
 !AGENT-CONNECT-CONTRACT.md
+
+# Dedicated business backup infrastructure; no deployed targets or credentials.
+!deploy/platform/business-backup.json
+!deploy/platform/BUSINESS-BACKUP.md
