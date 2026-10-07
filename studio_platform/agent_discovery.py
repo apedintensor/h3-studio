@@ -9,12 +9,14 @@ import zipfile
 
 from fastapi import HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from .agent_connect import CODE_TTL_SECONDS, RECOVERY_TTL_SECONDS, PROFILE_ID, PROFILE_VERSION, CONNECT_SCOPES, KEY_LIFETIME_DAYS
+from .agent_connect_routes import PUBLIC_GET_PATHS, HELPER_PATH, MANIFEST_PATH, helper_manifest
 
 PUBLIC_PATHS = frozenset({"/for-agents", "/for-agents/", "/llms.txt",
-    "/for-agents/guide.json", "/for-agents/SKILL.md", "/for-agents/skill.zip"})
+    "/for-agents/guide.json", "/for-agents/SKILL.md", "/for-agents/skill.zip"}) | PUBLIC_GET_PATHS
 DISCOVERY_LINK = '</for-agents>; rel="service-doc"; type="text/html", </llms.txt>; rel="alternate"; type="text/plain"'
 SKILL_ROOT = Path(__file__).resolve().parent.parent / "skills" / "sixnine-yingxu"
-SKILL_FILES = ("SKILL.md", "scripts/sixnine.py")
+SKILL_FILES = ("SKILL.md", "scripts/sixnine.py", "scripts/connect.py")
 MAX_SKILL_BYTES = 512 * 1024
 
 
@@ -73,11 +75,24 @@ def public_guide():
         "quick_chat": agent_contract(),
         "runtime_state": "Not advertised by this static guide. Authenticate, read capabilities, and inspect an actual plan's execution, blockers and estimate. Disabled generation is not a successful generation.",
         "public_resources": {"html": "/for-agents", "text": "/llms.txt", "manifest": "/for-agents/guide.json",
-            "skill": "/for-agents/SKILL.md", "skill_download": "/for-agents/skill.zip"},
+            "skill": "/for-agents/SKILL.md", "skill_download": "/for-agents/skill.zip",
+            "connection_helper": HELPER_PATH, "connection_manifest": MANIFEST_PATH},
+        "connection": {
+            "protocol": "client-held-pat-v1", "exchange": "/v1/agent-connect/exchange",
+            "browser_management": "/v1/account/agent-connections",
+            "profile": {"id": PROFILE_ID, "version": PROFILE_VERSION, "scopes": list(CONNECT_SCOPES),
+                "all_projects": True, "owner_only": True, "key_lifetime_days": KEY_LIFETIME_DAYS},
+            "code_ttl_seconds": CODE_TTL_SECONDS, "recovery_ttl_seconds": RECOVERY_TTL_SECONDS,
+            "flow": "The signed-in owner explicitly creates a connection. Copy the returned short-lived code, origin, owner, connection ID and authorization fingerprint to the Agent. Download and inspect the helper, verify its digest against the same-origin manifest, then run connect with the code through the hidden prompt or stdin. Never pass a permanent key in chat or argv.",
+            "storage": "The helper creates the PAT locally and saves it before exchange using Windows current-user DPAPI or Linux Secret Service. Missing supported storage stops before exchange. No internal AI Registry is required; macOS storage is not implemented.",
+            "recovery": "After a lost response, resume the same connection and locally saved verifier/token. Do not generate replacement material or request another grant. Code consumption is atomic; scopes, owner, origin and key expiry remain frozen.",
+            "authorization": "Connection grants broad access only to the owner's resources. It does not authorize a particular paid task, remove budgets, enable the website assistant or qualify unsupported model controls. Revocation denies further calls without deleting existing work.",
+            "publication": "The API/helper contract and the approved Connect UI have separate release gates. If this deployment does not serve the connection UI, use the explicit manual PAT fallback; do not assume a button is present.",
+        },
         "authentication": {
             "type": "Bearer", "header": "Authorization", "credential_environment": "SIXNINE_API_KEY",
-            "provisioning": "The account owner signs in to the website and creates a scoped Agent API Key; the agent cannot create its own key. Select the intended stories, scopes and expiry.",
-            "storage": "Use the key only in process memory or an existing encrypted api_registry service sixnine profile whose base_url matches this origin. Do not put credentials in URLs, prompts, chat, project files or logs.",
+            "provisioning": "Prefer the owner's explicit one-time connection grant described in connection. A machine key cannot issue another grant. Manual scoped PAT creation remains an advanced fallback; existing PAT permissions do not expand.",
+            "storage": "Prefer the helper's OS-protected connection store and scripts/sixnine.py --connection ID. Manual fallback uses process-only SIXNINE_API_KEY or an already configured secret manager. Do not put permanent credentials in URLs, prompts, chat, ordinary project files or logs. Internal AI Registry is optional and not required for external users.",
             "origin_policy": "Use the origin supplied by the user. HTTPS is required except loopback. Never forward credentials through redirects. Only the download helper can follow one signed public HTTPS storage hop using a separate credential-free client with a pinned public IP.",
             "scopes": {
                 "read_story": ["projects:read"],
@@ -100,7 +115,7 @@ def public_guide():
         },
         "workflow": [
             {"step": "Discover", "action": "Read the public skill; no key is needed to learn the contract. A shared URL alone does not authorize editing or spending."},
-            {"step": "Connect", "action": "Use an owner-issued scoped key, then GET the authenticated guide, guided schema and capabilities. Use OpenAPI for exact endpoint bodies."},
+            {"step": "Connect", "action": "Use the owner's one-time connection grant and OS-protected helper, or an explicit existing scoped PAT. Then GET the authenticated guide, guided schema and capabilities. Use OpenAPI for exact endpoint bodies."},
             {"step": "Choose a workflow", "action": "For conversation sessions and editable job cards, follow this guide's quick_chat contract and authenticated /v1/quick-chat/schema. The website assistant is disabled by default; external Agents can create cards directly. The following project steps remain the supported legacy freestyle/story workflow. Neither path submits generation while authoring."},
             {"step": "Edit", "action": "Read the current project/version, then POST atomic guided actions with expected_version. On 409 read again and reconcile; preserve unrelated edits."},
             {"step": "Prepare media", "action": "Upload into the same project, wait for ready, then shot.configure_generation saves prompt, controls and separate receipt-ID input slots. It maintains web associations; asset.attach remains available for general library editing. Preserve originals and explicit selections."},
@@ -199,12 +214,12 @@ def llms_text():
 - [Agent onboarding](/for-agents): Public HTML; no JavaScript or login is needed to read it.
 - [Machine-readable guide](/for-agents/guide.json): Authentication, request examples and supported workflow.
 - [Skill instructions](/for-agents/SKILL.md): How to work safely on the user's story.
-- [Skill download](/for-agents/skill.zip): Only SKILL.md and scripts/sixnine.py; the helper requires Python and httpx.
+- [Skill download](/for-agents/skill.zip): SKILL.md, scripts/sixnine.py and scripts/connect.py. The connection helper uses the Python standard library; the API/media helper also requires httpx.
 
 ## Quick Chat: sessions and job cards
 Read the guide JSON's quick_chat section and authenticated GET /v1/quick-chat/schema. POST /v1/quick-chat/sessions, then POST that session's turns with current expected_version, session model_id, assistant_mode=none, create_card=true and text containing the complete prompt. This creates a card without calling the disabled-by-default website assistant or starting generation. Alternatively POST the session's cards with explicit recipe_id, prompt, controls, inputs and copies.
 
-Upload media through same-origin multipart POST /v1/quick-chat/sessions/{session_id}/assets with file and a stable client_asset_id; use ready asset_id values in explicit card inputs or selected session materials. Upload alone does not select a reference. The helper's upload/resume-upload commands are project-only: use a direct HTTP client for session uploads, never the session's hidden project. Read the current revision and preflight it; only confirm a ready preflight within the user's authorization. The submission exposes items[].job_id for the existing shared job and its authenticated artifacts. Preserve write bodies and Idempotency-Key values when recovering uncertain responses.
+Upload media through same-origin multipart POST /v1/quick-chat/sessions/{session_id}/assets with file and a stable client_asset_id; use ready asset_id values in explicit card inputs or selected session materials. Upload alone does not select a reference. The helper's upload/resume-upload commands accept --session SESSION_ID (or legacy --project, never both); never address the session's hidden project. Read the current revision and preflight it; only confirm a ready preflight within the user's authorization. The submission exposes items[].job_id for the existing shared job and its authenticated artifacts. Preserve write bodies and Idempotency-Key values when recovering uncertain responses.
 
 This is an API workflow. Quick Chat frontend publication is a separate gate; a returned /quick-chat URL does not prove that this deployment serves that UI. Return session/card/submission/job IDs and verified download results without promising a working chat page. Direct cards do not require Google credentials or an AI Registry installation.
 
@@ -212,7 +227,7 @@ This is an API workflow. Quick Chat frontend publication is a separate gate; a r
 For one clip, POST /v1/projects with title and workspace=freestyle. Use project.journey.reviewShotId, upload intended references, and save with shot.configure_generation. GET the shot's generation-draft; POST its generation-plans with the returned project_version as expected_version. Only a ready plan within the user's authorization can be confirmed through POST /v1/jobs with a stable Idempotency-Key. The guide JSON contains exact examples and partial-update rules. Return /freestyle?project={project_id}&entity={shot_id}; the same draft and candidates remain editable. Creating/editing a draft does not generate video.
 
 ## Authorization and live capabilities
-A URL is a discovery link, not permission to edit or spend. The owner signs in and creates a scoped Agent API Key. Use process-only SIXNINE_API_KEY or an existing matching encrypted registry profile; never place credentials in chat, URLs or files. All /v1 resources and OpenAPI require authentication. Use only the origin supplied by the user and do not forward its credential to other origins.
+A URL is a discovery link, not permission to edit or spend. The owner explicitly authorizes a one-time connection. Read /for-agents/connect-manifest.json, inspect /for-agents/connect.py and verify its digest before executing. The five-minute code may be handed to the Agent; the permanent PAT is generated locally and stored before exchange in Windows user DPAPI or Linux Secret Service. No internal AI Registry is required. Missing supported storage stops before exchange. Resume uncertain exchanges with the same saved connection. Manual PATs remain an advanced fallback using a process-only credential. Never put permanent keys in chat, URLs, argv or ordinary files. The only anonymous POST is /v1/agent-connect/exchange; account/business APIs and OpenAPI require authentication. The connection UI has a separate publication gate. Use only the origin supplied by the user and do not forward its credential to other origins.
 
 After authorization, read GET /v1/agent-guide, /v1/guided-schema, /v1/capabilities and /openapi.json. Static documentation is not proof that generation is enabled. An actual plan may be blocked; do not invent successful media.
 
@@ -234,16 +249,16 @@ def landing_html():
 <nav><a href="/">← 回到映序</a><a href="/llms.txt">llms.txt</a><a href="/for-agents/guide.json">机器可读指南</a></nav>
 <p class="tag">FOR AI AGENTS · API V1</p><h1>让 AI 创作，<br>让你随时接手。</h1>
 <p>把这个网站链接发给 Codex 或其他支持 API 的 Agent。一个短片可以直接用快速创作：提示词、图片、动作视频、音频和设置都保存到同一份网页草稿。需要改编剧本时，也能整理故事、章节和分镜。</p>
-<div class="links"><a href="/for-agents/SKILL.md">阅读 Skill</a><a href="/for-agents/skill.zip">下载 Skill 包</a><a href="/">登录并创建 API Key</a></div>
-<section class="panel"><h2 style="margin-top:0">三步开始</h2><ol><li><strong>先把链接和创作要求给 Agent。</strong>这页、Skill 和机器指南公开可读，无需登录。</li><li><strong>登录网站，创建限定范围的 Agent API Key。</strong>选择它能操作的故事、权限和有效期；通过你的本地凭据管理器或进程环境交给 Agent。不要把 Key 贴进聊天或放进链接。</li><li><strong>回网站看结果，再继续调整。</strong>打开同一云故事，查看活动和任务；定位章节、角色或镜头，修改要求后只重做需要的部分。旧候选保留，选中哪一版由你决定。</li></ol>
+<div class="links"><a href="/for-agents/SKILL.md">阅读 Skill</a><a href="/for-agents/skill.zip">下载 Skill 包</a><a href="/">登录并连接 Agent</a></div>
+<section class="panel"><h2 style="margin-top:0">三步开始</h2><ol><li><strong>先把链接和创作要求给 Agent。</strong>这页、Skill 和机器指南公开可读，无需登录。</li><li><strong>登录网站，明确授权一次连接。</strong>连接界面上线后，复制短时有效的连接说明给 Agent。辅助脚本在本机生成正式 Key，并通过系统凭据存储保存；无需安装我们的 AI Registry。正式 Key 不进入聊天或链接。当前页面是否提供连接按钮以实际前端发布为准；手动 API Key 是高级备用方式。</li><li><strong>回网站看结果，再继续调整。</strong>打开同一云故事，查看活动和任务；定位章节、角色或镜头，修改要求后只重做需要的部分。旧候选保留，选中哪一版由你决定。</li></ol>
 <small>分享链接只用于发现功能。写入需要账户授权；生成还取决于当前服务是否启用、输入是否合格和可用预算。此页不代表 GPU 已上线。</small></section>
 <h2>可直接发给 Agent 的任务示例</h2><p>“阅读这个网站的 /for-agents 使用指南。用我已配置的凭据，为这个广告想法创建一个快速视频草稿，把我的图片、动作视频和音频放到对应位置，返回网页让我继续修改。生成前核对可用能力、阻塞原因和费用；只有在我已经授权的范围内才提交。结果先放候选，不覆盖我已选择的版本。”</p><p>如果你在做短剧，可以要求 Agent 建立章节、角色和分镜；同一份故事也能在快速创作中单独调整某个镜头。</p>
 <h2>Agent 的调用顺序</h2><ol>''' + steps + '''</ol>
-<h2>用对话和任务卡创作</h2><p>机器指南的 <code>quick_chat</code> 和认证后的 <code>/v1/quick-chat/schema</code> 提供完整示例：创建会话 → 上传素材 → 创建任务卡 → 预检 → 明确确认 → 查询原任务和下载结果。外部 Agent 可直接提交完整提示词，使用 <code>assistant_mode=none</code>、<code>create_card=true</code>；网站聊天助手默认关闭，不影响直接创建卡片，也不会因此自动生成。</p><p>会话素材须通过同源 <code>/v1/quick-chat/sessions/{session_id}/assets</code> 上传，不操作隐藏项目。现有辅助脚本的 upload/resume-upload 是项目接口；会话上传使用直接 HTTP multipart 请求。Quick Chat 网页尚有独立发布步骤，返回的 <code>/quick-chat</code> 地址不保证当前部署已能打开；先返回会话、卡片、任务 ID 和经核验的下载结果。用户不需要安装我们的 AI Registry。</p>
+<h2>用对话和任务卡创作</h2><p>机器指南的 <code>quick_chat</code> 和认证后的 <code>/v1/quick-chat/schema</code> 提供完整示例：创建会话 → 上传素材 → 创建任务卡 → 预检 → 明确确认 → 查询原任务和下载结果。外部 Agent 可直接提交完整提示词，使用 <code>assistant_mode=none</code>、<code>create_card=true</code>；网站聊天助手默认关闭，不影响直接创建卡片，也不会因此自动生成。</p><p>会话素材须通过同源 <code>/v1/quick-chat/sessions/{session_id}/assets</code> 上传，不操作隐藏项目。辅助脚本的 upload/resume-upload 支持 --session，会话与原有 --project 参数互斥。Quick Chat 网页尚有独立发布步骤，返回的 <code>/quick-chat</code> 地址不保证当前部署已能打开；先返回会话、卡片、任务 ID 和经核验的下载结果。用户不需要安装我们的 AI Registry。</p>
 <h2>原有快速草稿与故事接口</h2><p>使用本人全部项目范围和 projects:create 权限。为每次新建保存唯一的幂等键；重试原请求沿用原键。返回的 project.journey.reviewShotId 是单镜头 ID。随后用 shot.configure_generation 保存生成设置；创建草稿不会启动 GPU。</p><pre>''' + example + '''</pre><p>完整的纯文字、参考素材、预检、提交和候选采用示例见<a href="/for-agents/guide.json">机器可读指南</a>。</p>
 <h2>真实边界</h2><p>网站公开说明与已授权 API 文档分开。认证后的 <code>/v1/agent-guide</code>、<code>/v1/guided-schema</code>、<code>/v1/capabilities</code> 和 <code>/openapi.json</code> 是调用依据。若生成计划返回阻塞，保留草稿并说明原因；不要把演示素材当成生成成功。</p>
 <p>网站聊天助手默认关闭；不支持未配置的图像/音乐/Marble 生成、团队成员共享权限或服务器媒体 ZIP。外部 Agent 可以自行编写完整提示词并保存为任务卡或故事草稿；已有 API Key 不会扩大这些能力。</p>
-<p><small>Skill 包只包含 SKILL.md 和 scripts/sixnine.py；辅助脚本需要 Python 与 httpx。你也可以直接使用同源 HTTP API，无需安装 Skill。下载不会自动安装或授权。</small></p></main></body></html>'''
+<p><small>Skill 包只包含 SKILL.md、scripts/sixnine.py 和 scripts/connect.py；连接脚本只需 Python 标准库与受支持的系统凭据存储，API/媒体辅助脚本还需要 httpx。你也可以直接使用同源 HTTP API，无需安装 Skill。下载不会自动安装或授权。</small></p></main></body></html>'''
 
 
 def register_routes(app):
@@ -259,6 +274,14 @@ def register_routes(app):
     @app.api_route("/for-agents/guide.json", methods=["GET", "HEAD"], include_in_schema=False)
     def agent_manifest():
         return JSONResponse(public_guide())
+
+    @app.api_route(HELPER_PATH, methods=["GET", "HEAD"], include_in_schema=False)
+    def agent_connection_helper():
+        return Response(read_skill_file("scripts/connect.py"), media_type="text/x-python; charset=utf-8")
+
+    @app.api_route(MANIFEST_PATH, methods=["GET", "HEAD"], include_in_schema=False)
+    def agent_connection_manifest():
+        return JSONResponse(helper_manifest(read_skill_file("scripts/connect.py")))
 
     @app.api_route("/for-agents/SKILL.md", methods=["GET", "HEAD"], include_in_schema=False)
     def agent_skill():

@@ -344,7 +344,8 @@ def verify_policy(config, settings):
         limits = envelope.get("input_limits", {})
         if (envelope["controls"] != controls or envelope["max_pixels"] > 1344*768
                 or envelope["max_steps"] != 50 or envelope["max_duration_seconds"] > 362/24
-                or envelope["max_reference_files"] != 0 or envelope["max_guides"] != 0
+                or envelope["max_reference_files"] > (2 if envelope["allow_first_last"] else 0)
+                or envelope["max_guides"] != 0
                 or any(limits.get(key) != 0 for key in ("max_images", "max_videos", "max_audios"))
                 or limits.get("guide_kinds") != [] or limits.get("guide_recipe_ids") != []
                 or limits.get("allow_video_audio") is not False

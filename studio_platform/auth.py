@@ -41,7 +41,7 @@ personal_keys = Table("platform_personal_api_keys", metadata,
     Column("all_projects", Integer, nullable=False), Column("auth_mode", String(20), nullable=False),
     Column("password_version", Float, nullable=False), Column("created_at", Float, nullable=False),
     Column("expires_at", Float, nullable=False), Column("last_used_at", Float), Column("revoked_at", Float))
-API_SCOPES = frozenset({"projects:read", "projects:create", "projects:write", "assets:read", "assets:write", "jobs:read", "jobs:write"})
+API_SCOPES = frozenset({"projects:read", "projects:create", "projects:write", "assets:read", "assets:write", "jobs:read", "jobs:write", "assistant:run"})
 
 USERS = frozenset({"superdan", "supervan"})
 TOKEN = re.compile(r"^[A-Za-z0-9_-]{43,128}$")

@@ -1,5 +1,6 @@
 """Anonymous discovery, authenticated contract and distributable skill invariants."""
 import copy
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -62,6 +63,12 @@ class AgentDiscoveryTests(unittest.TestCase):
             self.assertEqual(archive.read("sixnine-yingxu/SKILL.md"), self.client.get("/for-agents/SKILL.md").content)
             for name in agent_discovery.SKILL_FILES:
                 self.assertEqual(archive.read("sixnine-yingxu/"+name), (agent_discovery.SKILL_ROOT/name).read_bytes())
+        manifest = self.client.get("/for-agents/connect-manifest.json").json()
+        helper = self.client.get(manifest["helper"]).content
+        self.assertEqual(manifest["sha256"], hashlib.sha256(helper).hexdigest())
+        guide = self.client.get("/for-agents/guide.json").json()
+        self.assertFalse(manifest["raw_api_key_response"])
+        self.assertTrue(guide["connection"]["profile"]["owner_only"])
 
     def test_missing_or_oversize_skill_fails_closed_without_local_path(self):
         with tempfile.TemporaryDirectory() as folder:
