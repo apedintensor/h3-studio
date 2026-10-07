@@ -273,6 +273,29 @@ example is still needed before claiming qualified last-frame fidelity.
 
 ## Checks and remaining gates
 
+### Repair preparation while preserving the accepted job
+
+The protected host entry `deploy/platform/preparation_hold_recovery.py` supports
+an explicit source-only repair of a retained `bootstrap_failed` hold. All pool
+rentals must be destroyed with settled billing, with no inference attempt or
+fleet start. Engine, model, dependency archive, policy, budget and original
+waiting deadline remain unchanged. Expired/cancelled jobs cannot be restored.
+
+After independent source/image review and exact-version host approval, stage
+the target configuration and only the changed public source files under
+`gpu-scaler/operator/preparation-repairs/<operation-uuid>`. Ordered actions are
+`freeze`, `prepare --job-id <original-id>`, `retire`, `stage`, then an explicit
+root-supervised `resume`. Each action holds the host release lock. Resume
+activates the existing provider-enabled controller; staging does not. The
+existing next-cycle transfer keeps the original request, reservation and deadline.
+
+An uncertain response or durable `*_started` phase requires reconciliation;
+never repeat it automatically. Exact controller ownership, the database fence
+and retirement evidence must agree. This helper cannot replace the accepted
+runtime or clear unknown execution. Its docstring/tests specify file modes and
+supported boundaries. Staging failures and attempted inference use separate
+recovery paths.
+
 ### Optional repair for measured provider SSH package drift
 
 The provider's [pinned SSH bootstrap](https://github.com/Datura-ai/lium-io/blob/ec31b1ecd9b5f4d594d88d7c1c8ecbfa7cdd7228/neurons/validators/src/services/assets/sshd_bootstrap.sh#L140-L175)
