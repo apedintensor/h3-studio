@@ -79,6 +79,15 @@ class FrontendTests(unittest.TestCase):
         self.assertEqual(selected_path.read_text(encoding="utf-8"), "<html>release A</html>")
         self.assertEqual(selected_stat.st_size, selected_path.stat().st_size)
 
+    def test_quick_chat_deep_link_is_public_shell_but_session_api_stays_private(self):
+        for route in ("/quick-chat", "/quick-chat/"):
+            response = self.client.get(route, params={"session": "session-example"})
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("<html>", response.text)
+            self.assertEqual(self.client.head(route).status_code, 200)
+        self.assertEqual(self.client.get("/v1/quick-chat/sessions").status_code, 401)
+        self.assertEqual(self.client.get("/v1/quick-chat/sessions/session-example").status_code, 401)
+
     def test_assets_survive_switch_and_prefer_shared_external_copy(self):
         old_name = "index-old12345.js"
         new_name = "index-new12345.js"
@@ -194,6 +203,23 @@ class FrontendTests(unittest.TestCase):
 
 
 class FrontendSettingsTests(unittest.TestCase):
+    def test_quick_chat_preview_ignores_ambient_cloud_settings(self):
+        from tools.run_quick_chat_preview import preview_settings
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ, {
+                "SIXNINE_DATABASE_URL": "postgresql://invalid.example/not-preview",
+                "SIXNINE_GENERATION_ENABLED": "1", "SIXNINE_EXECUTION_BACKEND": "wangp-worker",
+                "SIXNINE_RENDER_ENABLED": "1", "SIXNINE_PUBLIC_ORIGIN": "https://example.invalid",
+                "SIXNINE_STORAGE_PROVIDER": "s3"}):
+            root = Path(temporary)
+            settings = preview_settings(root / "isolated", root / "frontend")
+            self.assertEqual(settings.database_url, "sqlite:///" + (root / "isolated/platform.sqlite3").as_posix())
+            self.assertEqual(settings.auth_mode, "local-test")
+            self.assertFalse(settings.generation_enabled)
+            self.assertFalse(settings.render_enabled)
+            self.assertEqual(settings.execution_backend, "disabled")
+            self.assertEqual(settings.storage_provider, "local")
+            self.assertEqual(settings.public_origin, "")
+
     def test_explicit_existing_directory_from_environment(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
