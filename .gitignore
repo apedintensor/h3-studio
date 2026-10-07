@@ -35,6 +35,7 @@ inventory.json
 !tools/
 !tools/manage_users.py
 !tools/check_container.py
+!tools/ci_media_tools.py
 !deploy/
 !deploy/compose.yaml
 !deploy/Caddyfile
