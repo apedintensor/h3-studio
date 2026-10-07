@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import types
@@ -23,6 +24,24 @@ TEST_TOKEN = "synthetic-launcher-test-token-" + "x" * 32
 
 
 class WanGPLaunchTests(unittest.TestCase):
+    def test_bootstrap_receipt_reader_imports_without_runtime_environment(self):
+        # Bootstrap uses the provider's base Python, not the locked runtime venv.
+        script = """
+import sys
+class NoOptionalPackages:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'fastapi', 'httpx', 'torch', 'sqlalchemy', 'uvicorn', 'pydantic', 'requests'}:
+            raise AssertionError('optional dependency imported by bootstrap receipt reader')
+sys.meta_path.insert(0, NoOptionalPackages())
+from studio_platform.runtime_hosts.wangp_receipts import VERIFICATION_RECEIPT, read_verification_receipt
+assert VERIFICATION_RECEIPT == 'runtime-verification.json'
+assert callable(read_verification_receipt)
+"""
+        checked = subprocess.run([sys.executable, "-S", "-c", script],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=15)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stdout, "")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
