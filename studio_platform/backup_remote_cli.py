@@ -18,9 +18,10 @@ def aws_client(target):
     session=boto3.Session(region_name=target.region)
     limits=Config(connect_timeout=10, read_timeout=60,
                   retries={"mode":"standard", "total_max_attempts":1}, signature_version="s3v4")
+    identity_limits=limits.merge(Config(signature_version="v4"))
     identity_endpoint="https://sts."+target.region+".amazonaws.com"
     try:
-        sts=session.client("sts",config=limits,endpoint_url=identity_endpoint)
+        sts=session.client("sts",config=identity_limits,endpoint_url=identity_endpoint)
         identity=sts.get_caller_identity()
         need(identity.get("Account")==target.account_id,"backup_caller_account_mismatch")
         role=sts.assume_role(RoleArn=target.role_arn,RoleSessionName="sixnine-backup-copy",DurationSeconds=3600)
@@ -34,7 +35,7 @@ def aws_client(target):
              and 0<(expires-datetime.now(timezone.utc)).total_seconds()<=3660,"backup_role_expiry_invalid")
         scoped=boto3.Session(region_name=target.region,aws_access_key_id=credentials["AccessKeyId"],
             aws_secret_access_key=credentials["SecretAccessKey"],aws_session_token=credentials["SessionToken"])
-        assumed=scoped.client("sts",config=limits,endpoint_url=identity_endpoint).get_caller_identity()
+        assumed=scoped.client("sts",config=identity_limits,endpoint_url=identity_endpoint).get_caller_identity()
         need(assumed.get("Account")==target.account_id and assumed.get("Arn")==expected,"backup_assumed_role_mismatch")
         return scoped.client("s3",region_name=target.region,
             endpoint_url="https://s3."+target.region+".amazonaws.com",config=limits)

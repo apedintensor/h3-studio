@@ -313,8 +313,10 @@ class RemoteBackupTests(unittest.TestCase):
                 self.assertEqual(kwargs['config'].retries['total_max_attempts'],1)
                 if name=='sts':
                     self.assertEqual(kwargs['endpoint_url'],'https://sts.ap-southeast-1.amazonaws.com')
+                    self.assertEqual(kwargs['config'].signature_version,'v4')
                     return SimpleNamespace(assume_role=assume,get_caller_identity=lambda:dict(Account=target.account_id,Arn=expected))
                 self.assertTrue(scoped)
+                self.assertEqual(kwargs['config'].signature_version,'s3v4')
                 self.assertEqual(kwargs['endpoint_url'],'https://s3.ap-southeast-1.amazonaws.com')
                 return 'scoped-s3'
             return SimpleNamespace(client=client)
