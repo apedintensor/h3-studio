@@ -31,6 +31,7 @@ PRIVATE_FILES = (
     "studio_platform/runtime_hosts/wangp.py", "studio_platform/runtime_hosts/wangp_receipts.py",
     "studio_platform/runtime_hosts/wangp_session.py", "studio_platform/runtime_hosts/wangp_http.py",
     "studio_platform/runtime_hosts/wangp_launcher.py", "studio_platform/runtime_hosts/wangp_environment.py",
+    "deploy/wangp/probe_gpu.py",
 )
 
 
@@ -66,10 +67,21 @@ def small_bundle(output):
     return {"filename": output.name, "sha256": sha_file(output), "size_bytes": output.stat().st_size}
 
 
-def prepare(upstream, output, base_image):
+def wheel_metadata(wheel):
+    with zipfile.ZipFile(wheel) as package:
+        # Some wheels vendor other packages' metadata. Only their own root
+        # .dist-info/METADATA describes the installed distribution.
+        candidates = [name for name in package.namelist()
+                      if len(name.split("/")) == 2 and name.endswith(".dist-info/METADATA")]
+        if len(candidates) != 1:
+            raise ValueError("wangp_wheel_metadata_invalid")
+        return BytesParser().parsebytes(package.read(candidates[0]))
+
+
+def prepare(upstream, output, base_image, wheelhouse=None, system_debs="/var/cache/apt/archives"):
     if (platform.system() != "Linux" or platform.machine() != "x86_64"
-            or platform.python_version() != PYTHON):
-        raise ValueError("wangp_build_requires_linux_x86_64_python31114")
+            or not re.fullmatch(r"3\.11\.[0-9]+", platform.python_version())):
+        raise ValueError("wangp_build_requires_linux_x86_64_python311")
     if not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", base_image):
         raise ValueError("wangp_base_image_digest_required")
     upstream = Path(upstream).resolve(strict=True)
@@ -100,19 +112,23 @@ def prepare(upstream, output, base_image):
         if key.startswith("PIP_"):
             del env[key]
     env["PIP_CONFIG_FILE"] = os.devnull
-    print(json.dumps({"phase": "resolving_dependency_wheels"}), flush=True)
-    run([sys.executable, "-m", "pip", "wheel", "--wheel-dir", str(wheels),
-         "--extra-index-url", "https://download.pytorch.org/whl/cu128",
-         "-r", str(runtime / "requirements.txt"), "-r", str(Path(__file__).with_name("runtime-host.in"))], env=env)
+    if wheelhouse:
+        print(json.dumps({"phase": "copying_existing_wheels"}), flush=True)
+        for item in Path(wheelhouse).iterdir():
+            source = regular_file(Path(wheelhouse), item.name)
+            if source.suffix != ".whl":
+                raise ValueError("wangp_nonwheel_dependency")
+            shutil.copyfile(source, wheels / item.name)
+    else:
+        print(json.dumps({"phase": "resolving_dependency_wheels"}), flush=True)
+        run([sys.executable, "-m", "pip", "wheel", "--wheel-dir", str(wheels),
+             "--extra-index-url", "https://download.pytorch.org/whl/cu128",
+             "-r", str(runtime / "requirements.txt"), "-r", str(Path(__file__).with_name("runtime-host.in"))], env=env)
     records, seen = [], set()
     for wheel in sorted(wheels.iterdir()):
         if wheel.suffix != ".whl":
             raise ValueError("wangp_nonwheel_dependency")
-        with zipfile.ZipFile(wheel) as package:
-            candidates = [name for name in package.namelist() if name.endswith(".dist-info/METADATA")]
-            if len(candidates) != 1:
-                raise ValueError("wangp_wheel_metadata_invalid")
-            metadata = BytesParser().parsebytes(package.read(candidates[0]))
+        metadata = wheel_metadata(wheel)
         name = re.sub(r"[-_.]+", "-", metadata["Name"]).lower()
         if name in seen or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", name):
             raise ValueError("wangp_duplicate_wheel")
@@ -132,10 +148,22 @@ def prepare(upstream, output, base_image):
     query = ("import importlib.metadata,json,re; print(json.dumps({re.sub(r'[-_.]+','-',d.metadata['Name']).lower():"
              "d.version for d in importlib.metadata.distributions()},sort_keys=True))")
     installed = json.loads(run([python, "-c", query]))
-    lock = {"format": FORMAT, "source_revision": REVISION, "python": PYTHON,
+    debs = []
+    deb_root = payload / "debs"
+    deb_root.mkdir()
+    for source in sorted(Path(system_debs).glob("*.deb")):
+        source = regular_file(Path(system_debs), source.name)
+        fields = run(["dpkg-deb", "-f", str(source), "Package", "Version", "Architecture"]).decode().splitlines()
+        details = dict(line.split(": ", 1) for line in fields)
+        target = deb_root / source.name
+        shutil.copyfile(source, target)
+        debs.append({"file": source.name, "name": details["Package"], "version": details["Version"],
+                     "architecture": details["Architecture"], "sha256": sha_file(target), "size_bytes": target.stat().st_size})
+    lock = {"format": FORMAT, "source_revision": REVISION, "python": platform.python_version(),
             "requirements_sha256": REQUIREMENTS_SHA, "base_image": base_image,
             "source_files": sources, "wheels": records, "installed_packages": installed,
-            "system_packages": system_packages(), "requirements_lock_sha256": sha_file(payload / "requirements.lock"),
+            "system_packages": system_packages(), "debs": debs,
+            "requirements_lock_sha256": sha_file(payload / "requirements.lock"),
             "qualification": "resolved-build-inputs-only"}
     (runtime / ".sixnine-environment.json").write_bytes(canonical(lock))
     verify_source(runtime, lock)
@@ -170,6 +198,8 @@ def main(argv=None):
     item = sub.add_parser("prepare")
     for name in ("upstream-root", "output", "base-image"):
         item.add_argument("--" + name, required=True)
+    item.add_argument("--wheelhouse", help="Reuse an existing wheelhouse offline instead of resolving dependencies")
+    item.add_argument("--system-debs", default="/var/cache/apt/archives", help="Retained installed system package archives to include for offline bootstrap")
     item = sub.add_parser("source-bundle")
     item.add_argument("--output", required=True)
     item = sub.add_parser("bind-manifest")
@@ -178,7 +208,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
-            result = prepare(args.upstream_root, args.output, args.base_image)
+            result = prepare(args.upstream_root, args.output, args.base_image, args.wheelhouse, args.system_debs)
         elif args.command == "source-bundle":
             result = small_bundle(args.output)
         else:

@@ -76,6 +76,8 @@ def validate_config(value):
         raise ValueError("bootstrap_configuration_invalid")
     for key in ("install_root", "source_bundle_path", "manifest_path", "model_root", "config_path", "status_path"):
         checked_path(value[key])
+    if Path(value["config_path"]).name != "wgp_config.json":
+        raise ValueError("runtime_configuration_filename_invalid")
     for key in ("source_bundle_sha256", "dependency_artifact_sha256"):
         if not isinstance(value[key], str) or not re.fullmatch("[0-9a-f]{64}", value[key]):
             raise ValueError("bootstrap_digest_required")
@@ -141,8 +143,11 @@ def install(config, slot_key, token_file, *, launch=True):
     status_path.parent.mkdir(parents=True, exist_ok=True)
     started = False
     manifest_digest = None
+    last_phase = "checking_package"
 
     def status(phase, **fields):
+        nonlocal last_phase
+        last_phase = phase
         value = {"phase": phase, "updated_unix": time.time(), "slot_key": slot_key,
                  "manifest_digest": manifest_digest, "engine_manifest_digest": manifest_digest,
                  "state": "booting", "inference_verified": False, **fields}
@@ -154,8 +159,8 @@ def install(config, slot_key, token_file, *, launch=True):
 
     try:
         status("checking_package")
-        if platform.system() != "Linux" or platform.python_version() != "3.11.14":
-            raise ValueError("python31114_linux_required")
+        if platform.system() != "Linux" or not re.fullmatch(r"3\.11\.[0-9]+", platform.python_version()):
+            raise ValueError("python311_linux_required")
         bundle = checked_path(config["source_bundle_path"])
         if bundle.stat().st_size > MAX_SOURCE or sha_file(bundle) != config["source_bundle_sha256"]:
             raise ValueError("source_bundle_mismatch")
@@ -187,7 +192,18 @@ def install(config, slot_key, token_file, *, launch=True):
         lock = validate_lock(json.loads((runtime / ".sixnine-environment.json").read_text(encoding="utf-8")))
         if digest(lock) != manifest.document["runtime_digest"]:
             raise ValueError("environment_binding_mismatch")
-        if system_packages() != lock["system_packages"]:
+        deb_files = []
+        for item in lock.get("debs", []):
+            deb = regular_file(dependency / "debs", item["file"])
+            if deb.stat().st_size != item["size_bytes"] or sha_file(deb) != item["sha256"]:
+                raise ValueError("system_deb_mismatch")
+            deb_files.append(str(deb))
+        if deb_files:
+            status("system_package_install")
+            subprocess.run(["dpkg", "--install", *deb_files], check=True, capture_output=True,
+                           env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+        observed_system = system_packages()
+        if any(observed_system.get(name) != version for name, version in lock["system_packages"].items()):
             raise ValueError("system_package_mismatch")
         verify_source(runtime, lock)
         requirements = dependency / "requirements.lock"
@@ -207,6 +223,17 @@ def install(config, slot_key, token_file, *, launch=True):
             subprocess.run([python, "-m", "pip", "install", "--no-index", "--require-hashes", "--find-links",
                             str(dependency / "wheels"), "-r", str(requirements)], check=True, capture_output=True, env=environment)
         subprocess.run([python, "-m", "pip", "check"], check=True, capture_output=True, env=environment)
+        status("runtime_imports")
+        imported = subprocess.run([python, str(source / "deploy/wangp/probe_gpu.py"),
+                                  "--runtime-root", str(runtime), "--output", str(base / "gpu-import.json")],
+                                 capture_output=True, text=True, env=environment, timeout=180)
+        if imported.returncode != 0:
+            raise ValueError("runtime_import_probe_failed")
+        import_evidence = json.loads(imported.stdout)
+        if (import_evidence.get("state") != "imports_verified"
+                or import_evidence.get("environment_lock_sha256") != digest(lock)
+                or import_evidence.get("inference_verified") is not False):
+            raise ValueError("runtime_import_receipt_mismatch")
         model_root = checked_path(config["model_root"])
         model_root.mkdir(parents=True, exist_ok=True)
         from studio_platform.runtime_hosts.wangp_environment import safe_relative
@@ -295,6 +322,7 @@ def install(config, slot_key, token_file, *, launch=True):
     except Exception as error:
         allowed = isinstance(error, ValueError) and re.fullmatch(r"[a-z0-9_]{1,100}", str(error))
         return status("runtime_start_unknown" if started else "setup_failed", state="unknown" if started else "failed",
+                      failed_phase=last_phase,
                       code=str(error) if allowed else "bootstrap_operation_failed")
 
 

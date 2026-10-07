@@ -35,13 +35,40 @@ the existing platform. The upstream Session is private to a one-slot host.
 
 `package_tool.py` is an explicit build command, never an application import hook.
 `prepare --upstream-root CHECKOUT --output NEW_DIRECTORY --base-image IMAGE@sha256:DIGEST`
-runs on Linux x86-64/Python 3.11.14. It checks the upstream revision and requirements
+runs on Linux x86-64/Python 3.11.x and records the exact patch version. It checks the upstream revision and requirements
 hash, resolves the complete upstream import surface plus `runtime-host.in`, builds
 a wheelhouse, verifies an offline hash-locked installation in a fresh venv, and
 records every installed Python distribution, system package, source file and wheel.
 The resulting `wangp-dependencies.tar.gz` can be several GB; stream it to the GPU
 host separately. Never put it or the 124 GB model files in the controller's
 in-memory small-source map. Failed resolution does not produce a qualified lock.
+
+`--wheelhouse EXISTING_DIRECTORY` reuses already acquired wheels offline. Retain
+the exact additional/updated native `.deb` files and pass `--system-debs DIRECTORY`
+(default `/var/cache/apt/archives`). Their package/version/architecture, sizes and
+hashes are included in the environment lock and artifact. Bootstrap verifies these
+archives and uses offline `dpkg --install`; it never runs apt update/latest on a
+production cold start. Missing dependency closure fails the install. Python
+distributions must match the whole lock exactly. OS packages listed in the lock
+must be present at their exact recorded versions; extra provider packages such as
+SSH may exist and are recorded in the observed receipt. They cannot replace or
+upgrade a recorded library silently.
+
+For a pre-existing provider image, the concrete sequence is:
+
+1. Run its exact observed image digest locally, add required native packages,
+   and prepare a fresh isolated venv using the retained wheels and `.deb` files.
+   Capture Python, wheel and native-package identities on that target image.
+2. Bind a new manifest and stage the protected package/identity. The controller
+   must pin and verify the provider template's actual Docker digest separately.
+3. On the authorized GPU, the bootstrap installs that artifact and invokes
+   `probe_gpu.py` in a bounded child process before downloading models. It verifies
+   source/environment, real CUDA visibility, and imports `wgp` plus the H3 pipeline
+   with outbound socket connections refused. Import failure names the missing
+   module in the protected `gpu-import.json`; it does not auto-install anything.
+4. Keep this frozen environment identity for the explicit model/bootstrap and
+   first accepted task. `imports_verified` is not inference qualification. A
+   dependency repair creates a new captured lock/manifest before another lease.
 
 `Dockerfile.build` pins an official Python base and captures the packages actually
 installed by its initial build. Its apt operation alone is not a reproducible

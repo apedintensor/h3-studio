@@ -7,6 +7,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from studio_platform.runtime_hosts import wangp_environment as env
@@ -67,12 +68,21 @@ class PackageTests(unittest.TestCase):
                 patch.object(env, "installed_packages", return_value=self.lock["installed_packages"]), \
                 patch.object(env, "system_packages", return_value=self.lock["system_packages"]):
             self.assertFalse(env.verify_environment(self.lock)["inference_verified"])
+            with patch.object(env, "system_packages", return_value={**self.lock["system_packages"], "openssh-server": "1.0"}):
+                self.assertEqual(env.verify_environment(self.lock)["additional_system_packages"], ["openssh-server"])
             with patch.object(env, "installed_packages", return_value={"example": "2.0"}):
                 with self.assertRaisesRegex(ValueError, "dependency_mismatch"):
                     env.verify_environment(self.lock)
             with patch.object(env, "system_packages", return_value={"libc6:amd64": "other"}):
                 with self.assertRaisesRegex(ValueError, "system_mismatch"):
                     env.verify_environment(self.lock)
+
+    def test_nested_vendor_metadata_does_not_change_wheel_identity(self):
+        wheel = self.root / "example.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr("setuptools-84.0.0.dist-info/METADATA", "Name: setuptools\nVersion: 84.0.0\n")
+            archive.writestr("setuptools/_vendor/example-1.0.dist-info/METADATA", "Name: example\nVersion: 1.0\n")
+        self.assertEqual(package.wheel_metadata(wheel)["Name"], "setuptools")
 
     def test_environment_lock_is_bound_before_source_or_package_verification(self):
         (self.source / ".sixnine-environment.json").write_bytes(env.canonical(self.lock))
@@ -81,6 +91,20 @@ class PackageTests(unittest.TestCase):
                 env.verify_bound_environment(self.source, {"runtime_digest_kind": "sixnine-environment-lock-sha256",
                                                            "runtime_digest": "0" * 64})
             source.assert_not_called()
+
+    def test_actual_python_patch_is_frozen_and_deb_escape_is_rejected(self):
+        lock = copy.deepcopy(self.lock)
+        lock["python"] = "3.11.13"
+        env.validate_lock(lock)
+        with patch.object(env.platform, "system", return_value="Linux"), \
+                patch.object(env.platform, "machine", return_value="x86_64"), \
+                patch.object(env.platform, "python_version", return_value="3.11.14"):
+            with self.assertRaisesRegex(ValueError, "platform_mismatch"):
+                env.verify_environment(lock)
+        lock["debs"] = [{"file": "../libc.deb", "name": "libc6", "version": "2.36", "architecture": "amd64",
+                         "size_bytes": 1, "sha256": "a" * 64}]
+        with self.assertRaises(ValueError):
+            env.validate_lock(lock)
 
     def archive(self, member, *, kind=tarfile.REGTYPE, size=1):
         path = self.root / ("input-" + str(len(list(self.root.glob("input-*")))) + ".tar.gz")
@@ -106,6 +130,7 @@ class PackageTests(unittest.TestCase):
         for key in ("install_root", "source_bundle_path", "manifest_path", "model_root", "config_path", "status_path",
                     "dependency_artifact_path"):
             value[key] = str(self.root / key)
+        value["config_path"] = str(self.root / "wgp_config.json")
         value.update(source_bundle_sha256="a" * 64, dependency_artifact_sha256="b" * 64)
         return value
 
@@ -126,6 +151,10 @@ class PackageTests(unittest.TestCase):
         download.assert_not_called()
 
     def test_unsigned_config_and_dependency_selection_fail_closed(self):
+        invalid = self.config()
+        invalid["config_path"] = str(self.root / "wgp-config.json")
+        with self.assertRaisesRegex(ValueError, "filename_invalid"):
+            bootstrap.validate_config(invalid)
         value = self.config()
         value.update(dependency_artifact_path="", dependency_artifact_url="https://example.invalid/file?token=secret")
         with self.assertRaisesRegex(ValueError, "unsigned_https"):

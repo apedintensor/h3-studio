@@ -78,7 +78,8 @@ def system_packages():
 
 def validate_lock(lock):
     if (not isinstance(lock, dict) or lock.get("format") != FORMAT
-            or lock.get("source_revision") != REVISION or lock.get("python") != PYTHON
+            or lock.get("source_revision") != REVISION
+            or not re.fullmatch(r"3\.11\.[0-9]+", lock.get("python", ""))
             or lock.get("requirements_sha256") != REQUIREMENTS_SHA
             or not re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", lock.get("base_image", ""))):
         raise ValueError("wangp_environment_lock_invalid")
@@ -113,6 +114,16 @@ def validate_lock(lock):
             if (not isinstance(name, str) or not name or not isinstance(version, str)
                     or not version or any(c.isspace() for c in name + version)):
                 raise ValueError("wangp_environment_package_record_invalid")
+    if not isinstance(lock.get("debs", []), list):
+        raise ValueError("wangp_environment_deb_record_invalid")
+    for value in lock.get("debs", []):
+        record(value)
+        relative = safe_relative(value.get("file"))
+        if (len(relative.parts) != 1 or not value["file"].endswith(".deb")
+                or not re.fullmatch(r"[a-z0-9][a-z0-9+.-]*", value.get("name", ""))
+                or not re.fullmatch(r"[a-z0-9-]+", value.get("architecture", ""))
+                or not isinstance(value.get("version"), str) or any(c.isspace() for c in value["version"])):
+            raise ValueError("wangp_environment_deb_record_invalid")
     return lock
 
 
@@ -143,10 +154,14 @@ def verify_environment(lock):
         raise ValueError("wangp_runtime_platform_mismatch")
     if installed_packages() != lock["installed_packages"]:
         raise ValueError("wangp_runtime_dependency_mismatch")
-    if system_packages() != lock["system_packages"]:
+    observed_system = system_packages()
+    if any(observed_system.get(name) != version for name, version in lock["system_packages"].items()):
         raise ValueError("wangp_runtime_system_mismatch")
     return {"environment_lock_sha256": digest(lock), "python": lock["python"],
-            "package_count": len(lock["installed_packages"]), "inference_verified": False}
+            "package_count": len(lock["installed_packages"]),
+            "system_packages_sha256": digest(observed_system),
+            "additional_system_packages": sorted(set(observed_system) - set(lock["system_packages"])),
+            "inference_verified": False}
 
 
 def verify_bound_environment(runtime_root, manifest):
