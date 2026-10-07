@@ -112,6 +112,23 @@ class RepositoryTests(LedgerCase):
         for summary in self.repo.list_jobs(self.scope, summary=True):
             self.assertEqual(app.state.public_job(summary), app.state.public_job(self.repo.get_job(self.scope, summary["id"])))
 
+    def test_summary_preserves_delivery_spec_without_private_execution_snapshot(self):
+        from studio_platform.api import create_app
+        from studio_platform.settings import Settings
+        app = create_app(Settings(Path(self.temp.name)/"delivery-summary", tenant_id=self.scope.tenant_id,
+            auth_mode="local-test", database_url=self.url), repository=self.repo)
+        delivery = {"policy": "native-frames-v1", "fps": 24, "frame_count": 124,
+            "duration_s": 124/24, "requested_duration_s": 5}
+        for index, public_fields in enumerate(({}, {"delivery_spec": None}, {"delivery_spec": delivery})):
+            execution = {"backend": "mock", "pool": "test-pool", "private": "x"*4096, **public_fields}
+            plan = self.repo.create_plan(self.scope, {}, execution, expires_at=self.now+1000)
+            self.repo.create_job(self.scope, plan["id"], "delivery-summary-"+str(index))
+        for summary in self.repo.list_jobs(self.scope, summary=True):
+            full = self.repo.get_job(self.scope, summary["id"])
+            self.assertEqual(app.state.public_job(summary), app.state.public_job(full))
+            self.assertEqual(set(summary["execution_plan"]),
+                {"backend", "delivery_spec"} if "delivery_spec" in full["execution_plan"] else {"backend"})
+
     def test_batch_artifacts_require_exact_tenant_owner_project_and_skip_snapshots(self):
         from sqlalchemy import event
         from studio_platform.queue import TaskQueue
