@@ -31,6 +31,70 @@ the existing platform. The upstream Session is private to a one-slot host.
 
 ## Explicit startup interfaces
 
+### Package preparation and one-shot bootstrap
+
+`package_tool.py` is an explicit build command, never an application import hook.
+`prepare --upstream-root CHECKOUT --output NEW_DIRECTORY --base-image IMAGE@sha256:DIGEST`
+runs on Linux x86-64/Python 3.11.14. It checks the upstream revision and requirements
+hash, resolves the complete upstream import surface plus `runtime-host.in`, builds
+a wheelhouse, verifies an offline hash-locked installation in a fresh venv, and
+records every installed Python distribution, system package, source file and wheel.
+The resulting `wangp-dependencies.tar.gz` can be several GB; stream it to the GPU
+host separately. Never put it or the 124 GB model files in the controller's
+in-memory small-source map. Failed resolution does not produce a qualified lock.
+
+`Dockerfile.build` pins an official Python base and captures the packages actually
+installed by its initial build. Its apt operation alone is not a reproducible
+lock. Retain the resulting image digest. `Dockerfile.runtime` installs the recorded
+wheels offline on that exact base, without starting a server or fetching models.
+A container image/venv installation still does not prove NVIDIA driver support or
+successful H3 inference. A different provider template requires its own explicit
+environment capture and new manifest identity; the builder's Debian package list
+is not a universal requirement for every GPU provider.
+
+`source-bundle --output NEW_FILE` creates only the explicitly enumerated private
+host Python files, under 16 MiB. No credentials, media, settings, weights, runtime
+state or dependency wheel is included. `bind-manifest --manifest manifest.json
+--environment-lock ENVIRONMENT_JSON --image IMAGE@sha256:DIGEST --output NEW_FILE`
+creates a new identity bound to the measured full lock. It does not overwrite the
+historical source-only candidate and leaves inference qualification false.
+
+The controller stages the four small files (`wangp-bootstrap.py`,
+`wangp-runtime.json`, `wangp-manifest.json`, `wangp-package.tar.gz`) and, for the
+archive mode, streams the separately hash-bound `wangp-dependencies.tar.gz`.
+Copy `runtime-config.template.json` and fill measured hashes/paths; placeholder
+values deliberately fail validation. Exactly one dependency source is selected:
+an already-staged local artifact, an unsigned HTTPS artifact URL, or an immutable
+image's `prepared_root` containing `dependencies/` and `venv/`. URL credentials and
+query parameters are refused. API credentials and model credentials are not
+accepted by this bootstrap.
+
+The explicit remote command is:
+
+```sh
+python wangp-bootstrap.py --config wangp-runtime.json --slot-key APPROVED_INTENT_ID --token-file /protected/private-runtime-token
+```
+
+The token remains a protected mode-0600 file and is used only in process memory.
+The bootstrap's exclusive `wangp-bootstrap-started.json` is separate from the
+controller's start identity. A repeated invocation returns `reconcile_required`
+without changing status, launching a second process, or resetting the journal.
+After downloading pinned public components and verifying every size/hash, the
+bootstrap starts the existing launcher on loopback only. It then checks the
+authenticated `/v1/readiness` response for the exact manifest, slot and idle state.
+`setup-status.json` records phases and safe error codes; successful readiness has
+`state=ready`, `runtime_verified=true`, source/manifest identity, observed GPU UUID
+and bytes, and always `inference_verified=false`. Any uncertainty after process
+creation remains `unknown`; the controller must reconcile it before another start.
+The first accepted queued task, not a hidden smoke generation, proves inference.
+
+Environment attestation of an extracted package uses its hash-bound
+`.sixnine-environment.json`; the original git-checkout path remains available for
+the historical candidate. Both paths retain core-version and complete model-file
+checks. A guest cannot prove its own OCI identity: the controller/provider must
+verify that separately. Native libraries and model execution still need the
+authorized GPU test and exact release evidence.
+
 The launcher owns the listener, loopback authentication token, process lifetime,
 journal, immutable input storage and Worker transport. These helpers do not
 start anything merely by being imported:
