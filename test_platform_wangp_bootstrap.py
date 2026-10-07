@@ -212,7 +212,8 @@ class SystemDiagnosisTests(unittest.TestCase):
         self.host.client = SimpleNamespace(open_sftp=lambda: contextlib.nullcontext(remote))
         record_path = self.host.config.work_dir/'os-observations'/(POD+'.json')
         saved = []
-        def transfer(*args):
+        def transfer(*args, **options):
+            self.assertEqual(options, {'progress': None, 'should_stop': None})
             saved.append(json.loads(record_path.read_text()))
         self.host._upload_dependency = transfer
         with patch('studio_platform.wangp_bootstrap.dependency_source', return_value=('unused', 'a'*64, 1)):
