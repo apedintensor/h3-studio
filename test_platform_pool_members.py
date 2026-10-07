@@ -257,6 +257,25 @@ class PoolMemberTests(LedgerCase):
         self.assertEqual(self.repo.get_job(self.scope, original["id"])["status"], "queued")
         self.assertEqual(len(self.rows(instance_intents)), 2)
 
+    def test_first_member_removal_does_not_exhaust_unreserved_second_member(self):
+        original = self.waiter()
+        a = self.member("a")
+        self.repo.update_instance(a["id"], "destroying")
+        self.repo.update_instance(a["id"], "destroyed", destruction_confirmed=True)
+        self.assertEqual(self.controller.advance_once("cold-approval")["failed"], 0)
+        b = self.member("b")
+        self.assertNotEqual(b["id"], a["id"])
+        self.worker("b")
+        self.assertEqual(self.controller.advance_once("cold-approval")["activated"], 1)
+        self.assertEqual(self.repo.get_job(self.scope, original["id"])["status"], "queued")
+        self.repo.update_instance(b["id"], "destroying")
+        self.repo.update_instance(b["id"], "destroyed", destruction_confirmed=True)
+        for member in ("a", "b"):
+            with self.assertRaisesRegex(Conflict, "pool_members_unavailable"):
+                self.repo.reserve_capacity_member("cold-approval", member)
+        self.assertEqual(len(self.rows(instance_intents)), 2)
+        self.assertEqual(self.repo.get_budget("capacity-budget")["reserved_microusd"], 400_000)
+
     def test_wrong_configuration_backend_and_explicit_member_binding_do_not_activate(self):
         original = self.waiter()
         self.member("a")

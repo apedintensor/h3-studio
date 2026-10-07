@@ -276,10 +276,12 @@ def _approval_live(repo, connection, row):
                 capacity_pool_members.c.approval_id == row["id"],
                 capacity_pool_members.c.approval_hash == row["approval_hash"],
                 capacity_pool_members.c.member_id.in_(members))).mappings())
-        if bound:
-            if not any(r["state"] not in ("destroyed", "destroying", "draining") and r["hard_deadline"] > now for r in bound):
-                raise Conflict("capacity_pool_members_unavailable")
+        if any(r["state"] not in ("destroyed", "destroying", "draining") and r["hard_deadline"] > now for r in bound):
             return None  # Waiters belong to the approval, never its first member.
+        if len(bound) == len(members):
+            raise Conflict("capacity_pool_members_unavailable")
+        # A never-bound original member is still eligible. Run the ordinary
+        # capacity/account checks below; do not replace a failed bound member.
     if cycle:
         intent = connection.execute(select(instance_intents).where(instance_intents.c.id == cycle["intent_id"])).mappings().one()
         if intent["state"] in ("destroyed", "destroying", "draining") or intent["hard_deadline"] <= now:
