@@ -311,7 +311,12 @@ class ScaleCoordinator:
                     # call. Passing an already expired TTL to a provider is unsafe.
                     fact = ProviderFact("not_created", actual_cost_microusd=0, absence_confirmed=True)
                 else:
-                    fact = self.provider.create(tag, launch, hard_deadline=intent["hard_deadline"])
+                    bound_create = getattr(self.provider, "create_for_intent", None)
+                    if callable(bound_create):
+                        fact = bound_create(tag, launch, hard_deadline=intent["hard_deadline"],
+                            intent_created_at=intent["created_at"])
+                    else:
+                        fact = self.provider.create(tag, launch, hard_deadline=intent["hard_deadline"])
             elif operation == "destroy":
                 fact = self.provider.destroy(tag, intent["provider_instance_id"])
             else:
