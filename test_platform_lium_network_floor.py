@@ -82,6 +82,17 @@ class NetworkFloorTests(unittest.TestCase):
         self.assertEqual(queries, [{"min_download_mbps": "2000"}]*2)
         self.assertEqual(self.api.count("POST"), 0)
 
+    def test_scientific_notation_is_encoded_as_the_same_finite_number(self):
+        queries = []
+        def listing(request):
+            if request.url.path == "/api/executors":
+                queries.append(request.url.params["min_download_mbps"])
+                return httpx.Response(200, json=[])
+        self.api.hook = listing
+        self.assertEqual(self.provider(min_download_mbps=1e20).preflight_availability(launch()),
+                         "provider_inventory_unavailable")
+        self.assertEqual(queries, ["1e+20"])
+
     def test_spec_floor_is_identical_in_dry_run_and_single_paid_request(self):
         self.api.hook = self.spec_response
         provider = self.server_provider(min_download_mbps=2000.5)

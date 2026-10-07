@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlencode
 
 import httpx
 
@@ -402,7 +403,7 @@ class LiumProvider:
         if manifest.min_download_mbps is not None:
             # Lium applies its trusted telemetry precedence and excludes missing
             # measurements. Do not infer speed from a differently shaped field.
-            route += ("&" if "?" in route else "?") + "min_download_mbps=" + str(manifest.min_download_mbps)
+            route += ("&" if "?" in route else "?") + urlencode({"min_download_mbps": manifest.min_download_mbps})
         rows = self._rows(route)
         candidates = []
         for row in rows:
