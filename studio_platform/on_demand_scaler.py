@@ -32,7 +32,7 @@ from .repository import (Repository, capacity_approvals, capacity_cycles, capaci
 from .qualification_profiles import QUEUED_TASK_PROFILE
 from .scaler import LaunchSpec, ScaleCoordinator
 from .settings import Settings
-from .service_policy import cycle_sequence_allowed, validate_service_config
+from .service_policy import cycle_sequence_allowed, service_member_ids, validate_service_config
 from .worker import _slot_lock
 
 
@@ -512,7 +512,11 @@ class OnDemandController:
 
     def _open_cycle(self):
         config = cycle_config(self.config, self.sequence)
-        self.current = ServiceCycle(self.repo, self.settings, config,
+        cycle_type = ServiceCycle
+        if service_member_ids(config):
+            from .pool_member_controller import PoolServiceCycle
+            cycle_type = PoolServiceCycle
+        self.current = cycle_type(self.repo, self.settings, config,
             provider=self.provider, boot_factory=self.boot_factory)
         self.current.leader_id = self.leader_id
         self.current.preserve_rollover = lambda: not self.stopping()
@@ -635,6 +639,8 @@ class OnDemandController:
             and self.provider_failure_count() >= self.config.provider_preparation_failure_limit)
 
     def tick(self):
+        if service_member_ids(self.config):
+            return self._tick_members()
         # A failed qualification or explicit grant revocation ends the service.
         # Only our durable TTL-rollover marker authorizes preserving backlog
         # and opening a replacement cycle under the original service budget.
@@ -673,6 +679,30 @@ class OnDemandController:
                 value = self.current.status()
         return self.status(value=value)
 
+    def _tick_members(self):
+        """Original-pair lifecycle; a peer's failure/TTL never drains the pool."""
+        if self.stopping():
+            self.current.request_drain()
+        value = self.current.tick()
+        if self.current.stopping() and not self.stopping():
+            # Only whole-authority revocation/expiry enters this branch.
+            self.request_drain()
+        if "instances" not in value:
+            value = self.current.status(decision=value.get("phase", "not_leader"))
+        if (not self.stopping() and self.current.rotation_allowed() and self._can_rotate(value)):
+            self.repo.set_capacity_approval_enabled(self.current.config.capacity_approval_id, enabled=False)
+            enough = self.current.remaining_budget() >= self.config.scale_policy["instance_reservation_microusd"]
+            if not enough or not cycle_sequence_allowed(self.config, self.sequence+1):
+                self.request_drain()
+                value = self.current.tick()
+            else:
+                self.transfer_from = self.current.config.capacity_approval_id
+                self.sequence += 1
+                self._persist()
+                self._open_cycle()
+                value = self.current.status()
+        return self.status(value=value)
+
     def status(self, *, value=None, fresh_ledger_only=False):
         c = self.config
         if self.current is None:
@@ -680,7 +710,11 @@ class OnDemandController:
             if record.get("config_hash") != c.fingerprint():
                 raise ScalerError("ondemand_service_configuration_changed")
             self.sequence = record["sequence"]
-            self.current = ServiceCycle(self.repo, self.settings, cycle_config(c, self.sequence), provider=None)
+            cycle_type = ServiceCycle
+            if service_member_ids(c):
+                from .pool_member_controller import PoolServiceCycle
+                cycle_type = PoolServiceCycle
+            self.current = cycle_type(self.repo, self.settings, cycle_config(c, self.sequence), provider=None)
         value = value or self.current.status(fresh_ledger_only=fresh_ledger_only)
         rows = self.repo.list_instance_intents(pool=c.pool)
         all_destroyed = all(r["state"] == "destroyed" for r in rows)
@@ -713,6 +747,9 @@ class OnDemandController:
                 "failure_limit": c.provider_preparation_failure_limit, "automatic_rerent_allowed": False}
         elif not self.current._capacity_advance_allowed():
             result["recovery"] = {"code": "provider_preparation_evidence_unconfirmed", "automatic_rerent_allowed": False}
+        if service_member_ids(c):
+            result["target_gpu_instances"] = 2
+            result["member_replacement_enabled"] = False
         if not fresh_ledger_only:
             save(c.work_dir/"status.json", result)
         return result

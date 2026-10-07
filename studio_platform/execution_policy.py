@@ -397,7 +397,7 @@ class ExecutionPolicies:
             except (NotFound, BudgetExceeded, ValueError):
                 blockers.append("当前项目的生成预算未配置或可用预留额度不足")
                 break
-        approval, cold_latest_start = None, None
+        approval, cold_latest_start, member_warm = None, None, False
         if not blockers:
             capacity = self.control.pool_status(policy["pool"], model_id=policy["model_id"],
                 configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend,
@@ -406,8 +406,13 @@ class ExecutionPolicies:
             if capacity["ready"] + capacity["busy"] > 0:
                 from .capacity import pool_members_require_warm_binding
                 if pool_members_require_warm_binding(self.repo, scope.tenant_id, policy["pool"], policy["configuration_id"]):
-                    blockers.append("此双节点执行池尚未接入完整的持续服务，请保留任务并等待启用")
-        if not blockers and capacity["ready"] + capacity["busy"] == 0:
+                    candidate = self.repo.find_capacity_approval(scope, pool=policy["pool"], model_id=policy["model_id"],
+                        configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], policy_hash=request_hash(policy))
+                    member_warm = bool(candidate and candidate["payload"].get("pool_controller") == "continuing-two-members-v1"
+                        and self.capacity_approval_current(candidate["payload"]))
+                    if not member_warm:
+                        blockers.append("此双节点执行池尚未接入完整的持续服务，请保留任务并等待启用")
+        if not blockers and (capacity["ready"] + capacity["busy"] == 0 or member_warm):
             # Only an independently approved, current launch can admit a wait.
             # Empty approvals / gates=0 retain the original blocked behavior.
             approval = self.repo.find_capacity_approval(scope, pool=policy["pool"], model_id=policy["model_id"],
@@ -431,7 +436,7 @@ class ExecutionPolicies:
                         .where(capacity_cycles.c.approval_id == approval["id"])).scalar_one_or_none()
                 if actual_deadline is not None:
                     deadlines.append(actual_deadline)
-                cold_latest_start = min(deadlines) - scale["cold_start_s"] - quote["expected_runtime_s"]
+                cold_latest_start = min(deadlines) - (0 if member_warm else scale["cold_start_s"]) - quote["expected_runtime_s"]
                 if cold_latest_start <= now:
                     blockers.append("剩余运行窗口不足以启动并完成本次生成，请等待服务续期后重新预检")
         quote_known = quote["expires_at"] > now

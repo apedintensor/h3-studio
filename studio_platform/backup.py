@@ -26,7 +26,8 @@ from sqlalchemy.engine import URL
 from .storage import LocalObjectStore, _check_ancestors, _no_links, _copy, _sync_directory, key_belongs_to
 
 MIB = 1024*1024
-AUTH_TABLES = frozenset({"platform_accounts", "platform_sessions", "platform_service_clients", "platform_login_limits", "platform_personal_api_keys"})
+AUTH_TABLES = frozenset({"platform_accounts", "platform_sessions", "platform_service_clients", "platform_login_limits", "platform_personal_api_keys",
+                       "platform_agent_connections", "platform_agent_exchange_limits", "platform_agent_connection_audit"})
 
 
 class BackupError(Exception):

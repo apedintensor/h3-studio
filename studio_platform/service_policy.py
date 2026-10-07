@@ -1,4 +1,4 @@
-"""Pure operator policy for a continuing, single-slot service.
+"""Pure operator policy for explicit single-slot or two-member services.
 
 This is configuration validation, not an authorization grant, a budget update or
 a lease renewal. It has no database, cloud, credential or process dependencies.
@@ -14,6 +14,7 @@ FIELDS = {"version", "mode", "authorization_id", "tenant_id", "owner_ids",
           "starts_at", "expires_at", "budget_ceiling_microusd",
           "idle_shutdown_seconds", "max_cycles"}
 MODE = "continuing-single-slot"
+TWO_MEMBER_MODE = "continuing-two-members"
 IDENTIFIER = re.compile(r"[A-Za-z0-9_.:-]{1,120}")
 MAX_CYCLE_SEQUENCE = 2**31 - 1
 MAX_MONEY = 2**63 - 1
@@ -41,12 +42,21 @@ def validate_service_policy(value):
     callers subtract recorded spent/reserved money from the lesser of this cap
     and each existing account limit. It never raises or resets those accounts.
     """
-    if not isinstance(value, dict) or set(value) != FIELDS:
+    if not isinstance(value, dict):
+        raise ServicePolicyError("service_policy_fields_invalid")
+    two_members = value.get("mode") == TWO_MEMBER_MODE
+    if set(value) != FIELDS | ({"member_ids"} if two_members else set()):
         raise ServicePolicyError("service_policy_fields_invalid")
     if (type(value["version"]) is not int or value["version"] != 1
-            or value["mode"] != MODE or not _identifier(value["authorization_id"])
+            or value["mode"] not in (MODE, TWO_MEMBER_MODE) or not _identifier(value["authorization_id"])
             or not _identifier(value["tenant_id"])):
         raise ServicePolicyError("service_policy_identity_invalid")
+    if two_members:
+        members = value["member_ids"]
+        if (not isinstance(members, list) or len(members) != 2
+                or any(not _identifier(v) for v in members) or len(set(members)) != 2
+                or members != sorted(members)):
+            raise ServicePolicyError("service_policy_members_invalid")
     owners = value["owner_ids"]
     if (not isinstance(owners, list) or not 1 <= len(owners) <= 128
             or any(not _identifier(owner) for owner in owners)
@@ -64,7 +74,16 @@ def validate_service_policy(value):
     maximum = value["max_cycles"]
     if maximum is not None and (type(maximum) is not int or not 1 <= maximum <= MAX_CYCLE_SEQUENCE):
         raise ServicePolicyError("service_policy_cycles_invalid")
-    return {**value, "owner_ids": list(owners)}
+    return {**value, "owner_ids": list(owners), **({"member_ids": list(members)} if two_members else {})}
+
+
+def service_member_ids(config):
+    """An explicit operator mode, never inferred from counts or offer IDs."""
+    value = getattr(config, "service_policy", None)
+    if value is None:
+        return ()
+    value = validate_service_policy(value)
+    return tuple(value["member_ids"]) if value["mode"] == TWO_MEMBER_MODE else ()
 
 
 def validate_service_config(config):
@@ -95,8 +114,11 @@ def validate_service_config(config):
             or type(scale.get("idle_before_drain_s")) not in (int, float)
             or scale["idle_before_drain_s"] != value["idle_shutdown_seconds"]):
         raise ServicePolicyError("service_policy_limits_mismatch")
-    if any(type(scale.get(field)) is not int or scale[field] != 1
-           for field in ("max_instances", "max_physical_gpus", "new_instance_slots", "new_instance_physical_gpus")):
+    count = 2 if value["mode"] == TWO_MEMBER_MODE else 1
+    if (any(type(scale.get(field)) is not int or scale[field] != count
+            for field in ("max_instances", "max_physical_gpus"))
+            or any(type(scale.get(field)) is not int or scale[field] != 1
+                   for field in ("new_instance_slots", "new_instance_physical_gpus"))):
         raise ServicePolicyError("service_policy_single_slot_required")
     if hasattr(config, "max_cycles") and (config.max_cycles != value["max_cycles"]
             or config.max_cycles is not None and type(config.max_cycles) is not int):

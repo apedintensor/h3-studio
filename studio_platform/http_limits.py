@@ -9,6 +9,13 @@ from starlette.responses import JSONResponse
 
 
 ADMISSION_SCOPE_KEY = "sixnine.request_admission"
+AGENT_CONNECT_BODY_BYTES = 8192
+
+
+def body_limit(path, project_bytes, upload_bytes):
+    if path == "/v1/agent-connect/exchange" or path.startswith("/v1/account/agent-connections"):
+        return min(project_bytes, AGENT_CONNECT_BODY_BYTES)
+    return upload_bytes + 1024 * 1024 if is_asset_upload(path) else project_bytes
 
 
 def is_asset_upload(path):
@@ -194,7 +201,7 @@ class BodyLimitMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         path = scope.get("path", "")
-        maximum = self.upload_bytes + 1024 * 1024 if is_asset_upload(path) else self.project_bytes
+        maximum = body_limit(path, self.project_bytes, self.upload_bytes)
         if path == "/api/auth/login":
             maximum = min(maximum, 16 * 1024)
         total_seconds = min(self.total_seconds, self.login_seconds) if path == "/api/auth/login" else self.total_seconds

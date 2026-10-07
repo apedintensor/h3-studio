@@ -18,6 +18,7 @@ from sqlalchemy import insert
 from studio_platform.backup import backup_local, verify_local, restore_local, dump_postgres, BackupError
 from studio_platform.assets import AssetService, AssetNotFound
 from studio_platform.auth import Auth, accounts, sessions, clients
+from studio_platform.agent_connect import AgentConnect, audit as connection_audit
 from studio_platform.repository import Repository, Scope
 from studio_platform.queue import TaskQueue
 from studio_platform.storage import LocalObjectStore
@@ -45,8 +46,11 @@ class BackupTests(unittest.TestCase):
         self.job = self.repo.create_job(self.scope, plan["id"], "unfinished")
         self.repo.configure_capacity(max_instances=2, max_physical_gpus=2)
         auth = Auth(self.repo.engine)
+        AgentConnect(auth)
         self.canary = "fake-auth-secret-must-not-enter-backup"
         with self.repo.engine.begin() as conn:
+            conn.execute(insert(connection_audit).values(tenant="sixnine", id="audit-backup-fixture",
+                connection_id="connection-fixture", owner="superdan", event=self.canary, created_at=1))
             conn.execute(insert(accounts).values(tenant="sixnine", username="superdan", password_hash=self.canary, disabled=0, updated=1))
             conn.execute(insert(sessions).values(tenant="sixnine", token_hash=self.canary, username="superdan",
                 auth_mode="password", created=1, expires=9999999999, password_version=1))
@@ -103,6 +107,7 @@ class BackupTests(unittest.TestCase):
         with closing(sqlite3.connect(source/"database.sqlite3")) as db:
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.assertFalse(names & {"platform_accounts", "platform_sessions", "platform_service_clients"})
+            self.assertFalse(names & {"platform_agent_connections", "platform_agent_exchange_limits", "platform_agent_connection_audit"})
         self.assertEqual({p.name for p in source.iterdir()}, {"database.sqlite3", "media", "manifest.json"})
         self.assertTrue((self.live/".env").exists())
         if os.name != "nt":
