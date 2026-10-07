@@ -52,7 +52,7 @@ class WanGPLaunchTests(unittest.TestCase):
     def runtime_document(self):
         path = self.root / "runtime.json"
         value = {"version": 1, "enabled": True, "slot_key": "slot-test", "configuration_id": "config-test",
-                 "manifest_file": str(self.manifest_path), "token_file": str(self.token)}
+                 "manifest_file": str(self.manifest_path), "token_file": str(self.token), 'runtime_incarnation': 'a'*32}
         path.write_text(json.dumps(value), encoding="utf-8")
         path.chmod(0o600)
         slot = types.SimpleNamespace(runtime_config_file=str(path), endpoint="http://127.0.0.1:8199",
@@ -76,7 +76,8 @@ class WanGPLaunchTests(unittest.TestCase):
     def test_factory_requires_configuration_manifest_and_private_endpoint(self):
         path, value, slot = self.runtime_document()
         for invalid in ({**value, "enabled": False}, {**value, "configuration_id": "other"},
-                        {**value, "extra": "not-accepted"}):
+                        {**value, "extra": "not-accepted"}, {**value, 'runtime_incarnation': None},
+                        {**value, 'runtime_incarnation': ''}, {k:v for k,v in value.items() if k!='runtime_incarnation'}):
             path.write_text(json.dumps(invalid), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "configuration_mismatch"):
                 wangp_factory.create_backend(slot, self.root)

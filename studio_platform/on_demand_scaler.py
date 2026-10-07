@@ -32,16 +32,22 @@ from .repository import (Repository, capacity_approvals, capacity_cycles, capaci
 from .qualification_profiles import QUEUED_TASK_PROFILE
 from .scaler import LaunchSpec
 from .settings import Settings
+from .service_policy import cycle_sequence_allowed, validate_service_config
 from .worker import _slot_lock
 
 
 @dataclass(frozen=True)
 class OnDemandConfig(FiniteConfig):
     service_mode: str = "on-demand"
-    max_cycles: int = 8
+    max_cycles: int | None = 8
 
     def __post_init__(self):
         super().__post_init__()
+        if getattr(self, "service_policy", None) is not None:
+            validate_service_config(self)
+            if self.service_mode != "on-demand":
+                raise ScalerError("ondemand_service_mode_invalid")
+            return
         if (self.service_mode != "on-demand" or type(self.max_cycles) is not int
                 or not 1 <= self.max_cycles <= 8
                 or getattr(self, "allowed_owners", None) != ["superdan", "supervan"]
@@ -61,6 +67,11 @@ def json_config(config):
         value.pop("allowed_owners")
     if value.get("authorization_extension_s") == 0:
         value.pop("authorization_extension_s")
+    if value.get("service_policy") is None:
+        value.pop("service_policy", None)
+    if value.get("execution_backend", "comfy-worker") == "comfy-worker":
+        value.pop("execution_backend", None)
+        value.pop("engine_manifest_digest", None)
     for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[key] = str(value[key])
     return json.loads(json.dumps(value))
@@ -110,7 +121,7 @@ def verified_service_receipt(config):
                 or set(value)-required-{"transfer_from"} or type(value["version"]) is not int or value["version"] != 1
                 or value["config_hash"] != config.fingerprint()
                 or value["created_at"] != config.created_at
-                or type(value["sequence"]) is not int or not 1 <= value["sequence"] <= config.max_cycles):
+                or not cycle_sequence_allowed(config, value["sequence"])):
             raise ValueError
         previous = value.get("transfer_from")
         if previous is not None and (value["sequence"] <= 1
@@ -122,7 +133,7 @@ def verified_service_receipt(config):
 
 
 def cycle_config(config, sequence):
-    if type(sequence) is not int or not 1 <= sequence <= config.max_cycles:
+    if not cycle_sequence_allowed(config, sequence):
         raise ScalerError("ondemand_cycle_limit")
     values = {f.name: getattr(config, f.name) for f in fields(FiniteConfig)}
     suffix = "-"+str(sequence).zfill(3)
@@ -193,6 +204,8 @@ class ServiceCycle(FiniteController):
                 self.request_drain()
             return
         policy = read_policy(self.settings.execution_policy_file)
+        engine = ({"backend": c.execution_backend, "engine_manifest_digest": c.engine_manifest_digest}
+                  if getattr(c, "execution_backend", "comfy-worker") == "wangp-worker" else {})
         self.repo.approve_capacity(c.capacity_approval_id, tenant_id=c.tenant, pool=c.pool,
             model_id=MODEL, configuration_id=c.configuration_id, recipe_ids=list(c.recipe_ids),
             policy_hash=c.execution_policy_sha256, qualification_evidence_id=c.qualification_evidence_id,
@@ -200,7 +213,7 @@ class ServiceCycle(FiniteController):
             quote_expires_at=policy["reservation"]["expires_at"],
             expires_at=min(c.stop_claiming_at, policy["qualification"]["expires_at"], policy["reservation"]["expires_at"]),
             launch=LaunchSpec(**c.launches[0]), scale_policy=ScalePolicy(**c.scale_policy),
-            budget_scope=c.scope, budget_account_ids=c.budget_account_ids, enabled=True)
+            budget_scope=c.scope, budget_account_ids=c.budget_account_ids, enabled=True, **engine)
 
     def request_rollover(self):
         # Separate from final service shutdown: admitted jobs retain their
@@ -232,8 +245,7 @@ class ServiceCycle(FiniteController):
         if self.config.qualification_profile != QUEUED_TASK_PROFILE:
             return False
         directory = self.config.work_dir/"boot"/intent["id"]
-        expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
-            "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+        expected = self._bootstrap_identity(intent)
         evidence = json.loads((directory/"bootstrap-state.json").read_text())
         if (evidence.get("identity") != expected
                 or evidence.get("qualification_profile") != QUEUED_TASK_PROFILE
@@ -294,6 +306,14 @@ class ServiceCycle(FiniteController):
         if reason == "queued_task_repair_required":
             self.hold_queued_task_backlog()
 
+    def _bootstrap_identity(self, intent):
+        """Match the boot receipt without weakening historical Comfy identity."""
+        identity = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+            "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+        if getattr(self.config, "execution_backend", "comfy-worker") == "wangp-worker":
+            identity.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
+        return identity
+
     def _boot_failure(self, intent, state):
         if self.config.qualification_profile == QUEUED_TASK_PROFILE and state.get("state") in {
                 "fleet_attention_required", "fleet_recovery_required"}:
@@ -311,8 +331,7 @@ class ServiceCycle(FiniteController):
         path = self.config.work_dir/"boot"/intent["id"]/"bootstrap-state.json"
         try:
             evidence = json.loads(path.read_text())
-            expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
-                "configuration_id": self.config.configuration_id, "sources": self.config.source_sha256}
+            expected = self._bootstrap_identity(intent)
             boot = self.boots[intent["id"]]
             if (evidence.get("identity") != expected or evidence.get("phase") != "bootstrap_failed"
                     or evidence.get("smoke_submission_started") is not None or getattr(boot, "fleet", None) is not None
@@ -511,7 +530,7 @@ class OnDemandController:
             self.repo.set_capacity_approval_enabled(self.current.config.capacity_approval_id, enabled=False)
             # Keep unsettled invoice reservations. A cycle limit never resets spend.
             enough = self.current.remaining_budget() >= self.config.scale_policy["instance_reservation_microusd"]
-            if self.sequence >= self.config.max_cycles or not enough:
+            if not cycle_sequence_allowed(self.config, self.sequence + 1) or not enough:
                 self.request_drain()
                 value = self.current.tick()
             else:
@@ -547,7 +566,7 @@ class OnDemandController:
                 pass
         result = {**value, "cycle_id": c.cycle_id, "config_hash": c.fingerprint(),
             "service_mode": "on-demand", "sequence": self.sequence, "max_cycles": c.max_cycles,
-            "idle_shutdown_seconds": 600, "minimum_gpu_instances": 0,
+            "idle_shutdown_seconds": c.scale_policy["idle_before_drain_s"], "minimum_gpu_instances": 0,
             "admission_ready": admission_ready,
             "phase": "drained" if drained else "draining" if self.stopping() else
                 "awaiting_repair" if self.current.preparation_hold() else

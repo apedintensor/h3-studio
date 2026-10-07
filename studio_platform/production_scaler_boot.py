@@ -55,17 +55,24 @@ def _approved_boot_min_gpu_bytes(repo, finite, intent):
 
 class ProductionBoot(BootController):
     def __init__(self, repo, provider, finite, intent, local_port, *, config_path=None,
-                 ssh_factory=SSHHost, backend_factory=ComfyBackend, verify_smoke=None, popen=None):
+                 ssh_factory=None, backend_factory=ComfyBackend, verify_smoke=None, popen=None):
         self.finite, self.operator_path = finite, Path(config_path) if config_path else None
         self.intent_id = intent["id"]
         self._popen_impl = popen or subprocess.Popen
         self._stopping = False
+        if ssh_factory is None:
+            if finite.execution_backend == "wangp-worker":
+                from .wangp_bootstrap import WanGPSSHHost
+                ssh_factory = WanGPSSHHost
+            else:
+                ssh_factory = SSHHost
         config = BootConfig(finite.work_dir/"boot", finite.source_dir, finite.ssh_key_file,
             finite.known_hosts_file, local_port, finite.configuration_id, enabled=True,
             smoke_enabled=finite.qualification_profile != QUEUED_TASK_PROFILE, fleet_enabled=True,
             qualification_profile=QUEUED_TASK_PROFILE if finite.qualification_profile == QUEUED_TASK_PROFILE else "",
             trust_first_host_key=finite.trust_first_host_key,
             minimum_remaining_s=finite.drain_margin_s, recipe_ids=finite.recipe_ids,
+            execution_backend=finite.execution_backend, engine_manifest_digest=finite.engine_manifest_digest,
             min_gpu_bytes=_approved_boot_min_gpu_bytes(repo, finite, intent))
         super().__init__(repo, provider, config, ssh_factory=ssh_factory, backend_factory=backend_factory,
             verify_smoke=verify_smoke, fleet_factory=self._fleet)
@@ -112,9 +119,7 @@ class ProductionBoot(BootController):
         if self.backend is not None:
             return
         files, manifest = self._sources()
-        expected = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
-            "configuration_id": self.config.configuration_id,
-            "sources": {name: hashlib.sha256(value).hexdigest() for name, value in files.items()}}
+        expected = self._identity(intent, files)
         if state.get("identity") != expected or state.get("local_port") != self.config.local_port:
             raise BootError("finite_collection_identity_conflict")
         self.bound_intent, self.bound_instance = intent["id"], intent["provider_instance_id"]
@@ -125,10 +130,7 @@ class ProductionBoot(BootController):
         if report.get("identity") != expected or report.get("state") != "ready":
             raise BootError("finite_collection_runtime_unconfirmed")
         self._validate_report(report, manifest)
-        self.host.open_tunnel(self.config.local_port)
-        endpoint = f"http://127.0.0.1:{self.config.local_port}"
-        from .lium_bootstrap import COMFY_REVISION
-        self.backend = self.backend_factory(endpoint=endpoint, enabled=True, allowed_origins=(endpoint,), comfy_revision=COMFY_REVISION)
+        self._connect_backend(intent, self.config.work_dir/intent['id'], state)
 
     def tick(self, intent_id, *, stopping=False):
         from .production_scaler import verify_sources
@@ -139,13 +141,19 @@ class ProductionBoot(BootController):
             raise BootError("finite_boot_identity_mismatch")
         deadline = self._lifetime(intent)
         from .runtime_adoption import prepare_adoption
-        adoption = prepare_adoption(self, {**intent, "hard_deadline": deadline})
+        adoption = (prepare_adoption(self, {**intent, "hard_deadline": deadline})
+                    if self.config.execution_backend == 'comfy-worker' else None)
         if adoption is not None:
             return adoption
         self._stopping = (self._stopping or stopping or intent["state"] in ("draining", "destroying", "destroyed")
             or self.repo.clock() >= deadline-self.finite.drain_margin_s)
         if self._stopping:
             self.request_drain()
+            # A real queued task may still be executing or collecting after
+            # admission closes. Keep its original tunnel reachable even though
+            # this branch deliberately never enters boot/start again.
+            if self.host is not None and hasattr(self.host, 'ensure_connected'):
+                self.host.ensure_connected()
             # Preserve pending boot qualification collection too. No new
             # qualification POST is permitted once draining begins.
             receipt = self.config.work_dir/intent_id/"bootstrap-state.json"
@@ -381,9 +389,7 @@ class ProductionBoot(BootController):
                                 registered_workers.c.instance_id == instance_id)).first()):
                         raise BootError("finite_preparation_idle_unconfirmed")
                 files, _ = self._sources()
-                identity = {"intent_id": tag, "instance_id": instance_id,
-                    "configuration_id": self.config.configuration_id,
-                    "sources": {k: hashlib.sha256(v).hexdigest() for k, v in files.items()}}
+                identity = self._identity(intent, files)
                 if state.get("identity") != identity:
                     raise BootError("finite_preparation_idle_unconfirmed")
                 if self.host is None:
@@ -391,13 +397,15 @@ class ProductionBoot(BootController):
                     self.host = self.ssh_factory(self.config, coordinates)
                 report = self.host.preparation_idle_report()
                 now = self.repo.clock()
+                runtime_field = 'runtime_process_count' if self.config.execution_backend == 'wangp-worker' else 'comfy_process_count'
+                listener_field = 'runtime_port_listening' if self.config.execution_backend == 'wangp-worker' else 'comfy_port_listening'
                 idle = (report.get("identity") == identity and report.get("state") == "failed"
                     and report.get("process_visibility_complete") is True
                     and type(report.get("bootstrap_process_count")) is int
                     and report["bootstrap_process_count"] == 0
-                    and type(report.get("comfy_process_count")) is int
-                    and report["comfy_process_count"] == 0
-                    and report.get("comfy_port_listening") is False)
+                    and type(report.get(runtime_field)) is int
+                    and report[runtime_field] == 0
+                    and report.get(listener_field) is False)
                 self.bound_intent, self.bound_instance = tag, instance_id
                 self.idle_since = (self.idle_since if self.idle_since is not None else now) if idle else None
                 return InferenceIdleProof(instance_id, now, self.idle_since or now, idle)
@@ -463,6 +471,9 @@ def run_child(config, intent_id, expected_hash, settings):
         worker_id = "lium-"+intent_id.replace("-", "")
         spec = fleet.slot(worker_id).spec
         if (len(fleet.slots) != 1 or spec.pool != config.pool or spec.configuration_id != config.configuration_id
+                or spec.backend != config.execution_backend or spec.engine_manifest_digest != config.engine_manifest_digest
+                or identity.get('backend', 'comfy-worker') != config.execution_backend
+                or identity.get('engine_manifest_digest', '') != config.engine_manifest_digest
                 or spec.instance_id != identity.get("instance_id") or spec.model_id != config.launches[0]["model_id"]
                 or tuple(spec.recipe_ids) != config.recipe_ids or receipt.get("fleet_recipe_ids") != list(config.recipe_ids)):
             raise ScalerError("finite_child_identity_mismatch")

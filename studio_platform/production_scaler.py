@@ -101,15 +101,29 @@ class FiniteConfig:
     allowed_owners: list[str] | None = None
     qualification_profile: str = FL50_PROFILE
     authorization_extension_s: int = 0
+    execution_backend: str = "comfy-worker"
+    engine_manifest_digest: str = ""
+    service_policy: dict | None = None
 
     def __post_init__(self):
+        if self.execution_backend not in {"comfy-worker", "wangp-worker"}:
+            raise ScalerError("finite_backend_invalid")
+        if self.execution_backend == "wangp-worker":
+            if (not isinstance(self.engine_manifest_digest, str) or not HASH.fullmatch(self.engine_manifest_digest)
+                    or self.qualification_profile != QUEUED_TASK_PROFILE):
+                raise ScalerError("finite_wangp_identity_required")
+        elif self.engine_manifest_digest:
+            raise ScalerError("finite_unexpected_engine_manifest")
+        if self.service_policy is not None:
+            from .service_policy import validate_service_config
+            validate_service_config(self)
         if not isinstance(self.qualification_profile, str) or self.qualification_profile not in PROFILE_RECIPES:
             raise ScalerError("finite_qualification_profile_invalid")
         if (type(self.version) is not int or self.version != 1 or type(self.enabled) is not bool
-                or self.tenant != "sixnine" or self.owner not in ("superdan", "supervan")
+                or self.service_policy is None and (self.tenant != "sixnine" or self.owner not in ("superdan", "supervan"))
                 or type(self.trust_first_host_key) is not bool):
             raise ScalerError("finite_identity_invalid")
-        if self.allowed_owners is not None and (not isinstance(self.allowed_owners, list)
+        if self.service_policy is None and self.allowed_owners is not None and (not isinstance(self.allowed_owners, list)
                 or len(self.allowed_owners) != 2
                 or any(not isinstance(owner, str) for owner in self.allowed_owners)
                 or set(self.allowed_owners) != {"superdan", "supervan"}):
@@ -128,7 +142,7 @@ class FiniteConfig:
                 raise ScalerError("finite_absolute_paths_required")
             object.__setattr__(self, field, path)
         if (any(type(x) not in (int, float) or not math.isfinite(x) for x in (self.created_at, self.hard_deadline))
-                or not 0 < self.hard_deadline-self.created_at <= (
+                or self.service_policy is None and not 0 < self.hard_deadline-self.created_at <= (
                     (86400 if self.allowed_owners is not None else 14400) + self.authorization_extension_s)
                 or type(self.drain_margin_s) is not int or not 120 <= self.drain_margin_s <= 3600
                 or type(self.collection_margin_s) is not int or not 30 <= self.collection_margin_s <= 900
@@ -136,7 +150,7 @@ class FiniteConfig:
                 or type(self.port_start) is not int or not 1024 <= self.port_start <= 65533):
             raise ScalerError("finite_deadline_or_limits_invalid")
         if (not isinstance(self.source_sha256, dict)
-                or set(self.source_sha256) != {"bootstrap_cloud.py", "model_manifest.json"}
+                or set(self.source_sha256) != self.source_names
                 or any(not isinstance(v, str) or not HASH.fullmatch(v) for v in self.source_sha256.values())
                 or not isinstance(self.execution_policy_sha256, str) or not HASH.fullmatch(self.execution_policy_sha256)
                 or not isinstance(self.secret_arn, str) or not SECRET_ARN.fullmatch(self.secret_arn)
@@ -177,7 +191,16 @@ class FiniteConfig:
 
     @property
     def recipe_ids(self):
+        if self.execution_backend == "wangp-worker":
+            return (FL_RECIPE,)
         return PROFILE_RECIPES[self.qualification_profile]
+
+    @property
+    def source_names(self):
+        if self.execution_backend == "wangp-worker":
+            from .wangp_bootstrap import SOURCE_NAMES
+            return SOURCE_NAMES
+        return {"bootstrap_cloud.py", "model_manifest.json"}
 
     @property
     def stop_claiming_at(self):
@@ -195,6 +218,11 @@ class FiniteConfig:
         # The explicitly authorized five-hour extension is immutable identity.
         if self.authorization_extension_s == 0:
             value.pop("authorization_extension_s")
+        if self.execution_backend == "comfy-worker":
+            value.pop("execution_backend")
+            value.pop("engine_manifest_digest")
+        if self.service_policy is None:
+            value.pop("service_policy")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
@@ -261,7 +289,7 @@ def validate_settings(config, settings, *, require_policy=True):
     if (not settings.database_url.startswith("postgresql+psycopg:") or settings.tenant_id != config.tenant
             or settings.data_dir != config.data_dir.resolve() or settings.storage_provider != "local"
             or settings.auth_mode != "password" or settings.public_origin != "https://www.sixnine.art"
-            or not settings.generation_enabled or settings.execution_backend != "comfy-worker"):
+            or not settings.generation_enabled or settings.execution_backend != config.execution_backend):
         raise ScalerError("finite_requires_same_production_postgres_and_local_store")
     if require_policy:
         verify_policy(config, settings)
@@ -270,6 +298,8 @@ def validate_settings(config, settings, *, require_policy=True):
 def verify_policy(config, settings):
     policy = read_policy(settings.execution_policy_file)
     if (not policy or request_hash(policy) != config.execution_policy_sha256 or policy["pool"] != config.pool
+            or policy["backend"] != config.execution_backend
+            or policy.get("engine_manifest_digest", "") != config.engine_manifest_digest
             or policy["configuration_id"] != config.configuration_id or policy["recipe_ids"] != list(config.recipe_ids)
             or policy["qualification"]["status"] != ("runtime_required" if config.qualification_profile in RUNTIME_PROFILES else "accepted")
             or policy["qualification"]["evidence_id"] != config.qualification_evidence_id
@@ -279,6 +309,19 @@ def verify_policy(config, settings):
     # An explicit profile selects the entire qualification suite; no recipe or
     # input family is enabled just because the underlying model supports it.
     envelope = policy["envelope"]
+    if config.execution_backend == "wangp-worker":
+        controls = {"sampler_name": ["euler"], "scheduler": ["auto"], "video_decode": ["tiled"],
+                    "audio_decode": ["normal"], "encoder_device": ["default"]}
+        limits = envelope.get("input_limits", {})
+        if (envelope["controls"] != controls or envelope["max_pixels"] > 1344*768
+                or envelope["max_steps"] != 50 or envelope["max_duration_seconds"] > 362/24
+                or envelope["max_reference_files"] != 0 or envelope["max_guides"] != 0
+                or any(limits.get(key) != 0 for key in ("max_images", "max_videos", "max_audios"))
+                or limits.get("guide_kinds") != [] or limits.get("guide_recipe_ids") != []
+                or limits.get("allow_video_audio") is not False
+                or policy["qualification"].get("profile") != QUEUED_TASK_PROFILE):
+            raise ScalerError("finite_policy_outside_wangp_recipe")
+        return policy
     controls = {"sampler_name": ["res_multistep"], "scheduler": ["auto"], "video_decode": ["tiled"],
                 "audio_decode": ["normal"], "encoder_device": ["cpu"], "ref_image_size": ["max"]}
     # Legacy synthetic suites qualified five-second output only. Their bound
@@ -313,6 +356,12 @@ def verify_policy(config, settings):
 
 
 def verify_sources(config):
+    if config.execution_backend == "wangp-worker":
+        from .wangp_bootstrap import read_sources
+        files, _ = read_sources(config)
+        if {name: hashlib.sha256(data).hexdigest() for name, data in files.items()} != config.source_sha256:
+            raise ScalerError("finite_public_source_hash_mismatch")
+        return
     for name, expected in config.source_sha256.items():
         path = config.source_dir/name
         maximum = 524288 if name.endswith(".py") else 65536
@@ -427,6 +476,10 @@ class FiniteController:
         if len(accounts) != len(c.budget_account_ids) or any(a["tenant_id"] != c.tenant
                 or a["owner_id"] not in (None, c.owner) or a["project_id"] not in (None, c.project_id) for a in accounts):
             raise ScalerError("finite_existing_budget_scope_mismatch")
+        if c.service_policy is not None:
+            ceiling = c.service_policy["budget_ceiling_microusd"]
+            return min(max(0, min(a["limit_microusd"], ceiling)-a["spent_microusd"]-a["reserved_microusd"])
+                       for a in accounts)
         return min(c.scale_policy["approved_remaining_microusd"],
                    *(max(0, a["limit_microusd"]-a["spent_microusd"]-a["reserved_microusd"]) for a in accounts))
 
@@ -486,7 +539,7 @@ class FiniteController:
             pending = list(conn.execute(select(jobs.c.id, jobs.c.owner_id, jobs.c.created_at, jobs.c.expected_runtime_s).where(
                 self.scope_filter(), jobs.c.status == "queued", jobs.c.not_before <= now,
                 jobs.c.execution_plan["policy_hash"].as_string() == c.execution_policy_sha256,
-                jobs.c.execution_plan["backend"].as_string() == "comfy-worker",
+                jobs.c.execution_plan["backend"].as_string() == c.execution_backend,
                 jobs.c.execution_plan["enabled"].as_string() == ("true" if self.repo.engine.dialect.name == "postgresql" else 1),
                 jobs.c.request["recipe_id"].as_string().in_(c.recipe_ids),
                 jobs.c.request["request"]["model"].as_string() == MODEL

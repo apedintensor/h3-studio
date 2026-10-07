@@ -1,0 +1,7 @@
+# Private Session host only. Do not merge the business API's incompatible lock.
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+torchaudio==2.10.0+cu128
+fastapi==0.142.2
+httpx==0.28.1
+uvicorn==0.54.0

@@ -90,6 +90,24 @@ B2 extracted the Comfy seam in [PR #17](https://github.com/apedintensor/h3-studi
 
 Before WanGP activation, immutable execution configuration/attempt binding must identify engine code revision, image identity, compiler/recipe version, full component model revisions/precision and slot topology. Preserve old accepted Comfy bindings for reconcile/collect after new-task routing changes. One global backend switch cannot perform this migration safely.
 
+The WanGP cold path extends the existing controller and capacity ledger. Its
+approval, waiter, worker slot and attempt bind the same backend and manifest
+digest. The private client also pins the runtime incarnation; generation POSTs
+carry that precondition and a replaced host refuses them before dispatch. Reads
+of original receipts remain available. A transport reconnect reuses the same
+instance, host key, token and local port, including during draining; it does not
+upload, reinstall, restart or resubmit. A complete controller-process restart
+after fleet launch still requires explicit recovery under C2; transport recovery
+must not be reported as acceptance of that wider requirement.
+
+Continuing single-slot operation is an explicit `service_policy`, validated
+against the existing scope, absolute window, budget ceiling and idle interval.
+`max_cycles: null` removes the old test-cycle count only. Each new rental remains
+bounded by its own TTL and the same cumulative spent/reserved account balance;
+unknown outcomes and repair holds still block unsafe rotation. Changing this
+configuration does not alter previously accepted request identities, leases,
+deadlines or bills, and does not itself grant spending authority.
+
 ## 6. Output contract
 
 Engine success is not platform success. The worker validates expected geometry, duration, actual decodability and audio, normalizes the requested export, and publishes through the existing `ArtifactWriter` receipt. Audio-enabled generation requires an independent audio output as well as valid video; an engine returning only a muxed file needs an explicit verified extraction step.

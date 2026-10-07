@@ -33,11 +33,16 @@ def _operation(value):
 
 
 class HTTPWanGPTransport:
-    def __init__(self, endpoint, token, *, transport=None, timeout=30, max_transfer_seconds=180):
+    def __init__(self, endpoint, token, *, transport=None, timeout=30, max_transfer_seconds=180,
+                 expected_incarnation=None):
         self.endpoint = private_endpoint(endpoint)
         if not isinstance(token, str) or len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
             raise ValueError("wangp_private_token_required")
         self._token, self._transport = token, transport
+        if expected_incarnation is not None and (not isinstance(expected_incarnation, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", expected_incarnation)):
+            raise ValueError("wangp_invalid_runtime_incarnation")
+        self.expected_incarnation = expected_incarnation
         self._client = None
         self.timeout = timeout
         if not 0 < max_transfer_seconds < float("inf"):
@@ -54,9 +59,14 @@ class HTTPWanGPTransport:
     def _json(self, method, path, *, value=None, missing=False, submission=False):
         try:
             started = time.monotonic()
+            headers = {"Content-Type": "application/json"}
+            if method == "POST" and path == "/v1/operations" and self.expected_incarnation is not None:
+                # A readiness GET is only an observation. The receiving host
+                # must reject a replacement epoch before dispatching a POST.
+                headers["X-Wangp-Incarnation"] = self.expected_incarnation
             with self._http().stream(method, path,
                     content=canonical_json(value).encode() if value is not None else None,
-                    headers={"Content-Type": "application/json"}) as response:
+                    headers=headers) as response:
                 if missing and response.status_code == 404:
                     return None
                 # Even rejection of this POST cannot disprove a prior accepted

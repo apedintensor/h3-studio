@@ -1,0 +1,11 @@
+# CPU dependency resolver and reproducible runtime base; no model or GPU runs.
+# Pin observed official amd64 Python3.11.14 image, not mutable latest/tag content.
+FROM python@sha256:06bb5357fbe87fed6fd7793c8c525ba09417bb23361b161511bb2993e8f0a7e3
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PYTHONDONTWRITEBYTECODE=1
+RUN apt-get update && apt-get install --no-install-recommends -y \
+    ffmpeg libgl1 libglib2.0-0 libsndfile1 libportaudio2 cmake ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+# The full installed dpkg versions are captured by package_tool prepare. This
+# Dockerfile alone is not a system lock: publish/retain the resulting image by
+# digest before reuse and validate its captured packages. Never rebuild silently.
+WORKDIR /build

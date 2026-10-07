@@ -44,8 +44,21 @@ def fingerprint(value):
         ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
-def controller(image):
-    return {'image': image, 'pull_policy': 'never', 'user': '10001:10001',
+def engine_config(config):
+    backend = config.get('execution_backend', 'comfy-worker')
+    release.require(backend in ('comfy-worker', 'wangp-worker'), 'scaler_backend_invalid')
+    if backend == 'wangp-worker':
+        release.require(isinstance(config.get('engine_manifest_digest'), str)
+            and re.fullmatch(r'[0-9a-f]{64}', config['engine_manifest_digest'])
+            and config.get('qualification_profile') == 'queued-task-first-v1', 'scaler_engine_identity_invalid')
+    else:
+        release.require(not config.get('engine_manifest_digest'), 'scaler_engine_identity_invalid')
+    return backend
+
+
+def controller(image, backend='comfy-worker'):
+    release.require(backend in ('comfy-worker', 'wangp-worker'), 'scaler_backend_invalid')
+    value = {'image': image, 'pull_policy': 'never', 'user': '10001:10001',
         'init': True, 'restart': 'no', 'read_only': True, 'cap_drop': ['ALL'],
         'security_opt': ['no-new-privileges:true'], 'pids_limit': 192,
         'mem_limit': 1024**3, 'cpus': .75, 'stop_grace_period': '4m',
@@ -53,7 +66,7 @@ def controller(image):
             'SIXNINE_DATABASE_URL_FILE': '/run/secrets/app_database_url',
             'SIXNINE_PUBLIC_ORIGIN': 'https://www.sixnine.art',
             'SIXNINE_AUTH_MODE': 'password', 'SIXNINE_GENERATION_ENABLED': '1',
-            'SIXNINE_RENDER_ENABLED': '0', 'SIXNINE_EXECUTION_BACKEND': 'comfy-worker',
+            'SIXNINE_RENDER_ENABLED': '0', 'SIXNINE_EXECUTION_BACKEND': backend,
             'SIXNINE_CLOUD_CREATION_ENABLED': '0', 'SIXNINE_STORAGE_PROVIDER': 'local',
             'SIXNINE_EXECUTION_POLICY_FILE': POLICY_TARGET,
             'AWS_EC2_METADATA_DISABLED': 'true'},
@@ -70,14 +83,21 @@ def controller(image):
         'networks': {'database': {}, 'edge': {}},
         'depends_on': {'db': {'condition': 'service_healthy', 'required': True}},
         'logging': {'driver': 'json-file', 'options': {'max-size': '10m', 'max-file': '3'}}}
+    if backend == 'wangp-worker':
+        value['volumes'] = [m for m in value['volumes'] if not m['target'].startswith('/bootstrap-source/')]
+        value['volumes'] += [bind(SOURCE/name, '/bootstrap-source/'+name, True) for name in
+            ('wangp-bootstrap.py', 'wangp-manifest.json', 'wangp-runtime.json', 'wangp-package.tar.gz',
+             'wangp-dependencies.tar.gz')]
+    return value
 
 
-def overlay(image):
+def overlay(image, backend='comfy-worker'):
+    health = GPU_HEALTH.replace("=='comfy-worker'", "=="+repr(backend))
     return {'services': {'app': {'environment': {
-        'SIXNINE_GENERATION_ENABLED': '1', 'SIXNINE_EXECUTION_BACKEND': 'comfy-worker',
+        'SIXNINE_GENERATION_ENABLED': '1', 'SIXNINE_EXECUTION_BACKEND': backend,
         'SIXNINE_EXECUTION_POLICY_FILE': POLICY_TARGET},
         'volumes': [bind(POLICY_SOURCE, POLICY_TARGET, True)],
-        'healthcheck': {'test': ['CMD', 'python', '-c', GPU_HEALTH]}}, SERVICE: controller(image)}}
+        'healthcheck': {'test': ['CMD', 'python', '-c', health]}}, SERVICE: controller(image, backend)}}
 
 
 def validate(config, *, deployment_directory, compose_version):
@@ -96,16 +116,17 @@ def validate(config, *, deployment_directory, compose_version):
         if actual.get('entrypoint', False) is None:
             del actual['entrypoint']
     app = config['services']['app']
-    release.require(actual == controller(app['image']), 'unexpected_gpu_controller_configuration')
     env = app.get('environment', {})
+    backend = env.get('SIXNINE_EXECUTION_BACKEND')
+    release.require(actual == controller(app['image'], backend), 'unexpected_gpu_controller_configuration')
     release.require(env.get('SIXNINE_GENERATION_ENABLED') == '1'
-        and env.get('SIXNINE_EXECUTION_BACKEND') == 'comfy-worker'
+        and backend in ('comfy-worker', 'wangp-worker')
         and env.pop('SIXNINE_EXECUTION_POLICY_FILE', None) == POLICY_TARGET, 'scaler_admission_configuration_invalid')
     env['SIXNINE_GENERATION_ENABLED'], env['SIXNINE_EXECUTION_BACKEND'] = '0', 'disabled'
     mount = bind(POLICY_SOURCE, POLICY_TARGET, True)
     release.require(app.get('volumes', []).count(mount) == 1, 'scaler_policy_mount_invalid')
     app['volumes'].remove(mount)
-    release.require(app['healthcheck']['test'] == ['CMD', 'python', '-c', GPU_HEALTH], 'scaler_health_invalid')
+    release.require(app['healthcheck']['test'] == ['CMD', 'python', '-c', GPU_HEALTH.replace("=='comfy-worker'", "=="+repr(backend))], 'scaler_health_invalid')
     app['healthcheck']['test'][3] = CPU_HEALTH
     return validate_base(config, deployment_directory=deployment_directory, compose_version=compose_version)
 
@@ -147,6 +168,14 @@ def on_demand_config(config):
     """The host accepts one narrow on-demand mode; unknown modes fail closed."""
     mode = config.get('service_mode')
     release.require(mode in (None, 'on-demand'), 'scaler_service_mode_invalid')
+    if config.get('service_policy') is not None:
+        # Exact schema is checked again by the pinned application before launch.
+        # The pure source module is installed with reviewed host helpers.
+        from service_policy import validate_service_config
+        from types import SimpleNamespace
+        release.require(mode == 'on-demand', 'scaler_service_policy_mode_invalid')
+        validate_service_config(SimpleNamespace(**{'authorization_extension_s': 0, **config}))
+        return True
     extension = config.get('authorization_extension_s', 0)
     release.require(type(extension) is int and extension in (0, 18000)
         and (extension == 0 or mode == 'on-demand'
@@ -185,6 +214,7 @@ def protected_inputs(*, starting=False, now=None):
     release.require(key.st_uid == 10001 and stat.S_IMODE(key.st_mode) == 0o400,
                     'scaler_ssh_identity_permissions_invalid')
     config, policy, metadata = read_json(CONFIG_SOURCE), read_json(POLICY_SOURCE), read_json(RUNTIME_METADATA)
+    backend = engine_config(config)
     on_demand = on_demand_config(config)
     expected_paths = {'work_dir': '/control', 'data_dir': '/data', 'source_dir': '/bootstrap-source',
                      'ssh_key_file': '/worker-identity/key', 'known_hosts_file': '/control/known_hosts'}
@@ -196,18 +226,32 @@ def protected_inputs(*, starting=False, now=None):
         and metadata.get('service') == 'lium' and metadata.get('profile') == 'lium--rig-root',
         'scaler_identity_or_runtime_metadata_mismatch')
     release.require(config.get('execution_policy_sha256') == fingerprint(policy), 'scaler_policy_hash_mismatch')
+    release.require(policy.get('backend') == backend
+        and policy.get('engine_manifest_digest', '') == config.get('engine_manifest_digest', ''), 'scaler_policy_engine_mismatch')
     sources = config.get('source_sha256', {})
-    release.require(set(sources) == {'bootstrap_cloud.py', 'model_manifest.json'}, 'scaler_source_set_invalid')
+    expected_sources = ({'bootstrap_cloud.py', 'model_manifest.json'} if backend == 'comfy-worker' else
+        {'wangp-bootstrap.py', 'wangp-manifest.json', 'wangp-runtime.json', 'wangp-package.tar.gz'})
+    release.require(set(sources) == expected_sources, 'scaler_source_set_invalid')
     for name, digest in sources.items():
         source = SOURCE/name
-        release.regular(source, root_owned=True, maximum=524288 if name.endswith('.py') else 65536)
+        release.regular(source, root_owned=True, maximum=16*1024**2 if name.endswith('.gz') else 524288)
         release.require(release.checksum(source) == digest, 'scaler_source_hash_mismatch')
+    if backend == 'wangp-worker':
+        runtime = read_json(SOURCE/'wangp-runtime.json', 524288)
+        release.require(runtime.get('dependency_artifact_path') == '/root/sixnine-cache/wangp-dependencies.tar.gz'
+            and not runtime.get('dependency_artifact_url') and not runtime.get('prepared_root'),
+            'scaler_wangp_archive_source_required')
+        artifact = SOURCE/'wangp-dependencies.tar.gz'
+        release.regular(artifact, root_owned=True, maximum=32*1024**3)
+        release.require(release.checksum(artifact) == runtime.get('dependency_artifact_sha256'),
+            'scaler_dependency_hash_mismatch')
     if starting:
         now = time.time() if now is None else now
         deadline = config.get('hard_deadline')
         release.require(config.get('enabled') is True and type(deadline) in (int, float)
-            and math.isfinite(deadline) and now+300 < deadline <= now+(24 if on_demand else 4)*3600
-                + config.get('authorization_extension_s', 0),
+            and math.isfinite(deadline) and now+300 < deadline
+            and (config.get('service_policy') is not None or deadline <= now+(24 if on_demand else 4)*3600
+                + config.get('authorization_extension_s', 0)),
             'scaler_explicit_finite_authorization_required')
         # Never resume an uncertain previous lifecycle via a fresh start.
         entries = {path.name for path in (ROOT/'control').iterdir()}
@@ -509,7 +553,7 @@ def main(argv=None):
                 if args == ['resume-preparation']:
                     import gpu_preparation_recovery
                     gpu_preparation_recovery.verify_resume(config, commit, environment)
-                atomic(ROOT/'overlay.json', overlay(environment['SIXNINE_IMAGE']))
+                atomic(ROOT/'overlay.json', overlay(environment['SIXNINE_IMAGE'], engine_config(config)))
                 atomic(ROOT/'app-admission.json', release.app_admission_overlay(release.ROOT))
             else:
                 pin = read_json(ROOT/'active.json', 16384)

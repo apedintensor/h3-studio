@@ -85,17 +85,25 @@ The returned evidence contains no runtime environment or configuration values.
     models = Path(model_root).resolve(strict=True)
     config = _check_config(config_path, models)
     manifest = EngineManifest.from_dict(json.loads(Path(manifest_path).read_text(encoding="utf-8")))
-    revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
-                              check=True, capture_output=True, text=True).stdout.strip()
-    if revision != UPSTREAM_REVISION:
-        raise ValueError("wangp_runtime_source_mismatch")
-    for args in (["diff", "--quiet", "HEAD", "--"], ["diff", "--cached", "--quiet", "HEAD", "--"]):
-        if subprocess.run(["git", "-C", str(root), *args], capture_output=True).returncode:
-            raise ValueError("wangp_runtime_source_modified")
-    untracked = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
-                              check=True, capture_output=True).stdout.decode().split("\0")
-    if any(Path(name).suffix.lower() in {".py", ".pyd", ".so"} for name in untracked if name):
-        raise ValueError("wangp_runtime_untracked_code")
+    environment_evidence = {}
+    if manifest.document.get("runtime_digest_kind") == "sixnine-environment-lock-sha256":
+        from .wangp_environment import verify_bound_environment
+        environment_evidence = verify_bound_environment(root, manifest.document)
+        revision = UPSTREAM_REVISION
+    else:
+        # Historical candidate manifests retain their exact verification path;
+        # new cold bootstrap requires the fully bound package above.
+        revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        if revision != UPSTREAM_REVISION:
+            raise ValueError("wangp_runtime_source_mismatch")
+        for args in (["diff", "--quiet", "HEAD", "--"], ["diff", "--cached", "--quiet", "HEAD", "--"]):
+            if subprocess.run(["git", "-C", str(root), *args], capture_output=True).returncode:
+                raise ValueError("wangp_runtime_source_modified")
+        untracked = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+                                  check=True, capture_output=True).stdout.decode().split("\0")
+        if any(Path(name).suffix.lower() in {".py", ".pyd", ".so"} for name in untracked if name):
+            raise ValueError("wangp_runtime_untracked_code")
     versions = {}
     for package, required in CORE_VERSIONS.items():
         version = importlib.metadata.version(package)
@@ -121,7 +129,7 @@ The returned evidence contains no runtime environment or configuration values.
     return {"manifest_digest": manifest.digest, "source_revision": revision,
             "core_versions": versions, "verified_files": checked,
             "config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-            "inference_verified": False}
+            "inference_verified": False, **environment_evidence}
 
 
 def config_for_model_root(model_root):

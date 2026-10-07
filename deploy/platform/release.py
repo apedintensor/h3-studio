@@ -317,9 +317,14 @@ def protected_directory(path):
 def app_admission_overlay(root):
     policy = (root / "gpu-scaler" / "operator" / "execution-policy.json").as_posix()
     target = "/control-config/execution-policy.json"
+    operator = root / 'gpu-scaler' / 'operator' / 'scaler.json'
+    config = _protected_json(operator) if operator.exists() else {}
+    backend = config.get('execution_backend', 'comfy-worker')
+    require(backend in ('comfy-worker', 'wangp-worker'), 'gpu_execution_backend_invalid')
     health = "import json,urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8845/healthz',timeout=5)); assert h['auth_ready'] and h['generation_enabled'] and not h['render_enabled'] and not h['cloud_creation_enabled'] and h['execution_backend']=='comfy-worker'"
+    health = health.replace("=='comfy-worker'", "=="+repr(backend))
     return {"services": {"app": {"environment": {"SIXNINE_GENERATION_ENABLED": "1",
-        "SIXNINE_EXECUTION_BACKEND": "comfy-worker", "SIXNINE_EXECUTION_POLICY_FILE": target},
+        "SIXNINE_EXECUTION_BACKEND": backend, "SIXNINE_EXECUTION_POLICY_FILE": target},
         "volumes": [{"type": "bind", "source": policy, "target": target,
             "read_only": True, "bind": {"create_host_path": False}}],
         "healthcheck": {"test": ["CMD", "python", "-c", health]}}}}
@@ -361,13 +366,27 @@ def gpu_deployment_context(root, target_manifest=None):
             and value["container_name"] == "sixnine-finite-"+hashlib.sha256(value["cycle_id"].encode()).hexdigest()[:20]
             and config.get("execution_policy_sha256") == canonical_hash(policy), "gpu_execution_config_changed")
         sources = config.get("source_sha256")
-        require(isinstance(sources, dict) and set(sources) == {"bootstrap_cloud.py", "model_manifest.json"},
+        backend = config.get('execution_backend', 'comfy-worker')
+        require(backend in ('comfy-worker', 'wangp-worker') and policy.get('backend', 'comfy-worker') == backend
+            and policy.get('engine_manifest_digest', '') == config.get('engine_manifest_digest', ''), 'gpu_execution_engine_changed')
+        expected_sources = ({'bootstrap_cloud.py', 'model_manifest.json'} if backend == 'comfy-worker' else
+            {'wangp-bootstrap.py', 'wangp-manifest.json', 'wangp-runtime.json', 'wangp-package.tar.gz'})
+        require(isinstance(sources, dict) and set(sources) == expected_sources,
             "gpu_execution_sources_invalid")
         for filename, digest in sources.items():
             source = root / folder / "public-source" / filename
-            regular(source, root_owned=True, maximum=2*1024**2)
+            regular(source, root_owned=True, maximum=16*1024**2 if filename.endswith('.gz') else 2*1024**2)
             require(isinstance(digest, str) and DIGEST.fullmatch(digest) and checksum(source) == digest,
                 "gpu_execution_sources_changed")
+        if backend == 'wangp-worker':
+            runtime = _protected_json(root/folder/'public-source'/'wangp-runtime.json', maximum=524288)
+            require(runtime.get('dependency_artifact_path') == '/root/sixnine-cache/wangp-dependencies.tar.gz'
+                and not runtime.get('dependency_artifact_url') and not runtime.get('prepared_root'),
+                'gpu_execution_dependency_source_invalid')
+            archive = root/folder/'public-source'/'wangp-dependencies.tar.gz'
+            regular(archive, root_owned=True, maximum=32*1024**3)
+            require(checksum(archive) == runtime.get('dependency_artifact_sha256'),
+                'gpu_execution_dependency_changed')
         directory = root / "releases" / value["commit"]
         approved_manifest(root, directory, value["commit"])
         expected = manifest(directory, value["commit"])

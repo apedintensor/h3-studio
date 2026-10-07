@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "install_root": "/root/sixnine-cache/wangp",
+  "source_bundle_path": "/workspace/h3-studio/wangp-package.tar.gz",
+  "source_bundle_sha256": "REPLACE_WITH_MEASURED_SOURCE_BUNDLE_SHA256",
+  "dependency_artifact_url": "",
+  "dependency_artifact_path": "/root/sixnine-cache/wangp-dependencies.tar.gz",
+  "dependency_artifact_sha256": "REPLACE_WITH_MEASURED_DEPENDENCY_ARTIFACT_SHA256",
+  "manifest_path": "/workspace/h3-studio/wangp-manifest.json",
+  "model_root": "/root/sixnine-cache/models",
+  "config_path": "/root/sixnine-cache/wangp/wgp_config.json",
+  "status_path": "/workspace/h3-studio/setup-status.json",
+  "port": 8199,
+  "prepared_root": ""
+}

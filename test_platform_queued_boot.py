@@ -95,6 +95,18 @@ class QueuedTaskBootTests(LedgerCase):
                 self.assertEqual(self.workers(), [])
         self.assertEqual(self.backend.submissions, 0)
 
+    def test_draining_keeps_original_tunnel_recoverable_without_restarting_runtime(self):
+        self.start()
+        self.backend.queue = {"queue_running": [[1, "accepted-real-task"]], "queue_pending": []}
+        before = (self.host.starts, self.backend.submissions, self.workers())
+        refreshed = []
+        self.host.ensure_connected = lambda: refreshed.append(True)
+        result = self.boot.tick(self.intent['id'], stopping=True)
+        self.assertEqual(result['state'], 'draining')
+        self.assertFalse(result['children_done'])
+        self.assertEqual(refreshed, [True])
+        self.assertEqual((self.host.starts, self.backend.submissions, self.workers()), before)
+
     def test_ready_report_still_requires_pinned_runtime_weights_and_memory(self):
         for report in ({"actual_comfy_revision": "0"*40}, {"files": {}}, {"gpus": []},
                        {"runtime": {"gpu_total_bytes": 32*1024**3}}):

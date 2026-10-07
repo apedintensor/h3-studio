@@ -1,0 +1,16 @@
+# Build with the exact resolver-base image and resolved payload directory.
+# BASE_IMAGE must be a recorded name@sha256 digest, never a tag/default fallback.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY payload/ /opt/wangp/dependencies/
+RUN if ls /opt/wangp/dependencies/debs/*.deb >/dev/null 2>&1; then \
+       DEBIAN_FRONTEND=noninteractive dpkg --install /opt/wangp/dependencies/debs/*.deb; fi \
+    && python -m venv /opt/wangp/venv \
+    && /opt/wangp/venv/bin/python -m pip install --no-index --require-hashes \
+       --find-links=/opt/wangp/dependencies/wheels -r /opt/wangp/dependencies/requirements.lock \
+    && /opt/wangp/venv/bin/python -m pip check
+# No token, model weight, source-only publication claim or automatic listener.
+# The controller uploads the small private-host bundle and invokes bootstrap.
+ENV HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
