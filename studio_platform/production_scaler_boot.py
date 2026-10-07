@@ -426,7 +426,42 @@ class ProductionBoot(BootController):
                 control.retire(worker_id, upstream_idle_confirmed=True)
 
     def children_done(self):
-        return self.fleet is None or all(proc.poll() is not None for proc in self.fleet.children.values())
+        # A restarted controller has no Popen handles. That is not evidence that
+        # an already launched CPU fleet exited, even after its GPU is destroyed.
+        # Only the owning process can currently prove child exit; full fleet
+        # reconstruction remains a separate recovery operation.
+        try:
+            if self.fleet is not None:
+                expected = {slot.spec.worker_id for slot in self.fleet.config.slots if slot.enabled}
+                return (bool(expected) and set(self.fleet.children) == expected
+                    and all(proc.poll() is not None for proc in self.fleet.children.values()))
+            directory = self.config.work_dir/self.intent_id
+            if (directory/"fleet.json").exists() or (directory/"fleet"/"fleet-state.json").exists():
+                return False
+            receipt = directory/"bootstrap-state.json"
+            if receipt.exists():
+                with receipt.open("rb") as source:
+                    raw = source.read(1024*1024+1)
+                if len(raw) > 1024*1024:
+                    return False
+                state = json.loads(raw)
+                if (not isinstance(state, dict) or state.get("phase") not in {
+                        "reserved", "bootstrap_starting", "booting", "bootstrap_failed",
+                        "ready_for_qualification", "runtime_ready", "smoke_submitting",
+                        "smoke_running", "qualification_failed", "qualified"}
+                        or "fleet_recipe_ids" in state
+                        or not isinstance(state.get("identity"), dict)
+                        or state["identity"].get("intent_id") != self.intent_id
+                        or state["identity"].get("configuration_id") != self.config.configuration_id):
+                    return False
+            # Registration precedes Popen. Retain its obligation if launch
+            # metadata is missing rather than treating absent files as proof.
+            with self.repo.engine.connect() as conn:
+                worker = conn.execute(select(registered_workers.c.id).where(
+                    registered_workers.c.id == "lium-"+self.intent_id.replace("-", ""))).first()
+            return worker is None
+        except Exception:
+            return False
 
     def close_if_safe(self, *, destroyed=False):
         if not destroyed or not self.children_done():
