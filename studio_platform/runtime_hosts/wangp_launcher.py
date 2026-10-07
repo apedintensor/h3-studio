@@ -9,13 +9,81 @@ import json
 import math
 import os
 from pathlib import Path
+import re
+import tempfile
 import time
 
 from ..inference.wangp_contract import EngineManifest
 from ..inference.wangp_factory import read_document
 from .wangp import WanGPHost
 from .wangp_http import StagedInputs, create_app, private_token_file
-from .wangp_receipts import ReceiptJournal, checked_directory
+from .wangp_receipts import ReceiptJournal, checked_directory, checked_reader, sync_directory
+
+VERIFICATION_RECEIPT = "runtime-verification.json"
+MAX_VERIFICATION_RECEIPT = 1024 * 1024
+
+
+def _verification_identity(value, *, manifest_digest, slot_key, pid, incarnation=None):
+    if (not isinstance(value, dict) or set(value) != {
+            "version", "state", "manifest_digest", "slot_key", "pid", "incarnation", "verified_at", "evidence"}
+            or type(value.get("version")) is not int or value["version"] != 1
+            or value.get("state") != "runtime_files_verified"
+            or value.get("manifest_digest") != manifest_digest or value.get("slot_key") != slot_key
+            or type(value.get("pid")) is not int or value["pid"] != pid or pid <= 0
+            or not isinstance(value.get("incarnation"), str) or not re.fullmatch(r"[0-9a-f]{32}", value["incarnation"])
+            or incarnation is not None and value["incarnation"] != incarnation
+            or type(value.get("verified_at")) not in (int, float)
+            or not math.isfinite(value["verified_at"]) or value["verified_at"] <= 0
+            or not isinstance(value.get("evidence"), dict)
+            or value["evidence"].get("manifest_digest") != manifest_digest
+            or value["evidence"].get("inference_verified") is not False):
+        raise ValueError("verification_receipt_mismatch")
+    return value
+
+
+def write_verification_receipt(state, host, evidence):
+    """Called only after full verification while this process owns the slot.
+
+    This receipt is an observation, never a reusable verification cache. A new
+    launcher always rehashes before publishing evidence for its new incarnation.
+    """
+    state = checked_directory(state)
+    value = _verification_identity({"version": 1, "state": "runtime_files_verified",
+        "manifest_digest": host.manifest.digest, "slot_key": host.journal.slot_key,
+        "pid": os.getpid(), "incarnation": host.incarnation, "verified_at": time.time(), "evidence": evidence},
+        manifest_digest=host.manifest.digest, slot_key=host.journal.slot_key, pid=os.getpid(),
+        incarnation=host.incarnation)
+    raw = json.dumps(value, sort_keys=True, allow_nan=False).encode("utf-8")
+    if len(raw) > MAX_VERIFICATION_RECEIPT:
+        raise ValueError("verification_receipt_mismatch")
+    descriptor, name = tempfile.mkstemp(prefix=".runtime-verification-", suffix=".tmp", dir=state)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, state / VERIFICATION_RECEIPT)
+        sync_directory(state)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return value
+
+
+def read_verification_receipt(state, *, manifest_digest, slot_key, pid, incarnation=None):
+    """Consume only the exact owned child's private receipt, never trust a path alone."""
+    try:
+        state = checked_directory(state)
+        with checked_reader(state / VERIFICATION_RECEIPT, state) as stream:
+            if os.name != "nt" and os.fstat(stream.fileno()).st_mode & 0o077:
+                raise ValueError()
+            raw = stream.read(MAX_VERIFICATION_RECEIPT + 1)
+        if len(raw) > MAX_VERIFICATION_RECEIPT:
+            raise ValueError()
+        return _verification_identity(json.loads(raw), manifest_digest=manifest_digest,
+            slot_key=slot_key, pid=pid, incarnation=incarnation)
+    except Exception:
+        raise ValueError("verification_receipt_mismatch") from None
 
 
 class PendingSession:
@@ -140,6 +208,7 @@ def main(argv=None):
         evidence = verify_runtime(args.runtime_root, args.config, args.manifest, args.model_root)
         if evidence.get("manifest_digest") != manifest.digest:
             raise ValueError("wangp_verified_manifest_changed")
+        write_verification_receipt(state, host, evidence)
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         # Upstream console output is not an authorized channel for user prompts.
