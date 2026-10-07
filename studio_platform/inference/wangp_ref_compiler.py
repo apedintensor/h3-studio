@@ -1,4 +1,4 @@
-"""Offline Ref2VA qualification slice; this module enables no public recipe.
+"""Explicit Ref2VA qualification recipe; importing enables no operating policy.
 
 Pinned Base/BF16/50 steps, one small reference per kind. These are conservative
 qualification bounds, not the upstream model's complete capability limits.
@@ -24,6 +24,37 @@ TRANSFORMER = {"path": "MiniMax-H3-Ref2VA_bf16.safetensors", "size_bytes": 66280
 MAX_IMAGE_PIXELS = 832*480
 MAX_VIDEO_FRAMES = 73  # Normalization of an explicit 2--3-second source selection.
 MAX_AUDIO_SECONDS = 3
+RECIPE_ID = "h3-base-ref2va-v1"
+
+
+def control_schema():
+    from .wangp_compiler import control_schema as fl_schema
+    schema = fl_schema()
+    schema["duration"].update(default=5, minimum=5, maximum=5)
+    schema["resolution"].update(default="480P", enum=["480P"])
+    schema["aspect_ratio"].update(default="16:9", enum=["16:9"])
+    schema["width"].update(minimum=832, maximum=832)
+    schema["height"].update(minimum=480, maximum=480)
+    return schema
+
+
+def validate_envelope(envelope):
+    """Additional bounds after the common operator policy type validation."""
+    controls = {"sampler_name": ["euler"], "scheduler": ["auto"], "video_decode": ["tiled"],
+                "audio_decode": ["normal"], "encoder_device": ["default"]}
+    limits = envelope.get("input_limits", {})
+    maxima = {"max_images":1, "max_videos":1, "max_audios":1,
+        "max_image_pixels":MAX_IMAGE_PIXELS, "max_video_pixels":MAX_IMAGE_PIXELS,
+        "max_video_duration_seconds":MAX_VIDEO_FRAMES/24, "max_audio_duration_seconds":MAX_AUDIO_SECONDS}
+    if (envelope["controls"] != controls or envelope["max_pixels"] > MAX_IMAGE_PIXELS
+            or envelope["max_duration_seconds"] > 124/24 or envelope["max_steps"] != 50
+            or envelope["max_reference_files"] > 3 or envelope["max_guides"] != 0
+            or envelope["allow_first_last"] is not False or envelope["allow_audio"] is not True
+            or any(key not in limits or limits[key] > maximum for key,maximum in maxima.items())
+            or limits.get("guide_kinds") != [] or limits.get("guide_recipe_ids") != []
+            or limits.get("allow_video_audio") is not False):
+        raise ValueError("wangp_ref_policy_outside_qualification_envelope")
+    return envelope
 
 
 def _number(value):
@@ -35,6 +66,10 @@ def normalize_request(request, metadata, output_spec):
         raise ValueError("wangp_ref2va_base_only")
     if not isinstance(metadata, dict):
         raise ValueError("wangp_ref_metadata_invalid")
+    if (request.get("resolution", "480P") != "480P" or request.get("aspect_ratio", "16:9") != "16:9"
+            or any(field in request and (type(request[field]) is not int or request[field] != expected)
+                   for field,expected in (("width",832),("height",480)))):
+        raise ValueError("wangp_ref_qualification_output_exceeded")
     inputs = copy.deepcopy(request.get("inputs", {}))
     if (not isinstance(inputs, dict) or set(inputs)-{"images", "videos", "audios", "first_frame", "last_frame"}
             or inputs.get("first_frame") is not None or inputs.get("last_frame") is not None):
@@ -77,7 +112,7 @@ def normalize_request(request, metadata, output_spec):
         raise ValueError("wangp_ref_soundtrack_unsupported")
     # Reuse the immutable FL Base control validator, after validating EVERY
     # reference field above. No control/prompt/shape is silently discarded.
-    base = {**request, "mode": "fl", "inputs": {}, "video_audio": {}}
+    base = {"resolution":"480P", **request, "mode": "fl", "inputs": {}, "video_audio": {}}
     value = normalize_fl(base, {}, output_spec)
     if value["duration"] != 5 or (output_spec["width"], output_spec["height"], output_spec["frames"]) != (832,480,124):
         raise ValueError("wangp_ref_qualification_output_exceeded")
@@ -116,7 +151,7 @@ class H3Ref2VACompiler:
             assets, request, output = compiled.get("assets", {}), compiled["request"], compiled["output_spec"]
             metadata = {key: val["metadata"] for key,val in assets.items()}
             value = normalize_request(request, metadata, output)
-            if (compiled.get("recipe_id") != "h3-base-ref2va-v1"
+            if (compiled.get("recipe_id") != RECIPE_ID
                     or job["execution_plan"].get("engine_manifest_digest") != self.manifest.digest):
                 raise ValueError("wangp_manifest_binding_mismatch")
             descriptors, handles, keys = [], {}, {}

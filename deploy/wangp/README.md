@@ -423,10 +423,23 @@ trims overlong combined references. These are not our qualified input limits.
 video reference, and `A` the standalone audio. No `K` soundtrack extraction,
 additional guide, first/last mixing or VDN/pruned replacement is introduced.
 
-`test_platform_wangp_ref` exercises owned upload/selection, actual CPU media,
-strict mapping and private fake-Session delivery; it imports no model. Before
-a live probe, explicitly wire the public REF recipe, finite-controller recipe
-IDs, reviewed policy and native output contract to a newly locked manifest.
-They intentionally remain FL-only in this source slice. A first live sequence
-should qualify image, silent video, image+audio, then all three, retaining
+`test_platform_wangp_ref` and `test_platform_wangp_ref_api` exercise owned
+upload/selection, actual CPU media, strict mapping, explicit confirmation,
+cold waiting, private fake-Session delivery and native downloads; they import
+no model. Public plans now support the existing REF recipe ID, but only an
+explicit singleton REF policy with native delivery and the bounded envelope
+can admit it. Set `execution_recipe_id: h3-base-ref2va-v1` in a **new** controller
+configuration; its absent default retains FL and historical fingerprints.
+Boot requires the matching Ref manifest/compiler. Existing FL or legacy
+multi-recipe policies cannot silently route REF to their current weights.
+
+Before a live probe, bind a newly locked environment manifest to a reviewed
+configuration/policy and original capacity/budget authority. This source slice
+changes no enabled configuration. Upload via the existing owned asset endpoint,
+then pass `images: [image_asset_id]`, `videos: [{asset_id: video_asset_id,
+include_audio: false}]`, and `audios: [audio_asset_id]` in the normal generation
+plan inputs. Use recipe `h3-base-ref2va-v1`, duration 5, resolution `480P`,
+aspect `16:9`, and an explicit seed; omit an unused input kind. Inspect the
+preflight before explicitly confirming its plan ID. A first live sequence
+should qualify image, silent video, image+audio, then all three, preserving
 original jobs, measured memory and actual downloaded video/audio evidence.

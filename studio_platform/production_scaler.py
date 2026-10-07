@@ -115,8 +115,13 @@ class FiniteConfig:
     output_delivery: str = ""
     provider_preparation_timeout_s: int | None = None
     provider_preparation_failure_limit: int = 2
+    execution_recipe_id: str = ""
 
     def __post_init__(self):
+        if (self.execution_recipe_id and (self.execution_backend != "wangp-worker"
+                or self.execution_recipe_id != "h3-base-ref2va-v1" or self.output_delivery != "native-frames-v1")
+                or not isinstance(self.execution_recipe_id, str)):
+            raise ScalerError("finite_explicit_recipe_invalid")
         if self.provider_preparation_timeout_s is not None and (type(self.provider_preparation_timeout_s) is not int
                 or not 120 <= self.provider_preparation_timeout_s <= 7200):
             raise ScalerError("invalid_provider_preparation_timeout")
@@ -212,7 +217,7 @@ class FiniteConfig:
     @property
     def recipe_ids(self):
         if self.execution_backend == "wangp-worker":
-            return (FL_RECIPE,)
+            return (self.execution_recipe_id or FL_RECIPE,)
         return PROFILE_RECIPES[self.qualification_profile]
 
     @property
@@ -249,6 +254,8 @@ class FiniteConfig:
             value.pop("provider_preparation_timeout_s")
         if self.provider_preparation_failure_limit == 2:
             value.pop("provider_preparation_failure_limit")
+        if not self.execution_recipe_id:
+            value.pop("execution_recipe_id")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
@@ -337,6 +344,14 @@ def verify_policy(config, settings):
     # input family is enabled just because the underlying model supports it.
     envelope = policy["envelope"]
     if config.execution_backend == "wangp-worker":
+        if config.execution_recipe_id:
+            # read_policy has already checked the exact REF/native envelope.
+            from .inference.wangp_ref_compiler import validate_envelope
+            try:
+                validate_envelope(envelope)
+            except ValueError:
+                raise ScalerError("finite_policy_outside_wangp_ref_recipe") from None
+            return policy
         controls = {"sampler_name": ["euler"], "scheduler": ["auto"], "video_decode": ["tiled"],
                     "audio_decode": ["normal"], "encoder_device": ["default"]}
         limits = envelope.get("input_limits", {})

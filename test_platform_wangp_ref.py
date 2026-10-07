@@ -80,6 +80,7 @@ class RefCompilerTests(unittest.TestCase):
     def test_rejects_excess_controls_shapes_counts_soundtrack_and_unselected_media(self):
         modifications = [lambda r,m: r.update(steps=20), lambda r,m: r.update(encoder_device="cpu"),
             lambda r,m: r.update(guides=[]), lambda r,m: r.update(duration=6),
+            lambda r,m: r.update(width=640), lambda r,m: r.update(height=640),
             lambda r,m: r.update(resolution="768P"), lambda r,m: r["inputs"].update(first_frame="i"),
             lambda r,m: r["inputs"]["images"].append("i"), lambda r,m: r["video_audio"].update(v=True),
             lambda r,m: m["v"].update(has_audio=True), lambda r,m: m["v"].update(source_duration=4),
@@ -95,7 +96,7 @@ class RefCompilerTests(unittest.TestCase):
                 normalize_request(value, meta, native_output_spec(value))
             self.assertEqual(value, before)
 
-    def test_manifest_requires_exact_ref_weight_and_public_admission_remains_closed(self):
+    def test_manifest_requires_exact_ref_weight_and_public_compile_preserves_recipe(self):
         ref = manifest()
         H3Ref2VACompiler(ref, None)
         with self.assertRaisesRegex(ValueError, "manifest_mismatch"):
@@ -105,8 +106,10 @@ class RefCompilerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "manifest_mismatch"):
             H3Ref2VACompiler(EngineManifest.from_dict(changed), None)
         body = generation_request(recipe_id="h3-base-ref2va-v1", inputs={"images": ["i"]})
-        with self.assertRaisesRegex(ValueError, "wangp_fl2va_base_only"):
-            compile_request(body, lambda _: {"asset_id":"i", "metadata": metadata()["i"], "model": {}}, backend="wangp-worker")
+        compiled, fingerprint = compile_request(body, lambda _: {"asset_id":"i", "metadata": metadata()["i"], "model": {}}, backend="wangp-worker")
+        self.assertEqual(compiled["recipe_id"], "h3-base-ref2va-v1")
+        self.assertEqual(compiled["request"]["mode"], "ref")
+        self.assertEqual(len(fingerprint),64)
 
     def test_adapter_factory_selects_candidate_without_runtime_or_network(self):
         from studio_platform.inference.wangp_factory import create_backend

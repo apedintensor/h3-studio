@@ -141,7 +141,8 @@ class BootConfig:
                 or self.model_id != "MiniMax-H3-Base-BF16"
                 or type(self.min_gpu_bytes) is not int or self.min_gpu_bytes < 30*1024**3
                 or type(self.minimum_remaining_s) is not int or not 120 <= self.minimum_remaining_s <= 7200
-                or self.recipe_ids not in (("h3-base-fl2va-v1",), ("h3-base-fl2va-v1", "h3-base-ref2va-v1"))):
+                or self.recipe_ids not in (("h3-base-fl2va-v1",), ("h3-base-fl2va-v1", "h3-base-ref2va-v1"))
+                    and not (self.execution_backend == "wangp-worker" and self.recipe_ids == ("h3-base-ref2va-v1",))):
             raise ValueError("bootstrap_configuration_requires_explicit_fl2va_smoke_envelope")
         if self.qualification_profile not in ("", QUEUED_TASK_PROFILE):
             raise ValueError("bootstrap_qualification_profile_invalid")
@@ -152,7 +153,8 @@ class BootConfig:
         if self.execution_backend == "wangp-worker":
             if (not re.fullmatch(r"[0-9a-f]{64}", self.engine_manifest_digest)
                     or self.qualification_profile != QUEUED_TASK_PROFILE
-                    or self.recipe_ids != ("h3-base-fl2va-v1",)):
+                    or self.recipe_ids not in (("h3-base-fl2va-v1",), ("h3-base-ref2va-v1",))
+                    or self.recipe_ids == ("h3-base-ref2va-v1",) and self.output_delivery != "native-frames-v1"):
                 raise ValueError("bootstrap_wangp_identity_required")
         elif self.engine_manifest_digest:
             raise ValueError("bootstrap_unexpected_engine_manifest")

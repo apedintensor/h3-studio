@@ -165,12 +165,12 @@
   "outputs": {
     "raw_video": "mp4 h264 (upstream libx264_8 means CRF10), AAC128 stereo32kHz, fullnative frames",
     "raw_audio": "WAV IEEE float32 stereo32kHz from API artifact, not AAC reconstruction",
-    "delivery": "native124 frame consumer/public recipe binding pending; this candidate does not enable generation admission"
+    "delivery": "explicit REF policy requires native-frames-v1 and all124frames; this candidate alone does not enable generation admission"
   },
   "evidence": {
     "date": "2026-10-08",
     "model_metadata": "https://huggingface.co/api/models/DeepBeepMeep/MiniMax-H3/revision/adc81ccb71352192214d83d5fafb9487e860be39?blobs=true",
     "handler": "https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/models/minimax_h3/minimax_h3_handler.py",
-    "note": "Offline source/mapping candidate only. No weights downloaded, inference executed, or BF16 mixed-reference memory/disk envelope qualified. Public admission remains disabled."
+    "note": "Offline source/mapping candidate only. No weights downloaded, inference executed, or BF16 mixed-reference memory/disk envelope qualified. Production admission requires a separately reviewed locked manifest and explicit REF configuration/policy."
   }
 }

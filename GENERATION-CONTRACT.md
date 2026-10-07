@@ -215,7 +215,7 @@ Delivery is versioned and immutable; it is not inferred from the current default
 | Accepted execution contract | Delivery behavior |
 |---|---|
 | No `output_delivery` / `delivery_spec` | Historical requested-duration export, unchanged for existing jobs, Comfy and chapter roughcuts. A five-second H3 request delivers 120 frames. |
-| Explicit `output_delivery: native-frames-v1` | New qualified WanGP FL plans freeze `delivery_spec` with policy, fps, frame count, video duration and requested duration. All native frames remain: five requested seconds means 124 frames / 24 fps = 5.1667 seconds. No end-frame crop, frame-rate conversion, retiming or silence padding. |
+| Explicit `output_delivery: native-frames-v1` | New explicitly configured WanGP FL or bounded REF plans freeze `delivery_spec` with policy, fps, frame count, video duration and requested duration. All native frames remain: five requested seconds means 124 frames / 24 fps = 5.1667 seconds. No end-frame crop, frame-rate conversion, retiming or silence padding. |
 
 The native policy requires exactly matching video frame count, 24 fps, zero-based timestamps and native video-stream duration before and after export. Both the MP4 audio and independent FLAC derive from the complete generated waveform; neither is cut to the integer requested duration. Their observed lengths must remain within the existing 0.1-second audio tolerance of the native video timeline, including codec/sample rounding; larger mismatch rejects collection instead of being corrected silently. Video, container and audio durations remain distinct evidence. This tolerance is not a claim of perceptual lip-sync or real H3 audio qualification.
 
@@ -267,14 +267,22 @@ normalized bytes; they do not transcode or shorten inputs.
 
 The manifest/profile, model-specific pristine Session defaults and owned
 launcher are bound together; legacy FL manifests and accepted jobs stay on
-their original route. This source slice does **not** enable public REF plans:
-the public compiler/capability, finite controller recipe, operating envelope
-and `native-frames-v1` delivery currently remain FL-only. Wiring those exact
-bindings, freezing a complete environment package and recording real REF
-output/memory/cost evidence are separate required gates before API admission.
-Candidate construction or offline fake-Session success is not GPU parity or
-production availability. Inference and mixed-reference peak RAM/VRAM have not
-been established for this candidate on one B200.
+their original route. Public `h3-base-ref2va-v1` requests use the strict REF
+compiler. Execution requires a separate explicit singleton REF policy,
+`native-frames-v1`, the bounded envelope above, and a matching manifest/worker
+or approved cold capacity. The controller opt-in is
+`execution_recipe_id: h3-base-ref2va-v1`; absence keeps the historical FL recipe
+and hash/serialization. Boot validates that recipe against the manifest's
+compiler/profile before staging. An FL policy or a legacy multi-recipe policy
+cannot enable new WanGP REF requests. Preflight/card construction never rents
+or starts inference; explicit job confirmation retains the existing path.
+
+This source change does not activate a production policy. Freeze a complete
+environment package and review a REF configuration before enabling its first
+real qualification job; record actual output, peak memory and cost before
+advertising GPU parity. Candidate construction or offline fake-Session success
+is not production availability. Mixed-reference peak RAM/VRAM have not been
+established for this candidate on one B200.
 
 | Gate | Required proof | Evidence level |
 |---|---|---|
