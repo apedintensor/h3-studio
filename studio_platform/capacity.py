@@ -5,6 +5,7 @@ explicitly enabled, injected scaler/provider and current operator-policy guard
 can create an instance. Provider running is never model qualification.
 """
 from dataclasses import asdict, replace
+from contextlib import nullcontext
 import math
 import re
 
@@ -13,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .autoscale import Demand, ScalePolicy, ScaleState, Slot, recommend
 from .repository import (BudgetExceeded, Conflict, NotFound, Scope, budget_accounts, budget_reservations,
-    capacity_approvals, capacity_cycles, capacity_gate, capacity_waiters, canonical,
+    capacity_approvals, capacity_cycles, capacity_gate, capacity_waiters, capacity_pool_members, canonical,
     documents, instance_intents, jobs, pool_limits, registered_workers, request_hash, attempts, scaler_receipts)
 from .scaler import LaunchSpec, _safe_id
 from .inference.outputs import validate_delivery_policy
@@ -68,18 +69,138 @@ def _matches_engine(payload, binding):
         return False
 
 
+def pool_member_ids(payload):
+    """Absent means the unchanged single-intent contract; no inferred adoption."""
+    if "pool_members" not in payload:
+        return ()
+    value = payload["pool_members"]
+    if (not isinstance(value, dict) or set(value) != {"version", "member_ids"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or not isinstance(value["member_ids"], list) or len(value["member_ids"]) != 2
+            or any(not isinstance(v, str) for v in value["member_ids"])
+            or len(set(value["member_ids"])) != 2):
+        raise ValueError("invalid_capacity_pool_members")
+    for member in value["member_ids"]:
+        _safe_id(member)
+    return tuple(sorted(value["member_ids"]))
+
+
+def reserve_capacity_member(repo, approval_id, member_id, *, connection=None):
+    """Reserve and bind one immutable member in the existing ledger transaction.
+
+    No provider request or action is created here. E2 must integrate these same
+    intents with the sole controller; calling the legacy cold tick is forbidden.
+    A bound member cannot be replaced or rebound, even after confirmed removal.
+    """
+    _safe_id(approval_id), _safe_id(member_id)
+    with repo.transaction() if connection is None else nullcontext(connection) as conn:
+        repo._lock_capacity(conn)
+        approval = repo._locked(conn, select(capacity_approvals).where(capacity_approvals.c.id == approval_id))
+        if approval is None or member_id not in pool_member_ids(approval["payload"]):
+            raise Conflict("capacity_pool_member_not_approved")
+        p = approval["payload"]
+        _approval_live(repo, conn, approval)
+        existing = conn.execute(select(capacity_pool_members).where(
+            capacity_pool_members.c.approval_id == approval_id,
+            capacity_pool_members.c.member_id == member_id)).mappings().first()
+        if existing:
+            if existing["approval_hash"] != approval["approval_hash"]:
+                raise Conflict("capacity_pool_member_identity_mismatch")
+            row = conn.execute(select(instance_intents).where(instance_intents.c.id == existing["intent_id"])).mappings().one()
+            return {**row, "created": False, "dry_run": False}
+        policy = p["scale_policy"]
+        intent = repo.reserve_instance_intent(Scope(**p["budget_scope"]), p["pool"],
+            "member-"+request_hash({"approval_id": approval_id, "member_id": member_id}),
+            physical_gpus=1, slots=1, reserved_cost_microusd=policy["instance_reservation_microusd"],
+            hard_deadline=min(policy["hard_deadline"], approval["expires_at"]),
+            budget_account_ids=p["budget_account_ids"], dry_run=False,
+            provider=p["launch"]["provider"], connection=conn)
+        if not intent["created"]:
+            raise Conflict("capacity_pool_member_unbound_intent")
+        conn.execute(insert(capacity_pool_members).values(approval_id=approval_id, member_id=member_id,
+            approval_hash=approval["approval_hash"], intent_id=intent["id"], created_at=repo.clock()))
+        return intent
+
+
+def member_matches_worker(repo, connection, approval, worker, job):
+    """Check a ready member without binding the unsubmitted job to that node."""
+    p = approval["payload"]
+    member_ids = pool_member_ids(p)
+    if not member_ids:
+        return True
+    execution = job["execution_plan"]
+    now = repo.clock()
+    if (approval["tenant_id"] != job["tenant_id"] or p["pool"] != job["pool"]
+            or approval["id"] != execution.get("capacity_approval_id")
+            or approval["approval_hash"] != execution.get("capacity_approval_hash")
+            or p["configuration_id"] != worker["spec"]["configuration_id"]
+            or p["model_id"] != worker["spec"]["model_id"]
+            or job["request"].get("recipe_id") not in p["recipe_ids"]
+            or approval["enabled"] != 1 or approval["expires_at"] <= now
+            or min(p["quote_expires_at"], p["qualification_expires_at"], p["scale_policy"]["hard_deadline"]) <= now
+            or not _matches_engine(p, worker["spec"])):
+        return False
+    return connection.execute(select(capacity_pool_members.c.intent_id).join(instance_intents,
+        instance_intents.c.id == capacity_pool_members.c.intent_id).where(
+            capacity_pool_members.c.approval_id == approval["id"],
+            capacity_pool_members.c.approval_hash == approval["approval_hash"],
+            capacity_pool_members.c.member_id.in_(member_ids), instance_intents.c.pool == p["pool"],
+            instance_intents.c.provider == worker["provider"],
+            instance_intents.c.provider_instance_id == worker["instance_id"],
+            instance_intents.c.state.in_(("starting", "ready", "busy")),
+            instance_intents.c.hard_deadline > now+job["expected_runtime_s"]+120)).first() is not None
+
+
+def capacity_member_claim_allowed(repo, connection, job, worker):
+    binding = job["execution_plan"].get("capacity_binding")
+    if binding is None:
+        return True  # Historical claims do not acquire a new approval requirement.
+    if binding != "pool-members-v1":
+        return False
+    approval_id = job["execution_plan"].get("capacity_approval_id")
+    if not approval_id:
+        return False
+    approval = connection.execute(select(capacity_approvals).where(capacity_approvals.c.id == approval_id)).mappings().first()
+    if approval is None:
+        return False
+    try:
+        return bool(pool_member_ids(approval["payload"])) and member_matches_worker(repo, connection, approval, worker, job)
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+def pool_members_require_warm_binding(repo, tenant_id, pool, configuration_id):
+    """E1 has no warm-plan binding path; never downgrade an opted-in pool.
+
+    Revocation/expiry cannot convert these same slots back to unbound warm
+    admission. A later lifecycle implementation must supply the full binding.
+    """
+    with repo.engine.connect() as connection:
+        return connection.execute(select(capacity_approvals.c.id).where(
+            capacity_approvals.c.tenant_id == tenant_id, capacity_approvals.c.pool == pool,
+            capacity_approvals.c.configuration_id == configuration_id,
+            capacity_approvals.c.payload["pool_members"].as_string().is_not(None)).limit(1)).first() is not None
+
+
 def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configuration_id,
         recipe_ids, policy_hash, qualification_evidence_id, qualification_expires_at,
         quote_expires_at, expires_at, launch, scale_policy, budget_scope,
-        budget_account_ids, enabled=False, backend="comfy-worker", engine_manifest_digest="", output_delivery=""):
+        budget_account_ids, enabled=False, backend="comfy-worker", engine_manifest_digest="", output_delivery="",
+        pool_members=None):
     """Operator-only immutable approval. Revoke separately; never mutate its quote.
 
-    This is not a public API and does not reserve/create an instance. A new
-    approval ID is required after its sole bootstrap intent has ended.
+    This is not a public API and does not reserve/create an instance. Legacy
+    approvals bind one bootstrap intent; opt-in pool members each bind one
+    immutable intent. Neither mode permits replacement within that binding.
     """
     for value in (approval_id, tenant_id, pool, model_id, configuration_id, qualification_evidence_id):
         _safe_id(value)
     _engine_identity(dict(backend=backend, engine_manifest_digest=engine_manifest_digest, output_delivery=output_delivery))
+    members = pool_member_ids({"pool_members": pool_members}) if pool_members is not None else ()
+    if members and (not isinstance(scale_policy, ScalePolicy)
+            or scale_policy.max_instances != 2 or scale_policy.max_physical_gpus != 2
+            or scale_policy.new_instance_slots != 1 or scale_policy.new_instance_physical_gpus != 1):
+        raise ValueError("capacity_pool_requires_two_single_gpu_members")
     now = repo.clock()
     if (type(enabled) is not bool or not isinstance(launch, LaunchSpec)
             or not isinstance(scale_policy, ScalePolicy) or not isinstance(budget_scope, Scope)
@@ -102,6 +223,8 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
             or scale_policy.approved_remaining_microusd is None
             or scale_policy.instance_reservation_microusd > scale_policy.approved_remaining_microusd):
         raise ValueError("capacity_instance_budget_not_approved")
+    if members and 2*scale_policy.instance_reservation_microusd > scale_policy.approved_remaining_microusd:
+        raise ValueError("capacity_pool_budget_not_approved")
     for value in (*recipe_ids, *budget_account_ids):
         _safe_id(value)
     payload = canonical(dict(tenant_id=tenant_id, pool=pool, model_id=model_id,
@@ -112,7 +235,8 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
         budget_scope=asdict(budget_scope), budget_account_ids=sorted(budget_account_ids),
         **(dict(backend=backend, engine_manifest_digest=engine_manifest_digest)
             if backend == "wangp-worker" else {}),
-        **(dict(output_delivery=output_delivery) if output_delivery else {})))
+        **(dict(output_delivery=output_delivery) if output_delivery else {}),
+        **({"pool_members": {"version": 1, "member_ids": list(members)}} if members else {})))
     digest = request_hash(payload)
     try:
         with repo.transaction() as connection:
@@ -143,6 +267,21 @@ def _approval_live(repo, connection, row):
             pool["max_instances"], pool["max_physical_gpus"]) <= 0:
         raise BudgetExceeded("capacity_start_disabled")
     cycle = connection.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == row["id"])).mappings().first()
+    members = pool_member_ids(p)
+    if members:
+        if cycle:
+            raise Conflict("capacity_pool_has_legacy_cycle")
+        bound = list(connection.execute(select(instance_intents).join(capacity_pool_members,
+            capacity_pool_members.c.intent_id == instance_intents.c.id).where(
+                capacity_pool_members.c.approval_id == row["id"],
+                capacity_pool_members.c.approval_hash == row["approval_hash"],
+                capacity_pool_members.c.member_id.in_(members))).mappings())
+        if any(r["state"] not in ("destroyed", "destroying", "draining") and r["hard_deadline"] > now for r in bound):
+            return None  # Waiters belong to the approval, never its first member.
+        if len(bound) == len(members):
+            raise Conflict("capacity_pool_members_unavailable")
+        # A never-bound original member is still eligible. Run the ordinary
+        # capacity/account checks below; do not replace a failed bound member.
     if cycle:
         intent = connection.execute(select(instance_intents).where(instance_intents.c.id == cycle["intent_id"])).mappings().one()
         if intent["state"] in ("destroyed", "destroying", "draining") or intent["hard_deadline"] <= now:
@@ -206,6 +345,7 @@ def admit_waiter(repo, connection, scope, job, plan):
             or p["model_id"] != request.get("request", {}).get("model")
             or request.get("recipe_id") not in p["recipe_ids"]
             or p["configuration_id"] != execution.get("configuration_id")
+            or execution.get("capacity_binding") != ("pool-members-v1" if pool_member_ids(p) else None)
             or not _matches_engine(p, execution) or execution.get("enabled") is not True
             or execution.get("quote_known") is not True
             or p["qualification_evidence_id"] != execution.get("qualification_evidence_id")
@@ -286,6 +426,8 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
             raise Conflict("capacity_transfer_grants_missing")
         old, new = grants[previous_id], grants[next_id]
         a, b = old["payload"], new["payload"]
+        if pool_member_ids(a) or pool_member_ids(b):
+            raise Conflict("capacity_pool_transfer_not_implemented")
         exact = ("tenant_id", "pool", "model_id", "configuration_id", "recipe_ids", "policy_hash",
                  "qualification_evidence_id", "qualification_expires_at", "quote_expires_at",
                  "budget_scope", "budget_account_ids")
@@ -372,6 +514,7 @@ class ColdStartCoordinator:
 
     def _valid(self, approval):
         try:
+            pool_member_ids(approval["payload"])
             return bool(approval["enabled"] == 1 and approval["expires_at"] > self.repo.clock()
                 and approval["payload"]["quote_expires_at"] > self.repo.clock()
                 and approval["payload"]["qualification_expires_at"] > self.repo.clock()
@@ -437,6 +580,8 @@ class ColdStartCoordinator:
         approval = self.repo._locked(connection, select(capacity_approvals).where(capacity_approvals.c.id == approval_id))
         if not self._valid(approval):
             raise Conflict("capacity_approval_unavailable")
+        if pool_member_ids(approval["payload"]):
+            raise Conflict("capacity_pool_controller_not_implemented")
         if connection.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == approval_id)).first():
             raise Conflict("capacity_cycle_already_started")
         connection.execute(insert(capacity_cycles).values(approval_id=approval_id, intent_id=intent["id"], created_at=self.repo.clock()))
@@ -482,6 +627,7 @@ class ColdStartCoordinator:
                         or waiter["approval_id"] != approval["id"]):
                     continue
                 grant = connection.execute(select(capacity_approvals).where(capacity_approvals.c.id == approval["id"])).mappings().one()
+                members = pool_member_ids(grant["payload"])
                 reason = None
                 if not proven_unsubmitted_capacity_job(connection, job):
                     connection.execute(update(jobs).where(jobs.c.id == jid).values(status="recovery_hold",
@@ -492,12 +638,18 @@ class ColdStartCoordinator:
                     reason = "capacity_approval_expired_or_revoked"
                 elif not _matches_engine(grant["payload"], job["execution_plan"]):
                     reason = "capacity_plan_approval_mismatch"
+                elif job["execution_plan"].get("capacity_binding") != ("pool-members-v1" if members else None):
+                    reason = "capacity_plan_approval_mismatch"
                 elif waiter["deadline"] <= self.repo.clock():
                     reason = "capacity_wait_deadline_expired"
                 elif self.activation_guard(job) is not True:
                     reason = "execution_policy_unavailable_before_activation"
                 elif not self._source_current(connection, job):
                     reason = "capacity_source_changed_before_activation"
+                elif members and waiter["intent_id"] is not None:
+                    reason = "capacity_pool_waiter_identity_mismatch"
+                elif members and waiter["approval_hash"] != grant["approval_hash"]:
+                    reason = "capacity_pool_waiter_identity_mismatch"
                 intent = None
                 if waiter["intent_id"]:
                     intent = connection.execute(select(instance_intents).where(instance_intents.c.id == waiter["intent_id"])).mappings().one()
@@ -534,6 +686,7 @@ class ColdStartCoordinator:
                 match = next((w for w in candidates if _matches_engine(p, w["spec"])
                     and w["spec"]["model_id"] == p["model_id"] and w["spec"]["configuration_id"] == p["configuration_id"]
                     and job["request"]["recipe_id"] in w["spec"]["recipe_ids"]
+                    and (not members or member_matches_worker(self.repo, connection, grant, w, job))
                     and (intent is None or w["provider"] == intent["provider"]
                          and w["instance_id"] == intent["provider_instance_id"])), None)
                 if match is None:
@@ -580,6 +733,8 @@ class ColdStartCoordinator:
         if self.scaler is None:
             return {"state": "cloud_controller_not_configured"}
         approval = self._approval(approval_id)
+        if pool_member_ids(approval["payload"]):
+            return {"state": "capacity_pool_controller_not_implemented"}
         activated, failed = self._advance(approval)
         with self.repo.engine.connect() as connection:
             cycle = connection.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == approval_id)).mappings().first()

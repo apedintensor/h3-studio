@@ -395,6 +395,10 @@ class ExecutionPolicies:
                 configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend,
                 **({"engine_manifest_digest": policy["engine_manifest_digest"]} if backend == "wangp-worker" else {}),
                 **({"output_delivery": policy["output_delivery"]} if "output_delivery" in policy else {}))
+            if capacity["ready"] + capacity["busy"] > 0:
+                from .capacity import pool_members_require_warm_binding
+                if pool_members_require_warm_binding(self.repo, scope.tenant_id, policy["pool"], policy["configuration_id"]):
+                    blockers.append("此双节点执行池尚未接入完整的持续服务，请保留任务并等待启用")
         if not blockers and capacity["ready"] + capacity["busy"] == 0:
             # Only an independently approved, current launch can admit a wait.
             # Empty approvals / gates=0 retain the original blocked behavior.
@@ -434,7 +438,8 @@ class ExecutionPolicies:
         if "output_delivery" in policy:
             base.update(output_delivery=policy["output_delivery"], delivery_spec=native_delivery_spec(compiled))
         if approval:
-            base.update(capacity_approval_id=approval["id"], capacity_approval_hash=approval["approval_hash"])
+            base.update(capacity_approval_id=approval["id"], capacity_approval_hash=approval["approval_hash"],
+                **({"capacity_binding": "pool-members-v1"} if "pool_members" in approval["payload"] else {}))
         expiry = min(now+900, latest_start) if not blockers else now+900
         if approval:
             if not blockers:

@@ -454,7 +454,8 @@ class FiniteController:
 
     def approval_current(self, payload):
         c = self.config
-        return bool(not self.stopping() and payload["tenant_id"] == c.tenant and payload["pool"] == c.pool
+        return bool("pool_members" not in payload and not self.stopping()
+            and payload["tenant_id"] == c.tenant and payload["pool"] == c.pool
             and payload["configuration_id"] == c.configuration_id and payload["recipe_ids"] == list(c.recipe_ids)
             and payload["policy_hash"] == c.execution_policy_sha256
             and payload["budget_scope"] == asdict(c.scope)
