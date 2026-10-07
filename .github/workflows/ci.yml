@@ -349,8 +349,10 @@ jobs:
         with:
           role-to-assume: ${{ vars.SIXNINE_AWS_PUBLISH_ROLE }}
           aws-region: ap-southeast-1
-          allowed-account-ids: '829135631045'
       - run: python -m pip install -r requirements.lock.txt
+      - name: Verify actual AWS release caller account
+        timeout-minutes: 1
+        run: python tools/check_aws_release_account.py
       - name: Publish validated platform bundle (host approval remains independent)
         env:
           RELEASE_COMMIT: ${{ github.sha }}
@@ -385,8 +387,10 @@ jobs:
         with:
           role-to-assume: ${{ vars.SIXNINE_AWS_PUBLISH_ROLE }}
           aws-region: ap-southeast-1
-          allowed-account-ids: '829135631045'
       - run: python -m pip install -r requirements.lock.txt
+      - name: Verify actual AWS release caller account
+        timeout-minutes: 1
+        run: python tools/check_aws_release_account.py
       - name: Publish validated frontend bundle (host approval and API match still required)
         env:
           RELEASE_COMMIT: ${{ github.sha }}
@@ -417,8 +421,10 @@ jobs:
         with:
           role-to-assume: ${{ vars.SIXNINE_AWS_DEPLOY_ROLE }}
           aws-region: ap-southeast-1
-          allowed-account-ids: '829135631045'
       - run: python -m pip install -r requirements.lock.txt
+      - name: Verify actual AWS release caller account
+        timeout-minutes: 1
+        run: python tools/check_aws_release_account.py
       - name: Deploy previously tested and independently approved platform release
         env:
           APPROVED_COMMIT: ${{ inputs.approved_commit }}
@@ -457,8 +463,10 @@ jobs:
         with:
           role-to-assume: ${{ vars.SIXNINE_AWS_DEPLOY_ROLE }}
           aws-region: ap-southeast-1
-          allowed-account-ids: '829135631045'
       - run: python -m pip install -r requirements.lock.txt
+      - name: Verify actual AWS release caller account
+        timeout-minutes: 1
+        run: python tools/check_aws_release_account.py
       - name: Deploy approved frontend with matching deployed API compatibility
         env:
           APPROVED_COMMIT: ${{ inputs.approved_frontend_commit }}
