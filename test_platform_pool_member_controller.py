@@ -68,7 +68,8 @@ class MemberLaunchTests(LedgerCase):
         self.scaler = ScaleCoordinator(self.repo, provider=self.provider, enabled=True,
             preparation_timeout_s=120, preparation_binding="b"*64)
         self.launcher = MemberLaunchCoordinator(self.scaler,
-            approval_guard=self.policies.capacity_approval_current, job_guard=self.policies.activation_allowed)
+            approval_guard=self.policies.capacity_approval_current, job_guard=self.policies.activation_allowed,
+            budget_ceiling_microusd=10_000_000)
         self.lease = self.scaler.acquire("cold-pool", "pool-owner")
 
     def create(self, member):

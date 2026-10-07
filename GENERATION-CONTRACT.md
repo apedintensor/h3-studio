@@ -193,7 +193,10 @@ continue to refuse the new lifecycle. The original shared queue remains the
 only generation dispatcher.
 
 One confirmed task can finance the two original approved members, subject to
-the existing account and capacity gates. The sole pool leader commits each
+the existing account and capacity gates. The create transaction also checks
+cumulative spent plus reserved amounts against the lesser of the service
+ceiling and each locked account limit; a failed check rolls back the new member
+before any provider call. The sole pool leader commits each
 member's instance reservation, immutable binding, scaler action and optional
 provider-preparation start barrier in one transaction before its sole create
 call. Repeated ticks/restarts reconcile that action; unknown A is never rented
@@ -206,6 +209,11 @@ host fault domains; that is a separate provider/live acceptance requirement.
 Member preparation failures and runtime quarantine do not revoke a healthy
 peer's approval. Existing exact-instance stop/idle evidence still gates
 destruction, and all original attempt recovery remains attached to its worker.
+The existing rental receipt ledger commits member quarantine with its worker
+drain fence; restart replays that same evidence before activation. Missing
+private diagnostic files cannot clear a committed hold. Controller status
+names the held intents and reports repair-required when none remains usable,
+without changing an unknown attempt into a new waiting job.
 Unknown/cancel/collection obligations prevent pool-idle shutdown but do not, by
 themselves, create new redundancy demand. Positive waiting/queued/claimed/
 submitting/running work supplies that demand. Drafts and preflight remain inert.

@@ -478,7 +478,17 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
             execution = job["execution_plan"]
             existing = conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == jid)).mappings().first()
             if execution.get("capacity_approval_id") == next_id and existing and existing["approval_id"] == next_id:
+                if member_transfer and (execution.get("capacity_binding") != "pool-members-v1"
+                        or execution.get("capacity_approval_hash") != new["approval_hash"]
+                        or existing["approval_hash"] != new["approval_hash"] or existing["intent_id"] is not None):
+                    raise Conflict("capacity_pool_transfer_binding_mismatch")
                 continue  # Idempotent recovery after the transaction committed.
+            if member_transfer and (execution.get("capacity_binding") != "pool-members-v1"
+                    or execution.get("capacity_approval_id") != previous_id
+                    or execution.get("capacity_approval_hash") != old["approval_hash"]
+                    or existing is None or existing["approval_id"] != previous_id
+                    or existing["approval_hash"] != old["approval_hash"] or existing["intent_id"] is not None):
+                raise Conflict("capacity_pool_transfer_binding_mismatch")
             if (not proven_unsubmitted_capacity_job(conn, job) or execution.get("policy_hash") != a["policy_hash"]
                     or execution.get("capacity_approval_id") not in (None, previous_id)
                     or execution.get("capacity_approval_id") == previous_id

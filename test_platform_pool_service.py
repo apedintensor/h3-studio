@@ -4,19 +4,19 @@ import json
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlalchemy import select, update
+from sqlalchemy import delete, insert, select, update
 
-from studio_platform.capacity import pool_member_ids
+from studio_platform.capacity import pool_member_ids, transfer_unsubmitted_capacity
 from studio_platform.capabilities import compile_request
 from studio_platform.control import WorkerControl, WorkerSpec
 from studio_platform.execution_policy import ExecutionPolicies
-from studio_platform.on_demand_scaler import OnDemandConfig, OnDemandController
+from studio_platform.on_demand_scaler import OnDemandConfig, OnDemandController, cycle_config
 from studio_platform.pool_member_controller import PoolServiceCycle
-from studio_platform.production_scaler import RECIPE
+from studio_platform.production_scaler import RECIPE, save
 from studio_platform.qualification_profiles import QUEUED_TASK_PROFILE, MULTIMODAL_INPUT_LIMITS
 from studio_platform.inference.outputs import NATIVE_DELIVERY
 from studio_platform.queue import TaskQueue
-from studio_platform.repository import capacity_approvals, capacity_pool_members, capacity_waiters, instance_intents, request_hash
+from studio_platform.repository import Conflict, capacity_approvals, capacity_pool_members, capacity_waiters, instance_intents, jobs, request_hash
 from studio_platform.repository import Scope
 from studio_platform.scaler import ProviderFact
 from studio_platform.service_policy import TWO_MEMBER_MODE
@@ -195,6 +195,30 @@ class PoolServiceTests(LedgerCase):
         self.assertEqual(b.control.claim(b.worker, self.config.pool).job["id"], job["id"])
         self.assertFalse(self.controller.current.rotation_allowed())
 
+    def test_both_provider_timeouts_report_repair_without_searching_or_new_rental(self):
+        original = self.provider.create
+        def pending(tag, launch, **kwargs):
+            value = original(tag, launch, **kwargs)
+            value = ProviderFact("starting", value.instance_id, provider_status="PENDING", preparation_stage="provider_preparing")
+            self.provider.facts[tag] = value
+            return value
+        self.provider.create = pending
+        self.provider.billing = lambda *args: 100_000
+        scope, job = self.submit()
+        self.tick()
+        status = self.tick(121)
+        self.assertEqual(status["reason"], "queued_task_repair_required")
+        self.assertEqual(len(status["member_holds"]), 2)
+        self.assertEqual(status["billing_pending"], 0)
+        self.assertTrue(status["all_destroyed"])
+        self.assertEqual(self.controller.sequence, 1)
+        kept = self.repo.get_job(scope, job["id"])
+        self.assertEqual(kept["request"], job["request"])
+        self.assertEqual(kept["error_code"], "capacity_queued_task_repair_required")
+        self.assertEqual(kept["status"], "waiting_capacity")
+        self.tick()
+        self.assertEqual(len(self.provider.creates), 2)
+
     def test_whole_pair_ttl_transfers_original_unsubmitted_waiter_without_deadline_or_budget_reset(self):
         scope, job = self.start()
         old_approval = self.grant()["id"]
@@ -296,6 +320,95 @@ class PoolServiceTests(LedgerCase):
         self.assertEqual(boot.control.claim(boot.worker, self.config.pool).job["id"], job["id"])
         self.assertFalse(self.controller.stopping())
         self.assertEqual(self.repo.get_budget("finite-budget")["limit_microusd"], 2_000_000)
+
+    def test_cumulative_service_ceiling_is_atomic_below_larger_account_limit(self):
+        self.repo.configure_budget("finite-budget", tenant_id="sixnine", limit_microusd=10_000_000)
+        with self.repo.transaction() as connection:
+            self.repo._reserve(connection, self.config.scope, ["finite-budget"], "instance",
+                "historical-synthetic-rental", 3_000_000)
+            self.repo._settle(connection, "instance", "historical-synthetic-rental", 3_000_000)
+        scope, job = self.start()
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(set(self.mapping()), {"a"})
+        budget = self.repo.get_budget("finite-budget")
+        self.assertEqual(budget["spent_microusd"], 3_000_000)
+        self.assertEqual(budget["reserved_microusd"], 2_000_000)
+        self.assertEqual(budget["limit_microusd"], 10_000_000)
+        self.tick()
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(len(self.repo.list_instance_intents(pool=self.config.pool)), 1)
+        a = self.controller.current.boots[self.mapping()["a"]]
+        self.assertEqual(a.control.claim(a.worker, self.config.pool).job["id"], job["id"])
+
+    def test_quarantine_write_failure_fences_claims_and_old_partial_hold_replays_before_activation(self):
+        scope, original = self.start()
+        waiting_scope, waiting = self.submit("supervan", "waiting-through-repair")
+        rows = {r["id"]: r for r in self.repo.list_instance_intents(pool=self.config.pool)}
+        a, b = (rows[self.mapping()[member]] for member in ("a", "b"))
+        cycle = self.controller.current
+        with patch("studio_platform.pool_member_controller.save", side_effect=OSError("synthetic receipt failure")):
+            with self.assertRaises(OSError):
+                cycle._boot_failure(a, {"state": "bootstrap_failed"})
+        self.assertEqual(cycle.boots[a["id"]].control.get(cycle.boots[a["id"]].worker)["state"], "draining")
+        self.assertFalse((cycle.config.work_dir/"member-holds"/(a["id"]+".json")).exists())
+        self.assertIsNotNone(cycle.member_hold(a))  # Committed ledger proof survives the lost file.
+        # Reproduce the interrupted old file-before-ledger ordering. A restart
+        # must consume this evidence before any waiter can be activated on B.
+        save(cycle.config.work_dir/"member-holds"/(b["id"]+".json"), {
+            "config_hash": cycle.config.fingerprint(), "intent_id": b["id"],
+            "instance_id": b["provider_instance_id"], "sources": cycle.config.source_sha256,
+            "reason": "bootstrap_failed", "observed_at": self.now})
+        status = self.tick()
+        self.assertEqual(len(status["member_holds"]), 2)
+        self.assertEqual(status["reason"], "queued_task_repair_required")
+        kept = self.repo.get_job(waiting_scope, waiting["id"])
+        self.assertEqual(kept["status"], "waiting_capacity")
+        self.assertEqual(kept["error_code"], "capacity_queued_task_repair_required")
+        self.assertEqual(self.repo.get_job(scope, original["id"])["attempt_no"], 0)
+        self.assertIn(cycle.boots[b["id"]].control.get(cycle.boots[b["id"]].worker)["state"], ("draining", "retired"))
+        self.assertEqual(len(self.provider.creates), 2)
+        self.provider.billing = lambda *args: 100_000
+        self.tick(); self.tick()
+        self.assertEqual(self.controller.sequence, 1)
+        self.assertFalse(cycle.rotation_allowed())
+
+    def test_pair_transfer_rejects_unbound_or_missing_original_waiter_without_mutation(self):
+        scope, job = self.start()
+        previous = self.grant()["id"]
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.pool == self.config.pool)
+                .values(hard_deadline=self.now+16))
+        self.provider.billing = lambda *args: 100_000
+        with patch.object(self.controller, "_can_rotate", return_value=False):
+            self.tick()
+        next_cycle = PoolServiceCycle(self.repo, self.settings, cycle_config(self.config, 2),
+            provider=self.provider, boot_factory=single.HeartbeatBoot)
+        next_cycle.initialize()
+        self.repo.set_capacity_approval_enabled(previous, enabled=False)
+        current = self.repo.get_job(scope, job["id"])
+        with self.repo.engine.connect() as connection:
+            waiter = dict(connection.execute(select(capacity_waiters).where(
+                capacity_waiters.c.job_id == job["id"])).mappings().one())
+        for field in ("capacity_binding", "capacity_approval_id", "capacity_approval_hash", "waiter"):
+            with self.subTest(missing=field):
+                execution = dict(current["execution_plan"])
+                if field != "waiter":
+                    execution.pop(field)
+                with self.repo.transaction() as connection:
+                    connection.execute(update(jobs).where(jobs.c.id == job["id"]).values(execution_plan=execution))
+                    if field == "waiter":
+                        connection.execute(delete(capacity_waiters).where(capacity_waiters.c.job_id == job["id"]))
+                with self.assertRaisesRegex(Conflict, "capacity_pool_transfer_binding_mismatch"):
+                    transfer_unsubmitted_capacity(self.repo, previous, next_cycle.config.capacity_approval_id,
+                        allowed_owners=self.config.allowed_owners, children_done_confirmed=True)
+                after = self.repo.get_job(scope, job["id"])
+                self.assertEqual(after["execution_plan"], execution)
+                self.assertEqual(after["request"], current["request"])
+                self.assertEqual(after["attempt_no"], 0)
+                with self.repo.transaction() as connection:
+                    connection.execute(update(jobs).where(jobs.c.id == job["id"]).values(execution_plan=current["execution_plan"]))
+                    if field == "waiter":
+                        connection.execute(insert(capacity_waiters).values(**waiter))
 
     def test_duplicate_provider_instance_is_held_without_boot_or_third_rental(self):
         from studio_platform.repository import Conflict

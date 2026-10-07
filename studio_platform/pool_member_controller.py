@@ -6,13 +6,16 @@ The caller owns the same fenced pool leader and injects its current policy guard
 from __future__ import annotations
 
 from dataclasses import asdict
+from contextlib import nullcontext
 import json
+import uuid
 
 from sqlalchemy import insert, select, update
 
 from .capacity import pool_member_ids, reserve_capacity_member
 from .repository import (Conflict, capacity_approvals, capacity_pool_members,
-    capacity_waiters, instance_intents, jobs, registered_workers, scaler_actions, canonical, BudgetExceeded)
+    budget_accounts, capacity_waiters, instance_intents, jobs, registered_workers, scaler_actions,
+    scaler_receipts, canonical, BudgetExceeded)
 from .scaler import LaunchSpec
 
 
@@ -55,9 +58,12 @@ class MemberLaunchCoordinator:
     No replacement or rebound membership is provided by this primitive.
     """
 
-    def __init__(self, scaler, *, approval_guard, job_guard):
+    def __init__(self, scaler, *, approval_guard, job_guard, budget_ceiling_microusd):
+        if type(budget_ceiling_microusd) is not int or budget_ceiling_microusd <= 0:
+            raise ValueError("capacity_pool_service_budget_required")
         self.scaler, self.repo = scaler, scaler.repo
         self.approval_guard, self.job_guard = approval_guard, job_guard
+        self.budget_ceiling_microusd = budget_ceiling_microusd
 
     def managed(self, connection, approval):
         p = approval["payload"]
@@ -165,6 +171,16 @@ class MemberLaunchCoordinator:
             intent = reserve_capacity_member(self.repo, approval_id, member_id, connection=connection)
             if not intent["created"]:
                 raise Conflict("capacity_pool_member_action_missing")
+            # reserve_capacity_member already holds the ordered account locks.
+            # Check the post-reservation balance in this same transaction so a
+            # service ceiling below the account limit cannot be exceeded by a
+            # sibling/racing spender. Failure rolls back every new member row.
+            accounts = list(connection.execute(select(budget_accounts).where(
+                budget_accounts.c.id.in_(p["budget_account_ids"]))).mappings())
+            if len(accounts) != len(p["budget_account_ids"]) or any(
+                    a["spent_microusd"]+a["reserved_microusd"] > min(a["limit_microusd"], self.budget_ceiling_microusd)
+                    for a in accounts):
+                raise BudgetExceeded("capacity_pool_service_budget_exceeded")
             connection.execute(insert(scaler_actions).values(intent_id=intent["id"], pool=p["pool"],
                 launch_spec=canonical(asdict(launch)), create_started_at=self.repo.clock()))
             if self.scaler.preparation_timeout_s is not None:
@@ -196,7 +212,8 @@ class PoolServiceCycle(FiniteController):
         if len(self.member_ids) != 2:
             raise ScalerError("capacity_pool_members_required")
         self.members = MemberLaunchCoordinator(self.scaler,
-            approval_guard=self.approval_current, job_guard=self.job_allowed)
+            approval_guard=self.approval_current, job_guard=self.job_allowed,
+            budget_ceiling_microusd=self.config.service_policy["budget_ceiling_microusd"])
         self.scaler.unused_preparation_guard = self._unused_provider_preparation
         self.scaler.unsubmitted_retirement_guard = self._member_retirement_allowed
 
@@ -266,13 +283,18 @@ class PoolServiceCycle(FiniteController):
     def port_for(self, intent_id):
         return port_for_member(self.config, self.repo, intent_id)
 
-    def member_hold(self, intent):
+    def member_hold(self, intent, connection=None):
         path = self.config.work_dir/"member-holds"/(intent["id"]+".json")
-        if not path.exists():
-            return None
-        value = json.loads(path.read_text())
-        if (value.get("config_hash") != self.config.fingerprint() or value.get("intent_id") != intent["id"]
-                or value.get("instance_id") != intent["provider_instance_id"]
+        with self.repo.engine.connect() if connection is None else nullcontext(connection) as conn:
+            recorded = list(conn.execute(select(scaler_receipts.c.facts).where(
+                scaler_receipts.c.intent_id == intent["id"], scaler_receipts.c.operation == "member_quarantine")
+                .limit(2)).scalars())
+        file_value = json.loads(path.read_text()) if path.exists() else None
+        if len(recorded) > 1 or recorded and file_value is not None and recorded[0] != file_value:
+            raise ScalerError("capacity_pool_member_hold_mismatch")
+        value = recorded[0] if recorded else file_value
+        if value is not None and (not isinstance(value, dict) or value.get("config_hash") != self.config.fingerprint()
+                or value.get("intent_id") != intent["id"] or value.get("instance_id") != intent["provider_instance_id"]
                 or value.get("sources") != self.config.source_sha256):
             raise ScalerError("capacity_pool_member_hold_mismatch")
         return value
@@ -282,13 +304,29 @@ class PoolServiceCycle(FiniteController):
         # Existing worker recovery and provider idle proofs still gate deletion.
         directory = self.config.work_dir/"member-holds"
         directory.mkdir(exist_ok=True)
-        if not self.member_hold(intent):
-            save(directory/(intent["id"]+".json"), {"config_hash": self.config.fingerprint(),
-                "intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
-                "sources": self.config.source_sha256, "reason": state["state"], "observed_at": self.repo.clock()})
+        # Quarantine and claim fence commit together in the existing ledger.
+        # The optional private diagnostic copy is never retirement authority.
+        value = self._drain_member(intent, reason=state["state"])
+        if not (directory/(intent["id"]+".json")).exists():
+            save(directory/(intent["id"]+".json"), value)
+
+    def _drain_member(self, intent, *, reason=None):
         with self.repo.transaction() as connection:
             self.repo._lock_capacity(connection)
             row = self.repo._locked(connection, select(instance_intents).where(instance_intents.c.id == intent["id"]))
+            if row is None or row["pool"] != self.config.pool or row["provider_instance_id"] != intent["provider_instance_id"]:
+                raise ScalerError("capacity_pool_member_hold_mismatch")
+            value = self.member_hold(intent, connection)
+            if value is None:
+                if reason is None:
+                    raise ScalerError("capacity_pool_member_hold_missing")
+                value = {"config_hash": self.config.fingerprint(), "intent_id": intent["id"],
+                    "instance_id": intent["provider_instance_id"], "sources": self.config.source_sha256,
+                    "reason": reason, "observed_at": self.repo.clock()}
+            if connection.execute(select(scaler_receipts.c.id).where(scaler_receipts.c.intent_id == intent["id"],
+                    scaler_receipts.c.operation == "member_quarantine")).first() is None:
+                connection.execute(insert(scaler_receipts).values(id=str(uuid.uuid4()), intent_id=intent["id"],
+                    operation="member_quarantine", observed_at=self.repo.clock(), facts=canonical(value)))
             if row["state"] in ("starting", "ready", "busy"):
                 self.repo.update_instance(row["id"], "draining", connection=connection)
             connection.execute(update(registered_workers).where(registered_workers.c.provider == row["provider"],
@@ -296,6 +334,15 @@ class PoolServiceCycle(FiniteController):
                 registered_workers.c.state != "retired").values(drain_requested=1, state="draining", updated_at=self.repo.clock()))
         if intent["id"] in self.boots:
             self.boots[intent["id"]].request_drain()
+        return value
+
+    def _sync_provider_preparation(self):
+        # Replay existing durable holds before activation or boot observation.
+        # This also handles a receipt from an interrupted older write ordering.
+        rows, _ = self._managed()
+        for row in rows:
+            if self.member_hold(row) is not None:
+                self._drain_member(row)
 
     def _unused_provider_preparation(self, connection, intent):
         grant = self._approval(connection)
@@ -317,7 +364,7 @@ class PoolServiceCycle(FiniteController):
         if grant is None:
             return False
         _, _, mapping = self.members.managed(connection, grant)
-        return intent["id"] in mapping.values() and self.member_hold(intent) is not None
+        return intent["id"] in mapping.values() and self.member_hold(intent, connection) is not None
 
     def _bootstrap_start_allowed(self, intent_id, lease):
         if self.stopping():
@@ -357,7 +404,20 @@ class PoolServiceCycle(FiniteController):
                 return {"state": "blocked", "reason": "ledger_capacity_or_budget_limit"}
             except LeaseLost:
                 return {"state": "leader_changed_reconcile_required"}
+        rows, _ = self._managed()
+        repair = self._repair_members(rows)
+        if repair and not any(row["state"] in ("starting", "ready", "busy") and row["id"] not in repair for row in rows):
+            decision = {"state": "blocked", "reason": "queued_task_repair_required"}
         return decision
+
+    def _repair_members(self, rows):
+        held = set()
+        with self.repo.engine.connect() as connection:
+            for row in rows:
+                preparation = self.scaler.preparation(connection, row)
+                if self.member_hold(row, connection) is not None or preparation and preparation["phase"] == "retiring_unused":
+                    held.add(row["id"])
+        return held
 
     def request_rollover(self):
         # Only whole-pair retirement uses this; one member's TTL is local.
@@ -372,16 +432,12 @@ class PoolServiceCycle(FiniteController):
 
     def rotation_allowed(self):
         rows, _ = self._managed()
-        if not rows or any(self.member_hold(row) is not None for row in rows):
+        if not rows or self._repair_members(rows):
             return False
-        with self.repo.engine.connect() as connection:
-            for row in rows:
-                phase = self.scaler.preparation(connection, row)
-                if phase and phase["phase"] == "retiring_unused":
-                    return False  # No automatic failed-member replacement in this slice.
         return all(row["state"] == "destroyed" and row["billing_status"] == "settled" for row in rows)
 
-    def _close_unsubmitted(self):
-        # Final service shutdown retains the normal queued-task hold semantics.
-        # An idle pair has no accepted obligations; rotation does not cancel.
-        return super()._close_unsubmitted()
+    def status(self, *, fresh_ledger_only=False, **extra):
+        rows, _ = self._managed()
+        extra["member_holds"] = [{"intent_id": intent_id, "state": "repair_required"}
+            for intent_id in sorted(self._repair_members(rows))]
+        return super().status(fresh_ledger_only=fresh_ledger_only, **extra)
