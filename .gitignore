@@ -215,6 +215,8 @@ inventory.json
 !deploy/platform/gpu_preparation_recovery.py
 !studio_platform/backlog_handoff.py
 !studio_platform/preparation_recovery.py
+!studio_platform/preparation_hold_recovery.py
+!deploy/platform/preparation_hold_recovery.py
 !test_platform_preparation_recovery.py
 !test_platform_backlog_handoff.py
 !test_platform_gpu_acceptance.py
