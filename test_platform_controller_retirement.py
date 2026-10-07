@@ -30,7 +30,9 @@ class ControllerRetirementTests(LedgerCase):
         self.controller = object.__new__(OnDemandController)
         self.controller.repo = self.repo
         self.controller.current = SimpleNamespace(config=self.config,
-            boots={self.intent["id"]: self.boot}, _managed=lambda: ([self.intent], {}))
+            boots={self.intent["id"]: self.boot}, _managed=lambda: ([self.intent], {}),
+            provider_retirement=lambda: None, _capacity_advance_allowed=lambda: True)
+        # This fixture owns an already-booted fleet, not unused preparation.
         self.status = {"instances": [self.intent], "all_destroyed": True,
             "active_jobs_truncated": False, "active_job_ids": []}
 

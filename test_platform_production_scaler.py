@@ -74,6 +74,8 @@ def as_json(config):
         value.pop('output_delivery')
     if value['provider_preparation_timeout_s'] is None:
         value.pop('provider_preparation_timeout_s')
+    if value['provider_preparation_failure_limit'] == 2:
+        value.pop('provider_preparation_failure_limit')
     for field in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[field] = str(value[field])
     return value
@@ -474,12 +476,19 @@ class ConfigAndCredentialTests(unittest.TestCase):
 
     def test_provider_preparation_deadline_is_explicit_validated_and_omitted_when_disabled(self):
         self.assertNotIn('provider_preparation_timeout_s', as_json(self.config))
+        self.assertNotIn('provider_preparation_failure_limit', as_json(self.config))
         selected = replace(self.config, provider_preparation_timeout_s=1800)
         self.assertNotEqual(selected.fingerprint(), self.config.fingerprint())
         self.assertEqual(selected.scale_policy, self.config.scale_policy)
         for invalid in (True, 0, -1, 119, 7201, 1800.0, float('nan'), '1800'):
             with self.subTest(invalid=invalid), self.assertRaisesRegex(ScalerError, 'provider_preparation_timeout'):
                 replace(self.config, provider_preparation_timeout_s=invalid)
+        for invalid in (True, 0, -1, 6, 2.0, None, '2'):
+            with self.subTest(limit=invalid), self.assertRaisesRegex(ScalerError, 'provider_preparation_failure_limit'):
+                replace(selected, provider_preparation_failure_limit=invalid)
+        with self.assertRaisesRegex(ScalerError, 'provider_preparation_failure_limit'):
+            replace(self.config, provider_preparation_failure_limit=1)
+        self.assertNotEqual(replace(selected, provider_preparation_failure_limit=1).fingerprint(), selected.fingerprint())
 
     def envelope(self):
         return {"secret_arn": ARN, "version_id": VERSION, "payload": {"schema_version": 1, "service": "lium",
