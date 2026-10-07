@@ -243,6 +243,39 @@ User authorization obtained on 2026-10-06. Pinned research revision: `deepbeepme
 
 ## 8. Acceptance matrix
 
+### Offline REF candidate boundary (D4 #29)
+
+`deploy/wangp/manifest-ref2va-candidate.json` defines a separate pinned Ref2VA
+transformer and `sixnine-h3-ref2va-bf16-50-smallrefs-v1` compiler. It retains Base,
+BF16 transformer/text encoder, 50 steps, SDPA and MMGP profile 4. Its initial
+qualification input is at most one image, one silent video and one audio, with
+at least one visual reference; images/videos are 256--832 px per side, at most
+832x480 pixels and aspect ratio 0.4--2.5. A video is an explicit 2--3-second
+source selection normalized by the existing asset service to 24 fps and 56 or
+73 frames. Audio is 2--3 seconds, PCM16 WAV, 32 kHz stereo. Output is five
+requested seconds, 832x480 and 124 native frames. These conservative bounds are
+for the first qualification, not claims of the model's maximum capability.
+
+The compiler consumes immutable owned asset snapshots, preserves reference
+order, and maps images/video/audio to `image_refs` / `video_guide` /
+`audio_guide` with explicit `I`, `V-U`, and `A` flags. There is no soundtrack
+extraction, first/last mixing, automatic aggregate trimming or extra guide.
+The private resolver rechecks the actual staged content hash, image geometry,
+video frame count and absence of any audio track, and audio format/duration.
+Media metadata alone cannot attest silence. Typed file copies preserve exact
+normalized bytes; they do not transcode or shorten inputs.
+
+The manifest/profile, model-specific pristine Session defaults and owned
+launcher are bound together; legacy FL manifests and accepted jobs stay on
+their original route. This source slice does **not** enable public REF plans:
+the public compiler/capability, finite controller recipe, operating envelope
+and `native-frames-v1` delivery currently remain FL-only. Wiring those exact
+bindings, freezing a complete environment package and recording real REF
+output/memory/cost evidence are separate required gates before API admission.
+Candidate construction or offline fake-Session success is not GPU parity or
+production availability. Inference and mixed-reference peak RAM/VRAM have not
+been established for this candidate on one B200.
+
 | Gate | Required proof | Evidence level |
 |---|---|---|
 | Existing API compatibility | Same types/statuses/IDs; owner isolation; source-version rejection; same-key replay and conflict; no paid action on plan/card. | Isolated API/repository tests |

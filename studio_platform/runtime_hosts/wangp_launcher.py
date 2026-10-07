@@ -80,10 +80,42 @@ def shutdown_owned_host(host, session, *, grace_seconds=180, terminate=None,
             terminate_process()
 
 
-def resolve_inputs(prepared, inputs):
+def resolve_inputs(prepared, inputs, manifest=None):
     settings = prepared.settings
+    if manifest is not None:
+        from ..inference.wangp_compiler import COMPILER_ID as FL_COMPILER_ID, PROFILE_ID as FL_PROFILE_ID
+        from ..inference.wangp_ref_compiler import COMPILER_ID as REF_COMPILER_ID, PROFILE_ID as REF_PROFILE_ID
+        model = {(FL_COMPILER_ID, FL_PROFILE_ID): "minimax_h3_fl2va",
+                 (REF_COMPILER_ID, REF_PROFILE_ID): "minimax_h3_ref2va"}.get(
+            (manifest.document["compiler_id"], manifest.document["profile_id"]))
+        if model is None or settings.get("model_type") != model or prepared.manifest_digest != manifest.digest:
+            raise ValueError("wangp_manifest_binding_mismatch")
     handles = {item.handle: item for item in prepared.inputs}
     used = set()
+    if settings.get("model_type") == "minimax_h3_ref2va":
+        if any(settings.get(field) is not None for field in (
+                "image_start", "image_end", "video_source", "audio_source", "video_guide2",
+                "video_guide3", "audio_guide2", "audio_guide3")):
+            raise ValueError("wangp_ref_unsupported_input_role")
+        def resolve(handle, kind):
+            if (not isinstance(handle, str) or handle not in handles or handle in used
+                    or handles[handle].kind != kind):
+                raise ValueError("wangp_unbound_input_handle")
+            used.add(handle)
+            if kind == "image":
+                return str(inputs.image_path(handles[handle], reference=True))
+            return str(getattr(inputs, kind + "_path")(handles[handle]))
+        references = settings.get("image_refs")
+        if references is not None:
+            if not isinstance(references, list) or len(references) != 1:
+                raise ValueError("wangp_ref_qualification_count_exceeded")
+            settings["image_refs"] = [resolve(handle, "image") for handle in references]
+        for field, kind in (("video_guide", "video"), ("audio_guide", "audio")):
+            if settings.get(field) is not None:
+                settings[field] = resolve(settings[field], kind)
+        if used != set(handles) or not used:
+            raise ValueError("wangp_unused_input_handle")
+        return settings
     for field in ("image_start", "image_end"):
         handle = settings.get(field)
         if handle is not None:
@@ -139,7 +171,7 @@ def main(argv=None):
         # runtime; a competing process cannot load a second copy into this slot.
         host = WanGPHost(session=pending, journal=journal, manifest=manifest,
                          output_root=output, sealed_root=state / "sealed-output",
-                         settings_resolver=lambda prepared: resolve_inputs(prepared, inputs))
+                         settings_resolver=lambda prepared: resolve_inputs(prepared, inputs, manifest))
         evidence = verify_runtime(args.runtime_root, args.config, args.manifest, args.model_root)
         if evidence.get("manifest_digest") != manifest.digest:
             raise ValueError("wangp_verified_manifest_changed")

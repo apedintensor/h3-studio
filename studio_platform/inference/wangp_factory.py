@@ -6,6 +6,7 @@ import stat
 
 from .wangp import WanGPBackend
 from .wangp_compiler import H3FL2VACompiler, MODEL_ID
+from .wangp_ref_compiler import H3Ref2VACompiler, COMPILER_ID as REF_COMPILER_ID
 from .wangp_contract import EngineManifest
 from .wangp_http import HTTPWanGPTransport
 from ..runtime_hosts.wangp_http import private_token_file
@@ -52,6 +53,7 @@ the transport; they are never serialized into fleet/config/manifest identities.
         raise ValueError("wangp_manifest_binding_mismatch")
     transport = HTTPWanGPTransport(slot.endpoint, private_token_file(value["token_file"]),
         expected_incarnation=value['runtime_incarnation'])
+    compiler = H3Ref2VACompiler if manifest.document["compiler_id"] == REF_COMPILER_ID else H3FL2VACompiler
     return WanGPBackend(enabled=True, slot_key=value["slot_key"], manifest=manifest,
-                        transport=transport, compiler=H3FL2VACompiler(manifest, transport.stage_input),
+                        transport=transport, compiler=compiler(manifest, transport.stage_input),
                         expected_incarnation=value.get('runtime_incarnation'))
