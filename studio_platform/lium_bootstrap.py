@@ -629,6 +629,7 @@ class BootController:
                     "shutdown_grace_s": config.shutdown_grace_s, "slots": [{**asdict(spec), "enabled": True,
                         "endpoint": endpoint, "allowed_origins": [endpoint], "comfy_revision": COMFY_REVISION, "confirmed_idle": True}]}
                 if self.config.execution_backend == "wangp-worker":
+                    value["version"] = 2
                     value["slots"][0].update(comfy_revision="", runtime_config_file=slot.runtime_config_file)
                 cfg_path.write_text(json.dumps(value), encoding="utf-8")
                 self.fleet = self.fleet_factory(config, self.repo, cfg_path)

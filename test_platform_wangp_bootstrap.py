@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from studio_platform.inference.wangp_contract import EngineManifest, HostReadiness
+from studio_platform.fleet import read_config as read_fleet
 from studio_platform.lium_bootstrap import BootConfig, BootController, BootError
 from studio_platform.qualification_profiles import QUEUED_TASK_PROFILE
 from studio_platform.wangp_bootstrap import SOURCE_NAMES, connect_backend, read_sources, validate_report
@@ -63,6 +64,13 @@ class WanGPBootTests(LedgerCase):
         self.assertEqual(slot.comfy_revision, '')
         self.assertEqual(self.host.starts, 1)
         self.assertEqual(set(self.host.identity['sources']), SOURCE_NAMES)
+        # Exercise the same persisted file/parser boundary used by run_child;
+        # checking only FakeFleet's in-memory config misses schema mismatches.
+        fleet_path = self.config.work_dir/self.intent['id']/'fleet.json'
+        persisted = read_fleet(fleet_path)
+        self.assertEqual(json.loads(fleet_path.read_text())['version'], 2)
+        self.assertEqual(persisted, boot.fleet.config)
+        self.assertEqual(persisted.fingerprint(), boot.fleet.config.fingerprint())
 
     def test_lost_start_response_reconnects_original_without_install_or_start(self):
         self.host.lose_start = True
