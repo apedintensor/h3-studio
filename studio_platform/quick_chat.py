@@ -758,6 +758,13 @@ class QuickChatService:
         job = self.repo._job(conn, p["job_id"], Scope(self.tenant, principal.owner,
             self._get(conn, principal, item["session_id"], item["session_id"], "session")["payload"]["project_id"]), lock=lock)
         history = conn.execute(select(attempts).where(attempts.c.job_id == job["id"])).mappings().all()
+        current_id = job.get("current_attempt_id")
+        current = next((a for a in history if a["id"] == current_id), None)
+        if current_id is not None and (current is None or job["attempt_no"] < 1
+                or current["number"] != job["attempt_no"]):
+            # An orphan reference remains an obligation even when recovered
+            # summary counters are empty or another historical row is stopped.
+            raise QuickChatError("upstream_stop_unconfirmed", "当前执行身份须先核验；不会再次生成。")
         safe_unsubmitted = (job["status"] in {"planned", "blocked", "cancelled"} and not job["attempt_no"] and not history)
         safe_failed = (allow_failed and job["status"] in {"failed", "cancelled"}
             and len(history) >= job["attempt_no"] and all(a["upstream_stopped"] == 1 for a in history))

@@ -561,6 +561,45 @@ class QuickChatTests(unittest.TestCase):
         with self.assertRaises(QuickChatError):
             self.preflight(revision, key="restore-pf", item_ids=[item["id"]])
 
+    def test_orphan_current_attempt_needs_matching_stopped_history_before_retry(self):
+        revision = self.card()["revision"]
+        submitted = self.submit(revision)
+        item = submitted["items"][0]
+        with self.repo.transaction() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == item["job_id"]).values(
+                status="failed", attempt_no=0, current_attempt_id="missing-current-attempt"))
+
+        def refused(key):
+            current = self.service.get_submission(self.principal, self.sid, submitted["id"])
+            self.assertFalse(current["items"][0]["retryable"])
+            with self.assertRaises(QuickChatError) as error:
+                self.preflight(revision, key=key, item_ids=[item["id"]],
+                    retry_of_execution_id=item["current_execution_id"])
+            self.assertEqual(error.exception.code, "upstream_stop_unconfirmed")
+
+        refused("orphan-empty-history")
+        with self.repo.transaction() as conn:
+            conn.execute(insert(attempts).values(id="stopped-first-attempt", job_id=item["job_id"],
+                number=1, status="failed", fence=1, worker_id="synthetic-worker", created_at=1,
+                updated_at=1, upstream_stopped=1))
+            conn.execute(update(jobs).where(jobs.c.id == item["job_id"]).values(attempt_no=1))
+        refused("orphan-other-stopped-history")
+        with self.repo.transaction() as conn:
+            conn.execute(insert(attempts).values(id="stopped-second-attempt", job_id=item["job_id"],
+                number=2, status="failed", fence=2, worker_id="synthetic-worker", created_at=2,
+                updated_at=2, upstream_stopped=1))
+            conn.execute(update(jobs).where(jobs.c.id == item["job_id"]).values(
+                attempt_no=2, current_attempt_id="stopped-first-attempt"))
+        refused("current-number-mismatch")
+        with self.repo.transaction() as conn:
+            conn.execute(update(jobs).where(jobs.c.id == item["job_id"]).values(
+                current_attempt_id="stopped-second-attempt"))
+        current = self.service.get_submission(self.principal, self.sid, submitted["id"])
+        self.assertTrue(current["items"][0]["retryable"])
+        fresh = self.preflight(revision, key="matching-stopped-current", item_ids=[item["id"]],
+            retry_of_execution_id=item["current_execution_id"])
+        self.assertEqual(fresh["status"], "ready")
+
     def test_timeline_cursor_stable_scoped_and_runtime_does_not_append(self):
         for index in range(5):
             self.turn(mode="none", key="record-"+str(index))
