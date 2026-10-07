@@ -156,10 +156,10 @@ class FiniteControlTests(unittest.TestCase):
                 'ssh_key_file': '/worker-identity/key', 'known_hosts_file': '/control/known_hosts',
                 'hard_deadline': 5000, 'source_sha256': {name: hashlib.sha256((source/name).read_bytes()).hexdigest()
                     for name in ('bootstrap_cloud.py', 'model_manifest.json')},
-                'execution_policy_sha256': scaler.fingerprint({'approved': 'synthetic'})}
+                'execution_policy_sha256': scaler.fingerprint({'approved': 'synthetic', 'backend': 'comfy-worker'})}
             config_path = root/'operator'/'scaler.json'
             config_path.write_text(json.dumps(config))
-            (root/'operator'/'execution-policy.json').write_text(json.dumps({'approved': 'synthetic'}))
+            (root/'operator'/'execution-policy.json').write_text(json.dumps({'approved': 'synthetic', 'backend': 'comfy-worker'}))
             metadata = {'secret_arn': config['secret_arn'], 'version_id': config['secret_version_id'],
                 'service': 'lium', 'profile': 'lium--rig-root'}
             metadata_path = root/'runtime.json'

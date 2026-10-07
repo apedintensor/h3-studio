@@ -1,5 +1,6 @@
 """Fixed, operator-configured CPU adapter factory; imports never start a runtime."""
 import json
+import re
 from pathlib import Path
 import stat
 
@@ -38,14 +39,19 @@ the transport; they are never serialized into fleet/config/manifest identities.
     if slot.spec.backend != "wangp-worker":
         raise ValueError("wangp_factory_backend_mismatch")
     value = read_document(slot.runtime_config_file, maximum=16384)
-    required = {"version", "enabled", "slot_key", "configuration_id", "manifest_file", "token_file"}
-    if (set(value) != required or type(value["version"]) is not int or value["version"] != 1
+    required = {"version", "enabled", "slot_key", "configuration_id", "manifest_file", "token_file", "runtime_incarnation"}
+    if (set(value) != required
+            or not isinstance(value.get('runtime_incarnation'), str)
+            or not re.fullmatch(r'[0-9a-f]{32}', value['runtime_incarnation'])
+            or type(value["version"]) is not int or value["version"] != 1
             or value["enabled"] is not True or value["configuration_id"] != slot.spec.configuration_id):
         raise ValueError("wangp_runtime_configuration_mismatch")
     manifest = EngineManifest.from_dict(read_document(value["manifest_file"]))
     if (manifest.digest != slot.spec.engine_manifest_digest or slot.spec.model_id != MODEL_ID
             or manifest.document.get("synthetic") is True):
         raise ValueError("wangp_manifest_binding_mismatch")
-    transport = HTTPWanGPTransport(slot.endpoint, private_token_file(value["token_file"]))
+    transport = HTTPWanGPTransport(slot.endpoint, private_token_file(value["token_file"]),
+        expected_incarnation=value['runtime_incarnation'])
     return WanGPBackend(enabled=True, slot_key=value["slot_key"], manifest=manifest,
-                        transport=transport, compiler=H3FL2VACompiler(manifest, transport.stage_input))
+                        transport=transport, compiler=H3FL2VACompiler(manifest, transport.stage_input),
+                        expected_incarnation=value.get('runtime_incarnation'))

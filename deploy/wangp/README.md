@@ -31,6 +31,38 @@ the existing platform. The upstream Session is private to a one-slot host.
 
 ## Explicit startup interfaces
 
+### Platform cold-start integration
+
+The existing production controller selects `execution_backend=wangp-worker` and
+the frozen `engine_manifest_digest`; it still owns the original PostgreSQL
+capacity, rental and job ledger. Do not start a second controller or reuse a
+Comfy approval for this runtime. The cold path uses the real queued-task profile;
+boot readiness never fabricates an inference result.
+
+The initial host-managed rollout uses a separately staged, root-owned dependency
+archive at `gpu-scaler/public-source/wangp-dependencies.tar.gz`. The host verifies
+its hash from the small runtime configuration and mounts it read-only into the
+CPU controller. The controller streams it in bounded chunks to the GPU's
+`/root/sixnine-cache`, resumes only a matching prefix, and publishes it only after
+the complete hash matches. Large wheels and weights are never inserted into the
+controller's in-memory source map. Other bootstrap package modes are manual
+interfaces, not alternative enabled production configurations.
+
+The PyTorch template starts bootstrap through `/opt/conda/bin/python`; its
+observed Python patch version must match the captured lock. The private client
+configuration requires the original 32-hex `runtime_incarnation`. Missing/null
+identity cannot configure a production slot. Same-instance SSH recovery keeps
+the listener and worker identities while checking the retained host key; full
+controller-process restart recovery is a separate C2 gate.
+
+Host installation is separate from the application release. Install the reviewed
+`deploy/platform/gpu_scaler.py`, `deploy/platform/release.py` and the pure
+`studio_platform/service_policy.py` in their existing protected host locations;
+the application bundle does not automatically replace `/opt/sixnine-release`.
+Archive a verified finished lifecycle before constructing new inputs, preserve
+the SSH identity and database, and never reset accounting or old approvals to
+make the new configuration pass.
+
 ### Package preparation and one-shot bootstrap
 
 `package_tool.py` is an explicit build command, never an application import hook.

@@ -65,6 +65,11 @@ def as_json(config):
         value.pop("qualification_profile")
     if value["authorization_extension_s"] == 0:
         value.pop("authorization_extension_s")
+    if value['execution_backend'] == 'comfy-worker':
+        value.pop('execution_backend')
+        value.pop('engine_manifest_digest')
+    if value['service_policy'] is None:
+        value.pop('service_policy')
     for field in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[field] = str(value[field])
     return value

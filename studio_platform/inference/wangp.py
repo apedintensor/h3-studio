@@ -19,11 +19,16 @@ class WanGPBackend:
 
     def __init__(self, *, enabled=False, slot_key="wangp-disabled", manifest=None,
                  transport=None, compiler=None, max_download_bytes=512 * 1024 * 1024,
-                 max_transfer_seconds=180):
+                 max_transfer_seconds=180, expected_incarnation=None):
         self.enabled = enabled is True
         self.slot_key, self.manifest = slot_key, manifest
         self.transport, self.compiler = transport, compiler
         self.max_bytes, self.max_seconds = max_download_bytes, max_transfer_seconds
+        if expected_incarnation is not None:
+            import re
+            if not isinstance(expected_incarnation, str) or not re.fullmatch(r'[0-9a-f]{32}', expected_incarnation):
+                raise ValueError('wangp_invalid_runtime_incarnation')
+        self.expected_incarnation = expected_incarnation
         _identifier(slot_key)
         if (type(max_download_bytes) is not int or max_download_bytes <= 0
                 or not 0 < max_transfer_seconds < float("inf")):
@@ -40,7 +45,8 @@ class WanGPBackend:
         try:
             info = self.transport.readiness()
             return (isinstance(info, HostReadiness) and info.idle is True
-                    and info.manifest_digest == self.manifest.digest and info.slot_key == self.slot_key)
+                    and info.manifest_digest == self.manifest.digest and info.slot_key == self.slot_key
+                    and (self.expected_incarnation is None or info.incarnation == self.expected_incarnation))
         except Exception:
             return False
 
@@ -95,6 +101,7 @@ class WanGPBackend:
             raise BackendError("wangp_task_identity_mismatch")
         if (not isinstance(value, OperationReceipt) or value.operation_id != expected
                 or value.attempt_tag != tag or value.manifest_digest != self.manifest.digest
+                or self.expected_incarnation is not None and value.incarnation != self.expected_incarnation
                 or value.slot_key != self.slot_key):
             raise BackendError("wangp_receipt_identity_mismatch")
         return value

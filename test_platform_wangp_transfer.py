@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from studio_platform.lium_bootstrap import BootError
+from studio_platform import wangp_bootstrap
 from studio_platform.wangp_bootstrap import (
     DEPENDENCY_NAME, MAX_DEPENDENCY_BYTES, WanGPSSHHost, dependency_source,
 )
@@ -72,6 +73,45 @@ class LocalRemote:
         self.pipelined = []
         self.scripts = []
         self.corrupt_write = False
+        self.interrupt_after_write = False
+        self.after_write = lambda: None
+        self.channels = []
+        self.open_timeouts = []
+        self.open_error = None
+
+    def get_transport(self):
+        return self
+
+    def open_session(self, *, timeout):
+        self.open_timeouts.append(timeout)
+        if self.open_error is not None:
+            raise self.open_error
+
+        class Channel:
+            def __init__(self):
+                self.closed = False
+                self.timeout = None
+                self.subsystems = []
+
+            def settimeout(self, value):
+                self.timeout = value
+
+            def invoke_subsystem(self, name):
+                if self.closed:
+                    raise EOFError("Synthetic closed SFTP channel")
+                self.subsystems.append(name)
+
+            def close(self):
+                self.closed = True
+
+        channel = Channel()
+        self.channels.append(channel)
+        return channel
+
+    def sftp_client(self, channel):
+        if channel.closed:
+            raise EOFError("Synthetic closed SFTP channel")
+        return self.open_sftp()
 
     def run(self, script, **kwargs):
         anchor = "Path('/root/sixnine-cache')"
@@ -93,6 +133,9 @@ class LocalRemote:
                 return self
 
             def __exit__(self, *args):
+                pass
+
+            def close(self):
                 pass
 
             def open(self, name, mode):
@@ -120,7 +163,12 @@ class LocalRemote:
                         if remote.corrupt_write:
                             data = bytes([data[0] ^ 1]) + data[1:]
                             remote.corrupt_write = False
-                        return target.write(data)
+                        count = target.write(data)
+                        remote.after_write()
+                        if remote.interrupt_after_write:
+                            remote.interrupt_after_write = False
+                            raise ConnectionResetError("Synthetic transfer interruption")
+                        return count
 
                 return Writer()
 
@@ -147,6 +195,9 @@ class WanGPTransferTests(unittest.TestCase):
         self.host.run = self.remote.run
         self.host.client = self.remote
         self.host.start = Mock(side_effect=AssertionError("Transfer must not launch a runtime"))
+        sftp = patch("paramiko.SFTPClient", side_effect=self.remote.sftp_client)
+        sftp.start()
+        self.addCleanup(sftp.stop)
         self.source = GuardedSource(self.archive)
         self.final = self.remote.root / DEPENDENCY_NAME
         self.partial = self.remote.root / (DEPENDENCY_NAME + ".partial")
@@ -173,6 +224,10 @@ class WanGPTransferTests(unittest.TestCase):
         self.assertEqual(self.source.read_bytes, self.size)
         self.assertEqual(self.remote.pipelined, [True])
         self.assertEqual(len(self.remote.scripts), 2)
+        self.assertTrue(all(0 < value <= wangp_bootstrap.SFTP_OPEN_SECONDS
+                            for value in self.remote.open_timeouts))
+        self.assertTrue(all(channel.closed and 0 < channel.timeout <= wangp_bootstrap.SFTP_IO_SECONDS
+                            and channel.subsystems == ["sftp"] for channel in self.remote.channels))
         self.host.start.assert_not_called()
 
     def test_new_archive_streams_bounded_chunks_then_publishes(self):
@@ -235,6 +290,70 @@ class WanGPTransferTests(unittest.TestCase):
         self.assertFalse(self.final.exists())
         self.assertTrue(self.partial.is_file())
         self.assertEqual(len(self.remote.scripts), 1)
+        self.host.start.assert_not_called()
+
+    def test_interrupted_write_preserves_valid_prefix_then_resumes(self):
+        self.remote.interrupt_after_write = True
+        with self.assertRaises(ConnectionResetError):
+            self.transfer()
+        self.assertEqual(self.partial.stat().st_size, CHUNK)
+        self.assertFalse(self.final.exists())
+        self.assertTrue(self.remote.channels[0].closed)
+        self.host.start.assert_not_called()
+        self.transfer()
+        self.assertEqual(checksum(self.final), self.expected)
+        self.assertEqual([item[1] for item in self.remote.opens], ["wx", "ab"])
+        self.assertEqual(sum(self.remote.writes), self.size)
+        self.assertFalse(self.partial.exists())
+        self.host.start.assert_not_called()
+
+    def test_overall_deadline_interrupts_transfer_and_retains_resume_prefix(self):
+        clock = [10.0]
+        self.remote.after_write = lambda: clock.__setitem__(0, 10.0 + wangp_bootstrap.DEPENDENCY_TRANSFER_SECONDS + 1)
+        with patch.object(wangp_bootstrap.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaisesRegex(BootError, "wangp_dependency_transfer_timeout"):
+                self.transfer()
+        self.assertEqual(self.partial.stat().st_size, CHUNK)
+        self.assertFalse(self.final.exists())
+        self.assertTrue(self.remote.channels[0].closed)
+        self.host.start.assert_not_called()
+        self.remote.after_write = lambda: None
+        self.transfer()
+        self.assertEqual(checksum(self.final), self.expected)
+        self.assertEqual([item[1] for item in self.remote.opens], ["wx", "ab"])
+        self.host.start.assert_not_called()
+
+    def test_channel_open_has_explicit_timeout_and_never_writes_on_failure(self):
+        self.remote.open_error = TimeoutError("Synthetic channel open timeout")
+        with self.assertRaises(TimeoutError):
+            self.transfer()
+        self.assertEqual(len(self.remote.open_timeouts), 1)
+        self.assertLessEqual(self.remote.open_timeouts[0], wangp_bootstrap.SFTP_OPEN_SECONDS)
+        self.assertEqual(self.remote.opens, [])
+        self.assertFalse(self.partial.exists())
+        self.host.start.assert_not_called()
+
+    def test_subsystem_guard_closes_channel_even_before_negotiation_returns(self):
+        guards = []
+
+        class ExpiringTimer:
+            def __init__(self, seconds, callback):
+                self.seconds, self.callback, self.cancelled = seconds, callback, False
+                guards.append(self)
+
+            def start(self):
+                self.callback()
+
+            def cancel(self):
+                self.cancelled = True
+
+        with patch.object(wangp_bootstrap.threading, "Timer", ExpiringTimer):
+            with self.assertRaisesRegex(BootError, "wangp_dependency_transfer_timeout"):
+                self.transfer()
+        self.assertTrue(guards[0].cancelled)
+        self.assertLessEqual(guards[0].seconds, wangp_bootstrap.SFTP_OPEN_SECONDS)
+        self.assertTrue(self.remote.channels[0].closed)
+        self.assertEqual(self.remote.opens, [])
         self.host.start.assert_not_called()
 
 

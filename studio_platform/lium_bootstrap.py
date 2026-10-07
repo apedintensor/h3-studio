@@ -38,7 +38,14 @@ BOOT_FAILURE_CODES = frozenset({"InternalSetupFailure", "SubprocessTimeout", "Su
     "ComfyRevisionMismatch", "RequiredComfyFlagMissing", "ImageTorchMissing", "ImageTorchChanged",
     "XetRequiredForLargeWeights", "InsufficientCacheDiskSpace", "DownloadedFileSizeMismatch",
     "ExistingModelPathConflict", "ModelDownloadFailed", "ExistingOwnedComfyNotReady",
-    "Port8188AlreadyInUse", "ComfyExitedBeforeReady", "ComfyStartupTimeout"})
+    "Port8188AlreadyInUse", "ComfyExitedBeforeReady", "ComfyStartupTimeout",
+    "bootstrap_operation_failed", "source_bundle_mismatch", "resolved_environment_manifest_required",
+    "dependency_artifact_mismatch", "environment_binding_mismatch", "system_package_mismatch",
+    "requirements_lock_mismatch", "wheel_mismatch", "model_disk_headroom", "model_size_mismatch",
+    "verification_receipt_mismatch", "gpu_observation_invalid", "single_gpu_recipe_required",
+    "private_token_invalid", "runtime_process_exited", "runtime_readiness_timeout",
+    "python31114_linux_required", "python311_linux_required", "bootstrap_configuration_invalid",
+    "system_deb_mismatch", "runtime_import_probe_failed", "runtime_import_receipt_mismatch"})
 BOOT_FAILURE_TYPES = frozenset({"SetupError", "RuntimeError", "ValueError", "TypeError", "OSError",
     "FileNotFoundError", "PermissionError", "ImportError", "ModuleNotFoundError", "TimeoutError",
     "ConnectionError", "CalledProcessError", "TimeoutExpired", "HTTPError", "HTTPStatusError",
@@ -46,7 +53,10 @@ BOOT_FAILURE_TYPES = frozenset({"SetupError", "RuntimeError", "ValueError", "Typ
     "LocalEntryNotFoundError", "EntryNotFoundError", "RepositoryNotFoundError", "RevisionNotFoundError",
     "XetDownloadError", "XetError", "JSONDecodeError"})
 BOOT_PHASES = frozenset({"preflight", "clone_comfy", "fetch_comfy", "pin_comfy", "install_dependencies",
-    "download_preflight", "download_file", "weights_ready", "start_comfy", "comfy_ready", "failed", "download"})
+    "download_preflight", "download_file", "weights_ready", "start_comfy", "comfy_ready", "failed", "download",
+    "checking_package", "dependency_download", "dependency_unpack", "dependency_install", "model_download",
+    "runtime_verification", "runtime_start", "runtime_ready", "runtime_start_unknown", "setup_failed",
+    "system_package_install", "runtime_imports"})
 
 
 def _static(value, allowed, fallback):
@@ -99,6 +109,8 @@ class BootConfig:
     recipe_ids: tuple[str, ...] = ("h3-base-fl2va-v1",)
     minimum_remaining_s: int = 1200
     qualification_profile: str = ""
+    execution_backend: str = "comfy-worker"
+    engine_manifest_digest: str = ""
 
     def __post_init__(self):
         for field in ("work_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
@@ -120,27 +132,59 @@ class BootConfig:
             raise ValueError("bootstrap_qualification_profile_invalid")
         if self.qualification_profile == QUEUED_TASK_PROFILE and self.smoke_enabled:
             raise ValueError("queued_task_profile_cannot_submit_synthetic_smoke")
+        if self.execution_backend not in {"comfy-worker", "wangp-worker"}:
+            raise ValueError("bootstrap_backend_invalid")
+        if self.execution_backend == "wangp-worker":
+            if (not re.fullmatch(r"[0-9a-f]{64}", self.engine_manifest_digest)
+                    or self.qualification_profile != QUEUED_TASK_PROFILE
+                    or self.recipe_ids != ("h3-base-fl2va-v1",)):
+                raise ValueError("bootstrap_wangp_identity_required")
+        elif self.engine_manifest_digest:
+            raise ValueError("bootstrap_unexpected_engine_manifest")
         if self.fleet_enabled and not self.smoke_enabled and self.qualification_profile != QUEUED_TASK_PROFILE:
             raise ValueError("fleet_requires_successful_smoke")
 
 
 class SSHHost:
     """Paramiko private-key use stays inside the library; no secret serialization."""
+    remote_port = 8188
     def __init__(self, config, coordinates):
-        import paramiko
-        self.client = paramiko.SSHClient()
+        self.config, self.coordinates = config, dict(coordinates)
         self.tunnel = None
+        self._connection_lock = threading.Lock()
+        self._ever_connected = False
+        self.client = None
+        self.ensure_connected()
+
+    def ensure_connected(self):
+        """Reconnect the same endpoint with its already pinned key; never replay a command."""
+        with self._connection_lock:
+            transport = self.client.get_transport() if self.client is not None else None
+            if transport is not None and transport.is_active() and transport.is_authenticated():
+                return
+            self._connect()
+
+    def _connect(self):
+        import paramiko
+        config, coordinates = self.config, self.coordinates
+        if self.client is not None:
+            self.client.close()
+        self.client = paramiko.SSHClient()
         config.known_hosts_file.parent.mkdir(parents=True, exist_ok=True)
         if config.known_hosts_file.exists():
             self.client.load_host_keys(str(config.known_hosts_file))
         else:
             config.known_hosts_file.touch(mode=0o600)
             self.client.load_host_keys(str(config.known_hosts_file))
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy() if config.trust_first_host_key else paramiko.RejectPolicy())
+        # Initial explicit TOFU is allowed once. Transport recovery cannot trust
+        # a different host key if the endpoint was replaced or the pin was lost.
+        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy()
+            if config.trust_first_host_key and not self._ever_connected else paramiko.RejectPolicy())
         try:
             self.client.connect(coordinates["host"], port=coordinates["port"], username="root",
                 key_filename=str(config.ssh_key_file), look_for_keys=False, allow_agent=False,
                 timeout=15, banner_timeout=15, auth_timeout=15)
+            self._ever_connected = True
         except Exception:
             self.client.close()
             raise BootError("bootstrap_ssh_unavailable_or_host_key_untrusted") from None
@@ -148,6 +192,7 @@ class SSHHost:
     def run(self, script, *, limit=4*1024*1024, timeout=25):
         channel = None
         try:
+            self.ensure_connected()
             channel = self.client.get_transport().open_session(timeout=15)
             channel.exec_command("python3 -c "+shlex.quote(script))
             output, started = bytearray(), time.monotonic()
@@ -309,9 +354,9 @@ print(json.dumps(result))
         return self.run(script)
 
     def open_tunnel(self, port):
+        self.ensure_connected()
         if self.tunnel:
             return
-        transport = self.client.get_transport()
         gate = threading.BoundedSemaphore(8)
         class Handler(socketserver.BaseRequestHandler):
             def handle(inner):
@@ -319,7 +364,12 @@ print(json.dumps(result))
                     return
                 channel = None
                 try:
-                    channel = transport.open_channel("direct-tcpip", ("127.0.0.1", 8188), inner.request.getpeername(), timeout=15)
+                    # Keep the listening socket stable for existing workers;
+                    # each new request uses the current authenticated transport.
+                    transport = self.client.get_transport()
+                    if transport is None or not transport.is_active() or not transport.is_authenticated():
+                        return
+                    channel = transport.open_channel("direct-tcpip", ("127.0.0.1", self.remote_port), inner.request.getpeername(), timeout=15)
                     while transport.is_active():
                         readable, _, _ = io_select.select([inner.request, channel], [], [], 10)
                         for source, destination in ((inner.request, channel), (channel, inner.request)):
@@ -386,6 +436,9 @@ class BootController:
         return {"state": "bootstrap_failed", **safe_bootstrap_diagnosis(value)}
 
     def _sources(self):
+        if self.config.execution_backend == "wangp-worker":
+            from .wangp_bootstrap import read_sources
+            return read_sources(self.config)
         files = {}
         for name, maximum in (("bootstrap_cloud.py", 512*1024), ("model_manifest.json", 64*1024)):
             path = self.config.source_dir/name
@@ -397,6 +450,33 @@ class BootController:
                 or manifest.get("repository") != "Comfy-Org/MiniMax-H3" or len(manifest.get("files", [])) != 5):
             raise BootError("bootstrap_manifest_revision_mismatch")
         return files, manifest
+
+    def _identity(self, intent, files):
+        value = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+            "configuration_id": self.config.configuration_id,
+            "sources": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+        if self.config.execution_backend == "wangp-worker":
+            value.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
+        return value
+
+    def _connect_backend(self, intent, directory, state):
+        self.host.open_tunnel(self.config.local_port)
+        if self.backend is None:
+            if self.config.execution_backend == "wangp-worker":
+                from .wangp_bootstrap import connect_backend
+                self.backend = connect_backend(self, intent, directory, state)
+            else:
+                endpoint = f"http://127.0.0.1:{self.config.local_port}"
+                self.backend = self.backend_factory(endpoint=endpoint, enabled=True, allowed_origins=(endpoint,), comfy_revision=COMFY_REVISION)
+
+    def _slot(self, intent, report, directory):
+        if self.config.execution_backend == "wangp-worker":
+            from .wangp_bootstrap import make_slot
+            return make_slot(self.config, intent, report, directory)
+        endpoint = f"http://127.0.0.1:{self.config.local_port}"
+        spec = WorkerSpec("lium-"+intent["id"].replace("-", ""), intent["pool"], "lium", intent["provider_instance_id"],
+            (report["gpus"][0]["uuid"],), self.config.recipe_ids, self.config.model_id, self.config.configuration_id)
+        return SlotConfig(spec, True, endpoint, (endpoint,), COMFY_REVISION, True)
 
     def tick(self, intent_id):
         if not self.config.enabled:
@@ -425,9 +505,7 @@ class BootController:
                     self.fleet.drain()
                 return {"state": "bootstrap_deadline_insufficient"}
             files, manifest = self._sources()
-            identity = {"intent_id": intent_id, "instance_id": intent["provider_instance_id"],
-                "configuration_id": self.config.configuration_id,
-                "sources": {k: hashlib.sha256(v).hexdigest() for k, v in files.items()}}
+            identity = self._identity(intent, files)
             directory = self.config.work_dir/intent_id
             directory.mkdir(exist_ok=True)
             receipt = directory/"bootstrap-state.json"
@@ -480,10 +558,11 @@ class BootController:
             state["hardware"] = {"gpu": report["gpus"][0], "runtime": report["runtime"],
                 "model_revision": MODEL_REVISION, "comfy_revision": COMFY_REVISION,
                 "weight_verification": "pinned_cache_revision_and_exact_sizes_not_full_rehash"}
-            self.host.open_tunnel(self.config.local_port)
-            if self.backend is None:
-                endpoint = f"http://127.0.0.1:{self.config.local_port}"
-                self.backend = self.backend_factory(endpoint=endpoint, enabled=True, allowed_origins=(endpoint,), comfy_revision=COMFY_REVISION)
+            if self.config.execution_backend == "wangp-worker":
+                state["hardware"] = {"gpu": report["gpus"][0], "runtime": report["runtime"],
+                    "engine_manifest_digest": self.config.engine_manifest_digest,
+                    "source_revision": manifest["source_revision"], "weight_verification": "pinned_sha256"}
+            self._connect_backend(intent, directory, state)
             if not self.config.smoke_enabled and not queued_task:
                 if state["phase"] not in {"qualified", "fleet_starting", "fleet_started"}:
                     state["phase"] = "ready_for_qualification"
@@ -508,14 +587,15 @@ class BootController:
                     return {"state": "fleet_recovery_required", "generation_verified": not queued_task}
                 worker_id = "lium-"+intent_id.replace("-", "")
                 endpoint = f"http://127.0.0.1:{self.config.local_port}"
-                spec = WorkerSpec(worker_id, intent["pool"], "lium", intent["provider_instance_id"],
-                    (report["gpus"][0]["uuid"],), self.config.recipe_ids, self.config.model_id, self.config.configuration_id)
-                slot = SlotConfig(spec, True, endpoint, (endpoint,), COMFY_REVISION, True)
+                slot = self._slot(intent, report, directory)
+                spec = slot.spec
                 config = FleetConfig(directory/"fleet", (slot,), True, 1)
                 cfg_path = directory/"fleet.json"
                 value = {"version": 1, "work_dir": str(config.work_dir), "enabled": True, "max_children": 1,
                     "shutdown_grace_s": config.shutdown_grace_s, "slots": [{**asdict(spec), "enabled": True,
                         "endpoint": endpoint, "allowed_origins": [endpoint], "comfy_revision": COMFY_REVISION, "confirmed_idle": True}]}
+                if self.config.execution_backend == "wangp-worker":
+                    value["slots"][0].update(comfy_revision="", runtime_config_file=slot.runtime_config_file)
                 cfg_path.write_text(json.dumps(value), encoding="utf-8")
                 self.fleet = self.fleet_factory(config, self.repo, cfg_path)
                 state["fleet_recipe_ids"] = list(self.config.recipe_ids)
@@ -551,8 +631,12 @@ class BootController:
         # Once the fleet owns this endpoint, its normal attempt/fence controls
         # are authoritative. Never mistake its live real task for foreign work.
         if state["phase"] not in ("fleet_starting", "fleet_started"):
-            queue = self.backend._json("GET", "/queue")
-            if (not isinstance(queue, dict) or queue.get("queue_running") != [] or queue.get("queue_pending") != []):
+            if self.config.execution_backend == "wangp-worker":
+                idle = self.backend.is_idle() is True
+            else:
+                queue = self.backend._json("GET", "/queue")
+                idle = isinstance(queue, dict) and queue.get("queue_running") == [] and queue.get("queue_pending") == []
+            if not idle:
                 return {"state": "runtime_upstream_busy", "generation_verified": False}
             state["phase"] = "runtime_ready"
         elif existing is None or state.get("fleet_recipe_ids") != list(self.config.recipe_ids):
@@ -579,6 +663,9 @@ class BootController:
         return {"state": "qualified", "reference_evidence": result["evidence"]} if result["state"] == "qualified" else result
 
     def _validate_report(self, report, manifest):
+        if self.config.execution_backend == "wangp-worker":
+            from .wangp_bootstrap import validate_report
+            return validate_report(self.config, report, manifest)
         if (report.get("model_revision") != MODEL_REVISION or report.get("comfyui_revision") != COMFY_REVISION
                 or report.get("actual_comfy_revision") != COMFY_REVISION):
             raise BootError("bootstrap_runtime_revision_mismatch")
@@ -666,8 +753,11 @@ class BootController:
         if tag != self.bound_intent or instance_id != self.bound_instance or self.backend is None:
             raise BootError("bootstrap_idle_probe_not_bound")
         now = self.repo.clock()
-        queue = self.backend._json("GET", "/queue")
-        idle = queue.get("queue_running") == [] and queue.get("queue_pending") == []
+        if self.config.execution_backend == "wangp-worker":
+            idle = self.backend.is_idle() is True
+        else:
+            queue = self.backend._json("GET", "/queue")
+            idle = queue.get("queue_running") == [] and queue.get("queue_pending") == []
         self.idle_since = (self.idle_since if self.idle_since is not None else now) if idle else None
         return InferenceIdleProof(instance_id, now, self.idle_since or now, idle)
 
