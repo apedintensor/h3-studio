@@ -111,6 +111,7 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
     try:
         with repo.transaction() as connection:
             from .control import require_delivery_configuration
+            repo._lock_capacity(connection)
             require_delivery_configuration(connection, backend, configuration_id, output_delivery)
             existing = repo._locked(connection, select(capacity_approvals).where(capacity_approvals.c.id == approval_id))
             if existing:

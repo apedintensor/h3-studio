@@ -221,6 +221,14 @@ class BootTests(ledger.LedgerCase):
         self.assertEqual(controller.fleet.starts, 1)
         self.assertEqual(controller.fleet.config.slots[0].spec.physical_gpu_ids, (GPU,))
         self.assertEqual(controller.fleet.config.slots[0].spec.recipe_ids, ("h3-base-fl2va-v1",))
+        persisted = json.loads(controller.fleet.path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["version"], 1)
+        self.assertNotIn("output_delivery", persisted["slots"][0])
+        # Historical reader rejects unknown fields; preserve its exact schema,
+        # not merely the new reader's optional-field tolerance/fingerprint.
+        self.assertEqual(set(persisted["slots"][0]), {"worker_id", "pool", "provider", "instance_id",
+            "physical_gpu_ids", "recipe_ids", "model_id", "configuration_id", "backend",
+            "engine_manifest_digest", "enabled", "endpoint", "allowed_origins", "comfy_revision", "confirmed_idle"})
         self.assertEqual(self.tick(self.controller(smoke_enabled=True, fleet_enabled=True))["state"], "fleet_recovery_required")
         self.assertEqual(self.backend.submissions, 1)
 

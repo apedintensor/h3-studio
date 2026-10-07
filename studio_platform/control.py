@@ -8,13 +8,13 @@ from dataclasses import asdict, dataclass
 import math
 import re
 
-from sqlalchemy import and_, case, insert, select, update
+from sqlalchemy import and_, case, func, insert, select, update
 
 from .queue import TaskQueue
 from .inference.outputs import validate_delivery_policy
 from .repository import (
     BudgetExceeded, Conflict, NotFound, attempts, canonical, identifier, jobs,
-    cpu_slots, instance_intents, registered_devices, registered_workers, request_hash,
+    cpu_slots, instance_intents, registered_devices, registered_workers, request_hash, capacity_approvals,
 )
 
 
@@ -83,13 +83,25 @@ def worker_spec_payload(spec):
 def require_delivery_configuration(connection, backend, configuration_id, output_delivery):
     """A configuration's recorded delivery identity cannot be reused or upgraded.
 
-    Retired records matter too: an old executable/configuration must not become
-    eligible for a newly defined export contract. IDs remain opaque.
+    Historical registrations, immutable approvals and accepted jobs all matter,
+    including expired/revoked/terminal rows. An old bootstrap need not have
+    registered yet. Writers must hold the shared global capacity lock before
+    checking and recording the binding. IDs remain opaque.
     """
     rows = connection.execute(select(registered_workers.c.spec).where(
         registered_workers.c.spec["backend"].as_string() == backend,
         registered_workers.c.spec["configuration_id"].as_string() == configuration_id)).scalars()
     if any(row.get("output_delivery", "") != output_delivery for row in rows):
+        raise Conflict("configuration_output_delivery_conflict")
+    approvals = connection.execute(select(capacity_approvals.c.payload).where(
+        capacity_approvals.c.configuration_id == configuration_id,
+        func.coalesce(capacity_approvals.c.payload["backend"].as_string(), "comfy-worker") == backend)).scalars()
+    if any(row.get("output_delivery", "") != output_delivery for row in approvals):
+        raise Conflict("configuration_output_delivery_conflict")
+    accepted = connection.execute(select(jobs.c.execution_plan).where(
+        jobs.c.execution_plan["backend"].as_string() == backend,
+        jobs.c.execution_plan["configuration_id"].as_string() == configuration_id)).scalars()
+    if any(row.get("output_delivery", "") != output_delivery for row in accepted):
         raise Conflict("configuration_output_delivery_conflict")
 
 
@@ -339,7 +351,6 @@ class WorkerControl:
                 bindings.append(jobs.c.execution_plan["engine_manifest_digest"].as_string() == spec["engine_manifest_digest"])
             # Do not claim unsupported jobs then fail them: old slot identities
             # cannot acquire native-delivery work, including collection/recovery.
-            from sqlalchemy import func
             bindings.append(func.coalesce(jobs.c.execution_plan["output_delivery"].as_string(), "")
                             == spec.get("output_delivery", ""))
             if purpose == "generate":
