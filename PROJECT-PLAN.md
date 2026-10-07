@@ -131,6 +131,8 @@ The switching gate for the explicitly advertised recipe/control scope must demon
 
 Do not silently discard references, shorten videos, change precision, or ignore unsupported controls.
 The initial text-only Base proof does not qualify REF or last-frame fidelity. Comfy's retained recovery/rollback path is not an automatic fallback for new REF requests; any such routing needs its own explicit contract and acceptance. Supported request ranges, qualified execution envelopes and currently enabled public capabilities remain separate facts.
+
+D3's delivery direction is an explicit, frozen native-frame policy for new separately qualified WanGP configurations; existing accepted jobs keep their requested-duration export. Worker and cold-start identities must distinguish the delivery capability. Preserve full native video/audio without silently retiming; see [the output contract](GENERATION-CONTRACT.md#6-output-contract). This follow-up does not change the first text-only proof's operational configuration or establish real last-image fidelity.
 Quantized or distilled variants are separate quality profiles; their speed does not prove full Base capability parity.
 An execution slot may use one or several GPUs. Two single-GPU replicas are different from one tensor-parallel two-GPU slot.
 A first/last-frame-only node and a reference-only node do not provide redundancy for either individual capability.

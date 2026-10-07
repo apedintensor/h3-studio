@@ -126,6 +126,11 @@ def capabilities(settings):
                     "expires_at": min(policy["qualification"]["expires_at"], policy["reservation"]["expires_at"])
                         - policy["reservation"]["expected_runtime_s"]}
                 if qualified:
+                    if "output_delivery" in policy:
+                        recipe["execution_support"]["output_delivery"] = {
+                            "policy": policy["output_delivery"], "fps": 24,
+                            "duration_source": "generation_plan.execution.delivery_spec.duration_s",
+                            "semantics": "Preserve all native frames and generated audio; requested integer seconds may round upward. No retiming or padding."}
                     # This allowlisted envelope contains input/control limits,
                     # never account, worker, approval or budget identities.
                     recipe["execution_support"]["constraints"] = copy.deepcopy(policy["envelope"])
@@ -140,7 +145,8 @@ def capabilities(settings):
                             "estimate_basis": "operator_allowance", "performance_scaling_verified": False,
                             "expires_at_semantics": "baseline_latest_start; request_specific_preflight_required",
                             "native_sampling_duration_source": "generation_plan.output_spec.actual_duration",
-                            "requested_export_duration_source": "controls.duration",
+                            "requested_export_duration_source": "generation_plan.execution.delivery_spec.duration_s"
+                                if "output_delivery" in policy else "controls.duration",
                             "actual_output_duration_source": "verified_artifact_metadata",
                             "description": "expires_at是基线预留的最晚开始时间；具体时长和冷启动必须预检。额度与运行时间按原生补帧采样时长向上预留，不代表已测速度或最终费用。原生采样时长与请求导出时长分别处理，真实成片以核验文件为准。"}
                     if "input_limits" in policy["envelope"]:

@@ -1,20 +1,24 @@
 """Cold WanGP lifecycle checks with fake SSH/runtime and temporary ledgers only."""
 from dataclasses import replace
+import contextlib
 import hashlib
+import io
 import json
 import socket
 import socketserver
 import threading
 import time
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 from studio_platform.inference.wangp_contract import EngineManifest, HostReadiness
+from studio_platform.fleet import read_config as read_fleet
 from studio_platform.lium_bootstrap import BootConfig, BootController, BootError
 from studio_platform.qualification_profiles import QUEUED_TASK_PROFILE
-from studio_platform.wangp_bootstrap import SOURCE_NAMES, connect_backend, read_sources, validate_report
+from studio_platform.wangp_bootstrap import SOURCE_NAMES, WanGPSSHHost, connect_backend, read_sources, validate_report
 from test_platform_repository import LedgerCase
 from test_platform_lium_bootstrap import FakeFleet, POD, GPU
 
@@ -63,6 +67,13 @@ class WanGPBootTests(LedgerCase):
         self.assertEqual(slot.comfy_revision, '')
         self.assertEqual(self.host.starts, 1)
         self.assertEqual(set(self.host.identity['sources']), SOURCE_NAMES)
+        # Exercise the same persisted file/parser boundary used by run_child;
+        # checking only FakeFleet's in-memory config misses schema mismatches.
+        fleet_path = self.config.work_dir/self.intent['id']/'fleet.json'
+        persisted = read_fleet(fleet_path)
+        self.assertEqual(json.loads(fleet_path.read_text())['version'], 2)
+        self.assertEqual(persisted, boot.fleet.config)
+        self.assertEqual(persisted.fingerprint(), boot.fleet.config.fingerprint())
 
     def test_lost_start_response_reconnects_original_without_install_or_start(self):
         self.host.lose_start = True
@@ -71,6 +82,16 @@ class WanGPBootTests(LedgerCase):
             self.host.lose_start = False
             self.assertEqual(self.boot().tick(self.intent['id'])['state'], 'runtime_ready')
         self.assertEqual((self.host.starts, self.host.uploads), (1, 1))
+
+    def test_native_delivery_capability_binds_boot_marker_slot_and_reconnect(self):
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        boot = self.boot(fleet_enabled=True, output_delivery=NATIVE_DELIVERY)
+        with patch('studio_platform.wangp_bootstrap.connect_backend', self.connect):
+            result = boot.tick(self.intent['id'])
+        self.assertEqual(result['state'], 'fleet_running')
+        self.assertEqual(boot.fleet.config.slots[0].spec.output_delivery, NATIVE_DELIVERY)
+        self.assertEqual(self.host.identity['output_delivery'], NATIVE_DELIVERY)
+        self.assertEqual(self.host.starts, 1)
 
     def test_wrong_manifest_and_missing_marker_never_register_or_relaunch(self):
         self.host.lose_start = True
@@ -147,6 +168,71 @@ class Host:
 
     def open_tunnel(self, port):
         pass
+
+
+class SystemDiagnosisTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.host = WanGPSSHHost.__new__(WanGPSSHHost)
+        self.host.config = SimpleNamespace(work_dir=self.root/'cpu')
+        self.host.coordinates = {'instance_id': POD}
+
+    def test_report_preserves_old_failed_phase_and_sanitizes_package_details(self):
+        value = {'state': 'failed', 'phase': 'setup_failed', 'failed_phase': 'system_package_verification',
+            'code': 'system_package_mismatch', 'error_type': 'ValueError', 'log': 'SECRET',
+            'system_package_diagnostics': {'total': 2, 'truncated': False, 'mismatches': [
+                {'package': 'openssl', 'expected': '3.0.2', 'observed': '3.0.3', 'url': 'SECRET'},
+                {'package': 'libc6:amd64', 'expected': '2.35', 'observed': 'https://private.invalid/?secret=SECRET'}]}}
+        (self.root/'setup-status.json').write_text(json.dumps(value))
+        (self.root/'sixnine-bootstrap-identity.json').write_text('{}')
+        def execute(script, **kwargs):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(compile(script.replace('/workspace/h3-studio', self.root.as_posix()), '<offline-report>', 'exec'), {})
+            return json.loads(output.getvalue())
+        self.host.run = execute
+        result = self.host.report()
+        self.assertEqual(result['failure_phase'], 'system_package_verification')
+        self.assertEqual(result['error_type'], 'ValueError')
+        self.assertEqual(result['system_package_diagnostics']['mismatches'], [
+            {'package': 'openssl', 'expected': '3.0.2', 'observed': '3.0.3'}])
+        self.assertTrue(result['system_package_diagnostics']['truncated'])
+        self.assertNotIn('SECRET', json.dumps(result))
+
+    def test_preupload_inventory_is_saved_before_archive_transfer_and_not_overwritten(self):
+        files = {name: b'{}' for name in SOURCE_NAMES}
+        inventory = {'packages': {'libc6:amd64': '2.35-0ubuntu3.8', 'openssl': '3.0.2',
+                                 'bad/package': 'SECRET'}, 'total': 3, 'truncated': False}
+        def query(script, **kwargs):
+            return inventory if 'dpkg-query' in script else {'ok': True}
+        self.host.run = Mock(side_effect=query)
+        remote = SimpleNamespace(open=lambda name, mode: io.BytesIO(files[Path(name).name]))
+        self.host.client = SimpleNamespace(open_sftp=lambda: contextlib.nullcontext(remote))
+        record_path = self.host.config.work_dir/'os-observations'/(POD+'.json')
+        saved = []
+        def transfer(*args, **options):
+            self.assertEqual(options, {'progress': None, 'should_stop': None})
+            saved.append(json.loads(record_path.read_text()))
+        self.host._upload_dependency = transfer
+        with patch('studio_platform.wangp_bootstrap.dependency_source', return_value=('unused', 'a'*64, 1)):
+            self.host.upload(files)
+        self.assertEqual(saved[0]['packages'], {'libc6:amd64': '2.35-0ubuntu3.8', 'openssl': '3.0.2'})
+        self.assertTrue(saved[0]['truncated'])
+        self.assertNotIn('SECRET', record_path.read_text())
+        original = record_path.read_bytes()
+        with patch.object(self.host, 'inspect_system_packages', side_effect=AssertionError('preserve first observation')):
+            self.host._capture_system_observation()
+        self.assertEqual(record_path.read_bytes(), original)
+
+    def test_inventory_failure_retains_static_code_only(self):
+        self.host.run = Mock(side_effect=RuntimeError('SECRET_TOKEN https://private.invalid'))
+        self.host._capture_system_observation()
+        raw = (self.host.config.work_dir/'os-observations'/(POD+'.json')).read_text()
+        self.assertEqual(json.loads(raw)['state'], 'unavailable')
+        self.assertNotIn('SECRET', raw)
+        self.assertNotIn('private.invalid', raw)
 
 
 class SSHRecoveryTests(unittest.TestCase):

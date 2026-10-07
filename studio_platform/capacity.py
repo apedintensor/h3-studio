@@ -16,6 +16,7 @@ from .repository import (BudgetExceeded, Conflict, NotFound, Scope, budget_accou
     capacity_approvals, capacity_cycles, capacity_gate, capacity_waiters, canonical,
     documents, instance_intents, jobs, pool_limits, registered_workers, request_hash, attempts, scaler_receipts)
 from .scaler import LaunchSpec, _safe_id
+from .inference.outputs import validate_delivery_policy
 
 
 CAPACITY_WAIT_CODES = {
@@ -41,19 +42,22 @@ def _engine_identity(payload):
     """Missing engine fields denote the immutable historical Comfy approval."""
     backend = payload.get("backend", "comfy-worker")
     digest = payload.get("engine_manifest_digest", "")
+    delivery = payload.get("output_delivery", "")
+    validate_delivery_policy(backend, delivery)
     if backend == "wangp-worker":
         if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise ValueError("capacity_engine_manifest_required")
     elif backend != "comfy-worker" or digest != "":
         raise ValueError("invalid_capacity_engine")
-    return backend, digest
+    return backend, digest, delivery
 
 
 def _matches_engine(payload, binding):
     try:
-        backend, digest = _engine_identity(payload)
+        backend, digest, delivery = _engine_identity(payload)
         return (binding.get("backend") == backend
-            and binding.get("engine_manifest_digest", "") == digest)
+            and binding.get("engine_manifest_digest", "") == digest
+            and binding.get("output_delivery", "") == delivery)
     except (ValueError, AttributeError, TypeError):
         return False
 
@@ -61,7 +65,7 @@ def _matches_engine(payload, binding):
 def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configuration_id,
         recipe_ids, policy_hash, qualification_evidence_id, qualification_expires_at,
         quote_expires_at, expires_at, launch, scale_policy, budget_scope,
-        budget_account_ids, enabled=False, backend="comfy-worker", engine_manifest_digest=""):
+        budget_account_ids, enabled=False, backend="comfy-worker", engine_manifest_digest="", output_delivery=""):
     """Operator-only immutable approval. Revoke separately; never mutate its quote.
 
     This is not a public API and does not reserve/create an instance. A new
@@ -69,7 +73,7 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
     """
     for value in (approval_id, tenant_id, pool, model_id, configuration_id, qualification_evidence_id):
         _safe_id(value)
-    _engine_identity(dict(backend=backend, engine_manifest_digest=engine_manifest_digest))
+    _engine_identity(dict(backend=backend, engine_manifest_digest=engine_manifest_digest, output_delivery=output_delivery))
     now = repo.clock()
     if (type(enabled) is not bool or not isinstance(launch, LaunchSpec)
             or not isinstance(scale_policy, ScalePolicy) or not isinstance(budget_scope, Scope)
@@ -101,10 +105,14 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
         expires_at=expires_at, launch=asdict(launch), scale_policy=asdict(scale_policy),
         budget_scope=asdict(budget_scope), budget_account_ids=sorted(budget_account_ids),
         **(dict(backend=backend, engine_manifest_digest=engine_manifest_digest)
-            if backend == "wangp-worker" else {})))
+            if backend == "wangp-worker" else {}),
+        **(dict(output_delivery=output_delivery) if output_delivery else {})))
     digest = request_hash(payload)
     try:
         with repo.transaction() as connection:
+            from .control import require_delivery_configuration
+            repo._lock_capacity(connection)
+            require_delivery_configuration(connection, backend, configuration_id, output_delivery)
             existing = repo._locked(connection, select(capacity_approvals).where(capacity_approvals.c.id == approval_id))
             if existing:
                 if existing["approval_hash"] != digest:

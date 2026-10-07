@@ -1,9 +1,12 @@
 """Engine-bound cold approval and queued-first evidence; isolated fake runtime only."""
 from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import threading
+from unittest.mock import patch
 import uuid
 
 from sqlalchemy import select, update
@@ -60,6 +63,109 @@ class EngineCapacityTests(capacity_fixture.CapacityTests):
             self.assertFalse(self.policies.capacity_approval_current({**approved["payload"], **overrides}))
         comfy = ExecutionPolicies(replace(self.settings, execution_backend="comfy-worker"), self.repo)
         self.assertFalse(comfy.capacity_approval_current(approved["payload"]))
+
+    def test_native_delivery_cold_approval_requires_exact_exporter_capability(self):
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        self.use_wangp()
+        self.value.update(output_delivery=NATIVE_DELIVERY, recipe_ids=["h3-base-fl2va-v1"])
+        self.write()
+        old = self.approve_wangp()
+        self.assertFalse(self.policies.capacity_approval_current(old["payload"]))
+        self.assertFalse(self.policies.evaluate(self.compiled, self.scope, self.fingerprint).execution["enabled"])
+        self.repo.set_capacity_approval_enabled(old["id"], enabled=False)
+        self.value["configuration_id"] = "new-native-config"
+        self.launch = replace(self.launch, configuration_id="new-native-config")
+        self.write()
+        new = self.approve_wangp(approval_id="native-grant", configuration_id="new-native-config",
+            output_delivery=NATIVE_DELIVERY)
+        self.assertTrue(self.policies.capacity_approval_current(new["payload"]))
+        self.assertEqual(new["payload"]["output_delivery"], NATIVE_DELIVERY)
+        admission = self.policies.evaluate(self.compiled, self.scope, self.fingerprint)
+        self.assertTrue(admission.execution["enabled"], admission.execution)
+        self.assertEqual(admission.execution["delivery_spec"]["frame_count"], 124)
+        self.assertEqual(admission.execution["admission_state"], "waiting_capacity")
+        malformed = {**admission.execution, "output_delivery": ""}
+        plan = self.repo.create_plan(self.scope, self.compiled, malformed,
+            expires_at=admission.expires_at, estimated_cost_microusd=admission.cost)
+        with self.assertRaisesRegex(Conflict, "capacity_plan_approval_mismatch"):
+            self.repo.create_job(self.scope, plan["id"], "wrong-exporter", initial_status="waiting_capacity",
+                budget_account_ids=admission.execution["budget_account_ids"])
+
+    def test_unregistered_cold_approval_permanently_binds_delivery_identity(self):
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        self.use_wangp()
+        old = self.approve_wangp()
+        job = self.waiting()
+        self.repo.set_capacity_approval_enabled(old["id"], enabled=False)
+        self.now = old["expires_at"] + 1
+        self.value["qualification"]["expires_at"] = self.now + 5000
+        self.value["reservation"]["expires_at"] = self.now + 5000
+        self.scale_policy = replace(self.scale_policy, hard_deadline=self.now+5000)
+        self.value.update(output_delivery=NATIVE_DELIVERY, recipe_ids=["h3-base-fl2va-v1"])
+        self.write()
+        with self.assertRaisesRegex(Conflict, "configuration_output_delivery_conflict"):
+            self.approve_wangp(approval_id="new-delivery", output_delivery=NATIVE_DELIVERY)
+        self.assertFalse(self.policies.evaluate(self.compiled, self.scope, self.fingerprint).execution["enabled"])
+        self.assertEqual(self.repo.get_job(self.scope, job["id"])["execution_plan"], job["execution_plan"])
+        self.assertEqual(self.provider.creates, [])
+
+    def test_accepted_job_without_worker_or_approval_binds_delivery_identity(self):
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        self.use_wangp()
+        execution = {"pool": self.value["pool"], "backend": "wangp-worker", "enabled": True,
+            "configuration_id": self.value["configuration_id"], "engine_manifest_digest": DIGEST}
+        plan = self.repo.create_plan(self.scope, self.compiled, execution, expires_at=self.now+1000)
+        job = self.repo.create_job(self.scope, plan["id"], "warm-accepted")
+        with self.assertRaisesRegex(Conflict, "configuration_output_delivery_conflict"):
+            self.approve_wangp(approval_id="native-after-job", output_delivery=NATIVE_DELIVERY)
+        spec = WorkerSpec("native-worker", self.value["pool"], "test-only", "native-instance", ("native-gpu",),
+            tuple(self.value["recipe_ids"]), self.value["model_id"], self.value["configuration_id"],
+            "wangp-worker", DIGEST, output_delivery=NATIVE_DELIVERY)
+        with self.assertRaisesRegex(Conflict, "configuration_output_delivery_conflict"):
+            WorkerControl(self.repo).register(spec)
+        self.assertEqual(self.repo.get_job(self.scope, job["id"])["status"], "queued")
+
+    def test_old_unsubmitted_plan_cannot_cross_a_new_approval_identity(self):
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        self.use_wangp()
+        execution = {"pool": self.value["pool"], "backend": "wangp-worker", "enabled": True,
+            "configuration_id": self.value["configuration_id"], "engine_manifest_digest": DIGEST}
+        plan = self.repo.create_plan(self.scope, self.compiled, execution, expires_at=self.now+1000)
+        self.approve_wangp(approval_id="first-native", output_delivery=NATIVE_DELIVERY)
+        with self.assertRaisesRegex(Conflict, "configuration_output_delivery_conflict"):
+            self.repo.create_job(self.scope, plan["id"], "stale-plan")
+        self.assertEqual(self.repo.list_jobs(self.scope), [])
+
+    def test_opposite_first_approvals_share_the_registration_capacity_lock(self):
+        from studio_platform.control import require_delivery_configuration
+        from studio_platform.inference.outputs import NATIVE_DELIVERY
+        self.use_wangp()
+        first_checked, release_first, second_checked = threading.Event(), threading.Event(), threading.Event()
+        def guarded(connection, backend, configuration_id, delivery):
+            require_delivery_configuration(connection, backend, configuration_id, delivery)
+            if delivery == "":
+                first_checked.set()
+                if not release_first.wait(5):
+                    raise AssertionError("test did not release the first transaction")
+            else:
+                second_checked.set()
+        def approve(name, delivery):
+            try:
+                self.approve_wangp(approval_id=name, output_delivery=delivery)
+                return "approved"
+            except Conflict as exc:
+                return str(exc)
+        with patch("studio_platform.control.require_delivery_configuration", side_effect=guarded), \
+                ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(approve, "parallel-old", "")
+            self.assertTrue(first_checked.wait(5))
+            second = executor.submit(approve, "parallel-new", NATIVE_DELIVERY)
+            try:
+                self.assertFalse(second_checked.wait(.2), "second approval read before first binding committed")
+            finally:
+                release_first.set()
+            self.assertEqual(first.result(timeout=5), "approved")
+            self.assertEqual(second.result(timeout=5), "configuration_output_delivery_conflict")
 
     def test_waiter_rejects_forged_plan_engine_and_manifest_without_reservation(self):
         self.use_wangp()

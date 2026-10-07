@@ -94,7 +94,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
         # Expose user-relevant admission, not operator approval/budget identities.
         return {"admission_state": execution.get("admission_state", "queued" if execution.get("enabled") else "blocked"),
                 "enabled": bool(execution.get("enabled")), "quote_known": bool(execution.get("quote_known")),
-                "backend": execution.get("backend")}
+                "backend": execution.get("backend"),
+                **({"delivery_spec": execution["delivery_spec"]} if "delivery_spec" in execution else {})}
 
     def owned_plan(principal, plan_id):
         with repo.engine.connect() as conn:
@@ -126,6 +127,8 @@ def create_app(settings: Settings, *, repository=None, storage=None):
             recipe_id=stored_request.get("recipe_id"), effective_request=stored_request.get("request", {}),
             simulation=job["execution_plan"].get("backend") == "mock" or stored_request.get("simulation") is True, plan_id=job["plan_id"],
             project_id=job["project_id"], artifacts=[])
+        if "delivery_spec" in job["execution_plan"]:
+            visible["delivery_spec"] = job["execution_plan"]["delivery_spec"]
         if job["status"] == "succeeded":
             if artifact_records is None:
                 artifact_records = repo.list_artifacts(Scope(settings.tenant_id, job["owner_id"], job["project_id"]), job["id"])

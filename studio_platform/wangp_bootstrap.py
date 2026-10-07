@@ -15,7 +15,7 @@ import stat
 import threading
 import time
 
-from .lium_bootstrap import BootError, SSHHost, REMOTE_ROOT
+from .lium_bootstrap import BootError, SSHHost, REMOTE_ROOT, safe_bootstrap_diagnosis
 from .control import WorkerSpec
 from .fleet import SlotConfig
 from .inference.wangp_contract import EngineManifest, HostReadiness
@@ -85,7 +85,8 @@ def make_slot(config, intent, report, directory):
     endpoint = f'http://127.0.0.1:{config.local_port}'
     spec = WorkerSpec('lium-'+intent['id'].replace('-', ''), intent['pool'], 'lium',
         intent['provider_instance_id'], (report['gpus'][0]['uuid'],), config.recipe_ids,
-        config.model_id, config.configuration_id, 'wangp-worker', config.engine_manifest_digest)
+        config.model_id, config.configuration_id, 'wangp-worker', config.engine_manifest_digest,
+        output_delivery=config.output_delivery)
     return SlotConfig(spec, True, endpoint, (endpoint,), '', True,
         runtime_config_file=str(directory/'wangp-client.json'))
 
@@ -133,12 +134,19 @@ class WanGPSSHHost(SSHHost):
         self.config = config
         super().__init__(config, coordinates)
 
-    def upload(self, files):
+    def upload(self, files, *, progress=None, should_stop=None):
+        def check():
+            if should_stop is not None and should_stop():
+                from .bootstrap_staging import UploadCancelled
+                raise UploadCancelled
+        check()
         if set(files) != SOURCE_NAMES:
             raise BootError('wangp_boot_source_set_invalid')
+        self._capture_system_observation()
         self.run("from pathlib import Path; import json; Path('/workspace/h3-studio').mkdir(parents=True,exist_ok=True); print(json.dumps({'ok':True}))")
         with self.client.open_sftp() as sftp:
             for name, data in files.items():
+                check()
                 target = REMOTE_ROOT+'/'+name
                 try:
                     with sftp.open(target, 'rb') as f:
@@ -149,7 +157,54 @@ class WanGPSSHHost(SSHHost):
                         f.write(data)
         dependency = dependency_source(self.config, json.loads(files['wangp-runtime.json']))
         if dependency is not None:
-            self._upload_dependency(*dependency)
+            self._upload_dependency(*dependency, progress=progress, should_stop=should_stop)
+
+    def inspect_system_packages(self):
+        """Read-only pre-upload inventory; no package installation or admission."""
+        from .runtime_hosts.wangp_environment import PACKAGE_NAME_PATTERN, PACKAGE_VERSION_PATTERN, MAX_SYSTEM_PACKAGES
+        value = self.run('''import json,subprocess
+raw=subprocess.run(['dpkg-query','-W','-f=${binary:Package}\\t${Version}\\n'],check=True,capture_output=True,text=True,timeout=10).stdout
+if len(raw)>2097152: raise ValueError('inventory_too_large')
+rows=raw.splitlines()
+print(json.dumps({'packages':dict(line.split('\\t',1) for line in rows[:10000]),'total':len(rows),'truncated':len(rows)>10000}))
+''', limit=2*1024**2, timeout=20)
+        packages, total = value.get('packages'), value.get('total')
+        if not isinstance(packages, dict) or type(total) is not int or not 0 <= total <= MAX_SYSTEM_PACKAGES:
+            raise BootError('system_package_observation_invalid')
+        safe = {name: version for name, version in list(packages.items())[:MAX_SYSTEM_PACKAGES]
+                if isinstance(name, str) and re.fullmatch(PACKAGE_NAME_PATTERN, name)
+                and isinstance(version, str) and re.fullmatch(PACKAGE_VERSION_PATTERN, version)}
+        if total < len(safe):
+            raise BootError('system_package_observation_invalid')
+        return {'packages': dict(sorted(safe.items())), 'total': total,
+                'truncated': value.get('truncated') is True or total > len(safe)}
+
+    def _capture_system_observation(self):
+        """Keep the first safe inventory on CPU before transferring dependencies."""
+        from .lium_provider import _uuid
+        instance_id = self.coordinates.get('instance_id')
+        _uuid(instance_id)
+        directory = self.config.work_dir/'os-observations'
+        if directory.is_symlink():
+            raise BootError('system_package_observation_path_invalid')
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = directory/(instance_id+'.json')
+        if target.is_symlink():
+            raise BootError('system_package_observation_path_invalid')
+        if target.exists():
+            return  # Preserve the original pre-upload observation on reconnect.
+        record = {'version': 1, 'instance_id': instance_id, 'observed_at': time.time()}
+        try:
+            record.update(state='observed', **self.inspect_system_packages())
+        except Exception:
+            # Observation is diagnostic only. Do not turn it into a new
+            # readiness criterion or include exception text/SSH coordinates.
+            record.update(state='unavailable', code='system_package_observation_failed')
+        with target.open('x', encoding='utf-8') as destination:
+            target.chmod(0o600)
+            json.dump(record, destination, sort_keys=True)
+            destination.flush()
+            os.fsync(destination.fileno())
 
     @contextmanager
     def _transfer_sftp(self, deadline):
@@ -204,10 +259,16 @@ class WanGPSSHHost(SSHHost):
                     timer.cancel()
                 channel.close()
 
-    def _upload_dependency(self, path, expected, size):
+    def _upload_dependency(self, path, expected, size, *, progress=None, should_stop=None):
         # Upload can be resumed before the launch marker exists. Only an exact
         # verified prefix is appended; the final file is published atomically.
         deadline = time.monotonic() + DEPENDENCY_TRANSFER_SECONDS
+        def check():
+            if should_stop is not None and should_stop():
+                from .bootstrap_staging import UploadCancelled
+                raise UploadCancelled
+            _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+        check()
         self.ensure_connected()
         script = '''import hashlib,json,os,stat
 from pathlib import Path
@@ -227,6 +288,7 @@ if p.exists():
 else: print(json.dumps({'present':False,'complete':False,'size':0,'sha256':hashlib.sha256(b'').hexdigest()}))
 '''
         prior = self.run(script, limit=4096, timeout=_transfer_remaining(deadline, 600))
+        check()
         if (type(prior.get('size')) is not int or not 0 <= prior['size'] <= size
                 or type(prior.get('complete')) is not bool or type(prior.get('present')) is not bool):
             raise BootError('wangp_dependency_existing_untrusted')
@@ -234,13 +296,15 @@ else: print(json.dumps({'present':False,'complete':False,'size':0,'sha256':hashl
         with path.open('rb') as source:
             remaining = prior['size']
             while remaining:
-                _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+                check()
                 chunk = source.read(min(8*1024**2, remaining))
                 if not chunk: raise BootError('wangp_dependency_local_truncated')
                 prefix.update(chunk); remaining -= len(chunk)
             if prefix.hexdigest() != prior.get('sha256'):
                 raise BootError('wangp_dependency_existing_mismatch')
-            _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+            check()
+            if progress is not None:
+                progress(prior['size'], size)
             if prior['complete']:
                 if prior['size'] != size or prefix.hexdigest() != expected:
                     raise BootError('wangp_dependency_existing_mismatch')
@@ -250,8 +314,10 @@ else: print(json.dumps({'present':False,'complete':False,'size':0,'sha256':hashl
                 with sftp.open(target, 'ab' if prior['present'] else 'wx') as remote:
                     remote.set_pipelined(True)
                     for chunk in iter(lambda: source.read(8*1024**2), b''):
-                        _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
+                        check()
                         prefix.update(chunk); remote.write(chunk)
+                        if progress is not None:
+                            progress(source.tell(), size)
             if source.tell() != size or prefix.hexdigest() != expected:
                 raise BootError('wangp_dependency_source_hash_mismatch')
         result = self.run('''import hashlib,json,os,stat
@@ -270,6 +336,7 @@ print(json.dumps({'verified':True}))
         _transfer_remaining(deadline, DEPENDENCY_TRANSFER_SECONDS)
         if result != {'verified': True}:
             raise BootError('wangp_dependency_transfer_unconfirmed')
+        check()
 
     def start(self, identity):
         # Token generation is only in the initial reserved phase, never reconnect.
@@ -308,7 +375,7 @@ with (root/'sixnine-bootstrap.lock').open('a') as lock:
 '''.replace('IDENTITY', repr(identity)))
 
     def report(self):
-        return self.run('''import json,subprocess
+        report = self.run('''import json,subprocess
 from pathlib import Path
 root=Path('/workspace/h3-studio')
 def read(name):
@@ -317,22 +384,39 @@ def read(name):
  if p.is_symlink() or p.stat().st_size>4194304: raise ValueError('untrusted_report')
  return json.loads(p.read_text())
 s=read('setup-status.json')
-out={k:s.get(k) for k in ('state','phase','error_code','runtime_verified','engine_manifest_digest','source_revision','runtime')}
+out={k:s.get(k) for k in ('state','phase','error_code','error_type','runtime_verified','engine_manifest_digest','source_revision','runtime','system_package_diagnostics')}
 out['error_code']=s.get('error_code',s.get('code'))
-out['failure_phase']=s.get('phase')
+out['failure_phase']=s.get('failure_phase',s.get('failed_phase',s.get('phase')))
 out['identity']=read('sixnine-bootstrap-identity.json')
 if out['state']=='ready':
  rows=subprocess.check_output(['nvidia-smi','--query-gpu=uuid,memory.total,name','--format=csv,noheader,nounits'],text=True).strip().splitlines()
  out['gpus']=[{'uuid':x.split(',')[0].strip(),'memory_mib':int(x.split(',')[1].strip()),'name':','.join(x.split(',')[2:]).strip()} for x in rows]
 print(json.dumps(out))
 ''')
+        if report.get('state') == 'failed':
+            diagnosis = safe_bootstrap_diagnosis(report)
+            report.pop('system_package_diagnostics', None)
+            report.update(diagnosis)
+        return report
 
-    def preparation_idle_report(self):
+    def preparation_idle_report(self, *, expected_prestart_identity=None):
+        if expected_prestart_identity is not None and (
+                not isinstance(expected_prestart_identity, dict)
+                or expected_prestart_identity.get('backend') != 'wangp-worker'):
+            raise BootError('wangp_prestart_identity_required')
         return self.run('''import json,re,time
 from pathlib import Path
 root=Path('/workspace/h3-studio');proc=Path('/proc')
 out={'identity':{},'state':'unknown','process_visibility_complete':False,
  'bootstrap_process_count':None,'runtime_process_count':None,'runtime_port_listening':None}
+expected=PRESTART_IDENTITY
+markers=('sixnine-bootstrap-identity.json','setup-status.json','sixnine-bootstrap.lock','wangp-token')
+def absent():
+ for name in markers:
+  try: (root/name).lstat()
+  except FileNotFoundError: continue
+  return False
+ return True
 def read(name):
  p=root/name
  if p.is_symlink() or not p.is_file() or p.stat().st_size>4194304: raise ValueError('unconfirmed')
@@ -340,8 +424,12 @@ def read(name):
 def pids():
  return {p.name for p in proc.iterdir() if p.name.isdecimal() and p.is_dir()}
 try:
- identity=read('sixnine-bootstrap-identity.json');status=read('setup-status.json')
- if identity.get('backend')!='wangp-worker' or status.get('state')!='failed': raise ValueError('unconfirmed')
+ if expected is not None:
+  if not absent(): raise ValueError('unconfirmed')
+  identity=expected;state='not_started'
+ else:
+  identity=read('sixnine-bootstrap-identity.json');status=read('setup-status.json');state='failed'
+  if identity.get('backend')!='wangp-worker' or status.get('state')!='failed': raise ValueError('unconfirmed')
  before=pids()
  if not before: raise ValueError('unconfirmed')
  bootstrap=runtime=0
@@ -362,10 +450,12 @@ try:
    if len(fields)<10 or not re.fullmatch(r'[0-9A-Fa-f]+:[0-9A-Fa-f]{4}',fields[1]): raise ValueError('unconfirmed')
    listening=bool(listening or int(fields[1].rsplit(':',1)[1],16)==8199 and fields[3].upper()=='0A')
  if pids()!=before: raise ValueError('unconfirmed')
- out.update(identity=identity,state='failed',process_visibility_complete=True,bootstrap_process_count=bootstrap,
+ if expected is not None and not absent(): raise ValueError('unconfirmed')
+ out.update(identity=identity,state=state,setup_markers_absent=expected is not None,
+  process_visibility_complete=True,bootstrap_process_count=bootstrap,
   runtime_process_count=runtime,runtime_port_listening=listening)
 except Exception:
  pass
 out['observed_at']=time.time()
 print(json.dumps(out))
-''', limit=16384)
+'''.replace('PRESTART_IDENTITY', repr(expected_prestart_identity)), limit=16384)

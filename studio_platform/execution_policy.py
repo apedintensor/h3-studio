@@ -17,6 +17,8 @@ import string
 
 from .capabilities import MODEL, RECIPES
 from .control import WorkerControl, REAL_GPU_BACKENDS
+from .inference.outputs import validate_delivery_policy, native_delivery_spec, delivery_spec
+from .inference.protocol import BackendError
 from .repository import BudgetExceeded, NotFound, identifier, request_hash
 from .qualification_profiles import (FL50_PROFILE, MULTIMODAL_PROFILE, QUEUED_TASK_PROFILE,
     RUNTIME_PROFILES, MULTIMODAL_INPUT_LIMITS, PROFILE_RECIPES)
@@ -38,11 +40,14 @@ def positive(value, maximum):
 
 def validate_policy(value):
     """Reject ambiguous/misspelled operator settings rather than broadening them."""
-    if not isinstance(value, dict) or not FIELDS <= set(value) or set(value) - FIELDS - {"engine_manifest_digest"}:
+    if not isinstance(value, dict) or not FIELDS <= set(value) or set(value) - FIELDS - {"engine_manifest_digest", "output_delivery"}:
         raise ValueError("Invalid execution policy fields")
     if (value["id"] != POLICY or value["model_id"] != MODEL or value["backend"] not in REAL_GPU_BACKENDS
             or type(value["enabled"]) is not bool):
         raise ValueError("Invalid execution policy identity")
+    validate_delivery_policy(value["backend"], value.get("output_delivery", ""))
+    if "output_delivery" in value and not value["output_delivery"]:
+        raise ValueError("Explicit output delivery must name a supported policy")
     if value["backend"] == "wangp-worker":
         if not isinstance(value.get("engine_manifest_digest"), str) or not re.fullmatch(r"[0-9a-f]{64}", value["engine_manifest_digest"]):
             raise ValueError("Explicit engine manifest required")
@@ -51,6 +56,8 @@ def validate_policy(value):
     for field in ("revision", "pool", "configuration_id"):
         identifier(value[field])
     recipes = value["recipe_ids"]
+    if "output_delivery" in value and recipes != ["h3-base-fl2va-v1"]:
+        raise ValueError("Native delivery requires the qualified WanGP FL recipe")
     if not isinstance(recipes, list) or not recipes or len(set(recipes)) != len(recipes) or any(r not in RECIPES for r in recipes):
         raise ValueError("Invalid execution policy recipes")
     qualification = value["qualification"]
@@ -323,6 +330,13 @@ class ExecutionPolicies:
         qualification, envelope = policy["qualification"], policy["envelope"]
         quote = reservation_for_duration(policy, compiled["output_spec"]["actual_duration"])
         blockers = base["blockers"]
+        from .control import require_delivery_configuration
+        from .repository import Conflict
+        try:
+            with self.repo.engine.connect() as connection:
+                require_delivery_configuration(connection, backend, policy["configuration_id"], policy.get("output_delivery", ""))
+        except Conflict:
+            blockers.append("此执行配置已绑定另一种成片时长策略，请使用独立验收的配置")
         if not policy["enabled"]:
             blockers.append("操作员已暂停此执行策略")
         if qualification["status"] not in {"accepted", "runtime_required"} or not qualification["verified_at"] <= now < qualification["expires_at"]:
@@ -379,7 +393,8 @@ class ExecutionPolicies:
         if not blockers:
             capacity = self.control.pool_status(policy["pool"], model_id=policy["model_id"],
                 configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend,
-                **({"engine_manifest_digest": policy["engine_manifest_digest"]} if backend == "wangp-worker" else {}))
+                **({"engine_manifest_digest": policy["engine_manifest_digest"]} if backend == "wangp-worker" else {}),
+                **({"output_delivery": policy["output_delivery"]} if "output_delivery" in policy else {}))
         if not blockers and capacity["ready"] + capacity["busy"] == 0:
             # Only an independently approved, current launch can admit a wait.
             # Empty approvals / gates=0 retain the original blocked behavior.
@@ -416,6 +431,8 @@ class ExecutionPolicies:
         base["admission_state"] = "blocked" if blockers else "waiting_capacity" if approval else "queued"
         if backend == "wangp-worker":
             base["engine_manifest_digest"] = policy["engine_manifest_digest"]
+        if "output_delivery" in policy:
+            base.update(output_delivery=policy["output_delivery"], delivery_spec=native_delivery_spec(compiled))
         if approval:
             base.update(capacity_approval_id=approval["id"], capacity_approval_hash=approval["approval_hash"])
         expiry = min(now+900, latest_start) if not blockers else now+900
@@ -440,6 +457,8 @@ class ExecutionPolicies:
         if (not previous.get("enabled") or not current.execution["enabled"]
                 or previous.get("policy_hash") != current.execution.get("policy_hash")
                 or previous.get("backend") != current.execution["backend"]
+                or previous.get("output_delivery") != current.execution.get("output_delivery")
+                or previous.get("delivery_spec") != current.execution.get("delivery_spec")
                 or previous.get("backend") == "wangp-worker"
                    and previous.get("engine_manifest_digest") != current.execution.get("engine_manifest_digest")):
             from .repository import Conflict
@@ -469,7 +488,7 @@ class ExecutionPolicies:
                 and qualification["expires_at"] == payload["qualification_expires_at"]
                 and now < quote["expires_at"] == payload["quote_expires_at"]
                 and payload["expires_at"] > now)
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, BackendError):
             return False
 
     def _capacity_reference_current(self, execution, tenant_id):
@@ -518,10 +537,12 @@ class ExecutionPolicies:
             if policy is None:
                 return False
             qualification = policy["qualification"]
+            delivery_spec(job)
             quote = reservation_for_duration(policy,
                 job.get("request", {}).get("output_spec", {}).get("actual_duration"))
             now = self.repo.clock()
             return bool(policy["backend"] == self.settings.execution_backend
+                and execution.get("output_delivery", "") == policy.get("output_delivery", "")
                 and (policy["backend"] != "wangp-worker" or execution.get("engine_manifest_digest") == policy["engine_manifest_digest"])
                 and policy["enabled"] and execution.get("policy_hash") == request_hash(policy)
                 and qualification["status"] in {"accepted", "runtime_required"}
@@ -532,5 +553,5 @@ class ExecutionPolicies:
                 and job["request"]["request"]["model"] == policy["model_id"]
                 and execution.get("pool") == policy["pool"]
                 and execution.get("configuration_id") == policy["configuration_id"])
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, BackendError):
             return False

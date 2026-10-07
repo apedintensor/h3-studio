@@ -73,6 +73,7 @@ class ProductionBoot(BootController):
             trust_first_host_key=finite.trust_first_host_key,
             minimum_remaining_s=finite.drain_margin_s, recipe_ids=finite.recipe_ids,
             execution_backend=finite.execution_backend, engine_manifest_digest=finite.engine_manifest_digest,
+            output_delivery=finite.output_delivery,
             min_gpu_bytes=_approved_boot_min_gpu_bytes(repo, finite, intent))
         super().__init__(repo, provider, config, ssh_factory=ssh_factory, backend_factory=backend_factory,
             verify_smoke=verify_smoke, fleet_factory=self._fleet)
@@ -93,6 +94,7 @@ class ProductionBoot(BootController):
 
     def request_drain(self):
         self._stopping = True
+        self.cancel_preparation()
         if self.fleet:
             self.fleet.drain()
 
@@ -149,6 +151,9 @@ class ProductionBoot(BootController):
             or self.repo.clock() >= deadline-self.finite.drain_margin_s)
         if self._stopping:
             self.request_drain()
+            if self.preparation_pending():
+                return {"state": "draining", "children_done": False,
+                        "preparation": self.preparation_status()}
             # A real queued task may still be executing or collecting after
             # admission closes. Keep its original tunnel reachable even though
             # this branch deliberately never enters boot/start again.
@@ -159,6 +164,7 @@ class ProductionBoot(BootController):
             receipt = self.config.work_dir/intent_id/"bootstrap-state.json"
             if receipt.exists():
                 state = json.loads(receipt.read_text())
+                self.record_preparation_stop(receipt, state)
                 if state.get("smoke_submission_started") and state.get("phase") not in ("qualified", "qualification_failed", "fleet_starting", "fleet_started"):
                     self._collection_backend(intent, state)
                     result = self._smoke(receipt.parent, receipt, state)
@@ -187,7 +193,7 @@ class ProductionBoot(BootController):
             # runner records success only after validating/storing real output.
             result["qualification_scope"] = "runtime_ready_awaiting_real_task"
             receipt = self.config.work_dir/intent_id/"bootstrap-state.json"
-            if receipt.exists():
+            if receipt.exists() and result.get("state") in {"runtime_ready", "fleet_running", "fleet_attention_required"}:
                 try:
                     state = json.loads(receipt.read_text(encoding="utf-8"))
                     from .queued_task_runner import read_verification_summary
@@ -375,11 +381,17 @@ class ProductionBoot(BootController):
             # A preparation failure has no Comfy backend to query. Require a
             # fresh, identity-bound process/socket observation instead of
             # treating the missing endpoint or a failed status as idle proof.
-            if self.backend is None and state.get("phase") == "bootstrap_failed":
+            prestart = state.get("phase") in {"staging_failed", "staging_cancelled"}
+            if self.backend is None and (state.get("phase") == "bootstrap_failed" or prestart):
                 if (tag != self.intent_id or self.fleet is not None
                         or state.get("smoke_submission_started")
                         or any((receipt.parent/helper.name/"state.json").exists()
                                for helper in self._multimodal_helpers())):
+                    raise BootError("finite_preparation_idle_unconfirmed")
+                if prestart and (self.config.execution_backend != "wangp-worker"
+                        or self.preparation_stopped_before_start(state) is None
+                        or (receipt.parent/"fleet.json").exists()
+                        or (receipt.parent/"fleet"/"fleet-state.json").exists()):
                     raise BootError("finite_preparation_idle_unconfirmed")
                 with self.repo.engine.connect() as conn:
                     intent = dict(conn.execute(select(instance_intents).where(
@@ -395,11 +407,14 @@ class ProductionBoot(BootController):
                 if self.host is None:
                     coordinates = self.provider.ssh_connection(tag, instance_id)
                     self.host = self.ssh_factory(self.config, coordinates)
-                report = self.host.preparation_idle_report()
+                report = (self.host.preparation_idle_report(expected_prestart_identity=identity)
+                          if prestart else self.host.preparation_idle_report())
                 now = self.repo.clock()
                 runtime_field = 'runtime_process_count' if self.config.execution_backend == 'wangp-worker' else 'comfy_process_count'
                 listener_field = 'runtime_port_listening' if self.config.execution_backend == 'wangp-worker' else 'comfy_port_listening'
-                idle = (report.get("identity") == identity and report.get("state") == "failed"
+                idle = (report.get("identity") == identity
+                    and report.get("state") == ("not_started" if prestart else "failed")
+                    and (not prestart or report.get("setup_markers_absent") is True)
                     and report.get("process_visibility_complete") is True
                     and type(report.get("bootstrap_process_count")) is int
                     and report["bootstrap_process_count"] == 0
@@ -426,7 +441,45 @@ class ProductionBoot(BootController):
                 control.retire(worker_id, upstream_idle_confirmed=True)
 
     def children_done(self):
-        return self.fleet is None or all(proc.poll() is not None for proc in self.fleet.children.values())
+        # A restarted controller has no Popen handles. That is not evidence that
+        # an already launched CPU fleet exited, even after its GPU is destroyed.
+        # Only the owning process can currently prove child exit; full fleet
+        # reconstruction remains a separate recovery operation.
+        try:
+            if self.preparation_pending():
+                return False
+            if self.fleet is not None:
+                expected = {slot.spec.worker_id for slot in self.fleet.config.slots if slot.enabled}
+                return (bool(expected) and set(self.fleet.children) == expected
+                    and all(proc.poll() is not None for proc in self.fleet.children.values()))
+            directory = self.config.work_dir/self.intent_id
+            if (directory/"fleet.json").exists() or (directory/"fleet"/"fleet-state.json").exists():
+                return False
+            receipt = directory/"bootstrap-state.json"
+            if receipt.exists():
+                with receipt.open("rb") as source:
+                    raw = source.read(1024*1024+1)
+                if len(raw) > 1024*1024:
+                    return False
+                state = json.loads(raw)
+                if (not isinstance(state, dict) or state.get("phase") not in {
+                        "reserved", "staging", "staged", "staging_failed", "staging_cancelled",
+                        "bootstrap_starting", "booting", "bootstrap_failed",
+                        "ready_for_qualification", "runtime_ready", "smoke_submitting",
+                        "smoke_running", "qualification_failed", "qualified"}
+                        or "fleet_recipe_ids" in state
+                        or not isinstance(state.get("identity"), dict)
+                        or state["identity"].get("intent_id") != self.intent_id
+                        or state["identity"].get("configuration_id") != self.config.configuration_id):
+                    return False
+            # Registration precedes Popen. Retain its obligation if launch
+            # metadata is missing rather than treating absent files as proof.
+            with self.repo.engine.connect() as conn:
+                worker = conn.execute(select(registered_workers.c.id).where(
+                    registered_workers.c.id == "lium-"+self.intent_id.replace("-", ""))).first()
+            return worker is None
+        except Exception:
+            return False
 
     def close_if_safe(self, *, destroyed=False):
         if not destroyed or not self.children_done():

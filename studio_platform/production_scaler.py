@@ -104,8 +104,11 @@ class FiniteConfig:
     execution_backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
     service_policy: dict | None = None
+    output_delivery: str = ""
 
     def __post_init__(self):
+        from .inference.outputs import validate_delivery_policy
+        validate_delivery_policy(self.execution_backend, self.output_delivery)
         if self.execution_backend not in {"comfy-worker", "wangp-worker"}:
             raise ScalerError("finite_backend_invalid")
         if self.execution_backend == "wangp-worker":
@@ -223,6 +226,8 @@ class FiniteConfig:
             value.pop("engine_manifest_digest")
         if self.service_policy is None:
             value.pop("service_policy")
+        if not self.output_delivery:
+            value.pop("output_delivery")
         for key in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             value[key] = str(value[key])
         return request_hash(value)
@@ -300,6 +305,7 @@ def verify_policy(config, settings):
     if (not policy or request_hash(policy) != config.execution_policy_sha256 or policy["pool"] != config.pool
             or policy["backend"] != config.execution_backend
             or policy.get("engine_manifest_digest", "") != config.engine_manifest_digest
+            or policy.get("output_delivery", "") != config.output_delivery
             or policy["configuration_id"] != config.configuration_id or policy["recipe_ids"] != list(config.recipe_ids)
             or policy["qualification"]["status"] != ("runtime_required" if config.qualification_profile in RUNTIME_PROFILES else "accepted")
             or policy["qualification"]["evidence_id"] != config.qualification_evidence_id
@@ -679,6 +685,34 @@ class FiniteController:
         """Finite runs stop; on-demand preparation recovery may preserve backlog."""
         self.request_drain()
 
+    def _bootstrap_start_allowed(self, intent_id, lease):
+        """Fence upload completion before remote setup; never acquire ownership here."""
+        from .repository import capacity_waiters
+        try:
+            if self.stopping():
+                return False
+            with self.repo.transaction() as conn:
+                self.scaler._leader(conn, lease)
+                intent = conn.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()
+                approval = conn.execute(select(capacity_approvals).where(
+                    capacity_approvals.c.id == self.config.capacity_approval_id)).mappings().one()
+                if (intent["pool"] != self.config.pool or intent["state"] not in {"starting", "ready", "busy"}
+                        or intent["hard_deadline"]-self.repo.clock() < self.config.drain_margin_s
+                        or not approval["enabled"] or approval["expires_at"] <= self.repo.clock()
+                        or not self.approval_current(approval["payload"])):
+                    return False
+                if self.config.qualification_profile == QUEUED_TASK_PROFILE:
+                    demand = conn.execute(select(jobs.c.id).join(capacity_waiters, capacity_waiters.c.job_id == jobs.c.id).where(
+                        capacity_waiters.c.approval_id == approval["id"],
+                        capacity_waiters.c.intent_id == intent_id,
+                        capacity_waiters.c.state == "waiting_capacity", capacity_waiters.c.deadline > self.repo.clock(),
+                        jobs.c.status.in_(("queued", "waiting_capacity")), self.scope_filter()).limit(1)).first()
+                    if demand is None:
+                        return False
+                return True
+        except Exception:
+            return False
+
     def tick(self):
         c = self.config
         lease = self.scaler.acquire(c.pool, self.leader_id)
@@ -753,10 +787,17 @@ class FiniteController:
                 factory = self.boot_factory or ProductionBoot
                 self.boots[intent] = factory(self.repo, self.provider, c, row, self.port_for(intent),
                     config_path=getattr(self, "config_path", None))
+                if c.execution_backend == "wangp-worker":
+                    configure = getattr(self.boots[intent], "enable_pollable_upload", None)
+                    if configure is not None:
+                        configure()
+            if c.execution_backend == "wangp-worker":
+                self.boots[intent].start_guard = lambda intent=intent, lease=lease: self._bootstrap_start_allowed(intent, lease)
             try:
                 boot_status[intent] = self.boots[intent].tick(intent, stopping=stopping)
                 if boot_status[intent].get("state") in ("qualification_failed", "qualification_deadline_insufficient",
-                        "bootstrap_failed", "fleet_recovery_required", "fleet_attention_required"):
+                        "bootstrap_failed", "fleet_recovery_required", "fleet_attention_required",
+                        "staging_failed", "staging_cancelled", "staging_recovery_required"):
                     self._boot_failure(row, boot_status[intent])
             except Exception:
                 boot_status[intent] = {"state": "boot_observation_unconfirmed"}

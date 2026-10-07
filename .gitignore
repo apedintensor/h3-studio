@@ -215,6 +215,8 @@ inventory.json
 !deploy/platform/gpu_preparation_recovery.py
 !studio_platform/backlog_handoff.py
 !studio_platform/preparation_recovery.py
+!studio_platform/preparation_hold_recovery.py
+!deploy/platform/preparation_hold_recovery.py
 !test_platform_preparation_recovery.py
 !test_platform_backlog_handoff.py
 !test_platform_gpu_acceptance.py
@@ -302,8 +304,10 @@ inventory.json
 # Engine-bound cold boot and explicit continuing-service policy.
 !studio_platform/service_policy.py
 !studio_platform/wangp_bootstrap.py
+!studio_platform/bootstrap_staging.py
 !test_platform_wangp_bootstrap.py
 !studio_platform/runtime_hosts/wangp_environment.py
+!studio_platform/runtime_hosts/wangp_system_restore.py
 !deploy/wangp/bootstrap.py
 !deploy/wangp/package_tool.py
 !deploy/wangp/probe_gpu.py

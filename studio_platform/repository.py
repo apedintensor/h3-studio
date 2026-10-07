@@ -535,11 +535,11 @@ class Repository:
                          jobs.c.idempotency_key == idempotency_key)
         try:
             with self.transaction() as connection:
-                if initial_status in ("queued", "waiting_capacity"):
-                    # Same lock as idle shutdown: an admitted job cannot appear
-                    # between its empty-pool check and its destroy commitment.
-                    # Legacy/mock ledgers may have no physical capacity gate.
-                    self._locked(connection, select(capacity_gate).where(capacity_gate.c.id == "global"))
+                # Same lock as approvals/registration and idle shutdown. Even
+                # planned jobs preserve a frozen configuration identity that
+                # must not race a first cold approval with different delivery.
+                # Legacy/mock ledgers may have no physical capacity gate.
+                self._locked(connection, select(capacity_gate).where(capacity_gate.c.id == "global"))
                 plan = self._locked(connection, select(plans).where(plans.c.id == plan_id,
                     self._scope(plans, scope)))
                 if plan is None:
@@ -576,6 +576,11 @@ class Repository:
                 if initial_status == "waiting_capacity":
                     from .capacity import admit_waiter
                     admit_waiter(self, connection, scope, row, plan)
+                if execution.get("backend") == "wangp-worker":
+                    from .control import require_delivery_configuration
+                    self._lock_capacity(connection)
+                    require_delivery_configuration(connection, "wangp-worker",
+                        execution.get("configuration_id"), execution.get("output_delivery", ""))
                 self._emit(connection, "job.created", row["id"], {"job_id": row["id"], "status": initial_status})
                 return {**self._job(connection, row["id"]), "created": True}
         except IntegrityError:
@@ -595,6 +600,12 @@ class Repository:
             plan = connection.execute(select(plans).where(plans.c.id == job["plan_id"])).mappings().one()
             if plan["expires_at"] <= self.clock():
                 raise Conflict("plan_expired")
+            execution = plan["execution_plan"]
+            if execution.get("backend") == "wangp-worker":
+                from .control import require_delivery_configuration
+                self._lock_capacity(connection)
+                require_delivery_configuration(connection, "wangp-worker",
+                    execution.get("configuration_id"), execution.get("output_delivery", ""))
             self._require_pool_not_stopping(connection, job["pool"], plan["execution_plan"], plan["request"])
             self._reserve(connection, scope, budget_account_ids, "job", job_id, job["estimated_cost_microusd"])
             status = "waiting_capacity" if plan["execution_plan"].get("admission_state") == "waiting_capacity" else "queued"
@@ -687,6 +698,10 @@ class Repository:
                        else func.json_typeof(jobs.c.request[field]))
             columns.append(present.label("_type_"+field))
         columns.append(jobs.c.execution_plan["backend"].label("_summary_backend"))
+        columns.append(jobs.c.execution_plan["delivery_spec"].label("_summary_delivery_spec"))
+        present = (func.json_type(jobs.c.execution_plan, "$.delivery_spec") if self.engine.dialect.name == "sqlite"
+                   else func.json_typeof(jobs.c.execution_plan["delivery_spec"]))
+        columns.append(present.label("_type_delivery_spec"))
         return columns
 
     def _decode_job_summaries(self, values):
@@ -700,6 +715,9 @@ class Repository:
                         value = kind == "true"
                     row["request"][field] = value
             row["execution_plan"] = {"backend": row.pop("_summary_backend")}
+            delivery = row.pop("_summary_delivery_spec")
+            if row.pop("_type_delivery_spec") is not None:
+                row["execution_plan"]["delivery_spec"] = delivery
 
     @staticmethod
     def _job_batch_predicate(tenant_id, owner_id, job_projects, *, maximum):

@@ -259,14 +259,75 @@ track, preserves the native MP4, and hands both to the host for checksum sealing
 Failure during packaging retries the same completed result; it never regenerates.
 A crash before durable sealing remains unknown for reconciliation, not safe retry.
 
-The current worker exports the requested integer duration (for example 120 frames
-for 5 seconds), while the native H3 sample can have 124 frames. A last-image
-condition applies to that native ending and may be cut from the delivered export.
-The mapping tests do not prove the last frame remains visible in the delivered
-video. B3 should first prove text-to-video; accepting last-frame fidelity requires
-an explicit export/endpoint contract and a real last-frame test.
+Legacy/default worker export uses the requested integer duration (for example
+120 frames for 5 seconds), while the native H3 sample can have 124 frames. D3 adds
+the opt-in `native-frames-v1` delivery contract to preserve all native frames and
+the complete generated waveform for new separately qualified WanGP plans.
+It requires matching operator-policy, cold-approval, boot and worker capability
+identities; an existing configuration or accepted task is not silently upgraded.
+See [the output contract](../../GENERATION-CONTRACT.md#6-output-contract) for
+duration/audio validation and compatibility. Current first-proof configuration
+remains on its original export behavior. CPU numbered-frame evidence establishes
+export behavior only: B3 should first prove text-to-video, and a real first/last
+example is still needed before claiming qualified last-frame fidelity.
 
 ## Checks and remaining gates
+
+### Repair preparation while preserving the accepted job
+
+The protected host entry `deploy/platform/preparation_hold_recovery.py` supports
+an explicit source-only repair of a retained `bootstrap_failed` hold. All pool
+rentals must be destroyed with settled billing, with no inference attempt or
+fleet start. Engine, model, dependency archive, policy, budget and original
+waiting deadline remain unchanged. Expired/cancelled jobs cannot be restored.
+
+After independent source/image review and exact-version host approval, stage
+the target configuration and only the changed public source files under
+`gpu-scaler/operator/preparation-repairs/<operation-uuid>`. Ordered actions are
+`freeze`, `prepare --job-id <original-id>`, `retire`, `stage`, then an explicit
+root-supervised `resume`. Each action holds the host release lock. Resume
+activates the existing provider-enabled controller; staging does not. The
+existing next-cycle transfer keeps the original request, reservation and deadline.
+
+An uncertain response or durable `*_started` phase requires reconciliation;
+never repeat it automatically. Exact controller ownership, the database fence
+and retirement evidence must agree. This helper cannot replace the accepted
+runtime or clear unknown execution. Its docstring/tests specify file modes and
+supported boundaries. Staging failures and attempted inference use separate
+recovery paths.
+
+### Optional repair for measured provider SSH package drift
+
+The provider's [pinned SSH bootstrap](https://github.com/Datura-ai/lium-io/blob/ec31b1ecd9b5f4d594d88d7c1c8ecbfa7cdd7228/neurons/validators/src/services/assets/sshd_bootstrap.sh#L140-L175)
+can install `openssh-server` after the base image starts. A disposable CPU replay
+of that operation on the pinned PyTorch base upgraded `libsystemd0` from
+`249.11-0ubuntu3.12` to `249.11-0ubuntu3.22`; replaying the original 199 dependency
+archives left this one mismatch against the unchanged 425-package environment.
+This reproduction does not establish the contents of an already deleted host.
+
+For this exact side effect, an operator can include a finite local repair kit:
+
+```sh
+python deploy/wangp/package_tool.py source-bundle --output wangp-package.tar.gz \
+  --os-restore-kit /path/to/verified-kit --environment-lock /path/to/original-environment-lock.json
+```
+
+The kit contains `manifest.json` and six official amd64 archives from the signed
+[Ubuntu snapshot](https://snapshot.ubuntu.com/ubuntu/20250101T000000Z/):
+`libsystemd0`, `systemd`, `libnss-systemd`, `libpam-systemd`, `systemd-sysv`, and
+`systemd-timesyncd`, all at `249.11-0ubuntu3.12`. Their exact names, sizes and SHA256
+values are pinned in `wangp_system_restore.py`. The kit is private deployment
+material; do not commit binaries. Its manifest binds the original environment
+digest and base image, and the approved source-bundle SHA binds the complete kit.
+
+Bootstrap accepts only the measured `.22` family or a partially restored `.12`
+family, rejects unrelated environment differences, and validates every archive
+before installing the complete dependency closure. It does not fetch packages
+or run `apt install` on the GPU. It then requires the original environment pins,
+`dpkg --audit`, dependency consistency, and `sshd -t`. A matching original
+environment is unchanged. This is an exact repair, not a weaker lock, new model,
+new environment identity, or proof of GPU inference. A different drift requires
+diagnosis and a separately reviewed repair or a new qualified runtime identity.
 
 `test_platform_wangp_compiler.py` and `test_platform_wangp_session.py` use isolated
 fake Session objects/files only. They cover control rejection, immutable identities,

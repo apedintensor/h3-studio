@@ -31,6 +31,7 @@ PRIVATE_FILES = (
     "studio_platform/runtime_hosts/wangp.py", "studio_platform/runtime_hosts/wangp_receipts.py",
     "studio_platform/runtime_hosts/wangp_session.py", "studio_platform/runtime_hosts/wangp_http.py",
     "studio_platform/runtime_hosts/wangp_launcher.py", "studio_platform/runtime_hosts/wangp_environment.py",
+    "studio_platform/runtime_hosts/wangp_system_restore.py",
     "deploy/wangp/probe_gpu.py",
 )
 
@@ -57,11 +58,22 @@ def archive(path, folder):
                 target.add(source, arcname=source.relative_to(folder).as_posix(), recursive=False)
 
 
-def small_bundle(output):
+def small_bundle(output, os_restore_kit=None, environment_lock=None):
     output = Path(output)
+    extras = []
+    if os_restore_kit:
+        from studio_platform.runtime_hosts.wangp_system_restore import validate_kit, DIRECTORY
+        if not environment_lock:
+            raise ValueError("system_restore_environment_lock_required")
+        lock = json.loads(Path(environment_lock).read_text(encoding="utf-8"))
+        _, files = validate_kit(os_restore_kit, lock)
+        extras = [(regular_file(Path(os_restore_kit), "manifest.json"), f"{DIRECTORY}/manifest.json")]
+        extras.extend((path, f"{DIRECTORY}/{path.name}") for path in files)
     with tarfile.open(output, "x:gz") as target:
         for name in PRIVATE_FILES:
             target.add(regular_file(ROOT, name), arcname=name, recursive=False)
+        for path, name in extras:
+            target.add(path, arcname=name, recursive=False)
     if output.stat().st_size > 16 * 1024 * 1024:
         raise ValueError("wangp_source_bundle_limit")
     return {"filename": output.name, "sha256": sha_file(output), "size_bytes": output.stat().st_size}
@@ -206,6 +218,8 @@ def main(argv=None):
     item.add_argument("--system-debs", default="/var/cache/apt/archives", help="Retained installed system package archives to include for offline bootstrap")
     item = sub.add_parser("source-bundle")
     item.add_argument("--output", required=True)
+    item.add_argument("--os-restore-kit", help="Optional finite, locally verified SSH drift repair kit; never installed on the build host")
+    item.add_argument("--environment-lock", help="Original unchanged environment lock required when including an OS restore kit")
     item = sub.add_parser("bind-manifest")
     for name in ("manifest", "environment-lock", "output", "image"):
         item.add_argument("--" + name, required=True)
@@ -214,7 +228,7 @@ def main(argv=None):
         if args.command == "prepare":
             result = prepare(args.upstream_root, args.output, args.base_image, args.wheelhouse, args.system_debs)
         elif args.command == "source-bundle":
-            result = small_bundle(args.output)
+            result = small_bundle(args.output, args.os_restore_kit, args.environment_lock)
         else:
             result = bind_manifest(args.manifest, args.environment_lock, args.output, args.image)
         print(json.dumps(result))

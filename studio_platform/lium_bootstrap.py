@@ -45,7 +45,10 @@ BOOT_FAILURE_CODES = frozenset({"InternalSetupFailure", "SubprocessTimeout", "Su
     "verification_receipt_mismatch", "gpu_observation_invalid", "single_gpu_recipe_required",
     "private_token_invalid", "runtime_process_exited", "runtime_readiness_timeout",
     "python31114_linux_required", "python311_linux_required", "bootstrap_configuration_invalid",
-    "system_deb_mismatch", "runtime_import_probe_failed", "runtime_import_receipt_mismatch"})
+    "system_deb_mismatch", "runtime_import_probe_failed", "runtime_import_receipt_mismatch",
+    "system_restore_manifest_invalid", "system_restore_package_invalid", "system_restore_lock_conflict",
+    "system_restore_package_mismatch", "system_restore_extra_file", "system_restore_unrecognized_drift",
+    "system_restore_deb_metadata_mismatch", "system_restore_verification_failed", "system_restore_package_audit_failed"})
 BOOT_FAILURE_TYPES = frozenset({"SetupError", "RuntimeError", "ValueError", "TypeError", "OSError",
     "FileNotFoundError", "PermissionError", "ImportError", "ModuleNotFoundError", "TimeoutError",
     "ConnectionError", "CalledProcessError", "TimeoutExpired", "HTTPError", "HTTPStatusError",
@@ -56,7 +59,7 @@ BOOT_PHASES = frozenset({"preflight", "clone_comfy", "fetch_comfy", "pin_comfy",
     "download_preflight", "download_file", "weights_ready", "start_comfy", "comfy_ready", "failed", "download",
     "checking_package", "dependency_download", "dependency_unpack", "dependency_install", "model_download",
     "runtime_verification", "runtime_start", "runtime_ready", "runtime_start_unknown", "setup_failed",
-    "system_package_install", "runtime_imports"})
+    "system_package_install", "system_package_restore", "system_package_verification", "runtime_imports"})
 
 
 def _static(value, allowed, fallback):
@@ -64,7 +67,7 @@ def _static(value, allowed, fallback):
 
 
 def safe_bootstrap_diagnosis(value):
-    """Bounded static diagnosis only; never return logs, paths, URLs or details."""
+    """Static errors and bounded package versions; never logs, paths or URLs."""
     value = value if isinstance(value, dict) else {}
     diagnosis = {
         "error_code": _static(value.get("error_code"), BOOT_FAILURE_CODES, "UnclassifiedBootstrapFailure"),
@@ -85,6 +88,11 @@ def safe_bootstrap_diagnosis(value):
             bounded.append(entry)
         if bounded:
             diagnosis["failure_details"] = bounded
+    if diagnosis["error_code"] in {"system_package_mismatch", "system_restore_unrecognized_drift", "system_restore_verification_failed"}:
+        from .runtime_hosts.wangp_environment import safe_system_package_diagnostics
+        packages = safe_system_package_diagnostics(value.get("system_package_diagnostics"))
+        if packages is not None:
+            diagnosis["system_package_diagnostics"] = packages
     return diagnosis
 
 
@@ -111,8 +119,11 @@ class BootConfig:
     qualification_profile: str = ""
     execution_backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
+    output_delivery: str = ""
 
     def __post_init__(self):
+        from .inference.outputs import validate_delivery_policy
+        validate_delivery_policy(self.execution_backend, self.output_delivery)
         for field in ("work_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             if not Path(getattr(self, field)).is_absolute():
                 raise ValueError("bootstrap_paths_must_be_absolute")
@@ -444,6 +455,60 @@ class BootController:
         self.bound_intent = None
         self.bound_instance = None
         self.idle_since = None
+        self._preparation = None
+        self._preparation_identity = None
+        self._setup_dispatched = False
+        self.start_guard = None
+
+    def enable_pollable_upload(self):
+        """Production WanGP preparation only; preserve historical CLI behavior."""
+        if self.config.execution_backend != "wangp-worker":
+            raise BootError("pollable_staging_requires_wangp")
+        if self._preparation is None:
+            from .bootstrap_staging import PollableUpload
+            self._preparation = PollableUpload()
+
+    def preparation_pending(self):
+        return self._preparation is not None and self._preparation.pending()
+
+    def cancel_preparation(self):
+        if self._preparation is not None:
+            self._preparation.cancel()
+
+    def preparation_status(self):
+        return self._preparation.snapshot() if self._preparation is not None else {}
+
+    def preparation_stopped_before_start(self, state):
+        """Only the same controller's stopped upload can prove setup was never sent."""
+        if (self._preparation is None or self._setup_dispatched
+                or self._preparation_identity is None
+                or state.get("identity") != self._preparation_identity
+                or state.get("phase") not in {"staging", "staged", "staging_failed", "staging_cancelled"}):
+            return None
+        return self._preparation.stopped_for(self.bound_intent)
+
+    def record_preparation_stop(self, receipt, state):
+        proof = self.preparation_stopped_before_start(state)
+        if proof is None:
+            return False
+        phase = proof["state"]
+        if phase == "staged" and proof["cancel_requested"]:
+            phase = "staging_cancelled"
+        if phase not in {"staging_failed", "staging_cancelled"}:
+            return False
+        if state.get("phase") != phase:
+            state.update(phase=phase, staging={**proof, "state": phase})
+            self._save(receipt, state)
+        return True
+
+    def _start_allowed(self, intent_id):
+        if self.start_guard is not None and self.start_guard() is not True:
+            return False
+        with self.repo.engine.connect() as conn:
+            intent = conn.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()
+        return (intent["provider_instance_id"] == self.bound_instance
+            and intent["state"] in {"starting", "ready", "busy"}
+            and intent["hard_deadline"]-self.repo.clock() >= self.config.minimum_remaining_s)
 
     def _save(self, path, state):
         state["updated_at"] = self.repo.clock()
@@ -491,6 +556,8 @@ class BootController:
             "sources": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
         if self.config.execution_backend == "wangp-worker":
             value.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
+        if self.config.output_delivery:
+            value["output_delivery"] = self.config.output_delivery
         return value
 
     def _connect_backend(self, intent, directory, state):
@@ -560,13 +627,54 @@ class BootController:
                 # A retained failed attempt is terminal. Changing a marker or
                 # restarting remote setup requires separate audited recovery.
                 return {"state": "bootstrap_failed", **safe_bootstrap_diagnosis(state.get("failure"))}
+            if state["phase"] in {"staging_failed", "staging_cancelled"}:
+                return {"state": state["phase"], "phase": "staging_dependencies"}
+            if state["phase"] in {"staging", "staged"} and self._preparation is None:
+                return {"state": "staging_recovery_required"}
             if not self.host:
                 coordinates = self.provider.ssh_connection(intent_id, intent["provider_instance_id"])
                 self.host = self.ssh_factory(self.config, coordinates)
+            if self._preparation is not None and state["phase"] in {"reserved", "staging"}:
+                allowed = self._start_allowed(intent_id)
+                if not allowed:
+                    self.cancel_preparation()
+                # Persist before the upload thread touches remote source bytes.
+                if state["phase"] == "reserved":
+                    state.update(phase="staging", staging_started_at=self.repo.clock())
+                    self._save(receipt, state)
+                self._preparation_identity = identity
+                result = self._preparation.poll(directory, intent_id,
+                    lambda **options: self.host.upload(files, **options))
+                if not allowed:
+                    if self.record_preparation_stop(receipt, state):
+                        return {"state": state["phase"], "phase": "staging_dependencies"}
+                    return {**result, "state": "staging_authority_unavailable"}
+                state["staging"] = result
+                if self.preparation_pending():
+                    # The thread publishes its terminal state just before it
+                    # exits; do not dispatch setup or certify stop in that gap.
+                    self._save(receipt, state)
+                    return {**result, "state": "staging"}
+                if result["state"] in {"staged", "staging_failed", "staging_cancelled"}:
+                    state["phase"] = result["state"]
+                self._save(receipt, state)
+                if result["state"] != "staged":
+                    return result
             if state["phase"] == "reserved":
                 self.host.upload(files)
+                state["phase"] = "staged"
+            if state["phase"] == "staged":
+                # Upload completion is not permission to start. Ownership,
+                # revocation, deadline and cancellation may have changed.
+                if not self._start_allowed(intent_id):
+                    self.cancel_preparation()
+                    if self.record_preparation_stop(receipt, state):
+                        return {"state": state["phase"], "phase": "staging_dependencies"}
+                    self._save(receipt, state)
+                    return {"state": "bootstrap_start_not_authorized"}
                 state["phase"] = "bootstrap_starting"
                 self._save(receipt, state)
+                self._setup_dispatched = True
                 try:
                     self.host.start(identity)
                     state["phase"] = "booting"
@@ -629,7 +737,10 @@ class BootController:
                     "shutdown_grace_s": config.shutdown_grace_s, "slots": [{**asdict(spec), "enabled": True,
                         "endpoint": endpoint, "allowed_origins": [endpoint], "comfy_revision": COMFY_REVISION, "confirmed_idle": True}]}
                 if self.config.execution_backend == "wangp-worker":
+                    value["version"] = 2
                     value["slots"][0].update(comfy_revision="", runtime_config_file=slot.runtime_config_file)
+                if not spec.output_delivery:
+                    value["slots"][0].pop("output_delivery")
                 cfg_path.write_text(json.dumps(value), encoding="utf-8")
                 self.fleet = self.fleet_factory(config, self.repo, cfg_path)
                 state["fleet_recipe_ids"] = list(self.config.recipe_ids)

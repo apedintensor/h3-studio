@@ -70,6 +70,8 @@ def as_json(config):
         value.pop('engine_manifest_digest')
     if value['service_policy'] is None:
         value.pop('service_policy')
+    if not value['output_delivery']:
+        value.pop('output_delivery')
     for field in ("work_dir", "data_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
         value[field] = str(value[field])
     return value
