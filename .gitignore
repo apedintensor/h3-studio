@@ -308,6 +308,7 @@ inventory.json
 !test_platform_wangp_bootstrap.py
 !studio_platform/runtime_hosts/wangp_environment.py
 !studio_platform/runtime_hosts/wangp_system_restore.py
+!studio_platform/runtime_hosts/wangp_download.py
 !deploy/wangp/bootstrap.py
 !deploy/wangp/package_tool.py
 !deploy/wangp/probe_gpu.py

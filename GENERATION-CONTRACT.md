@@ -117,6 +117,19 @@ Preparation cancellation is cooperative and may wait for a bounded in-flight
 SSH operation. Pending transfer is not child-exit or upstream-idle evidence;
 staging failure retains original accepted backlog and accounting for repair.
 
+Model transfer runs only after the pinned environment/import checks, in one owned
+Linux child using the already locked Hugging Face SDK. The manifest's exact file
+allowlist and full revisions, official endpoint and explicit public `token=False`
+remain fixed. Two file workers, a bounded SDK retry per file, parent/child elapsed
+deadlines, disk/cache guards and parent-death termination bound preparation; SDK
+partials never authorize a second bootstrap or job submission. Only safe completed
+file/byte counts and static errors enter status. Native SDK logs are discarded,
+and the child must be stopped/reaped before local preparation can be idle.
+Transfer completion does not certify model bytes: full size/hash verification
+remains required before the runtime owns its slot. Model-transfer speed, native
+Xet interruption reuse and cross-instance model caching are not offline acceptance
+claims. See [the runtime preparation guide](deploy/wangp/README.md#bounded-public-model-transfer).
+
 Continuing single-slot operation is an explicit `service_policy`, validated
 against the existing scope, absolute window, budget ceiling and idle interval.
 `max_cycles: null` removes the old test-cycle count only. Each new rental remains

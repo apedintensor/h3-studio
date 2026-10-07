@@ -147,6 +147,40 @@ and bytes, and always `inference_verified=false`. Any uncertainty after process
 creation remains `unknown`; the controller must reconcile it before another start.
 The first accepted queued task, not a hidden smoke generation, proves inference.
 
+### Bounded public model transfer
+
+After the locked environment and import probe pass, bootstrap invokes
+`studio_platform.runtime_hosts.wangp_download` in one owned Linux child. It uses
+the **existing locked** `huggingface_hub`/`hf_xet` packages; it does not install an
+SDK or snapshot a repository. Each call names an exact manifest file and full
+repository revision, with the official Hub endpoint and literal `token=False`.
+Inherited Hub identity, endpoint and debug settings are removed for this child.
+
+At most two files transfer concurrently, with at most two SDK invocations per
+file. The SDK owns its partial files and transfer retries; this helper does not
+implement HTTP Range or replay bootstrap. Existing SDK partial files are retained
+within that preparation. HTTP fallback supports SDK resume; native Xet byte reuse
+across interruption is **not qualified by the fake SDK tests**. New ephemeral
+GPU instances do not gain a persistent model cache from this change.
+
+The parent watches a two-hour model-transfer deadline, free disk headroom and the
+isolated Hub/Xet cache (a watched 1 GiB threshold, not a filesystem quota, with
+chunk/shard caches disabled). The child
+also arms an independent Linux OS timer and parent-death termination before SDK
+import. Failure stops and reaps that exact child; an unconfirmed stop remains an
+obligation. Preparation-idle checks count the download child. SDK/native stdout,
+stderr and Xet file logs are suppressed; protected receipts contain only static
+error codes and completed-file/byte totals. Those totals are not network progress:
+Xet may preallocate files. The initial disk check conservatively requires all
+missing model sizes plus 10 GiB free, even if SDK partial files already exist.
+
+`downloaded_unverified` is transfer completion only. The existing complete
+size/hash checks still run before runtime launch and inside the owned launcher.
+This source change neither modifies the model manifest nor enables a new runtime
+configuration. Offline fake SDK and inert Linux process tests establish these
+guards; actual download throughput, interruption reuse and cold-start duration
+need a separately authorized future host measurement.
+
 Environment attestation of an extracted package uses its hash-bound
 `.sixnine-environment.json`; the original git-checkout path remains available for
 the historical candidate. Both paths retain core-version and complete model-file

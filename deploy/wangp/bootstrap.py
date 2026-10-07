@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tarfile
 import time
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 MAX_SOURCE = 16 * 1024**2
@@ -255,25 +255,10 @@ def install(config, slot_key, token_file, *, launch=True):
             raise ValueError("runtime_import_receipt_mismatch")
         model_root = checked_path(config["model_root"])
         model_root.mkdir(parents=True, exist_ok=True)
-        from studio_platform.runtime_hosts.wangp_environment import safe_relative
+        from studio_platform.runtime_hosts.wangp_download import run_download
         status("model_download")
-        for name, component in manifest.document["components"].items():
-            for item in component["files"]:
-                relative = safe_relative(item["path"])
-                path = checked_path(str(model_root / relative))
-                path.parent.mkdir(parents=True, exist_ok=True)
-                if not path.exists():
-                    if shutil.disk_usage(model_root).free < item["size_bytes"] + 10 * 1024**3:
-                        raise ValueError("model_disk_headroom")
-                    url = "https://huggingface.co/" + component["repository"] + "/resolve/" + component["revision"] + "/" + quote(item["path"])
-                    last = [0.0]
-                    def progress(size):
-                        if time.monotonic() - last[0] > 5:
-                            status("model_download", component=name, bytes_received=size, bytes_total=item["size_bytes"])
-                            last[0] = time.monotonic()
-                    download(url, path, maximum=item["size_bytes"], progress=progress)
-                if path.stat().st_size != item["size_bytes"]:
-                    raise ValueError("model_size_mismatch")
+        run_download(python, source, config["manifest_path"], manifest_digest,
+                     model_root, base / "model-download", environment, status)
         runtime_config = checked_path(config["config_path"])
         runtime_config.parent.mkdir(parents=True, exist_ok=True)
         with runtime_config.open("x", encoding="utf-8") as target:

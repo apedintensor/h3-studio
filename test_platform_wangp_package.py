@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
 import zipfile
 from unittest.mock import patch
@@ -135,6 +136,50 @@ class PackageTests(unittest.TestCase):
             archive.writestr("setuptools-84.0.0.dist-info/METADATA", "Name: setuptools\nVersion: 84.0.0\n")
             archive.writestr("setuptools/_vendor/example-1.0.dist-info/METADATA", "Name: example\nVersion: 1.0\n")
         self.assertEqual(package.wheel_metadata(wheel)["Name"], "setuptools")
+
+    def test_model_transfer_failure_cannot_reach_runtime_verification_or_launch(self):
+        from studio_platform.runtime_hosts import wangp_download
+        value = self.config()
+        prepared = self.root / "prepared"
+        dependency = prepared / "dependencies"
+        runtime = dependency / "upstream"
+        runtime.mkdir(parents=True)
+        (runtime / "wgp.py").write_bytes(b"# pinned source\n")
+        requirements = dependency / "requirements.lock"
+        requirements.write_bytes(b"# synthetic locked fixture\n")
+        self.lock["requirements_lock_sha256"] = env.sha_file(requirements)
+        wheels = dependency / "wheels"
+        wheels.mkdir()
+        wheel = wheels / self.lock["wheels"][0]["file"]
+        wheel.write_bytes(b"x")
+        self.lock["wheels"][0]["sha256"] = env.sha_file(wheel)
+        (runtime / ".sixnine-environment.json").write_bytes(env.canonical(self.lock))
+        value.update(prepared_root=str(prepared), dependency_artifact_path="")
+        Path(value["source_bundle_path"]).write_bytes(b"synthetic source fixture")
+        value["source_bundle_sha256"] = env.sha_file(value["source_bundle_path"])
+        manifest = json.loads((ROOT / "deploy/wangp/manifest.json").read_text())
+        manifest.update(runtime_digest_kind="sixnine-environment-lock-sha256", runtime_digest=env.digest(self.lock))
+        Path(value["manifest_path"]).write_text(json.dumps(manifest), encoding="utf-8")
+        imported = {"state": "imports_verified", "environment_lock_sha256": env.digest(self.lock),
+                    "inference_verified": False}
+        with patch.object(bootstrap.platform, "system", return_value="Linux"), \
+                patch.object(bootstrap.platform, "python_version", return_value=env.PYTHON), \
+                patch.object(bootstrap.sys, "path", list(bootstrap.sys.path)), \
+                patch.object(bootstrap, "extract", side_effect=lambda _, directory, **kw: directory.mkdir()), \
+                patch.object(env, "system_packages", return_value=self.lock["system_packages"]), \
+                patch.object(bootstrap.subprocess, "run", return_value=SimpleNamespace(returncode=0,
+                    stdout=json.dumps(imported))) as run, \
+                patch.object(bootstrap.subprocess, "Popen") as launch, \
+                patch.object(wangp_download, "run_download", side_effect=ValueError("model_download_timeout")) as transfer:
+            result = bootstrap.install(value, "test-slot", str(self.root / "token"))
+        self.assertEqual((result["state"], result["failure_phase"], result["code"]),
+                         ("failed", "model_download", "model_download_timeout"))
+        transfer.assert_called_once()
+        self.assertEqual(transfer.call_args.args[2], value["manifest_path"])
+        self.assertEqual(run.call_count, 2)  # pip check and inert mocked import probe only
+        launch.assert_not_called()
+        self.assertFalse(Path(value["config_path"]).exists())
+        self.assertTrue((Path(value["install_root"]) / "wangp-bootstrap-started.json").exists())
 
     def test_environment_lock_is_bound_before_source_or_package_verification(self):
         (self.source / ".sixnine-environment.json").write_bytes(env.canonical(self.lock))
