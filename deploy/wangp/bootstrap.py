@@ -308,7 +308,7 @@ def install(config, slot_key, token_file, *, launch=True):
         with open(os.devnull, "wb") as quiet:
             child = subprocess.Popen(command + ["--create-journal"], cwd=str(source), env=environment,
                 stdin=subprocess.DEVNULL, stdout=quiet, stderr=quiet, start_new_session=True)
-        from studio_platform.runtime_hosts.wangp_launcher import VERIFICATION_RECEIPT, read_verification_receipt
+        from studio_platform.runtime_hosts.wangp_receipts import VERIFICATION_RECEIPT, read_verification_receipt
         deadline = time.monotonic() + 900
         while time.monotonic() < deadline:
             if child.poll() is not None:
