@@ -5,6 +5,12 @@ Work items: [D1 #18](https://github.com/apedintensor/h3-studio/issues/18),
 [D2 #22](https://github.com/apedintensor/h3-studio/issues/22), coordinated
 [B1 #12](https://github.com/apedintensor/h3-studio/issues/12).
 
+Source checkpoint accepted in [PR #25](https://github.com/apedintensor/h3-studio/pull/25),
+merge `d8c811db79683507a959d3260cdf99b072d0022e`. This remains a dated technical
+receipt, not the live task board. The 2026-10-08 follow-through in
+[A4 #26](https://github.com/apedintensor/h3-studio/issues/26) links unresolved work
+below; it does not add a production observation or real-GPU result.
+
 ## Implemented scope
 
 The existing API, task ledger, worker and artifact writer remain authoritative.
@@ -124,3 +130,20 @@ denial, one rental per original demand, lost-start response reconciliation,
 missing-journal quarantine, collection before destruction and unknown destruction
 without replacement rental. Existing Comfy cold approvals intentionally cannot
 authorize WanGP until these extensions are accepted.
+
+## Follow-up ownership (2026-10-08)
+
+| Remaining outcome | Authoritative task / acceptance boundary |
+|---|---|
+| Shared plan/access/read service completion and Quick Chat compatibility | [B1 #12](https://github.com/apedintensor/h3-studio/issues/12); existing preflight/confirmation/enqueue are partial implementation |
+| Full runtime lock, engine-bound cold approvals, bootstrap/readiness/reconnect and real packaging | [D2 #22](https://github.com/apedintensor/h3-studio/issues/22); no production activation from this report |
+| Continuing operating configuration | [C1 #14](https://github.com/apedintensor/h3-studio/issues/14) |
+| Offline cold-start uncertainty, duplicate prevention and collection-before-destruction cases | [C2 #15](https://github.com/apedintensor/h3-studio/issues/15), coordinated with D2 |
+| Real public cold/warm/idle-restart/download proof | [B3 #16](https://github.com/apedintensor/h3-studio/issues/16) |
+| Native ending versus delivered duration and last-frame fidelity | [D3 #27](https://github.com/apedintensor/h3-studio/issues/27); known trimming behavior, actual H3 visual impact unverified |
+| Historical pending reservations and supplier statement reconciliation | [C3 #28](https://github.com/apedintensor/h3-studio/issues/28); historical counts are not current cash or duplicate-charge proof |
+| REF image/video/audio inputs and additional supported controls | [D4 #29](https://github.com/apedintensor/h3-studio/issues/29); not part of initial FL2VA acceptance |
+| Broader variants/performance and dual-node redundancy | [D #4](https://github.com/apedintensor/h3-studio/issues/4) and [E #5](https://github.com/apedintensor/h3-studio/issues/5); separate recipes and evidence required |
+
+Current criterion results and ownership belong to those issues. Future batch
+handoffs belong in their PRs/issues rather than another competing status report.

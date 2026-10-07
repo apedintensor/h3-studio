@@ -16,13 +16,30 @@ Describe the concrete problem and resulting behavior.
 - API, data, or execution contract changes:
 - Compatibility and dependencies on other work:
 
-## Verification
+## Acceptance and evidence
 
-Record checks and evidence against the issue's acceptance criteria. Distinguish offline/fake-provider tests, local integration, and production verification.
+Lead with accepted outcomes and what remains pending. Assess each criterion at the tested revision; split composite criteria without dropping requirements. Only a complete pass checks a box or closes its issue. Distinguish offline/fake-provider tests, local integration, and production evidence.
 
-- Passed:
-- Failed or not verified:
-- Remaining work / follow-up issues:
+| Criterion | Result: pass / partial / unverified / fail | Exact evidence, environment and revision | Remaining condition / issue |
+|---|---|---|---|
+| | | | |
+
+## Independent review and discoveries
+
+- Reviewer / session, reviewed revision and scope (or why independent review is not required):
+- Limitations / authoring overlap; technical review only or which acceptance criteria were also assessed:
+- Findings, fix commits and re-review result:
+- Unresolved discoveries → existing issue or bounded follow-up, with priority, dependency and release effect:
+
+Record blockers immediately; triage other material findings before merge/handoff. Small in-scope bugs fixed in this batch need no separate issue. Review is agent-managed; no mandatory human PR approval.
+
+## Handoff
+
+- Claim retained / transferred / released; Project Session and next bounded scope:
+- Required dependency capability and evidence; Ready only if satisfied, otherwise Backlog / Blocked with reason:
+- Parent delivery rollup updated separately from active ownership:
+
+Preserve shared feature checkouts and unfinished source; acceptance does not require switching them to main or cleanup.
 
 ## Release state
 

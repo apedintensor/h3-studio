@@ -1,11 +1,12 @@
 # Sixnine cross-session development workflow
 
-Updated: 2026-10-06 (Australia/Sydney). This is the GitHub workflow entry point. A local Chinese reading edition may be available as `WORKFLOW.zh-CN.md`; it is not required to start from a fresh clone. Keep the rules aligned rather than maintaining separate processes. This workflow does not change product requirements, API contracts, production budgets, or operating authorization.
+Updated: 2026-10-08 (Australia/Sydney). This is the GitHub workflow entry point. `WORKFLOW.zh-CN.md` is a Chinese reading edition; this English entry is authoritative. Keep the rules aligned rather than maintaining separate processes. This workflow does not change product requirements, API contracts, production budgets, or operating authorization.
 
 ## Planning and execution have distinct sources of truth
 
 - [PROJECT-PLAN.md](PROJECT-PLAN.md) provides the English architecture and A–H work-package entry point. Local detailed research may be indexed by `PLANNING-INDEX.zh-CN.md`; local-only documents are not assumed to exist on GitHub or in a fresh clone.
 - Current repository specifications, contracts, and approved UX define the intended behavior and invariants. Issues link to them instead of duplicating the architecture. Label proposals, implemented behavior, local verification, and production evidence separately.
+- Keep durable contracts, decisions and operating instructions in versioned documents. Keep batch progress, claims, acceptance receipts and outstanding work in the issue/PR, with links to the applicable document revision. Update `CURRENT-BASELINE.md` when an accepted change alters its dated overview; do not create another status document for every batch.
 - GitHub Issues and the Project track ownership, progress, dependencies, blockers, and acceptance evidence. Resolve the actual repository, Project, fields, and work-package issue links through [workflow/project.json](workflow/project.json). Do not create a parallel board or duplicate task from memory.
 - PRs and commits identify code versions. Deployment receipts identify released versions. Closing an issue, merging code, or passing local tests does not by itself mean the change is live.
 - Use English for GitHub titles, bodies, comments, milestones, labels, and statuses. Existing local Chinese research may remain; transfer relevant requirements into the English issue-linked specification. Do not link unpublished local files as if they were accessible on GitHub.
@@ -67,11 +68,17 @@ Claim / resume
 
 Every work item has one explicit integration owner. Parallel sessions use bounded child tasks with coordinated scopes and separate branches/worktrees; do not develop on shared main. Separate worktrees do not eliminate contract conflicts. Commit only owned changes, except an explicitly authorized source-preservation batch that records whose unfinished work it protects.
 
+Readiness applies to the next bounded scope. A dependency issue can remain open if the exact capability needed for that scope has already been delivered and verified: link its revision/evidence, record the remaining dependency gate, and explain why it does not block this scope. Do not silently remove the dependency or describe the whole parent as accepted. Missing required capabilities mean `Backlog` with `Blocked: Yes`, a reason and the next action. `Ready` does not grant production or paid-operation authority.
+
 ## Agent-managed integration and source protection
 
 The user does not perform routine manual PR work. Agents create the PR, inspect its complete diff, run the selected checks and merge the authorized batch when ready. Use independent agent review for material authentication, persistence, generation or billing changes. Required checks are not bypassed; a human approval count is not a substitute for that review. The stable backend CI check is `test`.
 
+Leave an independent review receipt in the PR or linked issue: reviewer/session, reviewed revision and boundaries, exclusions or authoring overlap, findings, fix commits and re-review result. An agent must not describe review of its own changes as independent. A technical review is not automatically full acceptance of every issue criterion; state whether acceptance was also assessed and which criteria remain unverified. An agent review receipt is sufficient; a mandatory human PR review is not required.
+
 Keep incomplete or unapproved work in a clearly labelled draft/source branch; do not merge it just to back it up. Push reviewed source at meaningful checkpoints and before handoff, excluding secrets, media, runtime data, environments and dependencies. Unpublished does not mean uncommitted. Git protects source; database/media recovery remains a separate F obligation.
+
+A handoff or merged PR does not require switching an existing shared feature checkout to `main`. Preserve its branch, unpublished work and preview dependencies; use an isolated worktree for the next task. Cleanup or retirement is a separate authorized action, not a completion ritual.
 
 Canonical frontend and approved mock are in the private `apedintensor/sixnine-design` repository at the existing `../video-studio-design` path. Its `test` workflow checks source without deploying it. The generated backend `yingxu/` snapshot remains on the existing release path. An approved source merge does not remove the user's existing frontend publication gate.
 
@@ -88,28 +95,47 @@ Engineering decides whether a request needs configuration or code. Account lists
 - Never put API keys, connection codes, tokens, cookies, passwords, signed URLs, private prompts, or user media in issues, PRs, comments, or attachments. Use redacted error codes, versions, aggregate evidence, or approved synthetic media. Keep sensitive receipts in protected locations and reference them without secrets.
 - If GitHub is unavailable, independent authorized work without ownership conflicts may continue. State that remote status is not synchronized. Do not claim that an issue was assigned or a board was updated unless that operation succeeded.
 
+## Triage discoveries before they are lost
+
+Record a new blocker immediately in the current issue and stop only work that depends on its resolution. Triage other material discoveries before merge or handoff. Reuse a relevant existing issue; create a bounded task only when the finding needs its own scope, acceptance or ownership. This includes unresolved bugs/risks, money/data/security obligations, out-of-scope capability gaps and work another session must pick up. A small in-scope bug fixed and verified in the same batch can stay in the PR evidence rather than getting another issue.
+
+For each unresolved finding, record the observed behavior and evidence, impact/priority, owning issue and next scope, acceptance condition, dependencies and release effect. Distinguish a confirmed defect, a risk needing verification and a capability not yet implemented. Keep sensitive evidence protected. A follow-up link cannot turn a failed criterion into a pass or remove it from the original scope without recording an explicitly authorized scope change.
+
 ## Pause or hand off
 
 Update the original issue with completed work, the exact commit or uncommitted files, verification results, blockers, next steps, and any running operations. State what remains unverified, particularly paid calls, GPU execution, deployment, and migration.
 
 Before ownership changes, identify the change boundary and unfinished operations. The receiving session checks the latest code and evidence before proceeding. A handoff does not cancel accepted jobs, restart instances, reset ledgers, or extend authorization windows. A brief absence does not release ownership; a transfer or relinquishment must be explicit.
 
+When explicitly releasing a claim, set the Project `Session` field to `Unclaimed` and keep the branch/worktree as preservation evidence. If the issue is not accepted, set it to `Ready` only when the documented next scope is ready under the dependency rule above; otherwise use `Backlog` and `Blocked: Yes` for missing required dependencies. Do not leave a released leaf task `In progress` as if a session were still implementing it. A retained claim awaiting review can be `In review`; inactivity alone never releases it.
+
 ## Finish and accept
 
 Record the following in the original issue/PR:
 
-1. Which acceptance criteria passed, with checks and environment; keep failures and unverified items explicit.
+1. Assess every acceptance criterion as `pass`, `partial`, `unverified` or `fail`, with the exact revision, evidence link/check and environment. `partial` identifies the satisfied part and the remaining condition; `unverified` is not a pass. Split composite criteria into independently assessable parts while preserving every original requirement; do not check the parent until all parts pass.
 2. The commit/PR, specification and contract updates, and compatibility impact. Code or mock tests are not proof of production success.
 3. Remaining work with linked follow-up issues and dependencies.
 4. Release state and applicable rollback evidence. Use `Not released` if deployment has not occurred.
+
+Use a compact acceptance table, not only a total test count:
+
+| Criterion | Result | Evidence, environment and revision | Remaining condition / issue |
+|---|---|---|---|
+| AC identifier or exact requirement | pass / partial / unverified / fail | Specific check/receipt, offline or live environment, commit | Link or none |
+
+Only `pass` maps to a checked acceptance box. The integration owner records the acceptance decision against this evidence and the review receipt; implementation progress alone does not close an issue. Reports lead with what is accepted, what is pending and the follow-up links. Test totals support those conclusions rather than replacing them.
 
 Project fields are:
 
 - `Status`: `Backlog`, `Ready`, `In progress`, `In review`, `Done`.
 - `Blocked`: `No`, `Yes`; include the reason, dependency, and next action when blocked.
 - `Release`: `Not required`, `Not released`, `Released`.
+- `Session`: the active claim or `Unclaimed`; historical ownership remains in comments.
 
 Read actual field IDs from `workflow/project.json`. `Done` means the acceptance criteria for that issue are satisfied. If those criteria include deployment, the issue cannot be completed without deployment and the required verification. A local-only deliverable can be completed while release remains a separate work item.
+
+Parent work-package status summarizes delivery, separately from active session ownership. Update it when children are accepted or material follow-ups change the remaining scope. A partly delivered parent can be `In progress` without a current coding claim; identify it as a rollup and use `Session`/child claims for ownership. Do not close a parent merely because one child passed, or automatically mark every parent blocked by one child's dependency.
 
 Evidence must distinguish `Local verified`, `Released`, and `Production verified`. Use the existing release process when deployment is required. Deployment receipts establish release facts; test counts, merged PRs, and board status do not establish online availability.
 

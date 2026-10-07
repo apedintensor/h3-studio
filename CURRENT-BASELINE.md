@@ -1,6 +1,6 @@
 # Sixnine implementation and production baseline
 
-Source/workflow refreshed: 2026-10-07 Australia/Sydney.
+Source/workflow refreshed: 2026-10-08 Australia/Sydney (source/board review only; no new production observation).
 Last public health/provider inventory observation: 2026-10-07, 11:23 Australia/Sydney (UTC+11).
 Last container/ledger/controller observation: 2026-10-06, 22:20–22:25 Australia/Sydney; those details were not rechecked by the WanGP integration batch.
 Work item: [A1 #10](https://github.com/apedintensor/h3-studio/issues/10).
@@ -11,7 +11,7 @@ This is a dated baseline, not a live status page or permission to operate GPUs.
 | Surface | Observed identity | Evidence / limits |
 |---|---|---|
 | Accepted generation foundation | `f51a90567227910cc2f30c55a8cb19b953d3d7a2` (PR #17) | A1/A2/B2 merged; not production-released. Read GitHub for subsequent source-only integration commits. |
-| WanGP integration source | D1/D2 checkpoint in `WANGP-INTEGRATION-RESULT.md` | Durable adapter/host and configured-slot routing implemented and tested offline. Pinned real image, on-demand boot integration and B3 real-generation proof remain incomplete; not production-released. |
+| WanGP integration source | `d8c811db79683507a959d3260cdf99b072d0022e` ([PR #25](https://github.com/apedintensor/h3-studio/pull/25)) | D1 #18 accepted offline. Durable adapter/host, configured-slot routing and partial shared admission are implemented. Full image lock, on-demand boot integration and B3 real-generation proof remain incomplete; not production-released. |
 | Running production API image tag | `sixnine-platform:73ca224970ffdfae30e1bc7d99c50b2c96ce91af` | Read-only Docker inspection through official AWS MCP/SSM. |
 | Running image configuration digest | `sha256:9cda5689e60064ec2f6269b469274824f704f13186707fa5c6f2dc11f1a35ac2` | Docker image ID; do not confuse this with an OCI manifest/index digest. |
 | Frontend compatibility label | `sixnine-web-v1` | Fresh `/healthz`; this is not an independently verified frontend build SHA. |
@@ -43,7 +43,7 @@ Read-only `python -m studio_platform.diagnostics` against the running container 
 | Pending funding reservations | 7 |
 | Diagnostic alert | `billing_unsettled_keep_reservations` |
 
-Aggregate account counters were limit **71,109,655**, reserved **5,400,000**, spent **3,690,396** micro-USD. These sum potentially overlapping account ledgers. They are **not** deduplicated supplier charges, remaining GPU authorization, or available cash. Preserve the 7 reservations until explicit settlement evidence resolves them.
+Aggregate account counters were limit **71,109,655**, reserved **5,400,000**, spent **3,690,396** micro-USD. These sum potentially overlapping account ledgers. They are **not** deduplicated supplier charges, remaining GPU authorization, or available cash. Preserve the 7 reservations until explicit settlement evidence resolves them. [C3 #28](https://github.com/apedintensor/h3-studio/issues/28) owns the fresh reconciliation and evidence-backed disposition; this workflow update does not refresh the historical counts or settle anything.
 
 Separate GET-only verification at 11:25 UTC:
 
@@ -68,11 +68,11 @@ No fresh frontend build identity, supplier final invoice reconciliation, WanGP G
 |---|---|---|
 | HTTP and account authorization | `platform_app.py`, `studio_platform/api.py`, `auth.py`, `guided.py` | Preserve routes, ownership and PAT semantics. |
 | Assets and snapshots | `assets.py`, `source_snapshot.py`, storage modules | GPU scratch must not be the only output copy. |
-| Admission and plans | `repository.py`, `execution_policy.py`; local `generation_admission.py` | Coordinate unpublished extraction; do not introduce another admission authority. |
+| Admission and plans | `repository.py`, `execution_policy.py`, merged `generation_admission.py` | PR #25 shares preflight/confirmation/enqueue; B1 #12 still needs explicit plan/read/access interfaces and preserved Quick Chat compatibility. |
 | Durable execution | `queue.py`, `control.py`, `worker.py` | Keep submission intent, fences, unknown states, attempt identity and collection recovery. |
 | Output publication | `artifact_writer.py` | Keep verified video and independent audio, receipts and storage settlement. |
-| Runtime and capacity | `fleet.py`, `scaler.py`, `production_scaler.py`, `on_demand_scaler.py`, `queued_task_runner.py` | Comfy-specific readiness/global backend selection still obstruct safe engine coexistence. |
-| Selected next engine | Upstream WanGP headless runtime | User authorization confirmed. Not installed, routed or GPU-qualified by this inventory. |
+| Runtime and capacity | `fleet.py`, `scaler.py`, `production_scaler.py`, `on_demand_scaler.py`, `queued_task_runner.py` | PR #25 binds configured slots and attempts to engine/manifest and preserves legacy recovery. On-demand approval/bootstrap/readiness still need the WanGP strategy in D2 #22. |
+| Selected next engine | Upstream WanGP headless runtime | PR #25 adds the offline adapter, compiler, host and configured-slot routing. No real runtime installation, GPU qualification or production switch is established. |
 
 The public generation contract is frozen in [GENERATION-CONTRACT.md](GENERATION-CONTRACT.md). It distinguishes existing routes from local Quick Chat additions and proposed engine changes.
 
@@ -82,9 +82,12 @@ The first live proof is one explicitly confirmed task: upload/resolve owned medi
 
 1. A1/A2/B2 are accepted in PR #17. A3 #19 protects source and reconciles guidance; source checks do not prove runtime readiness.
 2. B1 #12 coordinates the existing shared admission extraction with preserved G1/G2; do not overwrite it from an old checkout.
-3. D1 #18 implements the offline adapter/receipt boundary. D2 #22 adds real pinned control mapping, original-attempt engine binding, protected host/bootstrap and generalized GPU guards.
+3. D1 #18 is complete within its offline adapter/receipt scope. D2 #22 has partial pinned compilation/transport/routing implementation; next implement its engine-bound cold approvals/bootstrap/recovery and complete the runtime lock. Read its criterion-level evidence before claiming remaining work.
 4. C1 #14 separates configuration/continuing policy from finite tests; C2 #15 exercises ambiguous start/cancel/restart/collection under the resulting contract.
-5. B3 #16 depends on the above gates and current operating authority for one real public cold/warm/idle-restart-to-download slice. WanGP is selected, not yet integrated or qualified.
+5. B3 #16 depends on the above gates and current operating authority for one real public cold/warm/idle-restart-to-download slice. WanGP source integration exists; the live path is not yet qualified. C3 #28 reconciles historic supplier obligations before calculating available operating funds.
 6. E broad redundancy and G production integration follow the reliable core; G1 #20 and G2 #21 may preserve/review local UX independently. F backups precede storage migration; H follows measured demand.
+7. [D3 #27](https://github.com/apedintensor/h3-studio/issues/27) owns native/delivered duration and last-frame fidelity; its CPU reproduction may proceed now, while real validation waits for D2. [D4 #29](https://github.com/apedintensor/h3-studio/issues/29) owns REF capability expansion after the initial runtime/service gates. Neither is silently included in the initial text-only B3 proof.
+
+The 2026-10-08 workflow follow-through is [A4 #26](https://github.com/apedintensor/h3-studio/issues/26). Current ownership/status is read from the Project and latest claims, not this dated baseline. The shared checkout deliberately remains on the preserved Quick Chat branch; start new work in an isolated worktree instead of switching or cleaning that checkout.
 
 The user delegates routine PR creation, checks and merge to agents. Source preservation, product acceptance and publication remain distinct. GitHub branch enforcement is recorded in the A3 completion comment; no account upgrade/public visibility change is authorized to obtain it.

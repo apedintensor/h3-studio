@@ -204,6 +204,48 @@
         "A2",
         "B2"
       ]
+    },
+    "D3": {
+      "number": 27,
+      "node_id": "I_kwDOU6TGZc8AAAABVoLw6g",
+      "url": "https://github.com/apedintensor/h3-studio/issues/27",
+      "title": "[D3] Preserve last-frame conditioning in the delivered duration",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_KFI0",
+      "depends_on": [
+        "A2"
+      ]
+    },
+    "C3": {
+      "number": 28,
+      "node_id": "I_kwDOU6TGZc8AAAABVoL_dw",
+      "url": "https://github.com/apedintensor/h3-studio/issues/28",
+      "title": "[C3] Reconcile historical supplier charges and retained reservations",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_KFbQ",
+      "depends_on": [
+        "A1"
+      ]
+    },
+    "D4": {
+      "number": 29,
+      "node_id": "I_kwDOU6TGZc8AAAABVoMN9Q",
+      "url": "https://github.com/apedintensor/h3-studio/issues/29",
+      "title": "[D4] Implement and qualify WanGP H3 reference-input capabilities",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_KFrk",
+      "depends_on": [
+        "D2",
+        "B3"
+      ]
+    },
+    "A4": {
+      "number": 26,
+      "node_id": "I_kwDOU6TGZc8AAAABVoIp1Q",
+      "url": "https://github.com/apedintensor/h3-studio/issues/26",
+      "title": "[A4] Make acceptance evidence and follow-up ownership explicit",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_KCuE",
+      "depends_on": [
+        "A3",
+        "D1"
+      ]
     }
   },
   "views": {
