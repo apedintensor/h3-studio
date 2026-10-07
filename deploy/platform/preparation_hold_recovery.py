@@ -70,26 +70,22 @@ def supervisor_exited(saved, *, include_client=False):
     fields = dict(line.split('=', 1) for line in raw.splitlines() if '=' in line)
     if fields.get('MainPID') != '0':
         return False
-    if fields.get('LoadState') == 'not-found':
-        # This is accepted only after our acknowledged SIGKILL of the frozen
-        # exact main process, and both original process identities are gone.
-        pairs = [('pid', 'start_ticks')]
-        if include_client:
-            pairs.append(('docker_pid', 'docker_start_ticks'))
-        for key, ticks in pairs:
-            try:
-                if process_identity(saved[key])[1] == saved[ticks]:
-                    return False
-            except FileNotFoundError:
-                pass
-        return True
-    if fields.get('InvocationID') != saved['invocation_id']:
+    if fields.get('LoadState') != 'not-found' and fields.get('InvocationID') != saved['invocation_id']:
         return False
+    # This is accepted only after our acknowledged SIGKILL of the frozen
+    # exact main process. A zombie cannot execute, but may still have a /proc
+    # entry with an empty cmdline until PID1 reaps it; inspect start ticks/state
+    # rather than treating that ordinary termination interval as malformed.
+    pairs = [('pid', 'start_ticks')]
     if include_client:
+        pairs.append(('docker_pid', 'docker_start_ticks'))
+    for key, ticks in pairs:
         try:
-            return process_identity(saved['docker_pid'])[1] != saved['docker_start_ticks']
+            tail = (Path('/proc')/str(saved[key])/'stat').read_text().rsplit(')', 1)[1].split()
+            if int(tail[19]) == saved[ticks] and tail[0] != 'Z':
+                return False
         except FileNotFoundError:
-            return True
+            pass
     return True
 
 

@@ -168,6 +168,18 @@ class PreparationHoldHostTests(unittest.TestCase):
         self.assertEqual(self.core.call_count, 2)
         self.launch.assert_not_called()
 
+    def test_retirement_waits_for_original_client_but_allows_reaped_or_zombie_exit(self):
+        saved = {'unit': 'sixnine-synthetic.service', 'pid': 100, 'start_ticks': 50,
+            'docker_pid': 101, 'docker_start_ticks': 60, 'invocation_id': 'a'*32}
+        def proc(state, ticks):
+            return '101 (docker) '+state+' '+' '.join(['0']*18)+' '+str(ticks)
+        with patch.object(handoff, 'command', return_value=b'MainPID=0\nLoadState=not-found\n'), \
+                patch.object(Path, 'read_text', side_effect=[FileNotFoundError(), proc('S', 60)]):
+            self.assertFalse(host.supervisor_exited(saved, include_client=True))
+        with patch.object(handoff, 'command', return_value=b'MainPID=0\nLoadState=not-found\n'), \
+                patch.object(Path, 'read_text', side_effect=[FileNotFoundError(), proc('Z', 60)]):
+            self.assertTrue(host.supervisor_exited(saved, include_client=True))
+
     def configure_resume(self):
         host.stage(self.operation)
         self.stack.enter_context(patch.object(scaler, 'checked_release', return_value=(self.commit, self.root/'release', {'SIXNINE_IMAGE':'synthetic'})))
