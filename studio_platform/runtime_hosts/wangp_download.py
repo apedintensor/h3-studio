@@ -175,6 +175,7 @@ def fetch_files(document, expected_digest, model_root, progress_path, *, workers
         downloader = hf_hub_download
     lock = threading.Lock()
     completed = set()
+    failure = None
     total = sum(row[4] for row in records)
     def progress(state, code=None):
         value = {"state": state, "manifest_digest": expected_digest,
@@ -186,9 +187,13 @@ def fetch_files(document, expected_digest, model_root, progress_path, *, workers
         write_progress(progress_path, value)
     progress("downloading")
     def fetch(record):
+        nonlocal failure
         _, repo, revision, filename, size = record
         expected = path_checked(root / filename)
         for attempt in range(2):
+            with lock:
+                if failure is not None:
+                    raise ValueError(failure)
             try:
                 returned = downloader(repo_id=repo, filename=filename, revision=revision,
                     local_dir=str(root), token=False, endpoint=ENDPOINT, force_download=False,
@@ -203,11 +208,18 @@ def fetch_files(document, expected_digest, model_root, progress_path, *, workers
                 # SDK errors may contain transient signed URLs. Never retain or
                 # serialize them. Only a file transfer retries, not bootstrap.
                 if str(error) in SAFE_ERRORS or attempt == 1:
-                    raise ValueError(safe_error(error)) from None
+                    with lock:
+                        if failure is None:
+                            failure = safe_error(error)
+                            # Tell the parent now, before executor shutdown waits
+                            # for another native transfer. Only it stops/reaps us.
+                            progress("failed", failure)
+                    raise ValueError(failure) from None
                 sleep(1)
         with lock:
-            completed.add(filename)
-            progress("downloading")
+            if failure is None:
+                completed.add(filename)
+                progress("downloading")
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(fetch, records))
@@ -297,6 +309,8 @@ def run_download(python, source, manifest_path, expected_digest, model_root, sta
                         or type(value.get("bytes_complete")) is not int or not 0 <= value["bytes_complete"] <= value["bytes_total"]
                         or value.get("code", "model_download_failed") not in SAFE_ERRORS):
                     raise ValueError("model_download_progress_invalid")
+                if value["state"] == "failed":
+                    raise ValueError(value.get("code", "model_download_failed"))
                 if value != last:
                     progress("model_download", files_complete=value["files_complete"], files_total=value["files_total"],
                              bytes_complete=value["bytes_complete"], bytes_total=value["bytes_total"])

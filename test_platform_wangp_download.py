@@ -148,6 +148,51 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(json.loads(self.progress.read_text())["code"], "model_download_failed")
         self.assertTrue(all(call["token"] is False for call in calls))
 
+    def test_first_failure_latches_before_blocked_peer_or_queued_files_finish(self):
+        third = {"path": "queued.bin", "size_bytes": 1, "sha256": hashlib.sha256(b"x").hexdigest()}
+        self.manifest["components"]["model"]["files"].append(third)
+        self.digest = EngineManifest.from_dict(self.manifest).digest
+        blocked, release = threading.Event(), threading.Event()
+        errors, calls = [], []
+        def sdk(**kwargs):
+            name = kwargs["filename"]
+            calls.append(name)
+            if name == "tiny.bin":
+                self.assertTrue(blocked.wait(timeout=5))
+                raise RuntimeError("https://signed.invalid/?token=DO_NOT_RECORD")
+            if name == "second/config.json":
+                blocked.set()
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test peer release timed out")
+                return self.sdk(**kwargs)
+            self.fail("a queued file must not start after the first-failure latch")
+        def invoke():
+            try:
+                self.run_fetch(downloader=sdk, sleep=lambda _: None)
+            except Exception as error:
+                errors.append(str(error))
+        caller = threading.Thread(target=invoke)
+        caller.start()
+        try:
+            deadline = time.monotonic() + 5
+            failed = False
+            while time.monotonic() < deadline:
+                if self.progress.exists():
+                    failed = json.loads(self.progress.read_text()).get("state") == "failed"
+                    if failed:
+                        break
+                time.sleep(.01)
+            self.assertTrue(failed, "parent must observe failure before the other SDK call returns")
+            self.assertTrue(caller.is_alive())
+            self.assertNotIn("queued.bin", calls)
+        finally:
+            release.set()
+            caller.join(timeout=5)
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(errors, ["model_download_failed"])
+        self.assertEqual(json.loads(self.progress.read_text())["state"], "failed")
+        self.assertNotIn("DO_NOT_RECORD", self.progress.read_text())
+
     def test_same_size_corrupt_download_is_rejected_by_retained_full_verifier(self):
         def corrupt(**kwargs):
             target = self.sdk(**kwargs)
@@ -235,6 +280,19 @@ class DownloadTests(unittest.TestCase):
             self.run_child(launch, stop=stop, progress=progress)
         stop.assert_called_once()
         progress.assert_not_called()
+
+    def test_failure_receipt_stops_and_reaps_child_while_sdk_peer_still_runs(self):
+        value = self.receipt()
+        value.update(state="failed", code="model_download_failed", files_complete=0, bytes_complete=0)
+        child = NS(poll=Mock(return_value=None))
+        def launch(command, **kwargs):
+            fetch.write_progress(command[command.index("--progress") + 1], value)
+            return child
+        stop = Mock()
+        with self.assertRaisesRegex(ValueError, "model_download_failed"):
+            self.run_child(launch, stop=stop)
+        stop.assert_called_once_with(child)
+        child.poll.assert_not_called()  # failure is actionable before an exit acknowledgement
 
     def test_cache_overflow_stops_child(self):
         child = NS(poll=lambda: None)
