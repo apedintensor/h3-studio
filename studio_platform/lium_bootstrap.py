@@ -456,6 +456,8 @@ class BootController:
         self.bound_instance = None
         self.idle_since = None
         self._preparation = None
+        self._preparation_identity = None
+        self._setup_dispatched = False
         self.start_guard = None
 
     def enable_pollable_upload(self):
@@ -475,6 +477,29 @@ class BootController:
 
     def preparation_status(self):
         return self._preparation.snapshot() if self._preparation is not None else {}
+
+    def preparation_stopped_before_start(self, state):
+        """Only the same controller's stopped upload can prove setup was never sent."""
+        if (self._preparation is None or self._setup_dispatched
+                or self._preparation_identity is None
+                or state.get("identity") != self._preparation_identity
+                or state.get("phase") not in {"staging", "staged", "staging_failed", "staging_cancelled"}):
+            return None
+        return self._preparation.stopped_for(self.bound_intent)
+
+    def record_preparation_stop(self, receipt, state):
+        proof = self.preparation_stopped_before_start(state)
+        if proof is None:
+            return False
+        phase = proof["state"]
+        if phase == "staged" and proof["cancel_requested"]:
+            phase = "staging_cancelled"
+        if phase not in {"staging_failed", "staging_cancelled"}:
+            return False
+        if state.get("phase") != phase:
+            state.update(phase=phase, staging={**proof, "state": phase})
+            self._save(receipt, state)
+        return True
 
     def _start_allowed(self, intent_id):
         if self.start_guard is not None and self.start_guard() is not True:
@@ -610,16 +635,26 @@ class BootController:
                 coordinates = self.provider.ssh_connection(intent_id, intent["provider_instance_id"])
                 self.host = self.ssh_factory(self.config, coordinates)
             if self._preparation is not None and state["phase"] in {"reserved", "staging"}:
-                if not self._start_allowed(intent_id):
+                allowed = self._start_allowed(intent_id)
+                if not allowed:
                     self.cancel_preparation()
-                    return {**self.preparation_status(), "state": "staging_authority_unavailable"}
                 # Persist before the upload thread touches remote source bytes.
                 if state["phase"] == "reserved":
                     state.update(phase="staging", staging_started_at=self.repo.clock())
                     self._save(receipt, state)
+                self._preparation_identity = identity
                 result = self._preparation.poll(directory, intent_id,
                     lambda **options: self.host.upload(files, **options))
+                if not allowed:
+                    if self.record_preparation_stop(receipt, state):
+                        return {"state": state["phase"], "phase": "staging_dependencies"}
+                    return {**result, "state": "staging_authority_unavailable"}
                 state["staging"] = result
+                if self.preparation_pending():
+                    # The thread publishes its terminal state just before it
+                    # exits; do not dispatch setup or certify stop in that gap.
+                    self._save(receipt, state)
+                    return {**result, "state": "staging"}
                 if result["state"] in {"staged", "staging_failed", "staging_cancelled"}:
                     state["phase"] = result["state"]
                 self._save(receipt, state)
@@ -632,10 +667,14 @@ class BootController:
                 # Upload completion is not permission to start. Ownership,
                 # revocation, deadline and cancellation may have changed.
                 if not self._start_allowed(intent_id):
+                    self.cancel_preparation()
+                    if self.record_preparation_stop(receipt, state):
+                        return {"state": state["phase"], "phase": "staging_dependencies"}
                     self._save(receipt, state)
                     return {"state": "bootstrap_start_not_authorized"}
                 state["phase"] = "bootstrap_starting"
                 self._save(receipt, state)
+                self._setup_dispatched = True
                 try:
                     self.host.start(identity)
                     state["phase"] = "booting"

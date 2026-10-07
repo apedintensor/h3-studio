@@ -27,7 +27,13 @@ class PollableUpload:
         self._key = None
 
     def pending(self):
-        return self._thread is not None and not self._done.is_set()
+        return self._thread is not None and (self._thread.is_alive() or not self._done.is_set())
+
+    def stopped_for(self, key):
+        """Positive proof from this owned operation, never reconstructed from files."""
+        if self._key != key or not self._done.is_set() or self.pending():
+            return None
+        return {**self.snapshot(), "cancel_requested": self._cancelled.is_set()}
 
     def cancel(self):
         self._cancelled.set()
@@ -48,14 +54,18 @@ class PollableUpload:
             raise ValueError("bootstrap_staging_identity_changed")
         if self._thread is not None:
             return self.snapshot()
-        if self._cancelled.is_set():
-            self._state = "staging_cancelled"
+        if self._done.is_set():
             return self.snapshot()
         lock = _slot_lock(directory, "staging-" + key)
         if not lock.__enter__():
             lock.__exit__(None, None, None)
             return {"state": "staging_locked", "phase": "staging_dependencies"}
         self._key = key
+        if self._cancelled.is_set():
+            lock.__exit__(None, None, None)
+            self._state = "staging_cancelled"
+            self._done.set()
+            return self.snapshot()
 
         def run():
             state = "staged"

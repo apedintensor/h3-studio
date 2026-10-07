@@ -164,6 +164,7 @@ class ProductionBoot(BootController):
             receipt = self.config.work_dir/intent_id/"bootstrap-state.json"
             if receipt.exists():
                 state = json.loads(receipt.read_text())
+                self.record_preparation_stop(receipt, state)
                 if state.get("smoke_submission_started") and state.get("phase") not in ("qualified", "qualification_failed", "fleet_starting", "fleet_started"):
                     self._collection_backend(intent, state)
                     result = self._smoke(receipt.parent, receipt, state)
@@ -380,11 +381,17 @@ class ProductionBoot(BootController):
             # A preparation failure has no Comfy backend to query. Require a
             # fresh, identity-bound process/socket observation instead of
             # treating the missing endpoint or a failed status as idle proof.
-            if self.backend is None and state.get("phase") == "bootstrap_failed":
+            prestart = state.get("phase") in {"staging_failed", "staging_cancelled"}
+            if self.backend is None and (state.get("phase") == "bootstrap_failed" or prestart):
                 if (tag != self.intent_id or self.fleet is not None
                         or state.get("smoke_submission_started")
                         or any((receipt.parent/helper.name/"state.json").exists()
                                for helper in self._multimodal_helpers())):
+                    raise BootError("finite_preparation_idle_unconfirmed")
+                if prestart and (self.config.execution_backend != "wangp-worker"
+                        or self.preparation_stopped_before_start(state) is None
+                        or (receipt.parent/"fleet.json").exists()
+                        or (receipt.parent/"fleet"/"fleet-state.json").exists()):
                     raise BootError("finite_preparation_idle_unconfirmed")
                 with self.repo.engine.connect() as conn:
                     intent = dict(conn.execute(select(instance_intents).where(
@@ -400,11 +407,14 @@ class ProductionBoot(BootController):
                 if self.host is None:
                     coordinates = self.provider.ssh_connection(tag, instance_id)
                     self.host = self.ssh_factory(self.config, coordinates)
-                report = self.host.preparation_idle_report()
+                report = (self.host.preparation_idle_report(expected_prestart_identity=identity)
+                          if prestart else self.host.preparation_idle_report())
                 now = self.repo.clock()
                 runtime_field = 'runtime_process_count' if self.config.execution_backend == 'wangp-worker' else 'comfy_process_count'
                 listener_field = 'runtime_port_listening' if self.config.execution_backend == 'wangp-worker' else 'comfy_port_listening'
-                idle = (report.get("identity") == identity and report.get("state") == "failed"
+                idle = (report.get("identity") == identity
+                    and report.get("state") == ("not_started" if prestart else "failed")
+                    and (not prestart or report.get("setup_markers_absent") is True)
                     and report.get("process_visibility_complete") is True
                     and type(report.get("bootstrap_process_count")) is int
                     and report["bootstrap_process_count"] == 0

@@ -1,14 +1,24 @@
 """Fake blocked uploads and real isolated ledgers; no SSH/provider/model calls."""
 import json
+import contextlib
+from dataclasses import replace
+import hashlib
+import io
 from pathlib import Path
 import threading
 import unittest
 from unittest.mock import patch
 
-from sqlalchemy import select
+from sqlalchemy import insert, select
 
 from studio_platform.bootstrap_staging import PollableUpload, UploadCancelled
-from studio_platform.repository import scaler_leaders
+from studio_platform.autoscale import ScalePolicy
+from studio_platform.repository import scaler_actions, scaler_leaders
+from studio_platform.lium_bootstrap import BootError
+from studio_platform.production_scaler_boot import ProductionBoot
+from studio_platform.scaler import ProviderFact, ScaleCoordinator
+from studio_platform.wangp_bootstrap import WanGPSSHHost
+from test_platform_production_scaler import configuration, FakeProvider
 import test_platform_wangp_bootstrap as boot_fixture
 import test_platform_wangp_service_hold as service_fixture
 
@@ -98,7 +108,18 @@ class PollableBootTests(unittest.TestCase):
         self.start_upload()
         self.upload.finish(self.boot._preparation)
         self.boot.start_guard = lambda: False
+        self.assertEqual(self.tick()['state'], 'staging_cancelled')
+        self.assertEqual(json.loads(self.receipt.read_text())['phase'], 'staging_cancelled')
+        self.assertEqual(self.f.host.starts, 0)
+
+    def test_authority_loss_while_upload_pending_records_stop_after_thread_exits(self):
+        self.start_upload()
+        self.boot.start_guard = lambda: False
         self.assertEqual(self.tick()['state'], 'staging_authority_unavailable')
+        self.assertIsNone(self.boot.preparation_stopped_before_start(json.loads(self.receipt.read_text())))
+        self.upload.finish(self.boot._preparation)
+        self.assertEqual(self.tick()['state'], 'staging_cancelled')
+        self.assertIsNotNone(self.boot.preparation_stopped_before_start(json.loads(self.receipt.read_text())))
         self.assertEqual(self.f.host.starts, 0)
 
     def test_cancel_during_transfer_keeps_original_receipt_without_start(self):
@@ -141,6 +162,142 @@ class PollableBootTests(unittest.TestCase):
         self.assertNotIn('private', json.dumps(result))
         self.assertEqual(self.tick()['state'], 'staging_failed')
         self.assertEqual(self.f.host.starts, 0)
+
+
+class ProductionStagingIdleTests(unittest.TestCase):
+    """Real ProductionBoot + ledger retirement, with owned fake SSH/upload only."""
+    def setUp(self):
+        self.f = boot_fixture.WanGPBootTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.addCleanup(self.f.tearDown)
+        self.finite = replace(configuration(self.f.root, self.f.now),
+            source_dir=self.f.sources,
+            source_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in self.f.sources.iterdir()},
+            execution_backend='wangp-worker', engine_manifest_digest=self.f.manifest.digest,
+            qualification_profile=boot_fixture.QUEUED_TASK_PROFILE)
+        self.finite.work_dir.mkdir()
+        self.provider = FakeProvider(lambda: self.f.now)
+        self.provider.ssh_connection = lambda *a: {}
+        self.boot = self.make_boot()
+        self.upload = BlockedUpload()
+        self.f.host.upload = self.upload
+        self.addCleanup(lambda: self.upload.finish(self.boot._preparation))
+        self.f.host.close = lambda: None
+        self.proof_changes = {}
+        self.f.host.preparation_idle_report = lambda *, expected_prestart_identity: {
+            'identity': expected_prestart_identity, 'state': 'not_started', 'setup_markers_absent': True,
+            'process_visibility_complete': True, 'bootstrap_process_count': 0,
+            'runtime_process_count': 0, 'runtime_port_listening': False, **self.proof_changes}
+        self.receipt = self.boot.config.work_dir/self.f.intent['id']/'bootstrap-state.json'
+
+    def make_boot(self):
+        boot = ProductionBoot(self.f.repo, self.provider, self.finite, self.f.intent, 19300,
+            config_path=self.f.root/'config.json', ssh_factory=lambda *a: self.f.host)
+        boot.enable_pollable_upload()
+        boot.start_guard = lambda: True
+        return boot
+
+    def tick(self, **kwargs):
+        return self.boot.tick(self.f.intent['id'], **kwargs)
+
+    def probe(self, boot=None):
+        return (boot or self.boot).idle_probe(self.f.intent['id'], boot_fixture.POD)
+
+    def start(self):
+        self.assertEqual(self.tick()['state'], 'staging')
+        self.assertTrue(self.upload.entered.wait(1))
+
+    def fail(self):
+        self.start()
+        self.upload.failure = True
+        self.upload.finish(self.boot._preparation)
+        self.assertEqual(self.tick()['state'], 'staging_failed')
+
+    def test_failed_stopped_upload_proves_idle_and_existing_ledger_destroys_once(self):
+        self.fail()
+        self.assertTrue(self.probe().idle)
+        self.assertEqual(self.f.host.starts, 0)
+        intent = self.f.repo.list_instance_intents()[0]
+        self.f.repo.update_instance(intent['id'], 'draining')
+        with self.f.repo.transaction() as conn:
+            conn.execute(insert(scaler_actions).values(intent_id=intent['id'], pool=intent['pool'],
+                launch_spec={}, create_started_at=self.f.now))
+        def reconcile(tag, instance_id):
+            if self.provider.destroys:
+                return self.provider.facts[tag]
+            proof = self.probe()
+            return ProviderFact('running', instance_id, idle_confirmed=proof.idle, idle_since=proof.idle_since)
+        self.provider.reconcile = reconcile
+        scaler = ScaleCoordinator(self.f.repo, provider=self.provider, enabled=True)
+        budget = self.f.repo.get_budget('owner-budget')
+        for _ in range(2):
+            scaler.tick('staging-retirement', self.f.scope, intent['pool'], [], [],
+                policy=ScalePolicy(dry_run=False), budget_account_ids=['owner-budget'])
+            self.f.now += 16
+        self.assertEqual(self.provider.destroys, [intent['id']])
+        self.assertEqual(self.f.repo.list_instance_intents()[0]['state'], 'destroyed')
+        # Destruction is not a fabricated invoice or release of unknown cost.
+        self.assertEqual(self.f.repo.get_budget('owner-budget'), budget)
+        self.assertEqual(self.f.host.starts, 0)
+
+    def test_stopping_pending_upload_waits_then_records_cancel_and_proves_idle(self):
+        self.start()
+        self.assertFalse(self.tick(stopping=True)['children_done'])
+        with self.assertRaises(BootError):
+            self.probe()
+        self.upload.finish(self.boot._preparation)
+        self.assertTrue(self.tick(stopping=True)['children_done'])
+        self.assertEqual(json.loads(self.receipt.read_text())['phase'], 'staging_cancelled')
+        self.assertTrue(self.probe().idle)
+        self.assertEqual(self.f.host.starts, 0)
+
+    def test_durable_phase_alone_or_new_controller_cannot_certify_stop(self):
+        self.fail()
+        with self.assertRaises(BootError):
+            self.probe(self.make_boot())
+        self.boot._setup_dispatched = True
+        with self.assertRaises(BootError):
+            self.probe()
+
+    def test_remote_runtime_markers_or_incomplete_observation_prevents_retirement(self):
+        self.fail()
+        for change in ({'setup_markers_absent': False}, {'state': 'failed'}, {'identity': {}},
+                {'process_visibility_complete': False}, {'bootstrap_process_count': 1},
+                {'runtime_process_count': 1}, {'runtime_port_listening': True}):
+            with self.subTest(change=change):
+                self.proof_changes = change
+                self.assertFalse(self.probe().idle)
+
+
+class RemotePrestartProofTests(unittest.TestCase):
+    def test_authenticated_script_requires_absent_markers_and_full_process_socket_observation(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); proc = root/'proc'; (proc/'1').mkdir(parents=True); (proc/'net').mkdir()
+            (proc/'1'/'cmdline').write_bytes(b'/usr/bin/python3\0-c\0read-only-probe\0')
+            for name in ('tcp', 'tcp6'):
+                (proc/'net'/name).write_text('sl local_address rem_address st\n')
+            host = WanGPSSHHost.__new__(WanGPSSHHost)
+            def run(script, **kwargs):
+                script = script.replace('/workspace/h3-studio', root.as_posix()).replace(
+                    "Path('/proc')", 'Path('+repr(proc.as_posix())+')')
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    exec(compile(script, '<offline-prestart-proof>', 'exec'), {})
+                return json.loads(output.getvalue())
+            host.run = run
+            identity = {'backend': 'wangp-worker', 'intent_id': 'synthetic', 'instance_id': 'synthetic-pod'}
+            observe = lambda: host.preparation_idle_report(expected_prestart_identity=identity)
+            self.assertEqual(observe()['state'], 'not_started')
+            for name in ('sixnine-bootstrap-identity.json', 'setup-status.json', 'sixnine-bootstrap.lock', 'wangp-token'):
+                marker = root/name; marker.write_text('synthetic')
+                self.assertFalse(observe()['process_visibility_complete'])
+                marker.unlink()
+            (proc/'1'/'cmdline').write_bytes(b'python\0-m\0studio_platform.runtime_hosts.wangp_launcher\0')
+            self.assertEqual(observe()['runtime_process_count'], 1)
+            (proc/'1'/'cmdline').unlink()
+            self.assertFalse(observe()['process_visibility_complete'])
 
 
 class StagingControllerTests(unittest.TestCase):

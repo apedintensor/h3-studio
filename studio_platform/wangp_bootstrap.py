@@ -399,12 +399,24 @@ print(json.dumps(out))
             report.update(diagnosis)
         return report
 
-    def preparation_idle_report(self):
+    def preparation_idle_report(self, *, expected_prestart_identity=None):
+        if expected_prestart_identity is not None and (
+                not isinstance(expected_prestart_identity, dict)
+                or expected_prestart_identity.get('backend') != 'wangp-worker'):
+            raise BootError('wangp_prestart_identity_required')
         return self.run('''import json,re,time
 from pathlib import Path
 root=Path('/workspace/h3-studio');proc=Path('/proc')
 out={'identity':{},'state':'unknown','process_visibility_complete':False,
  'bootstrap_process_count':None,'runtime_process_count':None,'runtime_port_listening':None}
+expected=PRESTART_IDENTITY
+markers=('sixnine-bootstrap-identity.json','setup-status.json','sixnine-bootstrap.lock','wangp-token')
+def absent():
+ for name in markers:
+  try: (root/name).lstat()
+  except FileNotFoundError: continue
+  return False
+ return True
 def read(name):
  p=root/name
  if p.is_symlink() or not p.is_file() or p.stat().st_size>4194304: raise ValueError('unconfirmed')
@@ -412,8 +424,12 @@ def read(name):
 def pids():
  return {p.name for p in proc.iterdir() if p.name.isdecimal() and p.is_dir()}
 try:
- identity=read('sixnine-bootstrap-identity.json');status=read('setup-status.json')
- if identity.get('backend')!='wangp-worker' or status.get('state')!='failed': raise ValueError('unconfirmed')
+ if expected is not None:
+  if not absent(): raise ValueError('unconfirmed')
+  identity=expected;state='not_started'
+ else:
+  identity=read('sixnine-bootstrap-identity.json');status=read('setup-status.json');state='failed'
+  if identity.get('backend')!='wangp-worker' or status.get('state')!='failed': raise ValueError('unconfirmed')
  before=pids()
  if not before: raise ValueError('unconfirmed')
  bootstrap=runtime=0
@@ -434,10 +450,12 @@ try:
    if len(fields)<10 or not re.fullmatch(r'[0-9A-Fa-f]+:[0-9A-Fa-f]{4}',fields[1]): raise ValueError('unconfirmed')
    listening=bool(listening or int(fields[1].rsplit(':',1)[1],16)==8199 and fields[3].upper()=='0A')
  if pids()!=before: raise ValueError('unconfirmed')
- out.update(identity=identity,state='failed',process_visibility_complete=True,bootstrap_process_count=bootstrap,
+ if expected is not None and not absent(): raise ValueError('unconfirmed')
+ out.update(identity=identity,state=state,setup_markers_absent=expected is not None,
+  process_visibility_complete=True,bootstrap_process_count=bootstrap,
   runtime_process_count=runtime,runtime_port_listening=listening)
 except Exception:
  pass
 out['observed_at']=time.time()
 print(json.dumps(out))
-''', limit=16384)
+'''.replace('PRESTART_IDENTITY', repr(expected_prestart_identity)), limit=16384)
