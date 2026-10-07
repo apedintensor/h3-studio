@@ -476,7 +476,10 @@ class LiumProvider:
             raise LiumError("lium_invalid_pod_status")
         if status.upper() != "RUNNING":
             # FAILED/STOPPED may still reserve a billed node; not removed.
-            return ProviderFact("starting", pod_id)
+            known = status.upper() if status.upper() in {"PENDING", "FAILED", "STOPPED"} else None
+            phase = "configuring_ssh" if pod.get("phase") == "configuring ssh" else "provider_preparing"
+            return ProviderFact("starting", pod_id, provider_status=known,
+                preparation_stage=phase if known else None)
         proof = None
         if self._idle_probe is not None:
             try:

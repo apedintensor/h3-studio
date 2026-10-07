@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from .autoscale import ScalePolicy
 from .capacity import (proven_unadmitted_capacity_draft, proven_unsubmitted_capacity_job,
@@ -28,9 +28,9 @@ from .lium_runtime_aws import AwsLiumLoader
 from .production_scaler import (FiniteConfig, FiniteController, MODEL, RECIPE, ScalerError,
     save, stdin_loader, unique, validate_settings, verify_identity_files, verify_sources)
 from .repository import (Repository, capacity_approvals, capacity_cycles, capacity_waiters,
-    attempts, jobs, registered_workers, scaler_actions, scaler_leaders)
+    attempts, jobs, registered_workers, scaler_actions, scaler_leaders, instance_intents)
 from .qualification_profiles import QUEUED_TASK_PROFILE
-from .scaler import LaunchSpec
+from .scaler import LaunchSpec, ScaleCoordinator
 from .settings import Settings
 from .service_policy import cycle_sequence_allowed, validate_service_config
 from .worker import _slot_lock
@@ -71,6 +71,10 @@ def json_config(config):
         value.pop("service_policy", None)
     if not value.get("output_delivery"):
         value.pop("output_delivery", None)
+    if value.get("provider_preparation_timeout_s") is None:
+        value.pop("provider_preparation_timeout_s", None)
+    if value.get("provider_preparation_failure_limit") == 2:
+        value.pop("provider_preparation_failure_limit", None)
     if value.get("execution_backend", "comfy-worker") == "comfy-worker":
         value.pop("execution_backend", None)
         value.pop("engine_manifest_digest", None)
@@ -152,6 +156,72 @@ class ServiceCycle(FiniteController):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.scaler.unsubmitted_retirement_guard = self._preparation_retirement_allowed
+        self.scaler.unused_preparation_guard = self._unused_provider_preparation
+
+    def provider_retirement(self):
+        rows, _ = self._managed()
+        with self.repo.engine.connect() as conn:
+            for row in rows:
+                value = self.scaler.preparation(conn, row)
+                if value and value["phase"] == "retiring_unused":
+                    return value
+        return None
+
+    def _unused_provider_preparation(self, conn, intent):
+        """Called under leader/capacity/action locks, before durable retirement.
+
+        The awaiting_provider receipt, committed before rental creation, is the
+        positive start barrier. Missing files alone can never create that proof.
+        """
+        if (not getattr(self, "preserve_rollover", lambda: False)()
+                or intent["id"] in self.boots or intent["pool"] != self.config.pool):
+            return False
+        cycle = conn.execute(select(capacity_cycles).where(
+            capacity_cycles.c.approval_id == self.config.capacity_approval_id)).mappings().first()
+        grant = conn.execute(select(capacity_approvals).where(
+            capacity_approvals.c.id == self.config.capacity_approval_id)).mappings().first()
+        if not cycle or cycle["intent_id"] != intent["id"] or not grant or not grant["enabled"]:
+            return False
+        # A conflicting historical/bootstrap footprint requires explicit recovery.
+        for path in (self.config.work_dir/"boot"/intent["id"],
+                     self.config.work_dir/("lifetime-"+intent["id"]+".json")):
+            if path.exists() or path.is_symlink():
+                return False
+        pending = list(conn.execute(select(jobs).where(jobs.c.pool == self.config.pool,
+            jobs.c.status.not_in(("succeeded", "failed", "cancelled", "planned", "blocked")))
+            .order_by(jobs.c.id).with_for_update().limit(4097)).mappings())
+        if (len(pending) > 4096 or any(j["execution_plan"].get("capacity_approval_id") != grant["id"]
+                or not proven_unsubmitted_capacity_job(conn, j) for j in pending)):
+            return False
+        # Freeze new admissions atomically with the start fence and destroy intent.
+        conn.execute(update(capacity_approvals).where(capacity_approvals.c.id == grant["id"]).values(enabled=0))
+        return True
+
+    def _sync_provider_preparation(self):
+        value = self.provider_retirement()
+        if value is not None:
+            self.request_rollover()
+            self._expire_held_waiters()
+            self.cold.record_wait_reason(self.config.capacity_approval_id, self.provider_wait_reason(value))
+        elif not self._capacity_advance_allowed():
+            self._expire_held_waiters()
+            self.cold.record_wait_reason(self.config.capacity_approval_id, "creation_needs_reconciliation")
+
+    def _capacity_advance_allowed(self):
+        if self.config.provider_preparation_timeout_s is None:
+            return True
+        rows, _ = self._managed()
+        with self.repo.engine.connect() as conn:
+            for row in rows:
+                if row["state"] == "destroyed" and row["provider_instance_id"]:
+                    phase = self.scaler.preparation(conn, row)
+                    if phase is None or phase["phase"] == "awaiting_provider":
+                        return False  # Removed, but conflicting unused evidence is still unresolved.
+        return True
+
+    def provider_wait_reason(self, retirement):
+        return ("provider_preparation_retry_limit" if getattr(self, "provider_retry_limited", lambda: False)()
+                else retirement["reason"])
 
     def _preparation_retirement_allowed(self, conn, intent):
         hold = self.preparation_hold()
@@ -381,9 +451,13 @@ class ServiceCycle(FiniteController):
                     "error_code": "capacity_wait_deadline_expired"})
 
     def _close_unsubmitted(self):
-        if ((self.preparation_hold() or (self.config.work_dir/"rollover.flag").exists())
+        if ((self.preparation_hold() or self.provider_retirement() or (self.config.work_dir/"rollover.flag").exists())
                 and getattr(self, "preserve_rollover", lambda: False)()):
             self.repo.set_capacity_approval_enabled(self.config.capacity_approval_id, enabled=False)
+            if self.provider_retirement():
+                self._expire_held_waiters()
+                self.cold.record_wait_reason(self.config.capacity_approval_id,
+                    self.provider_wait_reason(self.provider_retirement()))
             if self.preparation_hold():
                 if self.preparation_hold()["reason"] == "bootstrap_repair_required":
                     self._expire_held_waiters()
@@ -440,6 +514,7 @@ class OnDemandController:
             provider=self.provider, boot_factory=self.boot_factory)
         self.current.leader_id = self.leader_id
         self.current.preserve_rollover = lambda: not self.stopping()
+        self.current.provider_retry_limited = self.provider_retry_limited
         config.work_dir.mkdir(parents=True, exist_ok=True)
         self.current.config_path = config.work_dir/"operator-cycle.json"
         expected = json_config(config)
@@ -467,6 +542,12 @@ class OnDemandController:
         # Empty pool is the initial waiting state, not a completed rental.
         if (not value["instances"] or not value["all_destroyed"] or value["active_jobs_truncated"]
                 or not all(b.children_done() for b in self.current.boots.values())):
+            return False
+        if not self.current._capacity_advance_allowed():
+            return False
+        if self.current.provider_retirement() and value["billing_pending"]:
+            return False  # Provider DELETE uncertainty and outstanding charges retain this cycle.
+        if self.provider_retry_limited():
             return False
         # An inventory race must not consume all approved cycles in one tight
         # loop. No-rent attempts retain the same job during this bounded pause.
@@ -509,10 +590,53 @@ class OnDemandController:
                     return False
         return True
 
+    def provider_failure_count(self):
+        """Read a bounded streak from the existing cycle/start-barrier ledger.
+
+        No process-local counter can reset this on restart. Only actual owned
+        provider pods count; inventory refusals/authoritative no-rent cycles do
+        not count or reset the streak. Read at most the limit plus current pod.
+        """
+        if self.config.provider_preparation_timeout_s is None:
+            return 0
+        count = 0
+        prefix = self.config.capacity_approval_id+"-"
+        with self.repo.engine.connect() as conn:
+            rows = conn.execute(select(instance_intents, capacity_cycles.c.approval_id).join(capacity_cycles,
+                capacity_cycles.c.intent_id == instance_intents.c.id).where(
+                instance_intents.c.pool == self.config.pool, instance_intents.c.provider_instance_id.is_not(None),
+                capacity_cycles.c.approval_id.startswith(prefix, autoescape=True))
+                .order_by(func.length(capacity_cycles.c.approval_id).desc(), capacity_cycles.c.approval_id.desc())
+                .limit(self.config.provider_preparation_failure_limit+1)).mappings()
+            for row in rows:
+                sequence = int(row["approval_id"][len(prefix):])
+                config = cycle_config(self.config, sequence)
+                if config.capacity_approval_id != row["approval_id"] or sequence > self.sequence:
+                    raise ScalerError("provider_preparation_history_unconfirmed")
+                reader = ScaleCoordinator(self.repo, preparation_timeout_s=config.provider_preparation_timeout_s,
+                    preparation_binding=config.fingerprint())
+                phase = reader.preparation(conn, row)
+                if phase is None:
+                    raise ScalerError("provider_preparation_history_unconfirmed")
+                if phase["phase"] == "bootstrap_started":
+                    return count
+                if phase["phase"] == "retiring_unused" or row["state"] == "destroyed":
+                    count += 1
+                    if count >= self.config.provider_preparation_failure_limit:
+                        return count
+                elif sequence != self.sequence:
+                    raise ScalerError("provider_preparation_history_unconfirmed")
+        return count
+
+    def provider_retry_limited(self):
+        return bool(self.current and self.current.provider_retirement()
+            and self.provider_failure_count() >= self.config.provider_preparation_failure_limit)
+
     def tick(self):
         # A failed qualification or explicit grant revocation ends the service.
         # Only our durable TTL-rollover marker authorizes preserving backlog
         # and opening a replacement cycle under the original service budget.
+        self.current._sync_provider_preparation()
         if (self.current.stopping() and not self.current.preparation_hold()
                 and not (self.current.config.work_dir/"rollover.flag").exists()):
             self.request_drain()
@@ -575,11 +699,18 @@ class OnDemandController:
             "idle_shutdown_seconds": c.scale_policy["idle_before_drain_s"], "minimum_gpu_instances": 0,
             "admission_ready": admission_ready,
             "phase": "drained" if drained else "draining" if self.stopping() else
+                "awaiting_provider_repair" if self.provider_retry_limited() or not self.current._capacity_advance_allowed() else
                 "awaiting_repair" if self.current.preparation_hold() else
                 ("waiting_capacity" if value["active_job_ids"] else "awaiting_jobs") if not value["instances"] else value["phase"],
             "drained": drained, "all_destroyed": all_destroyed,
             "billing_pending": sum(r["billing_status"] != "settled" for r in rows),
             "instances": [{k: r[k] for k in ("id", "state", "provider_instance_id", "hard_deadline", "billing_status")} for r in rows]}
+        if self.provider_retry_limited():
+            result["recovery"] = {"code": "provider_preparation_retry_limit",
+                "consecutive_failures": self.provider_failure_count(),
+                "failure_limit": c.provider_preparation_failure_limit, "automatic_rerent_allowed": False}
+        elif not self.current._capacity_advance_allowed():
+            result["recovery"] = {"code": "provider_preparation_evidence_unconfirmed", "automatic_rerent_allowed": False}
         if not fresh_ledger_only:
             save(c.work_dir/"status.json", result)
         return result

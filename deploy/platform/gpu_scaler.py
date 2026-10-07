@@ -168,6 +168,12 @@ def on_demand_config(config):
     """The host accepts one narrow on-demand mode; unknown modes fail closed."""
     mode = config.get('service_mode')
     release.require(mode in (None, 'on-demand'), 'scaler_service_mode_invalid')
+    timeout = config.get('provider_preparation_timeout_s')
+    release.require(timeout is None or type(timeout) is int and 120 <= timeout <= 7200,
+        'invalid_provider_preparation_timeout')
+    failures = config.get('provider_preparation_failure_limit', 2)
+    release.require(type(failures) is int and 1 <= failures <= 5 and (timeout is not None or failures == 2),
+        'invalid_provider_preparation_failure_limit')
     if config.get('service_policy') is not None:
         # Exact schema is checked again by the pinned application before launch.
         # The pure source module is installed with reviewed host helpers.

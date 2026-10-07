@@ -96,6 +96,18 @@ class MockAPI:
 
 
 class LiumProviderTests(unittest.TestCase):
+    def test_preparation_facts_allowlist_provider_status_and_never_infer_idle_or_eta(self):
+        provider = self.provider()
+        for status in ('PENDING', 'FAILED', 'STOPPED', 'provider-secret-status'):
+            fact = provider._running_fact(TAG, {**self.pod(status=status), 'phase': 'configuring ssh',
+                'estimated_ready_seconds': 0})
+            self.assertEqual(fact.state, 'starting')
+            self.assertFalse(fact.idle_confirmed)
+            self.assertEqual(fact.provider_status, status if status != 'provider-secret-status' else None)
+            self.assertEqual(fact.preparation_stage, 'configuring_ssh' if fact.provider_status else None)
+        fact = provider._running_fact(TAG, {**self.pod(status='PENDING'), 'phase': 'untrusted raw text'})
+        self.assertEqual(fact.preparation_stage, 'provider_preparing')
+
     def setUp(self):
         self.now, self.api, self.loaded = 1000, MockAPI(), []
         self.providers = []

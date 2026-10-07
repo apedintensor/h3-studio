@@ -37,6 +37,259 @@ class HeartbeatBoot(FakeBoot):
 
 
 class OnDemandTests(LedgerCase):
+    def start_pending_provider(self):
+        from studio_platform.scaler import ProviderFact
+        self.config = replace(self.config, work_dir=self.root/'timed-provider', provider_preparation_timeout_s=120)
+        original_create = self.provider.create
+        def pending(tag, launch, **kwargs):
+            result = original_create(tag, launch, **kwargs)
+            self.provider.facts[tag] = ProviderFact('starting', result.instance_id,
+                provider_status='PENDING', preparation_stage='configuring_ssh')
+            return self.provider.facts[tag]
+        self.provider.create = pending
+        self.controller = OnDemandController(self.repo, self.settings, self.config,
+            provider=self.provider, boot_factory=HeartbeatBoot)
+        self.controller.initialize()
+        scope, job = self.submit()
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(self.controller.current.boots, {})
+        intent = self.repo.list_instance_intents(pool=self.config.pool)[0]
+        return scope, job, intent
+
+    def test_provider_timeout_retains_job_and_bill_until_exact_removal_then_transfers_same_waiter(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, intent = self.start_pending_provider()
+        with self.repo.engine.connect() as conn:
+            waiter = dict(conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == job['id'])).mappings().one())
+        budget = self.repo.get_budget('job-budget')
+        def unknown_delete(tag, instance):
+            self.provider.destroys.append(tag)
+            return ProviderFact('unknown', instance)
+        self.provider.destroy = unknown_delete
+        status = self.tick(121)
+        self.assertEqual(self.provider.destroys, [intent['id']])
+        self.assertEqual(status['instances'][0]['state'], 'destroying')
+        self.assertEqual(self.repo.get_job(scope, job['id'])['status'], 'waiting_capacity')
+        self.assertEqual(self.repo.get_job(scope, job['id'])['error_code'], 'capacity_provider_preparation_timeout')
+        self.assertFalse(self.controller.stopping())
+        # Restart reads the irreversible ledger phase, never repeats DELETE/start.
+        self.controller = OnDemandController(self.repo, self.settings, self.config,
+            provider=self.provider, boot_factory=HeartbeatBoot)
+        self.controller.initialize()
+        self.tick(181)  # A restart waits for the original leader fence to expire.
+        for _ in range(3): self.tick()
+        self.assertEqual(self.provider.destroys, [intent['id']])
+        self.assertEqual(len(self.provider.creates), 1)
+        self.assertEqual(self.controller.current.boots, {})
+        self.provider.facts[intent['id']] = ProviderFact('destroyed', intent['provider_instance_id'])
+        self.tick()
+        self.assertEqual(self.controller.sequence, 1)  # Physical removal is not settlement.
+        self.assertEqual(self.repo.get_budget('finite-budget')['reserved_microusd'], 2_000_000)
+        self.provider.billing = lambda *args: 100_000
+        self.tick()
+        self.tick()
+        self.assertEqual(self.controller.sequence, 2)
+        after = self.repo.get_job(scope, job['id'])
+        self.assertEqual(after['request'], job['request'])
+        self.assertEqual(after['id'], job['id'])
+        self.assertEqual(self.repo.get_budget('job-budget'), budget)
+        with self.repo.engine.connect() as conn:
+            changed = conn.execute(select(capacity_waiters).where(capacity_waiters.c.job_id == job['id'])).mappings().one()
+        self.assertEqual(changed['deadline'], waiter['deadline'])
+        self.assertNotEqual(changed['approval_id'], waiter['approval_id'])
+
+    def test_provider_running_race_commits_start_barrier_before_boot_and_never_pending_retires(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, intent = self.start_pending_provider()
+        original_factory = self.controller.current.boot_factory
+        def check_phase(*args, **kwargs):
+            with self.repo.engine.connect() as conn:
+                phase = self.controller.current.scaler.preparation(conn, intent)
+            self.assertEqual(phase['phase'], 'bootstrap_started')
+            return original_factory(*args, **kwargs)
+        self.controller.current.boot_factory = check_phase
+        self.provider.facts[intent['id']] = ProviderFact('running', intent['provider_instance_id'])
+        self.tick(121)
+        self.assertEqual(self.provider.destroys, [])
+        self.assertEqual(len(self.controller.current.boots), 1)
+        self.provider.facts[intent['id']] = ProviderFact('starting', intent['provider_instance_id'], provider_status='STOPPED')
+        self.tick()
+        self.assertEqual(self.provider.destroys, [])
+
+    def test_preparation_policy_does_not_block_normal_worker_drain_after_real_job(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, intent = self.start_pending_provider()
+        self.provider.facts[intent['id']] = ProviderFact('running', intent['provider_instance_id'])
+        self.tick()
+        self.tick()
+        self.finish(scope, job)
+        self.tick()
+        for _ in range(40): self.tick()
+        self.assertEqual(self.provider.destroys, [intent['id']])
+        self.assertEqual(self.controller.sequence, 2)
+        self.assertEqual(self.repo.get_job(scope, job['id'])['status'], 'succeeded')
+
+    def test_provider_retirement_respects_original_waiter_deadline_while_deletion_is_unknown(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, intent = self.start_pending_provider()
+        self.provider.destroy = lambda *args: ProviderFact('unknown', intent['provider_instance_id'])
+        with self.repo.transaction() as conn:
+            conn.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == job['id'])
+                .values(deadline=self.now+140))
+        self.tick(121)
+        self.assertEqual(self.repo.get_job(scope, job['id'])['status'], 'waiting_capacity')
+        self.tick(20)
+        current = self.repo.get_job(scope, job['id'])
+        self.assertEqual((current['status'], current['error_code']), ('failed', 'capacity_wait_deadline_expired'))
+        self.assertEqual(self.repo.get_budget('finite-budget')['reserved_microusd'], 2_000_000)
+        self.assertEqual(len(self.provider.creates), 1)
+
+    def test_two_paid_preparation_failures_hold_without_rerent_across_restart_and_waiter_expiry(self):
+        scope, job, first = self.start_pending_provider()
+        self.provider.billing = lambda tag, instance: 100_000 if instance else 0
+        with self.repo.engine.connect() as conn:
+            deadline = conn.execute(select(capacity_waiters.c.deadline).where(capacity_waiters.c.job_id == job['id'])).scalar_one()
+        self.tick(121)
+        self.assertEqual(self.controller.sequence, 2)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.provider.creates), 2)
+        status = self.tick(121)
+        self.assertEqual(status['phase'], 'awaiting_provider_repair')
+        self.assertEqual(status['recovery'], {'code': 'provider_preparation_retry_limit',
+            'consecutive_failures': 2, 'failure_limit': 2, 'automatic_rerent_allowed': False})
+        self.assertEqual(len(self.provider.destroys), 2)
+        original = self.repo.get_job(scope, job['id'])
+        self.assertEqual((original['status'], original['error_code']),
+            ('waiting_capacity', 'capacity_provider_preparation_retry_limit'))
+        self.controller = OnDemandController(self.repo, self.settings, self.config,
+            provider=self.provider, boot_factory=HeartbeatBoot)
+        self.controller.initialize()
+        self.tick(181)
+        for _ in range(3): self.tick()
+        self.assertEqual(len(self.provider.creates), 2)
+        self.assertEqual(self.controller.sequence, 2)
+        after = self.repo.get_job(scope, job['id'])
+        self.assertEqual(after['request'], job['request'])
+        with self.repo.engine.connect() as conn:
+            self.assertEqual(conn.execute(select(capacity_waiters.c.deadline).where(
+                capacity_waiters.c.job_id == job['id'])).scalar_one(), deadline)
+        self.assertEqual(self.repo.get_budget('finite-budget')['spent_microusd'], 200_000)
+        self.assertEqual(self.repo.get_budget('finite-budget')['reserved_microusd'], 0)
+        # Test original expiry while the service still has time; no new wait window.
+        with self.repo.transaction() as conn:
+            conn.execute(update(capacity_waiters).where(capacity_waiters.c.job_id == job['id']).values(deadline=self.now+5))
+        self.tick(6)
+        self.assertEqual(self.repo.get_job(scope, job['id'])['error_code'], 'capacity_wait_deadline_expired')
+        self.assertEqual(len(self.provider.creates), 2)
+
+    def test_positive_bootstrap_transition_resets_provider_failure_streak(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, first = self.start_pending_provider()
+        self.provider.billing = lambda tag, instance: 100_000 if instance else 0
+        self.tick(121)
+        self.tick()
+        self.tick()
+        second = self.repo.list_instance_intents(pool=self.config.pool)[-1]
+        self.assertEqual(self.controller.provider_failure_count(), 1)
+        self.provider.facts[second['id']] = ProviderFact('running', second['provider_instance_id'])
+        self.tick()
+        self.assertEqual(self.controller.provider_failure_count(), 0)
+        self.assertFalse(self.controller.provider_retry_limited())
+
+    def test_authoritative_no_rent_does_not_count_or_reset_paid_preparation_failures(self):
+        from studio_platform.scaler import ProviderFact
+        self.repo.configure_budget('finite-budget', tenant_id='sixnine', limit_microusd=30_000_000)
+        self.configure_continuing_service()
+        scope, job, first = self.start_pending_provider()
+        self.provider.billing = lambda tag, instance: 100_000 if instance else 0
+        self.tick(121)
+        pending_create = self.provider.create
+        def not_created(tag, launch, **kwargs):
+            self.provider.creates.append((tag, launch))
+            self.provider.facts[tag] = ProviderFact('not_created', actual_cost_microusd=0, absence_confirmed=True)
+            self.provider.create = pending_create
+            return self.provider.facts[tag]
+        self.provider.create = not_created
+        self.tick()
+        self.tick()
+        self.assertEqual(self.controller.provider_failure_count(), 1)
+        self.tick(61)
+        self.assertEqual(self.controller.sequence, 3)
+        self.assertEqual(self.controller.provider_failure_count(), 1)
+        self.tick()
+        self.tick()
+        status = self.tick(121)
+        self.assertEqual(status['phase'], 'awaiting_provider_repair')
+        self.assertEqual(status['recovery']['consecutive_failures'], 2)
+        self.assertEqual(len(self.provider.creates), 3)  # Two paid pods plus one proved no-rent call.
+        self.assertEqual(len(self.provider.destroys), 2)
+        self.assertEqual(self.repo.get_job(scope, job['id'])['status'], 'waiting_capacity')
+
+    def test_provider_removal_before_timeout_retains_job_and_cannot_bypass_failure_cap(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, first = self.start_pending_provider()
+        self.provider.billing = lambda tag, instance: 100_000 if instance else 0
+        self.provider.facts[first['id']] = ProviderFact('destroyed', first['provider_instance_id'], actual_cost_microusd=100_000)
+        self.tick()  # Provider removal is earlier than the configured timeout.
+        self.assertEqual(self.controller.sequence, 2)
+        self.assertEqual(self.repo.get_job(scope, job['id'])['status'], 'waiting_capacity')
+        self.tick()
+        self.tick()
+        second = self.repo.list_instance_intents(pool=self.config.pool)[-1]
+        self.provider.facts[second['id']] = ProviderFact('destroyed', second['provider_instance_id'], actual_cost_microusd=100_000)
+        status = self.tick()
+        self.assertEqual(status['phase'], 'awaiting_provider_repair')
+        self.assertEqual(status['recovery']['consecutive_failures'], 2)
+        self.assertEqual(self.repo.get_job(scope, job['id'])['error_code'], 'capacity_provider_preparation_retry_limit')
+        self.assertEqual(self.provider.destroys, [])  # Already removed: no DELETE is emitted.
+        for _ in range(3): self.tick()
+        self.assertEqual(len(self.provider.creates), 2)
+        self.assertEqual(self.controller.current.boots, {})
+
+    def test_provider_removal_with_conflicting_boot_evidence_holds_job_instead_of_failing_or_rerenting(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, first = self.start_pending_provider()
+        (self.controller.current.config.work_dir/'boot'/first['id']).mkdir(parents=True)
+        self.provider.facts[first['id']] = ProviderFact('destroyed', first['provider_instance_id'], actual_cost_microusd=100_000)
+        for _ in range(3): status = self.tick()
+        self.assertEqual(status['phase'], 'awaiting_provider_repair')
+        self.assertEqual(status['recovery']['code'], 'provider_preparation_evidence_unconfirmed')
+        self.assertEqual(self.repo.get_job(scope, job['id'])['status'], 'waiting_capacity')
+        self.assertEqual(self.repo.get_job(scope, job['id'])['error_code'], 'capacity_rental_reconciliation')
+        self.assertEqual(self.provider.destroys, [])
+        self.assertEqual(len(self.provider.creates), 1)
+
+    def test_pending_retirement_refuses_conflicting_runtime_evidence_and_legacy_without_receipt(self):
+        from studio_platform.repository import scaler_receipts
+        scope, job, intent = self.start_pending_provider()
+        path = self.controller.current.config.work_dir/'boot'/intent['id']
+        path.mkdir(parents=True)
+        self.tick(121)
+        self.assertEqual(self.provider.destroys, [])
+        # A legacy intent with no durable start barrier remains unbound even if
+        # its provider says PENDING and its current local boot directory is empty.
+        with self.repo.transaction() as conn:
+            conn.execute(delete(scaler_receipts).where(scaler_receipts.c.intent_id == intent['id'],
+                scaler_receipts.c.operation == 'provider_preparation'))
+        status = self.tick()
+        self.assertEqual(self.provider.destroys, [])
+        self.assertEqual(status['boot'][intent['id']]['state'], 'provider_preparation_legacy_adoption_required')
+        self.assertEqual(self.repo.get_job(scope, job['id'])['status'], 'waiting_capacity')
+
+    def test_failed_provider_can_retire_unused_but_unknown_status_cannot(self):
+        from studio_platform.scaler import ProviderFact
+        scope, job, intent = self.start_pending_provider()
+        self.provider.facts[intent['id']] = ProviderFact('starting', intent['provider_instance_id'])
+        self.tick(121)
+        self.assertEqual(self.provider.destroys, [])
+        self.provider.facts[intent['id']] = ProviderFact('starting', intent['provider_instance_id'], provider_status='FAILED')
+        self.tick()
+        self.assertEqual(self.provider.destroys, [intent['id']])
+        self.assertEqual(self.repo.get_job(scope, job['id'])['error_code'], 'capacity_provider_preparation_failed')
+
     def test_wangp_one_use_approval_forwards_exact_engine_binding(self):
         from studio_platform.qualification_profiles import QUEUED_TASK_PROFILE
         # This tests only the coordinator seam, with no WanGP bootstrap import
