@@ -5,6 +5,7 @@ Last public health/provider inventory observation: 2026-10-07, 11:23 Australia/S
 Last container/ledger/controller observation: 2026-10-06, 22:20–22:25 Australia/Sydney; those details were not rechecked by the WanGP integration batch.
 Work item: [A1 #10](https://github.com/apedintensor/h3-studio/issues/10).
 This is a dated baseline, not a live status page or permission to operate GPUs.
+Durable selection rationale belongs in [DECISIONS.md](DECISIONS.md); this file records implementation and observation boundaries. Documentation-only corrections do not refresh the production timestamps above.
 
 ## Source and deployment are different
 
