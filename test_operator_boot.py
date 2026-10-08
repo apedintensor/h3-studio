@@ -135,6 +135,22 @@ class OperatorBootTests(unittest.TestCase):
         with self.assertRaisesRegex(BootError,'identity_mismatch'):
             self.boot.tick(SECOND)
 
+    def test_unknown_boot_is_blocked_with_safe_per_slot_cause(self):
+        self.boot.slots[0].tick=lambda _: {'state':'bootstrap_reconciliation_required',
+            'phase':'runtime_start_unknown','failure_phase':'runtime_manifest',
+            'error_code':'wangp_configuration_permissions','error_type':'ValueError','traceback':'SECRET'}
+        result=self.boot.tick(INTENT)
+        self.assertEqual(result['state'],'blocked')
+        self.assertEqual(result['reason_code'],'bootstrap_reconciliation_required')
+        self.assertEqual(result['slots'][0]['error_code'],'wangp_configuration_permissions')
+        self.assertEqual(result['slots'][0]['failure_phase'],'runtime_manifest')
+        self.assertEqual(result['slots'][1]['state'],'fleet_running')
+        self.assertNotIn('SECRET',json.dumps(result))
+        self.assertEqual(self.spawn,[])
+        self.boot.slots[0].tick=lambda _: {'state':'bootstrap_start_unknown'}
+        self.assertEqual(self.boot.tick(INTENT)['state'],'blocked')
+        self.assertEqual([s.closed for s in self.boot.slots],[0,0])
+
     def test_idle_proof_requires_every_slot_and_same_instance(self):
         a,b=self.boot.slots
         a.proof=InferenceIdleProof(INSTANCE,1004,1000,True)

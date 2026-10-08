@@ -26,6 +26,8 @@ Limits are versioned; concurrent edits require `expected_version`. Tightening li
 
 Drain stops new claims and retains reconciliation/collection. Stop is drain-then-destroy only after original execution, collection and provider obligations are safe. Partial/unknown outcomes retain their operation and provider identities; do not retry creation with another identity. Controller health, observation age, preparation, runtime readiness and serving state are displayed separately. No stale green state.
 
+An ambiguous bootstrap is `runtime_state: blocked` with `reason_code: bootstrap_reconciliation_required`, not indefinite preparation or proof of failure/removal. The node's optional `bootstrap` observation has a controller `observed_at`, aggregate state/reason and bounded per-slot `index`, `state`, `phase`, `failure_phase`, `error_code` and `error_type`. Only allowlisted static diagnostics are public; raw logs, exception messages, credentials and file paths are excluded. The last observation may remain visible after state changes and must be labelled historical. This projection preserves the original boot/rental journals, deadlines and reservations; it neither authorizes a restart nor converts unknown execution into safe destruction.
+
 ## Historical generation hints
 
 Use `total_seconds` consistently: task submission through local output save/validation, including component loading encountered in the task, excluding machine startup, queueing, dependency setup and prior downloads. Store process/loading context separately; no controlled warm/cold comparison was performed. Match profile, mode, resolution, native frames/fps, steps and reference roles exactly. A single measured sample is not an SLA or an estimate for another configuration.

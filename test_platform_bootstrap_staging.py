@@ -140,7 +140,11 @@ class PollableBootTests(unittest.TestCase):
         other.enable_pollable_upload()
         other.start_guard = lambda: True
         self.addCleanup(lambda: self.upload.finish(other._preparation))
-        self.tick(other)
+        # Hold the resumed upload too: the first transfer left its event set,
+        # so a fast thread could finish and start setup before lose_start was
+        # enabled below. Exercise the intended restart boundary deterministically.
+        self.upload.release.clear()
+        self.assertEqual(self.tick(other)['state'], 'staging')
         self.upload.finish(other._preparation)
         self.f.host.lose_start = True
         self.assertEqual(self.tick(other)['state'], 'bootstrap_start_unknown')

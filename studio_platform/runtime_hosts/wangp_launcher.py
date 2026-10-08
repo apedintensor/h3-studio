@@ -11,13 +11,21 @@ import os
 from pathlib import Path
 import time
 
-from ..inference.wangp_contract import EngineManifest
-from ..inference.wangp_factory import read_document
-from .wangp import WanGPHost
-from .wangp_http import StagedInputs, create_app, private_token_file
-from .wangp_receipts import (
-    ReceiptJournal, checked_directory, VERIFICATION_RECEIPT, read_verification_receipt, write_verification_receipt,
-)
+from .wangp_startup import write_startup_failure
+
+# Keep dependency/import failures observable before a journal can be created.
+# No exception text is printed or persisted by the startup receipt.
+_EARLY_IMPORT_FAILURE = None
+try:
+    from ..inference.wangp_contract import EngineManifest
+    from ..inference.wangp_factory import read_document
+    from .wangp import WanGPHost
+    from .wangp_http import StagedInputs, create_app, private_token_file
+    from .wangp_receipts import (
+        ReceiptJournal, checked_directory, VERIFICATION_RECEIPT, read_verification_receipt, write_verification_receipt,
+    )
+except Exception as error:
+    _EARLY_IMPORT_FAILURE = error
 
 
 
@@ -147,7 +155,15 @@ def main(argv=None):
     parser.add_argument("--create-journal", action="store_true",
                         help="Only a new authorized slot; fails if a journal already exists")
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--startup-status-file", type=Path)
+    parser.add_argument("--startup-id")
+    parser.add_argument("--expected-manifest-digest")
     args = parser.parse_args(argv)
+    diagnostics = (args.startup_status_file, args.startup_id, args.expected_manifest_digest)
+    if any(value is not None for value in diagnostics) and not all(value is not None for value in diagnostics):
+        parser.error("complete startup identity required")
+    if args.startup_status_file is not None and not args.startup_status_file.is_absolute():
+        parser.error("absolute startup status path required")
     if any(not getattr(args, name).is_absolute() for name in (
             "runtime_root", "config", "manifest", "model_root", "state_dir", "token_file")):
         parser.error("explicit absolute paths required")
@@ -158,29 +174,41 @@ def main(argv=None):
     host = None
     session_initialization_started = False
     pending = None
+    phase = "runtime_imports"
     try:
+        if _EARLY_IMPORT_FAILURE is not None:
+            raise _EARLY_IMPORT_FAILURE
         from .wangp_session import create_session, verify_runtime
+        phase = "runtime_manifest"
         manifest = EngineManifest.from_dict(read_document(args.manifest))
+        if args.expected_manifest_digest is not None and manifest.digest != args.expected_manifest_digest:
+            raise ValueError("wangp_verified_manifest_changed")
         if manifest.document.get("synthetic"):
             raise ValueError("wangp_synthetic_manifest_forbidden")
         if args.verify_only:
+            phase = "runtime_verification"
             evidence = verify_runtime(args.runtime_root, args.config, args.manifest, args.model_root)
             if evidence.get("manifest_digest") != manifest.digest:
                 raise ValueError("wangp_verified_manifest_changed")
             print(json.dumps({"state": "runtime_files_verified", **evidence}))
             return 0
+        phase = "runtime_token"
         token = private_token_file(args.token_file)
+        phase = "runtime_journal"
         state = checked_directory(args.state_dir, create=args.create_journal)
         journal = ReceiptJournal(state / "operations.sqlite3", slot_key=args.slot_key,
                                   manifest_digest=manifest.digest, create=args.create_journal)
+        phase = "runtime_inputs"
         output = checked_directory(state / "upstream-output", create=True)
         inputs = StagedInputs(state / "inputs")
         pending = PendingSession()
         # Acquire durable host ownership BEFORE importing/loading the upstream
         # runtime; a competing process cannot load a second copy into this slot.
+        phase = "runtime_host"
         host = WanGPHost(session=pending, journal=journal, manifest=manifest,
                          output_root=output, sealed_root=state / "sealed-output",
                          settings_resolver=lambda prepared: resolve_inputs(prepared, inputs, manifest))
+        phase = "runtime_verification"
         evidence = verify_runtime(args.runtime_root, args.config, args.manifest, args.model_root)
         if evidence.get("manifest_digest") != manifest.digest:
             raise ValueError("wangp_verified_manifest_changed")
@@ -189,16 +217,24 @@ def main(argv=None):
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         # Upstream console output is not an authorized channel for user prompts.
         with open(os.devnull, "w") as quiet, redirect_stdout(quiet), redirect_stderr(quiet):
+            phase = "runtime_session_initialization"
             session_initialization_started = True
             if manifest.document.get('deployment_profile_id') is not None:
                 pending.delegate = create_session(args.runtime_root, args.config, output, manifest=manifest)
             else:
                 pending.delegate = create_session(args.runtime_root, args.config, output)
+            phase = "runtime_http_service"
             import uvicorn
             uvicorn.run(create_app(host, inputs, token=token), host="127.0.0.1", port=args.port,
                         workers=1, access_log=False, log_level="critical", proxy_headers=False)
         return 0
-    except Exception:
+    except Exception as error:
+        if args.startup_status_file is not None:
+            try:
+                write_startup_failure(args.startup_status_file, slot_key=args.slot_key,
+                    manifest_digest=args.expected_manifest_digest, launch_id=args.startup_id, phase=phase, error=error)
+            except Exception:
+                pass  # Failure to publish is unknown; never expose raw fallback logs.
         print(json.dumps({"state": "wangp_runtime_start_failed"}))
         return 1
     finally:
