@@ -25,6 +25,7 @@ from .fleet import FleetConfig, FleetSupervisor, SlotConfig
 from .lium_provider import InferenceIdleProof, _uuid
 from .repository import Conflict, instance_intents
 from .qualification_profiles import QUEUED_TASK_PROFILE
+from .runtime_hosts.wangp_startup import CODES as STARTUP_CODES, PHASES as STARTUP_PHASES, TYPES as STARTUP_TYPES
 from .worker import ComfyBackend, SubmissionRejected, _slot_lock
 
 REMOTE_ROOT = "/workspace/h3-studio"
@@ -67,6 +68,9 @@ BOOT_PHASES = frozenset({"model_download_waiting_for_shared_cache", "preflight",
     "checking_package", "dependency_download", "dependency_unpack", "dependency_install", "model_download",
     "runtime_verification", "runtime_start", "runtime_ready", "runtime_start_unknown", "setup_failed",
     "system_package_install", "system_package_restore", "system_package_verification", "runtime_imports"})
+BOOT_FAILURE_CODES |= STARTUP_CODES
+BOOT_FAILURE_TYPES |= STARTUP_TYPES | {"RuntimeStartupError"}
+BOOT_PHASES |= STARTUP_PHASES
 
 
 def _static(value, allowed, fallback):
@@ -724,6 +728,12 @@ class BootController:
             report = self.host.report()
             if report.get("identity") != identity:
                 return {"state": "bootstrap_start_unknown"}
+            if (report.get("state") in {"unknown", "reconcile_required"}
+                    or report.get("phase") == "runtime_start_unknown"):
+                # A dispatched process may still exist. Surface the hold while
+                # retaining the original journal; never relaunch or call this a
+                # confirmed failure/stop merely because readiness is unknown.
+                return {"state": "bootstrap_reconciliation_required", **safe_bootstrap_diagnosis(report)}
             if report.get("state") == "failed":
                 state["phase"] = "bootstrap_failed"
                 state["failure"] = safe_bootstrap_diagnosis(report)

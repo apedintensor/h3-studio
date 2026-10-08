@@ -20,7 +20,7 @@ from .control import WorkerControl
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
 from .lium_bootstrap import BootConfig, BootController, BootError
 from .lium_provider import InferenceIdleProof, _uuid
-from .operator_capacity import operator_nodes
+from .operator_capacity import operator_nodes, public_bootstrap
 from .qualification_profiles import QUEUED_TASK_PROFILE
 from .repository import Repository, instance_intents, registered_workers
 from .runtime_catalog import engine_manifest, get_profile
@@ -158,10 +158,13 @@ class OperatorBoot:
         states = {r['state'] for r in reports}
         if states == {'fleet_running'}: state='ready'
         elif states <= {'draining'}: state='draining'
+        elif states & {'bootstrap_start_unknown','bootstrap_reconciliation_required'}: state='blocked'
         elif states & {'bootstrap_failed','staging_failed','fleet_attention_required'}: state='failed'
         elif states & {'fleet_recovery_required','staging_recovery_required'}: state='blocked'
         else: state='preparing'
-        return {'state':state,'slots':[{'state':r['state'],'phase':r.get('phase')} for r in reports]}
+        reason=('bootstrap_reconciliation_required' if states & {'bootstrap_start_unknown',
+            'bootstrap_reconciliation_required'} else 'operator_bootstrap_failed' if state in {'failed','blocked'} else None)
+        return public_bootstrap({'state':state,'reason_code':reason,'slots':reports})
 
     def idle_probe(self, tag, instance_id):
         if tag!=self.intent_id or instance_id!=self.instance_id:

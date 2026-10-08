@@ -165,6 +165,23 @@ class BootTests(ledger.LedgerCase):
         self.assertEqual(self.tick(self.controller())["state"], "bootstrap_start_unknown")
         self.assertEqual(self.host.starts, 1)
 
+    def test_unknown_runtime_reports_reconciliation_without_relaunch_or_failure_commit(self):
+        self.host.state = "unknown"
+        self.host.patch = {"phase":"runtime_start_unknown", "failure_phase":"runtime_manifest",
+            "error_code":"wangp_configuration_permissions", "error_type":"ValueError", "log":"SECRET"}
+        controller = self.controller()
+        first = self.tick(controller)
+        self.assertEqual(first, {"state":"bootstrap_reconciliation_required", "phase":"runtime_start_unknown",
+            "failure_phase":"runtime_manifest", "error_code":"wangp_configuration_permissions", "error_type":"ValueError"})
+        path = self.config.work_dir/self.intent['id']/'bootstrap-state.json'
+        original = path.read_bytes()
+        self.assertEqual(self.tick(controller), first)
+        self.assertEqual(self.tick(self.controller()), first)
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(json.loads(original)['phase'], 'booting')
+        self.assertEqual((self.host.starts, self.host.uploads, self.backend.submissions), (1,1,0))
+        self.assertNotIn('SECRET', json.dumps(first))
+
     def test_bad_gpu_or_revision_never_smokes(self):
         for patch in ({"actual_comfy_revision": "0"*40}, {"gpus": []},
                       {"runtime": {"gpu_total_bytes": 32*1024**3}}, {"files": {}}):
