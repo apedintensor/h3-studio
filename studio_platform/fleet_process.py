@@ -42,6 +42,12 @@ def _check_file(info):
         raise ValueError("fleet_process_file_untrusted")
 
 
+def _lock_identity(config, worker_id):
+    info = (_directory(config, worker_id)/"process-owner.lock").stat(follow_symlinks=False)
+    _check_file(info)
+    return {"device": info.st_dev, "inode": info.st_ino}
+
+
 @contextmanager
 def _ownership(config, worker_id):
     path = _directory(config, worker_id) / "process-owner.lock"
@@ -94,9 +100,10 @@ def _read(config, worker_id):
     if len(raw) > 65536:
         raise ValueError("fleet_process_owner_untrusted")
     value = json.loads(raw)
-    if (not isinstance(value, dict) or set(value) != {"protocol", "fleet_hash", "worker_id", "token", "state", "boot_id"}
+    if (not isinstance(value, dict) or set(value) != {"protocol", "fleet_hash", "worker_id", "token", "state", "boot_id", "lock_identity"}
             or value["protocol"] != PROTOCOL or value["fleet_hash"] != config.fingerprint()
             or value["boot_id"] != _boot_identity()
+            or value["lock_identity"] != _lock_identity(config, worker_id)
             or value["worker_id"] != worker_id or not isinstance(value["token"], str)
             or not TOKEN.fullmatch(value["token"]) or value["state"] not in {"launching", "running", "exited"}):
         raise ValueError("fleet_process_owner_identity_conflict")
@@ -147,7 +154,8 @@ class ObservedProcess:
             if not acquired or value["token"] != self.token or value["state"] == "launching":
                 return None
             return {"worker_id": self.worker_id, "protocol": PROTOCOL, "token": self.token,
-                    "fleet_hash": self.config.fingerprint(), "boot_id": value["boot_id"], "cpu_owner_stopped": True}
+                    "fleet_hash": self.config.fingerprint(), "boot_id": value["boot_id"],
+                    "lock_identity": value["lock_identity"], "cpu_owner_stopped": True}
 
 
 def prepare_launch(config, worker_id, *, recovering=False):
@@ -165,7 +173,8 @@ def prepare_launch(config, worker_id, *, recovering=False):
             raise ValueError("fleet_process_recovery_required")
         token = uuid.uuid4().hex
         _save(config, worker_id, {"protocol": PROTOCOL, "fleet_hash": config.fingerprint(),
-            "worker_id": worker_id, "token": token, "state": "launching", "boot_id": _boot_identity()})
+            "worker_id": worker_id, "token": token, "state": "launching", "boot_id": _boot_identity(),
+            "lock_identity": _lock_identity(config, worker_id)})
         return token, None
 
 

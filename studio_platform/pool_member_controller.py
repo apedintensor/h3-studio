@@ -395,6 +395,9 @@ class PoolServiceCycle(FiniteController):
                     and children[0].get("fleet_hash") == proof["fleet_hash"]
                     and isinstance(children[0].get("token"), str) and TOKEN.fullmatch(children[0]["token"]) is not None
                     and isinstance(children[0].get("boot_id"), str) and bool(children[0]["boot_id"])
+                    and isinstance(children[0].get("lock_identity"), dict)
+                    and set(children[0]["lock_identity"]) == {"device", "inode"}
+                    and all(type(value) is int and value >= 0 for value in children[0]["lock_identity"].values())
                     and children[0].get("cpu_owner_stopped") is True)
             if proof.get("kind") == "owned_preparation_never_registered":
                 return (proof.get("phase") in ("bootstrap_failed", "staging_failed", "staging_cancelled", "qualification_failed")

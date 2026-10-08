@@ -104,6 +104,19 @@ with owned_process(config,'cpu-test',sys.argv[2]):
         with owned_process(self.config, "cpu-test", new):
             pass
 
+    @unittest.skipIf(os.name == "nt", "POSIX permits unlink of a locked inode")
+    def test_replaced_lock_inode_cannot_hide_the_actual_live_cpu_owner(self):
+        token, _ = prepare_launch(self.config, "cpu-test")
+        proc = self.child(token)
+        path = self.config.work_dir/"cpu-test"/"process-owner.lock"
+        path.unlink()  # Deliberate corruption of this test-owned control path.
+        with self.assertRaisesRegex(ValueError, "identity_conflict"):
+            prepare_launch(self.config, "cpu-test", recovering=True)
+        self.assertIsNone(proc.poll())
+        (self.root/"stop").touch()
+        proc.communicate(timeout=5)
+        self.assertEqual(proc.returncode, 0)
+
     def test_missing_corrupt_legacy_or_changed_identity_never_mints_recovery(self):
         with self.assertRaises(FileNotFoundError):
             prepare_launch(self.config, "cpu-test", recovering=True)
