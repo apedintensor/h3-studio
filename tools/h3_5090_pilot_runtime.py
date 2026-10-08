@@ -189,6 +189,23 @@ def runtime_config(models):
             "embed_source_images": False, "checkpoints_paths": [str(models)]}
 
 
+def prepare_runtime_config(path, requested):
+    added_defaults = []
+    if path.exists():
+        existing = json.loads(path.read_text())
+        if not isinstance(existing, dict):
+            raise ValueError("pilot_runtime_config_changed")
+        changed = [key for key, value in requested.items()
+                   if key not in existing or canonical(existing[key]) != canonical(value)]
+        if changed:
+            raise ValueError("pilot_runtime_config_changed:" + ",".join(sorted(changed)))
+        added_defaults = sorted(existing.keys() - requested.keys())
+    # Pinned WanGP persists defaults and last-selection fields into this file.
+    # Recreate the exact authored inputs so those extras cannot influence a new process.
+    write_json(path, requested)
+    return {"requested_keys_preserved": sorted(requested), "upstream_added_keys_reset": added_defaults}
+
+
 def validate_task(task):
     allowed = {"id", "mode", "steps", "seed", "prompt", "resolution", "frames", "inputs", "timeout_seconds"}
     if not isinstance(task, dict) or set(task) - allowed:
@@ -553,9 +570,7 @@ def run(args):
         verified = time.monotonic()
         config = runtime_config(models)
         config_path = run_root / "wgp_config.json"
-        if config_path.exists() and json.loads(config_path.read_text()) != config:
-            raise ValueError("pilot_runtime_config_changed")
-        write_json(config_path, config)
+        config_preparation = prepare_runtime_config(config_path, config)
         output = run_root / "outputs"
         output.mkdir(exist_ok=True, mode=0o700)
         # All component bytes must already be present; fail closed on unplanned HF fetches.
@@ -586,6 +601,7 @@ def run(args):
                 raise ValueError("INT8_runtime_quantization_mismatch")
         write_json(run_root / "preflight.json", {"recipe": asset_manifest(), "environment": observed,
             "verified_modes": pending_modes, "verified_asset_paths": verified_assets,
+            "config_preparation": config_preparation,
             "config": config, "verification_seconds": verified-started,
             "runtime_initialization_seconds": time.monotonic()-verified,
             "note": "Runtime import readiness is not inference success."})

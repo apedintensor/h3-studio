@@ -206,6 +206,24 @@ class PilotTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "vendored_mmgp_import_collision"):
                 pilot.environment(self.root)
 
+    def test_upstream_config_defaults_are_reset_but_authored_changes_refuse(self):
+        path = self.root / "wgp_config.json"
+        requested = pilot.runtime_config(self.root)
+        expanded = {**requested, "last_model_type": "minimax_h3_fl2va_pruned",
+                    "last_resolution_choice": "832x480", "audio_profile": 3.5}
+        pilot.write_json(path, expanded)
+        result = pilot.prepare_runtime_config(path, requested)
+        self.assertEqual(json.loads(path.read_text()), requested)
+        self.assertEqual(result["upstream_added_keys_reset"],
+                         ["audio_profile", "last_model_type", "last_resolution_choice"])
+        for change in ({**expanded, "transformer_quantization": "bf16"},
+                       {key: value for key, value in expanded.items() if key != "int8_kernels"},
+                       {**expanded, "save_queue_if_crash": False}):
+            pilot.write_json(path, change)
+            with self.assertRaisesRegex(ValueError, "pilot_runtime_config_changed"):
+                pilot.prepare_runtime_config(path, requested)
+            self.assertEqual(json.loads(path.read_text()), change)
+
 
 if __name__ == "__main__":
     unittest.main()
