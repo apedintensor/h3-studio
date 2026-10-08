@@ -259,6 +259,29 @@ class PilotTests(unittest.TestCase):
             self.pilot.rent(SECOND, TEMPLATE, PUBLIC_KEY)
         self.assertEqual(self.count("POST", "/rent"), 1)
 
+    def test_prior_verified_ttl_drift_is_refreshed_before_second_rental(self):
+        original = self.rent()
+        self.assertTrue(original["ttl_verified"])
+        self.assertEqual(original["phase"], "starting")
+        self.now += 60
+        self.pods[0].update(status="RUNNING", removal_scheduled_at=stamp(self.now + 7200))
+        self.nodes.append(node(SECOND))
+        before = len(self.calls)
+        restarted = Pilot(self.folder, fetch=self.feed, factory=self.factory, clock=lambda: self.now)
+        with self.assertRaisesRegex(PilotError, "unknown_outcome_hold"):
+            restarted.rent(SECOND, TEMPLATE, PUBLIC_KEY)
+        self.assertTrue(self.calls[before:])
+        self.assertTrue(all(method == "GET" for method, _, _ in self.calls[before:]))
+        self.assertEqual(self.count("POST", "/rent"), 1)
+        self.assertEqual(self.count("POST", "/schedule-removal"), 1)
+        records = restarted.read()["records"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["tag"], original["tag"])
+        self.assertEqual(records[0]["deadline"], original["deadline"])
+        self.assertEqual(records[0]["collection_deadline"], original["collection_deadline"])
+        self.assertEqual(records[0]["phase"], "running")
+        self.assertFalse(records[0]["ttl_verified"])
+
     def test_inventory_units_missing_fields_and_staleness_fail_closed(self):
         self.assertIn("ram_below_96_gib", qualify(node(ram_gb=96)))
         self.assertIn("free_disk_below_250_gib", qualify(node(disk_free_gb=250)))

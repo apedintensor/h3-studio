@@ -261,6 +261,23 @@ class Pilot:
                 return {"replay_refused": True, **self.summary(old)}
             if len(state["records"]) >= MAX_RECORDS:
                 raise PilotError("pilot_rental_count_limit")
+            unresolved = [row for row in state["records"]
+                          if row["phase"] not in ("destroyed", "not_created")
+                          or row.get("actual_cost_microusd") is None]
+            if unresolved:
+                # A PENDING -> RUNNING transition can reset the provider TTL.
+                # Cached readiness never authorizes another rental. Invalidate
+                # it durably before GET-only refresh, including when GET fails.
+                for prior in unresolved:
+                    prior["ttl_verified"] = False
+                    prior.pop("connection", None)
+                self.save(state)
+                prior_provider = self.provider()
+                try:
+                    for prior in unresolved:
+                        self._refresh(state, prior, prior_provider)
+                finally:
+                    prior_provider.close()
             held = sum(row.get("actual_cost_microusd") if row.get("actual_cost_microusd") is not None
                        else RESERVATION for row in state["records"])
             if held + RESERVATION > BUDGET or any(
