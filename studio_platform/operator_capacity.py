@@ -218,6 +218,11 @@ class OperatorRegistry:
             require(isinstance(result, DeploymentBinding) and result.matches(chosen), "operator_binding_selection_mismatch")
             return result
         values = [item for item in self.bindings.values() if item.matches(chosen)]
+        # Retired bindings remain addressable by get() for their paid ledger.
+        # New selections prefer the unique enabled successor, never insertion order.
+        enabled = [item for item in values if item.enabled]
+        if enabled:
+            values = enabled
         require(len(values)==1, "operator_deployment_not_configured")
         return values[0]
 
