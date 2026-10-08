@@ -231,6 +231,14 @@ class _BoundLiumProvider(LiumProvider):
         require(_manifest(self.binding)==self.bound_manifest,"operator_runtime_manifest_changed")
         return super().validate_launch(launch,**kwargs)
 
+    def inventory_observation(self):
+        result=self.preflight_availability(self.binding.launch)
+        cached=self._availability_cache.get(self.bound_manifest)
+        require(cached is not None and cached[1]==result
+            and type(cached[0]) in (int,float) and math.isfinite(cached[0])
+            and 0<=self.clock()-cached[0]<=60,"operator_inventory_unconfirmed")
+        return result,cached[0]
+
 
 def _assemble(path, *, clock=time.time, credential_loader=None):
     config=load_runtime_config(path)
@@ -303,17 +311,17 @@ class InventoryRefresh:
 
     def _probe(self,binding):
         try:
-            result=self.providers[binding.binding_id].preflight_availability(binding.launch)
+            result,observed_at=self.providers[binding.binding_id].inventory_observation()
             reason=None if result is None else result if result in {
                 "provider_inventory_unavailable","provider_inventory_unconfirmed"} else "operator_inventory_unavailable"
-            return "available" if result is None else "unavailable",reason
+            return "available" if result is None else "unavailable",reason,observed_at
         except Exception:
-            return "unavailable","operator_inventory_unavailable"
+            return "unavailable","operator_inventory_unavailable",self.repo.clock()
 
     def __call__(self,controller_id,*,stopping=False):
         if self.pending and self.pending[1].done():
-            binding,future,started_at=self.pending
-            status,reason=future.result()
+            binding,future=self.pending
+            status,reason,observed_at=future.result()
             self.pending=None
             if not stopping:
                 with self.repo.transaction() as connection:
@@ -322,7 +330,7 @@ class InventoryRefresh:
                         operator_heartbeats.c.id=="global")).mappings().first()
                     if heartbeat and heartbeat["controller_id"]==controller_id:
                         value=dict(binding_hash=binding.fingerprint,controller_id=controller_id,
-                            observed_at=started_at,status=status,reason_code=reason)
+                            observed_at=observed_at,status=status,reason_code=reason)
                         row=connection.execute(select(operator_inventory.c.binding_id).where(
                             operator_inventory.c.binding_id==binding.binding_id)).first()
                         if row:
@@ -342,7 +350,7 @@ class InventoryRefresh:
         binding=min(eligible,key=lambda b:self.last.get(b.binding_id,float("-inf")))
         if self.executor is None: self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix="operator-inventory")
         self.last[binding.binding_id]=now
-        self.pending=(binding,self.executor.submit(self._probe,binding),now)
+        self.pending=(binding,self.executor.submit(self._probe,binding))
 
 
 def _status_writer(config,*,clock):

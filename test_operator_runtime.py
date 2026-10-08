@@ -151,11 +151,12 @@ class RuntimeTests(LedgerCase):
         chosen={"runtime_profile_id":self.profile,"mode":"fl","gpu_type":self.binding["gpu_type"],
             "gpu_count":2,"node_count":1,"ttl_seconds":120,"filters":{}}
         with patch("studio_platform.operator_runtime.ThreadPoolExecutor",Executor), \
-             patch.object(providers[binding.binding_id],"preflight_availability",return_value=None) as call:
+             patch.object(providers[binding.binding_id],"inventory_observation",return_value=(None,self.now-10)) as call:
             probe("ctl");probe("ctl")
             call.assert_called_once()
         value=api.offers(chosen,self.now)
         self.assertEqual(value["status"],"available")
+        self.assertEqual(value["observed_at"],self.now-10)
         self.assertEqual(value["hourly_cost_microusd"],2_380_000)
         self.assertEqual(value["offers"],[])
         self.now+=31
@@ -181,10 +182,19 @@ class RuntimeTests(LedgerCase):
             probe("ctl")
             self.assertIs(probe.pending[1],future)
             probe("ctl")
-            future.set_result(("available",None))
+            future.set_result(("available",None,self.now))
             probe("ctl",stopping=True)
         with self.repo.engine.connect() as connection:
             self.assertIsNone(connection.execute(select(operator_inventory)).first())
+
+    def test_repeated_native_cache_read_preserves_actual_observation_time(self):
+        _,registry,providers=_assemble(self.path,clock=lambda:self.now)
+        provider=providers[self.binding["binding_id"]]
+        provider._availability_cache[provider.bound_manifest]=(self.now-59,None)
+        with patch.object(provider,"_select_offer",side_effect=AssertionError("network")):
+            result,observed_at=provider.inventory_observation()
+        self.assertIsNone(result)
+        self.assertEqual(observed_at,self.now-59)
 
     def test_durable_controller_status_binds_raw_config_and_local_shutdown_only(self):
         from studio_platform.repository import request_hash
