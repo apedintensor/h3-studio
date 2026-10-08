@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createOperatorClient} from './operator-client.js';
 import {createOperatorController} from './operator-controller.js';
-import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload,operatorFilterEdit,previewOperatorSelection} from './operator-model.js';
+import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload,operatorFilterEdit,hasBoundOperatorSelection,previewOperatorSelection} from './operator-model.js';
 import {recipeFor,effectiveControlSchema,effectiveLimits,clipLimits,inputProblems} from './quick-chat-model.js';
 
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
@@ -71,9 +71,9 @@ test('catalog filters supply profile-specific defaults without leaking another p
 });
 test('preview replaces catalog suggestions with exact server filters, including old deployed defaults and absent bandwidth',()=>{
   const selection={...initialOperatorSelection({max_ttl_seconds:10800}),filters:{min_ram_gib:96,min_disk_gib:128,min_download_mbps:200,allowed_countries:[]}};
-  const oldPreview={selection:{...selection,filters:{min_ram_gib:96,min_disk_gib:250,min_download_mbps:500}}};
+  const oldPreview={configuration_id:'configured-old',selection:{...selection,filters:{min_ram_gib:96,min_disk_gib:250,min_download_mbps:500}}};
   assert.deepEqual(previewOperatorSelection(selection,oldPreview).filters,oldPreview.selection.filters);
-  const noNetworkPreview={selection:{...selection,filters:{min_ram_gib:96,min_disk_gib:128}}};
+  const noNetworkPreview={configuration_id:'configured-no-network',selection:{...selection,filters:{min_ram_gib:96,min_disk_gib:128}}};
   const applied=previewOperatorSelection(selection,noNetworkPreview);
   assert.deepEqual(applied.filters,noNetworkPreview.selection.filters);
   assert.equal(Object.hasOwn(applied.filters,'min_download_mbps'),false);
@@ -81,6 +81,16 @@ test('preview replaces catalog suggestions with exact server filters, including 
   assert.notEqual(applied.filters,noNetworkPreview.selection.filters);
   assert.equal(selection.filters.min_download_mbps,200);
   assert.equal(previewOperatorSelection(selection,{}),selection);
+});
+test('unresolved preview preserves draft filters and cannot label them as bound server conditions',()=>{
+  const selection={...initialOperatorSelection({max_ttl_seconds:10800}),filters:{min_ram_gib:96,min_disk_gib:128,min_download_mbps:200}};
+  for(const configuration_id of [null,undefined,'',' ',123]){
+    const preview={configuration_id,selection:{...selection,filters:{}},can_start:false,blockers:[{code:'operator_deployment_not_configured'}]};
+    assert.equal(hasBoundOperatorSelection(preview),false);
+    assert.equal(previewOperatorSelection(selection,preview),selection);
+  }
+  assert.equal(hasBoundOperatorSelection({configuration_id:'configured',selection}),true);
+  assert.equal(hasBoundOperatorSelection({configuration_id:'configured'}),false);
 });
 test('blank optional custom filters are omitted while explicit numeric values still reach server validation',()=>{
   const selection={...initialOperatorSelection({max_ttl_seconds:10800}),filters:{min_download_mbps:200,min_ram_gib:96}};

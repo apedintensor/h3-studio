@@ -44,8 +44,11 @@ export function profileSelection(profile,selection,customFilters=false){
 export function operatorFilterEdit(filters,key,value){
   const next={...filters};if(value==null||value==='')delete next[key];else next[key]=value;return next;
 }
+export function hasBoundOperatorSelection(preview){
+  return typeof preview?.configuration_id==='string'&&preview.configuration_id.trim().length>0&&!!preview.selection;
+}
 export function previewOperatorSelection(selection,preview){
-  return preview?.selection?{...preview.selection,filters:{...preview.selection.filters}}:selection;
+  return hasBoundOperatorSelection(preview)?{...preview.selection,filters:{...preview.selection.filters}}:selection;
 }
 export function runtimeDuration(policy,reportedMinimum=null,value=null){
   const maximumMinutes=Number.isFinite(policy?.max_ttl_seconds)?Math.floor(policy.max_ttl_seconds/60):null;
