@@ -109,7 +109,7 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(config["compile"], "")
             settings = pilot.base.settings_for(self.task)
             self.assertEqual(settings["model_type"], "minimax_h3_fl2va")
-            self.assertEqual(settings["config"], "bf16,bf16,lower_ram")
+            self.assertEqual(settings["config"], "bf16,bf16" if arm == "bf16" else "bf16,bf16,lower_ram")
             self.assertEqual(settings["override_profile"], 3)
             self.assertEqual(settings["activated_loras"], [])
             self.assertEqual(settings["skip_steps_cache_type"], "")
@@ -159,7 +159,7 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(session.closes, 1)
         self.assertEqual([s["model_type"] for s in session.calls], list(pro.MODEL_TYPES.values()))
         self.assertEqual([s["num_inference_steps"] for s in session.calls], [20, 50])
-        self.assertTrue(all(s["config"] == pro.CONFIG and s["override_profile"] == 3 for s in session.calls))
+        self.assertTrue(all(s["config"] == pro.config_for("int8") and s["override_profile"] == 3 for s in session.calls))
 
     def test_memory_pressure_defers_without_lowering_shared_host_gate(self):
         pilot = pro.ProPilot("bf16")
@@ -208,12 +208,16 @@ class ComparisonTests(unittest.TestCase):
 
     def fake_runtime(self, pilot):
         config = pilot.runtime_config(self.root)
+        attention = types.SimpleNamespace(**({"q_proj": object(), "k_proj": object(), "v_proj": object()}
+                                            if pilot.arm == "bf16" else {"qkv_proj": object()}))
         module = types.SimpleNamespace(server_config=config.copy(), default_profile_video=3, loaded_profile=3,
-            loaded_config=pro.CONFIG, transformer_type=pro.MODEL_TYPES["fl"],
+            loaded_config=pro.config_for(pilot.arm), transformer_type=pro.MODEL_TYPES["fl"],
             transformer_quantization=pilot.arm, text_encoder_quantization="bf16",
             int8_backend=types.SimpleNamespace(_backend="kitchen" if pilot.arm == "int8" else "pytorch"),
             preload_mode=lambda kind: "default", wan_model=types.SimpleNamespace(
-                transformer=types.SimpleNamespace(h3_checkpoint_info={"compressed_modulation": False, "time_embed_dim": 2688})))
+                transformer=types.SimpleNamespace(h3_checkpoint_info={"compressed_modulation": False, "time_embed_dim": 2688},
+                    split_linear_modules_map={"qkv_proj": {}} if pilot.arm == "bf16" else None,
+                    blocks=[types.SimpleNamespace(attn=attention)])))
         return module, config
 
     def test_loaded_audit_rejects_pruning_changed_profile_or_silent_global_precision(self):
@@ -243,9 +247,33 @@ class ComparisonTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "kernel_backend_changed"):
                     pilot.runtime_audit(module, config)
 
+    def test_BF16_layout_fix_has_new_identity_and_checks_loaded_structure(self):
+        bf = pro.ProPilot("bf16")
+        quant = pro.ProPilot("int8")
+        self.assertEqual(bf.base.RECIPE, "h3-unpruned33b-bf16-qwenbf16-vaefp16-sdpa-p3-splitqkv-v2")
+        self.assertEqual(quant.base.RECIPE, "h3-unpruned33b-int8-qwenbf16-vaefp16-sdpa-p3-lowram-v1")
+        current_digest = bf.base.task_digest(self.task)
+        with patch.object(bf.base, "RECIPE", "h3-unpruned33b-bf16-qwenbf16-vaefp16-sdpa-p3-lowram-v1"):
+            self.assertNotEqual(current_digest, bf.base.task_digest(self.task))
+        for pilot, path in ((bf, "interleaved_split"), (quant, "grouped_convrot_fused")):
+            module, config = self.fake_runtime(pilot)
+            self.assertEqual(pilot.runtime_audit(module, config, loaded=True)["loaded_qkv_path"], path)
+            module.wan_model.transformer.blocks[0].attn = types.SimpleNamespace(qkv_proj=object())
+            if pilot.arm == "bf16":
+                with self.assertRaisesRegex(ValueError, "QKV_layout"):
+                    pilot.runtime_audit(module, config, loaded=True)
+        # Two-head checkpoint row labels: a contiguous-thirds split scrambles
+        # native interleaved Q/K/V, while the upstream split maps preserve heads.
+        native = ["q0", "k0", "v0", "q1", "k1", "v1"]
+        expected = [["q0", "q1"], ["k0", "k1"], ["v0", "v1"]]
+        self.assertEqual([native[index::3] for index in range(3)], expected)
+        self.assertNotEqual([native[start:start + 2] for start in range(0, 6, 2)], expected)
+        self.assertTrue(bf.audit_definitions(self.fake_definitions(bf))["fl"]["qkv_splitting"])
+        self.assertFalse(quant.audit_definitions(self.fake_definitions(quant))["fl"]["qkv_splitting"])
+
     def fake_definitions(self, pilot, *, vae=None, architecture=None):
         def definition(model_type):
-            return {"architecture": architecture or model_type, "URLs": ["https://example/" + f[0]
+            return {"architecture": architecture or model_type, "qkv_splitting": True, "URLs": ["https://example/" + f[0]
                     for f in (pro.MODEL_FILES["bf16"][0 if model_type.endswith("fl2va") else 1],
                               pro.MODEL_FILES["int8"][0 if model_type.endswith("fl2va") else 1])]}
         groups = [{"bf16": {"text_encoder_URLs": ["https://example/" + pro.SHARED_ASSETS[0][0]]}},

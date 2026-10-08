@@ -4,8 +4,11 @@ Import and `assets --arm ...` are metadata-only. No torch, network, installation
 provider or inference work runs on import. Reuses a PRIVATE module instance of
 the reviewed 5090 receipt/collection helpers; never edits or globally patches it.
 
-Both arms use profile 3, BF16 Qwen, FP16 video VAE, FP32 audio VAE, SDPA and
-Lower RAM. At pinned WanGP 0e58385, wgp.py:3940-3976 gives profile 3 an 80% VRAM
+Both arms use profile 3, BF16 Qwen, FP16 video VAE, FP32 audio VAE and SDPA.
+BF16 v2 uses the upstream interleaved-QKV split path. INT8 keeps its validated
+grouped-ConvRot Lower RAM path and original v1 receipt identity. These are working
+deployment recipes, not a precision-only performance experiment. At pinned
+WanGP 0e58385, wgp.py:3940-3976 gives profile 3 an 80% VRAM
 per-model budget; mmgp/offload.py:5116-5220 pins only the transformer. This allows
 a fitting DiT to remain resident during denoising while other stages are offloaded.
 It does not promise that every reference envelope fits. No profile fallback.
@@ -36,7 +39,11 @@ REVISION = "0e58385fbde7ff102d276e4a9e490845de76b4ea"
 MODEL_REVISION = "adc81ccb71352192214d83d5fafb9487e860be39"
 MODEL_TYPES = {"fl": "minimax_h3_fl2va", "ref": "minimax_h3_ref2va"}
 PROFILE = 3
-CONFIG = "bf16,bf16,lower_ram"  # TE, Video VAE selector (actual FP16 file), QKV.
+# Original BF16 weights are head-interleaved. At pinned transformer.py:289-296,
+# the unsplit path expects grouped Q/K/V rows, as used by ConvRot INT8. Selecting
+# lower_ram for plain BF16 bypasses the interleaved-aware loader split and corrupts
+# attention without necessarily raising an exception. Never reuse its v1 recipe.
+ARM_CONFIGS = {"bf16": "bf16,bf16", "int8": "bf16,bf16,lower_ram"}
 MIN_AVAILABLE_RAM_GIB = 128
 MIN_FREE_GPU_GIB = 88
 MODEL_FILES = {
@@ -69,7 +76,13 @@ def checked_arm(arm):
 
 
 def recipe_id(arm):
-    return f"h3-unpruned33b-{checked_arm(arm)}-qwenbf16-vaefp16-sdpa-p3-lowram-v1"
+    checked_arm(arm)
+    suffix = "splitqkv-v2" if arm == "bf16" else "lowram-v1"
+    return f"h3-unpruned33b-{arm}-qwenbf16-vaefp16-sdpa-p3-{suffix}"
+
+
+def config_for(arm):
+    return ARM_CONFIGS[checked_arm(arm)]
 
 
 def assets_for(arm):
@@ -116,7 +129,7 @@ class ProPilot:
 
         def settings(task):
             value = inherited_settings(task)
-            value.update(config=CONFIG, override_profile=PROFILE)
+            value.update(config=config_for(self.arm), override_profile=PROFILE)
             return value
 
         self.base.settings_for = settings
@@ -188,7 +201,7 @@ class ProPilot:
                 raise ValueError("unpruned_model_architecture_mismatch")
             groups = module.get_model_config_groups(model_type, definition)
             effective = definition.copy()
-            for _, _, values in module.model_config_groups.selected_model_configs(groups, CONFIG):
+            for _, _, values in module.model_config_groups.selected_model_configs(groups, config_for(self.arm)):
                 effective.update(values)
             wanted = MODEL_FILES[self.arm][0 if mode == "fl" else 1][0]
             selected = module.get_model_filename(model_type, quantization=self.arm,
@@ -203,12 +216,12 @@ class ProPilot:
                 raise ValueError("FP16_video_VAE_selection_mismatch")
             if effective.get("audio_vae_file", SHARED_ASSETS[2][0]) != SHARED_ASSETS[2][0]:
                 raise ValueError("FP32_audio_VAE_selection_mismatch")
-            if (effective.get("qkv_splitting") is not False
+            if (effective.get("qkv_splitting") is not (self.arm == "bf16")
                     or any(effective.get(k) for k in ("pdd", "vdn", "auto_quantize"))):
                 raise ValueError("comparison_model_options_changed")
             observed[mode] = {"model_type": model_type, "transformer": wanted,
                               "text_encoder": SHARED_ASSETS[0][0],
-                              "video_vae": effective["video_vae_file"], "qkv_splitting": False}
+                              "video_vae": effective["video_vae_file"], "qkv_splitting": self.arm == "bf16"}
             if models is not None and mode in (set(MODEL_TYPES) if modes is None else set(modes)):
                 # Attest the files the real loader will resolve, not another cache
                 # with the same basename. Prior verify_assets fully hashed these.
@@ -234,18 +247,25 @@ class ProPilot:
         if effective_backend != expected_backend:
             raise ValueError("comparison_effective_kernel_backend_changed")
         result["effective_int8_backend"] = effective_backend
-        result.update(task_override_profile=PROFILE, arm=self.arm, task_config=CONFIG,
-                      migration_explanation="Same canonical settings as receipt helpers; explicit profile 3 and original companion files in both arms.",
+        result.update(task_override_profile=PROFILE, arm=self.arm, task_config=config_for(self.arm),
+                      migration_explanation="BF16 v2 enables the interleaved-aware QKV split; INT8 retains the validated grouped-ConvRot v1 path. Original companion files and profile 3 remain fixed.",
                       memory_profile_policy="profile3: per-model80%VRAM budget, transformer-only RAM pinning; one active DiT")
         if module.default_profile_video != PROFILE:
             raise ValueError("comparison_default_profile_changed")
         if loaded:
-            if module.loaded_profile != PROFILE or module.loaded_config != CONFIG:
+            if module.loaded_profile != PROFILE or module.loaded_config != config_for(self.arm):
                 raise ValueError("comparison_loaded_settings_changed")
             pipeline = module.wan_model
             checkpoint = pipeline.transformer.h3_checkpoint_info
             if checkpoint.get("compressed_modulation") is not False or checkpoint.get("time_embed_dim") != 2688:
                 raise ValueError("loaded_transformer_is_not_unpruned")
+            split = self.arm == "bf16"
+            attention = pipeline.transformer.blocks[0].attn
+            has_split = all(hasattr(attention, name) for name in ("q_proj", "k_proj", "v_proj"))
+            if (bool(pipeline.transformer.split_linear_modules_map) != split
+                    or has_split != split or hasattr(attention, "qkv_proj") == split):
+                raise ValueError("loaded_transformer_QKV_layout_mismatch")
+            result["loaded_qkv_path"] = "interleaved_split" if split else "grouped_convrot_fused"
             result["loaded_checkpoint"] = {"compressed_modulation": False, "time_embed_dim": 2688}
             result["loaded_model_type"] = module.transformer_type
             if module.transformer_type not in MODEL_TYPES.values():
