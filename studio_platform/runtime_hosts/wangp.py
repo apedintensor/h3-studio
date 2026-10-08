@@ -13,7 +13,7 @@ import time
 from typing import Callable
 import uuid
 
-from ..inference.protocol import BackendError, NotReady
+from ..inference.protocol import BackendError, NotReady, safe_failure_code
 from ..inference.wangp_contract import (
     ArtifactDescriptor, EngineManifest, HostReadiness, PreparedRequest,
     RuntimeObservation, RuntimeOutput, TERMINAL, canonical_json, _object,
@@ -150,9 +150,13 @@ class WanGPHost:
                     return self.journal.transition(operation_id, expected={"running", "unknown", "sealing"},
                         state="unknown", reason="wangp_stop_unproven")
                 if observation.state in {"failed", "cancelled"}:
+                    reason = (safe_failure_code(observation.error_code)
+                        if observation.state == "failed" else None) or "wangp_runtime_stop_confirmed"
+                    result = self.journal.transition(operation_id, expected={"running", "unknown"},
+                        state=observation.state, stop_proven=True, reason=reason)
+                    # Retain the original handle/diagnostic if persistence fails.
                     self._handles.pop(operation_id, None)
-                    return self.journal.transition(operation_id, expected={"running", "unknown"},
-                        state=observation.state, stop_proven=True, reason="wangp_runtime_stop_confirmed")
+                    return result
                 self.journal.transition(operation_id, expected={"running", "unknown"},
                                         state="sealing", stop_proven=True)
                 self._fault("after_sealing")

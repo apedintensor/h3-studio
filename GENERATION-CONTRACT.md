@@ -102,6 +102,22 @@ optional cost resolver and close()
 
 Preserve `Outcome.state`, optional `task_id` and optional integer micro-USD cost. `succeeded` requires completed output evidence; `failed`/`cancelled` require verified upstream stop because the existing runner treats those terminal values as stop proof. Transport errors, missing in-memory tasks and unconfirmed disappearance must remain `unknown`. Preserve exception identity via compatibility imports: `BackendError`, `NotReady`, `SubmissionRejected`, `SubmissionUncertain`. A definitely rejected start differs from an uncertain start. Unknown adapter response or malformed/failed idle check fails closed.
 
+An optional `Outcome.error_code` carries only a closed diagnostic vocabulary.
+For a positively stopped WanGP failure, the facade classifies the first pinned
+`GenerationError` into an allowlisted stage (`validation`, `generation`, `runtime`,
+or `unknown`) and message-signature category. The existing operation receipt's
+`reason`, CPU job/attempt `error_code`, and queued-task failure evidence retain
+that static code after the GPU is removed. Cancellation, other adapters and old
+receipts retain their existing behavior; unrecognized adapter codes fall back to
+`upstream_generation_failed`. Unknown upstream messages use `unclassified`.
+Raw messages, tracebacks, prompts, asset paths and URLs are never persisted by
+this diagnostic path. Upstream discards the original exception class, so a
+signature label is not an attested exception type or definitive root cause.
+Diagnostics cannot establish stop, authorize retry, release a reservation, or
+qualify a modality. A failed receipt write retains the original runtime handle
+for reconciliation; it never regenerates. This is the source fix for [#63](https://github.com/apedintensor/h3-studio/issues/63),
+not proof that the failed REF video case has been corrected or rerun.
+
 `prepare` may validate/stage inputs, but must not start inference. `submit` is called only after durable intent. `reconcile`/`poll` never trigger another inference. `fetch` only retrieves the existing attempt's artifacts. Idle confirmation is evidence for a currently empty matching engine; it is not proof of full model coverage or successful H3 inference.
 
 B2 extracted the Comfy seam in [PR #17](https://github.com/apedintensor/h3-studio/pull/17), preserving its existing imports, defaults, controls, queue rules and CPU/mock paths. [PR #25](https://github.com/apedintensor/h3-studio/pull/25) subsequently added configured-slot/attempt engine binding and original-engine recovery with offline evidence. Engine-bound cold approvals, bootstrap/readiness and reconnect integration remain [D2 #22](https://github.com/apedintensor/h3-studio/issues/22); configured routing alone is not a production migration.

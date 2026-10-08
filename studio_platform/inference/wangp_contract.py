@@ -234,6 +234,7 @@ class RuntimeObservation:
     state: str
     stopped: bool = False
     outputs: Mapping[str, RuntimeOutput] = field(default_factory=dict, repr=False)
+    error_code: str | None = None
 
 
 class RuntimeHandle(Protocol):
