@@ -243,6 +243,20 @@ class PilotTests(unittest.TestCase):
         self.assertEqual(pilot.cgroup_ram_headroom(200, 100, 90,
             {**fields, "file_dirty": 100}), (10, 0))
 
+    def test_runtime_audit_records_effective_profile_and_refuses_control_mutation(self):
+        requested = pilot.runtime_config(self.root)
+        self.assertEqual(requested["video_preload_mode"], "default")
+        self.assertEqual(requested["enhancer_enabled"], 3)
+        self.assertEqual(pilot.settings_for(self.task)["prompt_enhancer"], "")
+        module = types.SimpleNamespace(server_config={**requested, "extensions_defaults_version": "1.25"},
+            default_profile_video=4, loaded_profile=4, preload_mode=lambda output: "default")
+        result = pilot.runtime_audit(module, requested)
+        self.assertEqual(result["loaded_profile"], 4)
+        self.assertEqual(result["effective_config"], requested)
+        module.server_config["kernel_precision"] = "fast"
+        with self.assertRaisesRegex(ValueError, "effective_pilot_config_changed:kernel_precision"):
+            pilot.runtime_audit(module, requested)
+
 
 if __name__ == "__main__":
     unittest.main()

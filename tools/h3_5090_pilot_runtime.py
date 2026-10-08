@@ -180,11 +180,13 @@ def runtime_config(models):
             "video_profile": 4, "profile": 4, "vae_config": 3, "vae_precision": "16",
             "mixed_precision": "0", "compile": "", "boost": 1,
             "int8_kernels": "kitchen", "kernel_precision": "strict",
-            "video_preload_mode": "manual", "video_preload_in_VRAM": 0,
+            "video_preload_mode": "default", "video_preload_in_VRAM": 0,
             "perc_reserved_mem_max": 20, "smart_memory_pinning": True,
             "read_ahead": False, "vram_allocator": "default", "preload_model_policy": [],
             "fit_canvas": 2, "video_output_codec": "libx264_8", "video_container": "mp4",
-            "audio_output_codec": "aac_128", "enhancer_enabled": 0,
+            # Pinned extension migration canonicalizes manual+0 to default and
+            # enhancer availability 0 to 3. Every task still disables enhancement.
+            "audio_output_codec": "aac_128", "enhancer_enabled": 3,
             "save_queue_if_crash": 0, "notification_sound_enabled": 0,
             "embed_source_images": False, "checkpoints_paths": [str(models)]}
 
@@ -204,6 +206,21 @@ def prepare_runtime_config(path, requested):
     # Recreate the exact authored inputs so those extras cannot influence a new process.
     write_json(path, requested)
     return {"requested_keys_preserved": sorted(requested), "upstream_added_keys_reset": added_defaults}
+
+
+def runtime_audit(module, requested):
+    effective = {key: module.server_config.get(key) for key in requested}
+    changed = [key for key in requested if canonical(requested[key]) != canonical(effective[key])]
+    if changed:
+        raise ValueError("effective_pilot_config_changed:" + ",".join(sorted(changed)))
+    return {"requested_config": requested, "effective_config": effective,
+            "extensions_defaults_version": module.server_config.get("extensions_defaults_version"),
+            "default_video_profile": module.default_profile_video,
+            "loaded_profile": module.loaded_profile,
+            "video_preload_mode": module.preload_mode("video"),
+            "video_preload_in_VRAM": module.server_config.get("video_preload_in_VRAM"),
+            "task_override_profile": 4, "task_prompt_enhancer": "",
+            "migration_explanation": "At pinned 0e58385, extension migration maps manual preload with zero budget to default (same init_pipe budgets), and enhancer availability 0 to 3. Task prompt_enhancer remains empty, so enhancement is not requested. Canonical inputs now match the first pilot's effective settings; inference recipe identity is unchanged."}
 
 
 def validate_task(task):
@@ -476,7 +493,7 @@ def defer_for_deadline(task, run_root, deadline):
     return state
 
 
-def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=output_records):
+def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=output_records, audit=None):
     previous_mode = None
     for task in tasks:
         identity = task_digest(task)
@@ -529,6 +546,8 @@ def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=out
             state["state"] = "collecting"
             write_json(receipt, state)
             outputs, probe = collect(job.result(timeout=0), output_dir, task)
+            if audit is not None:
+                state["runtime_audit"] = audit()
             state.update(state="complete", outputs=outputs, media_probe=probe,
                          total_seconds=time.monotonic() - started, completed_epoch=time.time(),
                          memory_after=memory_snapshot(torch))
@@ -612,10 +631,12 @@ def run(args):
         write_json(run_root / "preflight.json", {"recipe": asset_manifest(), "environment": observed,
             "verified_modes": pending_modes, "verified_asset_paths": verified_assets,
             "config_preparation": config_preparation,
+            "runtime_audit": runtime_audit(module, config),
             "config": config, "verification_seconds": verified-started,
             "runtime_initialization_seconds": time.monotonic()-verified,
             "note": "Runtime import readiness is not inference success."})
-        outcome = run_tasks(session, tasks, run_root, output, torch, args.deadline_epoch)
+        outcome = run_tasks(session, tasks, run_root, output, torch, args.deadline_epoch,
+                            audit=lambda: runtime_audit(module, config))
         session.close()
         print(canonical({**outcome, "total_seconds": time.monotonic()-started}))
 
