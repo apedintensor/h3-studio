@@ -46,7 +46,7 @@ Do not create a parallel `backend_v2`, duplicate job database, or dual-write gen
 
 The incremental boundaries are:
 
-- Application services: retain the shared preflight/confirmation/enqueue merged in PR #25; complete explicit access/plan/read interfaces and preserved Quick Chat parity in #12.
+- Application services: shared `GenerationAdmission` receives explicit HTTP-independent `GenerationAccess` and `GenerationPlanning`; `GenerationRead` serves owner-isolated job/result projections. Story, direct and Quick Chat keep the existing ledger and confirmation semantics. Track source compatibility evidence in #12 and separate frontend/public acceptance in #20.
 - Engine adapters: preserve the Comfy seam extracted in PR #17 and extend engine integration through the same worker contract; PR #25 adds the first offline WanGP slice.
 - Runtime policy: separate finite acceptance limits from continuing on-demand service rules while retaining the rental ledger.
 - Storage and identity: address their specific scaling constraints without changing existing ownership semantics implicitly.
