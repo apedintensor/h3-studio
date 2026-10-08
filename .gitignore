@@ -342,6 +342,7 @@ inventory.json
 # Explicit encrypted business-backup copies; no backup data or receipts.
 !studio_platform/backup_remote.py
 !studio_platform/backup_remote_cli.py
+!studio_platform/backup_reconcile.py
 !BACKUP-OFFDEVICE.md
 
 # Dedicated business backup infrastructure; no deployed targets or credentials.
