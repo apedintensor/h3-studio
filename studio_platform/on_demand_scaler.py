@@ -749,7 +749,7 @@ class OnDemandController:
             result["recovery"] = {"code": "provider_preparation_evidence_unconfirmed", "automatic_rerent_allowed": False}
         if service_member_ids(c):
             result["target_gpu_instances"] = 2
-            result["member_replacement_enabled"] = False
+            result["member_replacement_enabled"] = "member_replacement" in c.service_policy
         if not fresh_ledger_only:
             save(c.work_dir/"status.json", result)
         return result

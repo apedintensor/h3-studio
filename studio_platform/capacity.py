@@ -38,6 +38,11 @@ CAPACITY_WAIT_CODES = {
     "searching": "capacity_searching_gpu",
     "bootstrap_repair_required": "capacity_bootstrap_repair_required",
     "queued_task_repair_required": "capacity_queued_task_repair_required",
+    **{code: "capacity_"+code for code in (
+        "member_replacement_removal_unconfirmed", "member_replacement_billing_unconfirmed",
+        "member_replacement_worker_unretired", "member_replacement_attempt_unresolved",
+        "member_replacement_local_stop_unconfirmed", "member_replacement_limit",
+        "member_replacement_failure_limit", "member_replacement_backoff", "member_replacement_no_waiting_demand")},
 }
 
 
@@ -140,11 +145,10 @@ def member_matches_worker(repo, connection, approval, worker, job):
             or min(p["quote_expires_at"], p["qualification_expires_at"], p["scale_policy"]["hard_deadline"]) <= now
             or not _matches_engine(p, worker["spec"])):
         return False
-    return connection.execute(select(capacity_pool_members.c.intent_id).join(instance_intents,
-        instance_intents.c.id == capacity_pool_members.c.intent_id).where(
-            capacity_pool_members.c.approval_id == approval["id"],
-            capacity_pool_members.c.approval_hash == approval["approval_hash"],
-            capacity_pool_members.c.member_id.in_(member_ids), instance_intents.c.pool == p["pool"],
+    from .pool_member_generations import bindings
+    _, current = bindings(connection, approval)
+    return connection.execute(select(instance_intents.c.id).where(
+            instance_intents.c.id.in_([r["intent_id"] for r in current.values()]), instance_intents.c.pool == p["pool"],
             instance_intents.c.provider == worker["provider"],
             instance_intents.c.provider_instance_id == worker["instance_id"],
             instance_intents.c.state.in_(("starting", "ready", "busy")),
@@ -165,7 +169,7 @@ def capacity_member_claim_allowed(repo, connection, job, worker):
         return False
     try:
         return bool(pool_member_ids(approval["payload"])) and member_matches_worker(repo, connection, approval, worker, job)
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, Conflict):
         return False
 
 
@@ -186,12 +190,13 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
         recipe_ids, policy_hash, qualification_evidence_id, qualification_expires_at,
         quote_expires_at, expires_at, launch, scale_policy, budget_scope,
         budget_account_ids, enabled=False, backend="comfy-worker", engine_manifest_digest="", output_delivery="",
-        pool_members=None, pool_controller=None):
+        pool_members=None, pool_controller=None, member_replacement=None):
     """Operator-only immutable approval. Revoke separately; never mutate its quote.
 
     This is not a public API and does not reserve/create an instance. Legacy
-    approvals bind one bootstrap intent; opt-in pool members each bind one
-    immutable intent. Neither mode permits replacement within that binding.
+    approvals bind one bootstrap intent; each opt-in member retains its original
+    immutable binding. Explicit replacement policy admits new immutable
+    generations without changing those original rows or existing job identity.
     """
     for value in (approval_id, tenant_id, pool, model_id, configuration_id, qualification_evidence_id):
         _safe_id(value)
@@ -199,6 +204,11 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
     members = pool_member_ids({"pool_members": pool_members}) if pool_members is not None else ()
     if pool_controller is not None and (not members or pool_controller != "continuing-two-members-v1"):
         raise ValueError("capacity_pool_controller_invalid")
+    if member_replacement is not None:
+        from .service_policy import validate_member_replacement
+        member_replacement = validate_member_replacement(member_replacement)
+        if not members or pool_controller != "continuing-two-members-v1":
+            raise ValueError("capacity_member_replacement_identity")
     if members and (not isinstance(scale_policy, ScalePolicy)
             or scale_policy.max_instances != 2 or scale_policy.max_physical_gpus != 2
             or scale_policy.new_instance_slots != 1 or scale_policy.new_instance_physical_gpus != 1):
@@ -239,7 +249,8 @@ def approve_capacity(repo, approval_id, *, tenant_id, pool, model_id, configurat
             if backend == "wangp-worker" else {}),
         **(dict(output_delivery=output_delivery) if output_delivery else {}),
         **({"pool_members": {"version": 1, "member_ids": list(members)}} if members else {}),
-        **({"pool_controller": pool_controller} if pool_controller is not None else {})))
+        **({"pool_controller": pool_controller} if pool_controller is not None else {}),
+        **({"member_replacement": member_replacement} if member_replacement is not None else {})))
     digest = request_hash(payload)
     try:
         with repo.transaction() as connection:
@@ -274,14 +285,15 @@ def _approval_live(repo, connection, row):
     if members:
         if cycle:
             raise Conflict("capacity_pool_has_legacy_cycle")
-        bound = list(connection.execute(select(instance_intents).join(capacity_pool_members,
-            capacity_pool_members.c.intent_id == instance_intents.c.id).where(
-                capacity_pool_members.c.approval_id == row["id"],
-                capacity_pool_members.c.approval_hash == row["approval_hash"],
-                capacity_pool_members.c.member_id.in_(members))).mappings())
+        from .pool_member_generations import bindings, replacement_policy
+        _, current = bindings(connection, row)
+        replacement = replacement_policy(p)
+        bound = list(connection.execute(select(instance_intents).where(
+            instance_intents.c.id.in_([r["intent_id"] for r in current.values()]))).mappings())
         if any(r["state"] not in ("destroyed", "destroying", "draining") and r["hard_deadline"] > now for r in bound):
             return None  # Waiters belong to the approval, never its first member.
-        if len(bound) == len(members):
+        if len(bound) == len(members) and (replacement is None or all(
+                r["generation"] >= replacement["max_replacements"] for r in current.values())):
             raise Conflict("capacity_pool_members_unavailable")
         # A never-bound original member is still eligible. Run the ordinary
         # capacity/account checks below; do not replace a failed bound member.
@@ -432,7 +444,8 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
         member_transfer = bool(pool_member_ids(a) or pool_member_ids(b))
         if member_transfer and (pool_member_ids(a) != pool_member_ids(b)
                 or a.get("pool_controller") != "continuing-two-members-v1"
-                or b.get("pool_controller") != "continuing-two-members-v1"):
+                or b.get("pool_controller") != "continuing-two-members-v1"
+                or a.get("member_replacement") != b.get("member_replacement")):
             raise Conflict("capacity_pool_transfer_not_implemented")
         exact = ("tenant_id", "pool", "model_id", "configuration_id", "recipe_ids", "policy_hash",
                  "qualification_evidence_id", "qualification_expires_at", "quote_expires_at",
@@ -444,13 +457,13 @@ def transfer_unsubmitted_capacity(repo, previous_id, next_id, *, allowed_owners,
             raise Conflict("capacity_transfer_grant_identity_mismatch")
         rows = list(conn.execute(select(instance_intents).where(instance_intents.c.pool == a["pool"])).mappings())
         if member_transfer:
-            bindings = list(conn.execute(select(capacity_pool_members).where(
-                capacity_pool_members.c.approval_id == previous_id)).mappings())
-            if (not bindings or any(r["approval_hash"] != old["approval_hash"]
-                    or r["member_id"] not in pool_member_ids(a) for r in bindings)
+            from .pool_member_generations import bindings as generation_bindings
+            old_bindings, _ = generation_bindings(conn, old)
+            if (not old_bindings or any(r["approval_hash"] != old["approval_hash"]
+                    or r["member_id"] not in pool_member_ids(a) for r in old_bindings)
                     or any(repo._instance_billing(conn, row)["billing_status"] != "settled" for row in rows)):
                 raise Conflict("capacity_pool_transfer_obligations_unsettled")
-            old_ids = {r["intent_id"] for r in bindings}
+            old_ids = {r["intent_id"] for r in old_bindings}
         else:
             cycle = conn.execute(select(capacity_cycles).where(capacity_cycles.c.approval_id == previous_id)).mappings().one()
             old_ids = {cycle["intent_id"]}

@@ -261,6 +261,18 @@ capacity_pool_members = Table("platform_capacity_pool_members", metadata,
     Column("intent_id", String(36), ForeignKey("platform_instance_intents.id"), unique=True, nullable=False),
     Column("created_at", Float, nullable=False))
 
+# Additive ancestry only: generation zero remains in capacity_pool_members.
+# The greatest validated ordinal is the current binding, including unknown rent.
+capacity_member_generations = Table("platform_capacity_member_generations", metadata,
+    Column("approval_id", String(200), ForeignKey("platform_capacity_approvals.id"), primary_key=True),
+    Column("member_id", String(200), primary_key=True),
+    Column("generation", Integer, primary_key=True),
+    Column("approval_hash", String(64), nullable=False),
+    Column("previous_intent_id", String(36), ForeignKey("platform_instance_intents.id"), unique=True, nullable=False),
+    Column("intent_id", String(36), ForeignKey("platform_instance_intents.id"), unique=True, nullable=False),
+    Column("created_at", Float, nullable=False),
+    CheckConstraint("generation > 0 AND generation <= 16"))
+
 
 class Repository:
     def __init__(self, database_url, *, clock=time.time):

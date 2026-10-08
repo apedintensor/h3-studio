@@ -13,7 +13,7 @@ import stat
 import subprocess
 import sys
 
-from sqlalchemy import select, update
+from sqlalchemy import insert, select, update
 
 from .control import WorkerControl
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
@@ -77,6 +77,8 @@ class ProductionBoot(BootController):
             min_gpu_bytes=_approved_boot_min_gpu_bytes(repo, finite, intent))
         super().__init__(repo, provider, config, ssh_factory=ssh_factory, backend_factory=backend_factory,
             verify_smoke=verify_smoke, fleet_factory=self._fleet)
+        preparation_receipt = config.work_dir/self.intent_id/"bootstrap-state.json"
+        self._member_preparation_owner = not preparation_receipt.exists() and not preparation_receipt.is_symlink()
 
     def _fleet(self, config, repo, path):
         return FleetSupervisor(config, repo, path, popen=self._popen)
@@ -484,13 +486,85 @@ class ProductionBoot(BootController):
     def close_if_safe(self, *, destroyed=False):
         if not destroyed or not self.children_done():
             return False
+        replacement = (getattr(self.finite, "service_policy", None) or {}).get("member_replacement")
+        proof = self._member_closure_proof() if replacement is not None else None
         if self.backend:
             self.backend.close()
             self.backend = None
         if self.host:
             self.host.close()
             self.host = None
+        if proof is not None:
+            # Only the process that owns these Popen/SSH handles can certify
+            # closure. A restart cannot reconstruct it from missing handles.
+            from .repository import canonical, scaler_receipts
+            from .pool_member_generations import one_receipt
+            import uuid
+            with self.repo.transaction() as conn:
+                self.repo._lock_capacity(conn)
+                row = self.repo._locked(conn, select(instance_intents).where(instance_intents.c.id == self.intent_id))
+                if row is None or row["state"] != "destroyed" or row["provider_instance_id"] != proof["instance_id"]:
+                    raise BootError("member_replacement_removal_unconfirmed")
+                existing = one_receipt(conn, self.intent_id, "member_local_closed")
+                if existing is None:
+                    conn.execute(insert(scaler_receipts).values(id=str(uuid.uuid4()), intent_id=self.intent_id,
+                        operation="member_local_closed", observed_at=self.repo.clock(), facts=canonical(proof)))
+                elif existing != proof:
+                    raise BootError("member_replacement_closure_conflict")
         return True
+
+    def _member_closure_proof(self):
+        """Bound the exact local ownership observation; never infer dead children."""
+        from .pool_member_generations import one_receipt
+        with self.repo.engine.connect() as conn:
+            row = conn.execute(select(instance_intents).where(instance_intents.c.id == self.intent_id)).mappings().one()
+            existing = one_receipt(conn, self.intent_id, "member_local_closed")
+        expected = {"version": 1, "intent_id": self.intent_id, "instance_id": row["provider_instance_id"],
+            "worker_id": "lium-"+self.intent_id.replace("-", ""), "config_hash": self.finite.fingerprint(),
+            "sources": self.finite.source_sha256, "local_port": self.config.local_port}
+        if existing is not None:
+            if any(existing.get(k) != v for k, v in expected.items()):
+                raise BootError("member_replacement_closure_conflict")
+            return existing
+        if row["state"] != "destroyed" or not row["provider_instance_id"] or not self.children_done():
+            return None
+        if self.host is None:
+            # A reconstructed object cannot attest the previous controller's
+            # transport closure merely because it has no local handle. The
+            # never-bootstrap barrier is handled separately by the member gate.
+            return None
+        path = self.config.work_dir/self.intent_id/"bootstrap-state.json"
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1048576:
+            return None
+        state = json.loads(path.read_text())
+        files, _ = self._sources()
+        if state.get("identity") != self._identity(row, files):
+            return None
+        if self.fleet is not None:
+            if (state.get("phase") not in ("fleet_starting", "fleet_started")
+                    or state.get("local_port") != self.config.local_port):
+                return None
+            expected_workers = {slot.spec.worker_id for slot in self.fleet.config.slots if slot.enabled}
+            if expected_workers != {expected["worker_id"]} or set(self.fleet.children) != expected_workers:
+                return None
+            children = [{"worker_id": key, "pid": proc.pid, "exit_code": proc.poll()}
+                        for key, proc in sorted(self.fleet.children.items())]
+            if any(type(child["pid"]) is not int or child["pid"] <= 0 or type(child["exit_code"]) is not int for child in children):
+                return None
+            detail = {"kind": "owned_fleet_exited", "fleet_hash": self.fleet.config.fingerprint(), "children": children}
+        else:
+            if (not self._member_preparation_owner
+                    or state.get("phase") not in ("bootstrap_failed", "staging_failed", "staging_cancelled", "qualification_failed")
+                    or state.get("fleet_recipe_ids") is not None):
+                return None
+            with self.repo.engine.connect() as conn:
+                if conn.execute(select(registered_workers.c.id).where(
+                        registered_workers.c.id == expected["worker_id"])).first():
+                    return None
+            detail = {"kind": "owned_preparation_never_registered", "phase": state["phase"]}
+        # Caller publishes only AFTER close() returns for this exact backend,
+        # tunnel and SSH client. Failed close leaves no usable certificate.
+        return {**expected, **detail, "bootstrap_identity": state["identity"], "local_transport_closed": True}
 
     def close(self):
         # Intentionally cannot use BootController.close's finite shutdown

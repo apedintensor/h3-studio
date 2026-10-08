@@ -20,6 +20,18 @@ MAX_CYCLE_SEQUENCE = 2**31 - 1
 MAX_MONEY = 2**63 - 1
 
 
+def validate_member_replacement(value):
+    """Explicit paid-action limits. Omission never enables replacement."""
+    if (not isinstance(value, dict) or set(value) != {
+            "version", "max_replacements", "backoff_s", "failure_limit"}
+            or type(value["version"]) is not int or value["version"] != 1
+            or type(value["max_replacements"]) is not int or not 1 <= value["max_replacements"] <= 16
+            or type(value["backoff_s"]) is not int or not 60 <= value["backoff_s"] <= 86400
+            or type(value["failure_limit"]) is not int or not 1 <= value["failure_limit"] <= 5):
+        raise ServicePolicyError("service_member_replacement_invalid")
+    return dict(value)
+
+
 class ServicePolicyError(ValueError):
     """Static diagnostic codes only; do not echo operator input."""
 
@@ -45,8 +57,11 @@ def validate_service_policy(value):
     if not isinstance(value, dict):
         raise ServicePolicyError("service_policy_fields_invalid")
     two_members = value.get("mode") == TWO_MEMBER_MODE
-    if set(value) != FIELDS | ({"member_ids"} if two_members else set()):
+    replacement = {"member_replacement"} if two_members and "member_replacement" in value else set()
+    if set(value) != FIELDS | ({"member_ids"} if two_members else set()) | replacement:
         raise ServicePolicyError("service_policy_fields_invalid")
+    if replacement:
+        validate_member_replacement(value["member_replacement"])
     if (type(value["version"]) is not int or value["version"] != 1
             or value["mode"] not in (MODE, TWO_MEMBER_MODE) or not _identifier(value["authorization_id"])
             or not _identifier(value["tenant_id"])):
@@ -74,7 +89,8 @@ def validate_service_policy(value):
     maximum = value["max_cycles"]
     if maximum is not None and (type(maximum) is not int or not 1 <= maximum <= MAX_CYCLE_SEQUENCE):
         raise ServicePolicyError("service_policy_cycles_invalid")
-    return {**value, "owner_ids": list(owners), **({"member_ids": list(members)} if two_members else {})}
+    return {**value, "owner_ids": list(owners), **({"member_ids": list(members)} if two_members else {}),
+            **({"member_replacement": dict(value["member_replacement"])} if replacement else {})}
 
 
 def service_member_ids(config):
@@ -115,6 +131,9 @@ def validate_service_config(config):
             or scale["idle_before_drain_s"] != value["idle_shutdown_seconds"]):
         raise ServicePolicyError("service_policy_limits_mismatch")
     count = 2 if value["mode"] == TWO_MEMBER_MODE else 1
+    replacement = value.get("member_replacement")
+    if replacement is not None and config.port_start + 2*replacement["max_replacements"] + 1 > 65535:
+        raise ServicePolicyError("service_member_port_range_invalid")
     if (any(type(scale.get(field)) is not int or scale[field] != count
             for field in ("max_instances", "max_physical_gpus"))
             or any(type(scale.get(field)) is not int or scale[field] != 1
