@@ -271,6 +271,12 @@ transport closure, bound to intent/pod/worker, source/config and port. Lost
 handles or absent files alone are not proof. A never-registered predecessor
 instead requires exact owned failed-preparation evidence, or the irreversible
 `retiring_unused` start barrier with no contradictory runtime evidence.
+An authoritative `not_created` result is a separate no-rent case: the exact
+current intent's create receipt and applied action must positively agree on
+absence, all its reservations must be released at zero, and no pod, worker,
+attempt or bootstrap evidence may contradict it. Later fresh demand may use a
+new ordinal; the old intent is never retried. This consumes the absolute ordinal
+cap but neither increments nor resets the paid preparation-failure streak.
 
 The same fenced capacity/account transaction reserves the next generation,
 records ancestry, and commits its sole create action before the provider call.

@@ -17,7 +17,7 @@ from .repository import (Conflict, Scope, capacity_approvals, capacity_pool_memb
     budget_accounts, capacity_waiters, instance_intents, jobs, registered_workers, scaler_actions,
     scaler_receipts, canonical, request_hash, BudgetExceeded)
 from .scaler import LaunchSpec
-from .pool_member_generations import bindings as member_bindings, replacement_policy, retirement_ledger, one_receipt, successful_generation
+from .pool_member_generations import bindings as member_bindings, replacement_policy, retirement_ledger, one_receipt, successful_generation, no_rent_proven
 
 
 def port_for_member(config, repo, intent_id):
@@ -392,7 +392,10 @@ class PoolServiceCycle(FiniteController):
         # An irreversible provider start barrier proves bootstrap was never
         # allowed. This is not an inference from absent files or a PENDING label.
         preparation = self.scaler.preparation(connection, intent)
-        if (preparation is None or preparation["phase"] != "retiring_unused"
+        never_created = no_rent_proven(connection, intent)
+        unused = preparation is not None and preparation["phase"] == "retiring_unused"
+        no_boot = never_created and (preparation is None or preparation["phase"] == "awaiting_provider")
+        if (not (unused or no_boot)
                 or intent["id"] in self.boots
                 or connection.execute(select(registered_workers.c.id).where(
                     registered_workers.c.id == expected["worker_id"])).first() is not None):

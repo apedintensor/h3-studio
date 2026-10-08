@@ -300,6 +300,42 @@ class ReplacementTests(LedgerCase):
         self.assertEqual(len(self.provider.creates), 2)
         self.assertEqual(self.repo.get_budget("finite-budget")["reserved_microusd"], 2_000_000)
         self.assertFalse(WorkerControl(self.repo).get("lium-"+b.replace("-", ""))["drain_requested"])
+        self.now += 61
+        self.submit(story="new-demand-after-no-rent")
+        next_result = self.create()
+        self.assertEqual(next_result["state"], "creation_observed")
+        self.assertNotEqual(next_result["intent_id"], result["intent_id"])
+        history, current = self.chain()
+        self.assertEqual(current["a"]["generation"], 2)
+        self.assertEqual(current["a"]["previous_intent_id"], result["intent_id"])
+        self.assertEqual(current["b"]["intent_id"], b)
+        self.assertEqual(len(history), 4)
+        self.assertEqual(len(self.provider.creates), 3)  # No paid call for ordinal1.
+        self.assertEqual(self.controller.current.port_for(next_result["intent_id"]), self.config.port_start+4)
+
+    def test_no_rent_requires_exact_positive_create_receipt_and_does_not_reset_failures(self):
+        scope, job, a, _ = self.begin(); self.close_member(a); self.now += 61
+        original = self.controller.current.members.before_create
+        def cancel(*args):
+            self.repo.request_cancel(scope, job["id"])
+            return original(*args)
+        with patch.object(self.controller.current.members, "before_create", side_effect=cancel):
+            no_rent = self.create()["intent_id"]
+        self.now += 61; self.submit(story="after-no-rent")
+        with self.repo.transaction() as conn:
+            receipt = conn.execute(select(scaler_receipts).where(scaler_receipts.c.intent_id == no_rent,
+                scaler_receipts.c.operation == "create")).mappings().one()
+            conn.execute(update(scaler_receipts).where(scaler_receipts.c.id == receipt["id"])
+                .values(facts={**receipt["facts"], "absence_confirmed": False}))
+        self.assertEqual(self.create()["reason"], "member_replacement_removal_unconfirmed")
+        with self.repo.transaction() as conn:
+            conn.execute(update(scaler_receipts).where(scaler_receipts.c.id == receipt["id"]).values(facts=receipt["facts"]))
+            gate = self.controller.current.members.replacement_status(conn, self.grant(), "a")
+            self.assertEqual(gate["consecutive_failures"], 1)
+        self.provider.uncertain = True
+        unknown = self.create()["intent_id"]
+        self.assertEqual(self.create()["intent_id"], unknown)
+        self.assertEqual(len(self.provider.creates), 3)
 
     def test_actual_boot_closure_requires_owned_exited_child_and_successful_transport_close(self):
         from studio_platform.production_scaler_boot import ProductionBoot

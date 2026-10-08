@@ -58,21 +58,42 @@ def one_receipt(connection, intent_id, operation):
     return values[0] if values else None
 
 
+def no_rent_proven(connection, intent):
+    """An exact once-only create returned authoritative absence, not a list miss."""
+    if intent["state"] != "destroyed" or intent["provider_instance_id"] is not None:
+        return False
+    action = connection.execute(select(scaler_actions).where(scaler_actions.c.intent_id == intent["id"])).mappings().first()
+    if action is None or action["create_started_at"] is None or action["destroy_started_at"] is not None:
+        return False
+    def positive(fact):
+        return (isinstance(fact, dict) and fact.get("state") == "not_created"
+            and fact.get("instance_id") is None and fact.get("absence_confirmed") is True
+            and type(fact.get("actual_cost_microusd")) is int and fact["actual_cost_microusd"] == 0)
+    if not positive(action["last_observation"]):
+        return False
+    receipts = list(connection.execute(select(scaler_receipts).where(
+        scaler_receipts.c.intent_id == intent["id"], scaler_receipts.c.operation.in_(("create", "reconcile", "destroy")))).mappings())
+    return (any(row["operation"] == "create" and positive(row["facts"]) for row in receipts)
+        and all(row["facts"].get("instance_id") is None
+            and row["facts"].get("state") not in ("starting", "running", "destroyed") for row in receipts))
+
+
 def retirement_ledger(connection, approval, intent):
     """Positive exact removal/billing and original execution stop obligations."""
-    if intent["state"] != "destroyed" or not intent["provider_instance_id"]:
+    no_rent = no_rent_proven(connection, intent)
+    if intent["state"] != "destroyed" or not intent["provider_instance_id"] and not no_rent:
         raise Conflict("member_replacement_removal_unconfirmed")
     if intent["pool"] != approval["pool"] or intent["provider"] != approval["payload"]["launch"]["provider"]:
         raise Conflict("capacity_pool_member_identity_mismatch")
     action = connection.execute(select(scaler_actions).where(scaler_actions.c.intent_id == intent["id"])).mappings().one()
     fact = action["last_observation"] or {}
-    if fact.get("state") != "destroyed" or fact.get("instance_id") != intent["provider_instance_id"]:
+    if not no_rent and (fact.get("state") != "destroyed" or fact.get("instance_id") != intent["provider_instance_id"]):
         raise Conflict("member_replacement_removal_unconfirmed")
     receipts = list(connection.execute(select(scaler_receipts.c.facts).where(
         scaler_receipts.c.intent_id == intent["id"])).scalars())
     removed = [r for r in receipts if isinstance(r, dict) and r.get("state") == "destroyed"
                and r.get("instance_id") == intent["provider_instance_id"]]
-    if not removed:
+    if not removed and not no_rent:
         raise Conflict("member_replacement_removal_unconfirmed")
     final = [r["actual_cost_microusd"] for r in removed
              if type(r.get("actual_cost_microusd")) is int and r["actual_cost_microusd"] >= 0]
@@ -86,14 +107,16 @@ def retirement_ledger(connection, approval, intent):
             or len(set(costs)) != 1
             or {r["account_id"] for r in reservations} != set(approval["payload"]["budget_account_ids"])
             or any(r["state"] not in ("settled", "released") for r in reservations)
-            or any(value != costs[0] for value in final)):
+            or any(value != costs[0] for value in final)
+            or no_rent and (costs[0] != 0 or any(r["state"] != "released" for r in reservations))):
         raise Conflict("member_replacement_billing_unconfirmed")
     worker_id = "lium-"+intent["id"].replace("-", "")
     workers = list(connection.execute(select(registered_workers).where(or_(
         registered_workers.c.id == worker_id,
         (registered_workers.c.provider == intent["provider"]) &
-        (registered_workers.c.instance_id == intent["provider_instance_id"]))).with_for_update()).mappings())
-    if workers and (len(workers) != 1 or workers[0]["id"] != worker_id
+        (registered_workers.c.instance_id == intent["provider_instance_id"]) &
+        registered_workers.c.instance_id.is_not(None))).with_for_update()).mappings())
+    if workers and (no_rent or len(workers) != 1 or workers[0]["id"] != worker_id
             or workers[0]["provider"] != intent["provider"] or workers[0]["instance_id"] != intent["provider_instance_id"]
             or workers[0]["pool"] != approval["pool"] or workers[0]["state"] != "retired" or workers[0]["current_job_id"]):
         raise Conflict("member_replacement_worker_unretired")
