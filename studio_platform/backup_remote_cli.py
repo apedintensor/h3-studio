@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 
-from .backup import _regular
+from .backup import _absolute, _private_new_directory, _regular
 from .backup_remote import BackupTarget, RemoteBackupError, copy_backup, need, plan_copy, restore_copy
+from .backup_reconcile import _json, reconcile_copy, validate_intent, validate_receipt
 
 
 def aws_client(target):
@@ -51,10 +52,11 @@ def read_json(path, *, maximum):
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action",choices=("plan","copy","restore"),nargs="?",default="plan")
+    parser.add_argument("action",choices=("plan","copy","restore","reconcile"),nargs="?",default="plan")
     parser.add_argument("--target",required=True,type=Path,help="Explicit nonsecret account/region/bucket/prefix/KMS-key/backup-role JSON")
     parser.add_argument("--backup",type=Path)
     parser.add_argument("--receipts",type=Path,help="New private action receipt directory for one copy")
+    parser.add_argument("--reconciliation",type=Path,help="New private evidence directory for read-only reconciliation; original receipts are preserved")
     parser.add_argument("--receipt",type=Path,help="Exact immutable completion receipt retained independently of the source host")
     parser.add_argument("--download",type=Path,help="New private readback directory")
     parser.add_argument("--destination",type=Path,help="New isolated restore directory; never the live application data")
@@ -73,6 +75,34 @@ def main(argv=None):
             result=copy_backup(args.backup,target,args.receipts,client=aws_client(target))
             result={k:result[k] for k in ("phase","completion_sha256","completion_bytes",
                 "completion_version_id","snapshot_manifest_sha256","objects","bytes","restore_verified")}
+        elif args.action=="reconcile":
+            from .backup_remote import MAX_JSON, _record, canonical, sha
+            need(args.receipts is not None and args.reconciliation is not None,"backup_reconciliation_paths_required")
+            original=_absolute(args.receipts);destination=_absolute(args.reconciliation)
+            need(not original.is_relative_to(destination) and not destination.is_relative_to(original),
+                 "backup_reconciliation_overlaps_original")
+            intent=_json(_regular(original/"intent.json",max_bytes=MAX_JSON).read_bytes())
+            validate_intent(target,intent)
+            saved=original/"completion.json"
+            receipt=_json(_regular(saved,max_bytes=16384).read_bytes()) if saved.exists() or saved.is_symlink() else None
+            if args.receipt is not None:
+                explicit=_json(_regular(args.receipt,max_bytes=16384).read_bytes())
+                need(receipt is None or receipt==explicit,"backup_reconciliation_receipt_conflict")
+                receipt=explicit
+            validate_receipt(target,intent,receipt)
+            evidence=_private_new_directory(destination)
+            _record(evidence/"read-intent.json",dict(phase="before_read_only_reconciliation",
+                original_intent_sha256=sha(canonical(intent)),target=intent["target"],
+                operation_id=intent["operation_id"],automatic_retry=False,cloud_write_operations=0))
+            report=reconcile_copy(target,intent,client=aws_client(target),receipt=receipt)
+            _record(evidence/"reconciliation.json",report)
+            if report["classification"]=="complete":
+                _record(evidence/"completion.json",report["transfer_receipt"])
+            result={k:report[k] for k in ("classification","code","original_intent_sha256",
+                "snapshot_manifest_sha256","automatic_retry","cloud_write_operations","restore_verified")}
+            result.update(state="backup_copy_reconciled",verified_files=len(report["verified_files"]),
+                          missing_current_files=len(report["missing_current_files"]))
+            print(json.dumps(result,sort_keys=True));return 0 if result["classification"]=="complete" else 2
         else:
             need(all(x is not None for x in (args.receipt,args.download,args.destination)),"backup_restore_paths_required")
             receipt=read_json(args.receipt,maximum=16384)
