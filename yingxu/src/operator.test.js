@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createOperatorClient} from './operator-client.js';
 import {createOperatorController} from './operator-controller.js';
-import {allowed,profileSelection,nodeDeadline} from './operator-model.js';
+import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload} from './operator-model.js';
 import {recipeFor,effectiveControlSchema,effectiveLimits,clipLimits,inputProblems} from './quick-chat-model.js';
 
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
@@ -55,6 +55,26 @@ test('deployment profile selects only reported GPU topology, preserving price/TT
   const selection={node_count:2,ttl_seconds:1800,filters:{max_price_per_gpu_hour_microusd:1500000}};
   const next=profileSelection({id:'pro-bf16',gpu_models:['PRO exact'],gpu_count_options:[2],minimum_ram_bytes:256*1024**3,minimum_disk_bytes:350*1024**3},selection);
   assert.equal(next.gpu_count,2);assert.equal(next.gpu_type,'PRO exact');assert.equal(next.filters.min_ram_gib,256);assert.equal(next.node_count,2);assert.equal(next.ttl_seconds,1800);assert.equal(next.filters.max_price_per_gpu_hour_microusd,1500000);
+});
+test('new operator run uses a policy-bounded 180-minute default and reports provider minimum without changing an override',()=>{
+  assert.equal(initialOperatorSelection({max_ttl_seconds:14400}).ttl_seconds,10800);
+  assert.equal(initialOperatorSelection({max_ttl_seconds:7200}).ttl_seconds,7200);
+  const authored={ttl_seconds:3600},bounds=runtimeDuration({max_ttl_seconds:10800},3780,authored.ttl_seconds);
+  assert.equal(bounds.minimumMinutes,63);assert.equal(bounds.maximumMinutes,180);assert.ok(bounds.problem);assert.equal(bounds.suggestedSeconds,10800);assert.equal(authored.ttl_seconds,3600);
+  assert.equal(runtimeDuration({max_ttl_seconds:10800},3780,7200).problem,null);
+  assert.equal(runtimeDuration({max_ttl_seconds:3600},3780,3600).suggestedSeconds,null);
+  assert.ok(runtimeDuration({max_ttl_seconds:3600},3780,3600).problem);
+  assert.equal(runtimeDuration({max_ttl_seconds:10800}).minimumMinutes,null);
+});
+test('default start omits filters and custom Lium filters never invent a CPU requirement',()=>{
+  const selection=initialOperatorSelection({max_ttl_seconds:10800});
+  assert.equal(Object.hasOwn(selection.filters,'min_cpu_cores'),false);
+  assert.equal(Object.hasOwn(operatorStartPayload(selection),'filters'),false);
+  selection.filters.min_ram_gib=128;selection.filters.max_price_per_gpu_hour_microusd=1200000;
+  assert.equal(operatorStartPayload(selection,true),selection);
+  assert.equal(operatorStartPayload(selection,true).filters.min_ram_gib,128);
+  assert.equal(operatorStartPayload(selection,true).filters.max_price_per_gpu_hour_microusd,1200000);
+  assert.equal(Object.hasOwn(operatorStartPayload(selection,true).filters,'min_cpu_cores'),false);
 });
 test('explicit deployment receives own control schema without legacy pool limits, old requests remain unchanged',()=>{
   const base={id:'fl',mode:'fl',controls:{steps:{type:'integer',maximum:100}},limits:{max_images:9},execution_support:{constraints:{max_steps:20,input_limits:{max_images:1}}},deployment_preset:{controls:{video_decode:'tiled'}}};
