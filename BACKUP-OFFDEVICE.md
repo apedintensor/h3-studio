@@ -92,6 +92,7 @@ authority or automatically replaying writes.
 ```text
 python -m studio_platform.backup_remote_cli plan --target <target.json> --backup <verified-backup>
 python -m studio_platform.backup_remote_cli copy --execute --target <target.json> --backup <verified-backup> --receipts <new-private-action-dir>
+python -m studio_platform.backup_remote_cli reconcile --execute --target <same-target.json> --receipts <original-action-dir> --reconciliation <new-private-evidence-dir>
 python -m studio_platform.backup_remote_cli restore --execute --target <target.json> --receipt <retained-completion.json> --download <new-private-readback-dir> --destination <new-isolated-restore-dir>
 ```
 
@@ -124,6 +125,54 @@ without a local success receipt. Do not replay the same copy or treat an absent
 object/list as proof that a write failed. Reconcile the recorded exact prefix,
 operation ID, version/checksum and key binding through an independently reviewed
 operator action; never erase unique copies to make a retry pass.
+
+### Reconcile an uncertain copy without writing to S3
+
+The `reconcile` action reads the original `intent.json`; it does not create a new
+prefix or rerun the copy. The exact target, operation ID, snapshot hash and full
+file inventory must match. It initializes the existing separately assumed backup
+role only after local evidence validation and a new private read-intent receipt.
+It uses only bucket checks and object GETs, never PUT, DELETE or absence inferred
+from a listing. Missing/denied/ambiguous reads do not grant retry authority.
+
+The original remote claim must match the original operation. If the original
+local `completion.json` exists, its exact version/hash is mandatory; an optional
+`--receipt <independently-retained-completion.json>` may supply that pin when the
+local final receipt was lost. Conflicting retained receipts are rejected. A
+missing/corrupt pinned version never falls back to the latest version. Without a
+retained completion pin, one current completion GET discovers its immutable
+version and validates its bytes, encryption, operation and exact original plan.
+All referenced payloads are then read by their completion-pinned versions and
+full SHA-256. Every returned streaming body is closed.
+
+- `complete` (exit 0): all pinned bytes were verified. The new evidence directory
+  contains a restored **transfer receipt** named `completion.json`, suitable for
+  the existing explicit isolated-restore command. This is not a restore-success
+  receipt; `restore_verified` remains false.
+- `partial` (exit 2): the matching claim and observed files were verified, but no
+  transport completion was observed. Even all payloads without `complete.json`
+  remain partial. The helper does not synthesize remote completion or resume
+  writes. A current `NoSuchKey` is a dated observation, not proof an in-flight
+  write failed.
+- `unknown` (exit 2): identity, checksum, key, version or read outcome could not be
+  established. Static diagnostics and any already verified version evidence are
+  retained. Permission denial is not treated as absence. A malformed local
+  intent or refused output location fails before object reads (exit 1).
+
+The original action directory and uncertainty receipts remain untouched. A new
+private directory receives `read-intent.json` and `reconciliation.json`; only a
+fully verified result receives its local transfer receipt. Reusing that output
+directory is refused. Reconciliation can be explicitly repeated as a new local
+read observation of the same original prefix; this never authorizes upload
+replay, a new prefix, deletion, restore, automatic cadence or execution of held
+jobs. Preserve any observed completion/version pins during follow-up review;
+changed remote evidence is not permission to silently substitute versions.
+
+Source tests use real synthetic portable snapshots and a fake client that
+forbids all writes during reconciliation. They cover lost final receipts,
+partial copies, version/content/key/operation mismatch, ambiguous reads, exact
+retained-version behavior and a disabled isolated restore from the recovered
+receipt. These tests do not exercise AWS, real role credentials or a live copy.
 
 Current bounds reuse the portable backup envelope: at most 512 MiB per copied
 file, 40 GiB plus bounded database/manifests in total, and bounded file count and
