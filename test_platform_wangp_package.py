@@ -211,7 +211,7 @@ class PackageTests(unittest.TestCase):
                 {"state": "reconcile_required", "code": "bootstrap_marker_exists"})
         self.assertEqual(json.loads(Path(value["status_path"]).read_text()), result)
 
-    def bootstrap_after_download(self, *, launch=True, receipt="valid", ready_incarnation="a"*32):
+    def bootstrap_after_download(self, *, launch=True, receipt="valid", ready_incarnation="a"*32, startup_failure=None):
         from studio_platform.inference.wangp_contract import EngineManifest
         from studio_platform.runtime_hosts import wangp_download, wangp_launcher
         value, imported = self.prepared_import_fixture()
@@ -219,7 +219,7 @@ class PackageTests(unittest.TestCase):
         token = self.root / "token"
         token.write_text("synthetic-private-bootstrap-token-" + "x"*32)
         token.chmod(0o600)
-        child = SimpleNamespace(pid=os.getpid(), poll=lambda: None)
+        child = SimpleNamespace(pid=os.getpid(), poll=lambda: 1 if startup_failure else None)
         evidence = {"manifest_digest": manifest.digest, "inference_verified": False}
 
         def command(args, **kwargs):
@@ -230,6 +230,12 @@ class PackageTests(unittest.TestCase):
         def start(args, **kwargs):
             self.assertNotIn("--verify-only", args)
             self.assertIn("--create-journal", args)
+            if startup_failure:
+                from studio_platform.runtime_hosts.wangp_startup import write_startup_failure
+                write_startup_failure(args[args.index("--startup-status-file")+1], slot_key="test-slot",
+                    manifest_digest=manifest.digest, launch_id=args[args.index("--startup-id")+1],
+                    phase="runtime_manifest", error=ValueError("wangp_startup_stage_failed"),
+                    pid=child.pid + (1 if startup_failure == "wrong-pid" else 0))
             if receipt != "missing":
                 state = Path(args[args.index("--state-dir")+1])
                 state.mkdir()
@@ -267,6 +273,19 @@ class PackageTests(unittest.TestCase):
                 patch.object(wangp_download, "run_download"):
             result = bootstrap.install(value, "test-slot", str(token), launch=launch)
         return result, runs, starts, value
+
+    def test_startup_failure_is_projected_but_dispatch_remains_unknown(self):
+        result, _, starts, value = self.bootstrap_after_download(receipt="missing", startup_failure="valid")
+        self.assertEqual((result["state"], result["failure_phase"], result["code"]),
+                         ("unknown", "runtime_manifest", "wangp_startup_stage_failed"))
+        self.assertFalse(result["runtime_verified"])
+        self.assertEqual(json.loads(Path(value["status_path"]).read_text()), result)
+        starts.assert_called_once()
+
+    def test_wrong_startup_identity_falls_back_without_claiming_stop(self):
+        result, _, starts, _ = self.bootstrap_after_download(receipt="missing", startup_failure="wrong-pid")
+        self.assertEqual((result["state"], result["code"]), ("unknown", "runtime_process_exited"))
+        starts.assert_called_once()
 
     def test_normal_bootstrap_starts_once_without_a_separate_full_verification(self):
         result, runs, starts, value = self.bootstrap_after_download()
