@@ -2,7 +2,7 @@ import {boundVideoRange,videoBinding} from './video-cut-model.js';
 import {createCloudClient,safeCloudPath} from './cloud-client.js';
 import {store as defaultStore} from './store.js';
 import {getFile,setCloudMediaHandlers} from './media.js';
-import {executionPresetControls,blankCloudProject,freestyleProject,copyForCloud,checkedProjectRecord,referenceSpecs,shotSnapshot,stableJSON,digest,buildPlanPayload,mergeJobCandidate,activeJobStatuses} from './cloud-model.js';
+import {executionPresetControls,selectedRecipe,blankCloudProject,freestyleProject,copyForCloud,checkedProjectRecord,referenceSpecs,shotSnapshot,stableJSON,digest,buildPlanPayload,mergeJobCandidate,activeJobStatuses} from './cloud-model.js';
 import {roughCutSnapshot,roughCutJobs} from './roughcut-model.js';
 import {burnCaptionStatus} from './caption-model.js';
 
@@ -92,16 +92,16 @@ export function createCloudController({store=defaultStore,client,storage=globalT
     return result.data.cloudAssetId;}
   function assertNotHeld(key,id){if(state.jobs.some(job=>job.status==='recovery_hold'&&job.client_ref?.[key]===id&&(key!=='chapter_id'||job.recipe_id==='chapter-roughcut-v1')))throw Error('原任务恢复后待核对，请等待管理员核对执行与费用；可以继续编辑作品，不能重新提交。');}
   async function prepare(shotId){requireCloud();assertNotHeld('shot_id',shotId);if(readPending()[shotId]||readBatchPending()?.shotIds.includes(shotId))throw Error('这个镜头有未确认的提交。先刷新任务或用原标识核对提交，不能创建新计划绕过。');const ctx=context();emit({preflightErrors:{...state.preflightErrors,[shotId]:null}});const currentHash=await digest(shotSnapshot(current().project,shotId));guard(ctx);if(state.jobs.some(job=>job.client_ref?.shot_id===shotId&&job.client_ref.source_hash===currentHash&&activeJobStatuses.has(job.status)))throw Error('这个镜头的相同版本已在队列中，请查看进度或先取消原任务。');await reloadCapabilities();guard(ctx);
-    let shot=current().project.entities.find(e=>e.id===shotId);if(!shot)throw Error('镜头不存在。');const recipe=state.capabilities.recipes.find(r=>r.id===(shot.data.h3?.recipeId||state.capabilities.recipes[0]?.id));if(!recipe)throw Error('此生成配方已不可用，请刷新并重新选择。');
+    let shot=current().project.entities.find(e=>e.id===shotId);if(!shot)throw Error('镜头不存在。');const recipe=selectedRecipe(state.capabilities.recipes,shot.data.h3);if(!recipe)throw Error('此生成配方已不可用，请刷新并重新选择。');
     const runtime=executionPresetControls(recipe),saved=shot.data.h3?.controls||{};
     if(Object.entries(runtime).some(([field,value])=>saved[field]!==value)){
       if(!store.updateEntity(shotId,{data:{h3:{...shot.data.h3,controls:{...saved,...runtime}}}}))throw Error('自动匹配云端设置未保存，请重新预检。');
     }
 
     const matchedHash=await digest(shotSnapshot(current().project,shotId));guard(ctx);if(state.jobs.some(job=>job.client_ref?.shot_id===shotId&&job.client_ref.source_hash===matchedHash&&activeJobStatuses.has(job.status)))throw Error('这个镜头的相同版本已在队列中，请查看进度或先取消原任务。');
-    let refs=referenceSpecs(current().project,shotId);if(refs.issues.length)throw Error(refs.issues.join(' '));
+    let refs=referenceSpecs(current().project,shotId,{mode:recipe.mode});if(refs.issues.length)throw Error(refs.issues.join(' '));
     for(const id of new Set([...refs.references.map(r=>r.entity.id),...(shot.data.h3?.guides||[]).map(g=>g.media_id)])){await syncEntity(id);guard(ctx);}
-    refs=referenceSpecs(current().project,shotId);const assetMap={};for(const ref of refs.references){if(ref.range){const derivative=await api.derivative(ref.entity.data.cloudAssetId,ref.range,intent('clip',await digest({id:ref.entity.data.cloudAssetId,start:ref.range.start,end:ref.range.end})));guard(ctx);if(!derivative.asset_id||derivative.status!=='ready')throw Error('选段仍在处理中，请稍后重新预检；未使用整个原文件替代。');assetMap[ref.key]=derivative.asset_id;}}
+    refs=referenceSpecs(current().project,shotId,{mode:recipe.mode});const assetMap={};for(const ref of refs.references){if(ref.range){const derivative=await api.derivative(ref.entity.data.cloudAssetId,ref.range,intent('clip',await digest({id:ref.entity.data.cloudAssetId,start:ref.range.start,end:ref.range.end})));guard(ctx);if(!derivative.asset_id||derivative.status!=='ready')throw Error('选段仍在处理中，请稍后重新预检；未使用整个原文件替代。');assetMap[ref.key]=derivative.asset_id;}}
     const updated=current().project,liveShot=updated.entities.find(e=>e.id===shotId);for(const [index,guide]of (liveShot.data.h3?.guides||[]).entries()){if(!guide.source_range)continue;const entity=updated.entities.find(e=>e.id===guide.media_id),range=guide.source_range;if(range.fileId!==entity?.data.fileId||!Number.isFinite(range.start)||!Number.isFinite(range.end)||range.start<0||range.end<=range.start)throw Error('时间锚点的原文件已改变或选段无效，请重设锚点。');const derivative=await api.derivative(entity.data.cloudAssetId,range,intent('clip',await digest({id:entity.data.cloudAssetId,start:range.start,end:range.end})));guard(ctx);if(!derivative.asset_id||derivative.status!=='ready')throw Error('锚点选段尚未就绪，没有使用完整原文件替代。');assetMap['guide:'+index]=derivative.asset_id;}
     await save();guard(ctx);const snapshot=current().project,hash=await digest(shotSnapshot(snapshot,shotId)),payload=buildPlanPayload(snapshot,shotId,{recipe,capabilitiesVersion:state.capabilities.capabilities_version,assetMap,sourceHash:hash});
     const plan=await api.plan(payload,intent('plan',snapshot.id+':'+shotId+':'+hash));guard(ctx);

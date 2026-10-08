@@ -1,0 +1,40 @@
+import {createCloudClient,safeCloudPath} from './cloud-client.js';
+const enc=value=>encodeURIComponent(value);
+const base=id=>`/v1/quick-chat/sessions/${enc(id)}`;
+/** Same authenticated HTTP client as stories. No provider or GPU credentials. */
+export function createQuickChatClient(options={}){
+  const api=createCloudClient(options),write=(path,body,key,method='POST')=>api.request(path,{method,body,key});
+  return {...api,
+    schema:()=>api.request('/v1/quick-chat/schema'),
+    sessions:({cursor,limit=30}={})=>api.request('/v1/quick-chat/sessions?'+new URLSearchParams({limit,...(cursor?{cursor}:{})})),
+    createSession:(body,key)=>write('/v1/quick-chat/sessions',body,key),
+    session:id=>api.request(base(id)),
+    patchSession:(id,body,key)=>write(base(id),body,key,'PATCH'),
+    materials:(id,{cursor,limit=50}={})=>api.request(base(id)+'/materials?'+new URLSearchParams({limit,...(cursor?{cursor}:{})})),
+    saveMaterials:(id,body,key)=>write(base(id)+'/materials',body,key,'PUT'),
+    uploadMaterial:(id,file,assetId,key)=>{const body=new FormData();body.append('file',file,file.name||'reference');body.append('client_asset_id',assetId);return write(base(id)+'/assets',body,key);},
+    sessionAssets:(id,assetId)=>api.request(base(id)+'/assets'+(assetId?'?client_asset_id='+enc(assetId):'')),
+    resumeMaterial:(id,assetId,body,key)=>write(base(id)+`/assets/${enc(assetId)}/resume`,body||{},key),
+    timeline:(id,{before_cursor,after_cursor,limit=30}={})=>api.request(base(id)+'/timeline?'+new URLSearchParams({limit,...(before_cursor?{before_cursor}:{}),...(after_cursor?{after_cursor}:{})})),
+    turn:(id,body,key)=>write(base(id)+'/turns',body,key),
+    getTurn:(id,turn)=>api.request(base(id)+`/turns/${enc(turn)}`),
+    acknowledgeUnknown:(id,turn,body,key)=>write(base(id)+`/turns/${enc(turn)}/acknowledge-unknown`,body||{},key),
+    createCard:(id,body,key)=>write(base(id)+'/cards',body,key),
+    card:(id,card)=>api.request(base(id)+`/cards/${enc(card)}`),
+    revision:(id,revision)=>api.request(base(id)+`/revisions/${enc(revision)}`),
+    reviseCard:(id,card,body,key)=>write(base(id)+`/cards/${enc(card)}/revisions`,body,key),
+    preflight:(id,revision,body,key)=>write(base(id)+`/revisions/${enc(revision)}/preflights`,body,key),
+    getPreflight:(id,preflight)=>api.request(base(id)+`/preflights/${enc(preflight)}`),
+    submit:(id,revision,body,key)=>write(base(id)+`/revisions/${enc(revision)}/submissions`,body,key),
+    submission:(id,submission)=>api.request(base(id)+`/submissions/${enc(submission)}`),
+    cancelSubmission:(id,submission,body,key)=>write(base(id)+`/submissions/${enc(submission)}/cancel`,body,key),
+    retryItem:(id,submission,item,body,key)=>write(base(id)+`/submissions/${enc(submission)}/items/${enc(item)}/retry`,body,key),
+    resumeAdmission:(id,submission,body,key)=>write(base(id)+`/submissions/${enc(submission)}/resume-admission`,body,key),
+    importResult:(id,body,key)=>write(base(id)+'/result-imports',body,key),
+    getResultImport:(id,importId)=>api.request(base(id)+`/result-imports/${enc(importId)}`),
+    connections:()=>api.request('/v1/account/agent-connections'),
+    createConnection:(body,key)=>write('/v1/account/agent-connections',body,key),
+    revokeConnection:(id,key)=>write(`/v1/account/agent-connections/${enc(id)}`,undefined,key,'DELETE'),
+    safeContent:safeCloudPath,
+  };
+}
