@@ -116,6 +116,105 @@ class LeaderLease:
 
 
 class ScaleCoordinator:
+    def create_manual_once(self, leader_id, scope, pool, intent_key, *, launch, policy,
+                           budget_account_ids, authorize, on_reserved=None):
+        """Explicit operator capacity, not a synthetic generation/queue demand.
+
+        ``authorize(connection)`` is a trusted, pure application guard. It checks
+        the durable command, expiry and cumulative operating limits under the
+        same global ledger lock. The committed intent/action is the only create
+        barrier: re-entry returns it, even after a crash before the provider call.
+        """
+        _safe_id(intent_key)
+        if not self.enabled or self.provider.enabled is not True:
+            return {"state": "disabled"}
+        if not isinstance(launch, LaunchSpec) or not isinstance(policy, ScalePolicy) or not callable(authorize):
+            raise ValueError("manual_capacity_contract_required")
+        if policy.dry_run or launch.provider != self.provider.provider_id:
+            raise ValueError("manual_capacity_provider_mismatch")
+        lease = self.acquire(pool, leader_id)
+        if lease is None:
+            return {"state": "not_leader"}
+        with self.repo.transaction() as connection:
+            self._leader(connection, lease)
+            self.repo._lock_capacity(connection)
+            existing = connection.execute(select(instance_intents).where(
+                instance_intents.c.pool == pool, instance_intents.c.intent_key == intent_key)).mappings().first()
+            if existing is not None:
+                action = connection.execute(select(scaler_actions).where(
+                    scaler_actions.c.intent_id == existing["id"])).mappings().first()
+                if action is None or action["launch_spec"] != canonical(asdict(launch)):
+                    raise Conflict("manual_capacity_existing_binding_mismatch")
+                return {"state": "existing_intent", "intent_id": existing["id"]}
+            if authorize(connection) is not True:
+                raise Conflict("manual_capacity_authority_changed")
+            validate = getattr(self.provider, "validate_launch", None)
+            if validate is not None:
+                validate(launch, physical_gpus=policy.new_instance_physical_gpus,
+                    slots=policy.new_instance_slots, reserved_cost_microusd=policy.instance_reservation_microusd,
+                    hard_deadline=policy.hard_deadline)
+            intent = self.repo.reserve_instance_intent(scope, pool, intent_key,
+                physical_gpus=policy.new_instance_physical_gpus, slots=policy.new_instance_slots,
+                reserved_cost_microusd=policy.instance_reservation_microusd, hard_deadline=policy.hard_deadline,
+                budget_account_ids=budget_account_ids, dry_run=False, provider=launch.provider, connection=connection)
+            now = self.repo.clock()
+            connection.execute(insert(scaler_actions).values(intent_id=intent["id"], pool=pool,
+                launch_spec=canonical(asdict(launch)), create_started_at=now))
+            if self.preparation_timeout_s is not None:
+                self._preparation_receipt(connection, intent, "awaiting_provider")
+            self.repo.update_instance(intent["id"], "creating", connection=connection)
+            if on_reserved is not None:
+                on_reserved(connection, intent)
+        def still_authorized():
+            try:
+                with self.repo.transaction() as connection:
+                    self._leader(connection, lease)
+                    self.repo._lock_capacity(connection)
+                    return authorize(connection) is True
+            except Exception:
+                # This invocation proves it has not sent its sole provider call.
+                # A pure guard failure is NOT an ambiguous network submission.
+                return False
+        fact, observed_at = self._call(intent, "create", launch=launch, before_create=still_authorized)
+        self._apply(lease, intent["id"], fact, observed_at)
+        return {"state": "creation_observed", "intent_id": intent["id"], "provider_state": fact.state}
+
+    def observe_manual_instance(self, leader_id, intent_id, *, policy, drain=False, stop=False):
+        """Reuse normal reconciliation/destruction proofs; never force-kill work.
+
+        Drain only closes worker admission. Stop additionally requests the
+        existing safe destruction path; pending/unknown/collection obligations
+        can keep it waiting. Neither command declares provider billing stopped.
+        """
+        with self.repo.engine.connect() as connection:
+            row = connection.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()
+        lease = self.acquire(row["pool"], leader_id)
+        if lease is None:
+            return {"state": "not_leader"}
+        if row["state"] == "destroyed":
+            self.settle(intent_id)
+            return {"state": "destroyed", "intent_id": intent_id}
+        self._reconcile(lease, row)
+        with self.repo.transaction() as connection:
+            self._leader(connection, lease)
+            self.repo._lock_capacity(connection)
+            row = self.repo._locked(connection, select(instance_intents).where(instance_intents.c.id == intent_id))
+            if drain or stop:
+                connection.execute(update(registered_workers).where(
+                    registered_workers.c.provider == row["provider"],
+                    registered_workers.c.instance_id == row["provider_instance_id"],
+                    registered_workers.c.state != "retired").values(
+                        drain_requested=1, state="draining", updated_at=self.repo.clock()))
+            if stop and row["state"] in {"starting", "ready", "busy"}:
+                self.repo.update_instance(intent_id, "draining", connection=connection)
+                row = {**row, "state": "draining"}
+        self._drain_or_destroy(lease, row, policy)
+        with self.repo.engine.connect() as connection:
+            final = connection.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()
+        if final["state"] == "destroyed":
+            self.settle(intent_id)
+        return {"state": final["state"], "intent_id": intent_id}
+
     def __init__(self, repository, *, provider=None, enabled=False, leader_seconds=60,
                  min_observation_s=15, unsubmitted_retirement_guard=None,
                  preparation_timeout_s=None, preparation_binding=None, unused_preparation_guard=None):
