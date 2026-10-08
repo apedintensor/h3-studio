@@ -395,7 +395,7 @@ def read(name):
  if p.is_symlink() or p.stat().st_size>4194304: raise ValueError('untrusted_report')
  return json.loads(p.read_text())
 s=read('setup-status.json')
-out={k:s.get(k) for k in ('state','phase','error_code','error_type','runtime_verified','engine_manifest_digest','source_revision','runtime','system_package_diagnostics')}
+out={k:s.get(k) for k in ('state','phase','error_code','error_type','runtime_verified','engine_manifest_digest','source_revision','runtime','system_package_diagnostics','download_failure')}
 out['error_code']=s.get('error_code',s.get('code'))
 out['failure_phase']=s.get('failure_phase',s.get('failed_phase',s.get('phase')))
 out['identity']=read('sixnine-bootstrap-identity.json')
@@ -407,7 +407,10 @@ print(json.dumps(out))
         if report.get('state') == 'failed':
             diagnosis = safe_bootstrap_diagnosis(report)
             report.pop('system_package_diagnostics', None)
+            report.pop('download_failure', None)
             report.update(diagnosis)
+        else:
+            report.pop('download_failure', None)
         return report
 
     def preparation_idle_report(self, *, expected_prestart_identity=None):

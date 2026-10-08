@@ -147,6 +147,13 @@ deadlines, disk/cache guards and parent-death termination bound preparation; SDK
 partials never authorize a second bootstrap or job submission. Only safe completed
 file/byte counts and static errors enter status. Native SDK logs are discarded,
 and the child must be stopped/reaped before local preparation can be idle.
+The owner's separate failure receipt retains the original static download error
+and `stop_status` (`confirmed`, `unconfirmed`, or `not_observed` when no child
+handle was returned). Bootstrap and retained CPU diagnostics project those same
+bounded fields. Failed stop/reap keeps `model_download_stop_unconfirmed` as the
+outward error; these diagnostic fields never replace fresh process/idle proof,
+authorize replay, or expose SDK exception text. Receipt-write failure still
+attempts child cleanup and cannot mask the original safe cause.
 Transfer completion does not certify model bytes: the launcher acquires exclusive
 journal/slot ownership, then performs full source/configuration/environment and
 model size/hash verification before Session initialization or HTTP readiness.

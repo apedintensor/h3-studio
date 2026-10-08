@@ -97,6 +97,11 @@ def safe_bootstrap_diagnosis(value):
         packages = safe_system_package_diagnostics(value.get("system_package_diagnostics"))
         if packages is not None:
             diagnosis["system_package_diagnostics"] = packages
+    if diagnosis["failure_phase"] == "model_download":
+        from .runtime_hosts.wangp_download import SAFE_ERRORS, safe_download_failure
+        download = safe_download_failure(value.get("download_failure"))
+        if diagnosis["error_code"] in SAFE_ERRORS and download is not None:
+            diagnosis["download_failure"] = download
     return diagnosis
 
 
