@@ -61,6 +61,8 @@ Quick Chat selects the deployment profile and FL/REF mode. Saving or revising a 
 
 Drain stops new claims. Safe stop also waits for bound jobs, output collection and positive per-slot idle proof before removal. An uncertain rental keeps its original identity and reservation. A controller restart does not blindly spawn a replacement for an unobserved child: unknown process ownership is reported and needs recovery under [#60](https://github.com/apedintensor/h3-studio/issues/60). Do not restart a controller with live owned processes as a normal way of changing profiles. The supplier TTL still bounds remote lifetime, but it does not reconcile unpaid invoices or retrieve lost files.
 
+SIGINT/SIGTERM initiate a graceful controller drain: no new rentals, retained original node identities and continued reconciliation/collection. The process closes its local tunnels only after proving that its owned children and bound jobs are finished; this is not a supplier-removal or billing-settlement receipt. The default 900-second grace threshold reports attention rather than forcibly killing collectors. A service manager must not impose a shorter forced-kill timeout (`TimeoutStopSec=infinity` or an explicitly reviewed recovery policy). Forced termination, host loss and adopting a previous process's unknown fleet remain #60; do not claim this orderly shutdown path proves crash recovery.
+
 ## Acceptance before calling it operational
 
 Offline coverage establishes permissions, idempotency, accounting, slot isolation, native output delivery and profile matching. Release packaging includes the profile catalog and fingerprints it for both API/worker compatibility. A code merge does not publish the frontend or enable a rental service.

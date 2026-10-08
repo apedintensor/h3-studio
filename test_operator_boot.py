@@ -206,6 +206,35 @@ class OperatorBootTests(unittest.TestCase):
             self.boot._popen([sys.executable,'untrusted.py'])
         self.assertEqual(len(self.spawn),1)
 
+    def test_local_shutdown_keeps_collectors_and_does_not_claim_provider_destruction(self):
+        for index,slot in enumerate(self.boot.slots):
+            slot.fleet.children={f'child-{index}':NS(poll=lambda:None)}
+        self.boot.request_drain()
+        self.assertEqual(self.boot.shutdown_status(),{'ownership_known':True,'children_done':False})
+        with self.assertRaisesRegex(BootError,'local_shutdown_unconfirmed'):
+            self.boot.release_after_drain()
+        for slot in self.boot.slots:
+            for child in slot.fleet.children.values(): child.poll=lambda:0
+        self.repo.worker={'current_job_id':'original-job','drain_requested':True}
+        self.assertFalse(self.boot.shutdown_status()['children_done'])
+        self.repo.worker['current_job_id']=None
+        self.assertEqual(self.boot.shutdown_status(),{'ownership_known':True,'children_done':True})
+        self.boot.release_after_drain()
+        self.assertEqual([s.closed for s in self.boot.slots],[1,1])
+        self.assertEqual(self.repo.intent['state'],'starting')
+
+    def test_local_shutdown_does_not_infer_child_exit_from_absent_handles(self):
+        self.boot.request_drain()
+        self.assertFalse(self.boot.shutdown_status()['ownership_known'])
+        for slot in self.boot.slots: slot.fleet=None
+        directory=self.boot.slots[0].config.work_dir/INTENT
+        directory.mkdir(parents=True)
+        (directory/'fleet.json').write_text('{}')
+        self.assertEqual(self.boot.shutdown_status(),{'ownership_known':False,'children_done':False})
+        with self.assertRaisesRegex(BootError,'local_shutdown_unconfirmed'):
+            self.boot.release_after_drain()
+        self.assertEqual([s.closed for s in self.boot.slots],[0,0])
+
     def _run_worker(self, summary=None):
         worker_id='lium-'+INTENT.replace('-','')+'-gpu0'
         expected_path=Path(self.config['work_dir'])/'boot'/INTENT/'0'/INTENT/'fleet.json'

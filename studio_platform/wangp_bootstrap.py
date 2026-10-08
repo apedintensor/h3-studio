@@ -68,7 +68,7 @@ def read_sources(config):
     from .inference.wangp_compiler import H3FL2VACompiler
     from .inference.wangp_ref_compiler import H3Ref2VACompiler, RECIPE_ID
     try:
-        if config.deployment_profile_id:
+        if getattr(config,'deployment_profile_id',''):
             from .runtime_catalog import validate_manifest
             validate_manifest(manifest)
             runtime = json.loads(files['wangp-runtime.json'])

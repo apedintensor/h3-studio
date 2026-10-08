@@ -172,6 +172,42 @@ class OperatorBoot:
         return InferenceIdleProof(instance_id,min(p.observed_at for p in proofs),
             max(p.idle_since for p in proofs),all(p.idle for p in proofs))
 
+    def shutdown_status(self):
+        """Local ownership proof only; never proof of remote removal/settlement."""
+        known, done = True, True
+        for boot in self.slots:
+            pending = getattr(boot,'preparation_pending',None)
+            if callable(pending) and pending():
+                done = False
+            directory = boot.config.work_dir/self.intent_id
+            worker_id = 'lium-'+self.intent_id.replace('-','')+'-gpu'+str(boot.config.profile_slot_index)
+            with self.repo.engine.connect() as conn:
+                worker = conn.execute(select(registered_workers).where(registered_workers.c.id==worker_id)).mappings().first()
+            if worker and worker['current_job_id'] is not None:
+                done = False
+            if boot.fleet:
+                config = getattr(boot.fleet,'config',None)
+                expected = {s.spec.worker_id for s in config.slots if s.enabled} if config else set(boot.fleet.children)
+                if not expected or set(boot.fleet.children)!=expected:
+                    known,done = False,False
+                elif any(p.poll() is None for p in boot.fleet.children.values()):
+                    done = False
+            elif worker is not None or (directory/'fleet.json').exists() or (directory/'fleet'/'fleet-state.json').exists():
+                known,done = False,False
+            else:
+                receipt = directory/'bootstrap-state.json'
+                if receipt.exists():
+                    state = json.loads(receipt.read_text())
+                    if state.get('phase') in {'fleet_starting','fleet_started'} or 'fleet_recipe_ids' in state:
+                        known,done = False,False
+        return {'ownership_known':known,'children_done':done}
+
+    def release_after_drain(self):
+        if not self.stopping or self.shutdown_status()!={'ownership_known':True,'children_done':True}:
+            raise BootError('operator_local_shutdown_unconfirmed')
+        for boot in self.slots:
+            boot.close()
+
     def close(self):
         # Called after authoritative destruction, never to prove it is safe.
         with self.repo.engine.connect() as conn:
