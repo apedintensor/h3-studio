@@ -37,6 +37,7 @@ inventory.json
 !tools/check_container.py
 !tools/ci_media_tools.py
 !tools/check_aws_release_account.py
+!tools/h3_pro6000_pilot_runtime.py
 !deploy/
 !deploy/compose.yaml
 !deploy/Caddyfile
