@@ -309,6 +309,7 @@ inventory.json
 !studio_platform/service_policy.py
 !studio_platform/pool_member_controller.py
 !studio_platform/pool_member_generations.py
+!studio_platform/member_readiness.py
 !studio_platform/wangp_bootstrap.py
 !studio_platform/bootstrap_staging.py
 !test_platform_wangp_bootstrap.py

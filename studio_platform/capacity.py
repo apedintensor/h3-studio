@@ -35,6 +35,8 @@ CAPACITY_WAIT_CODES = {
     "provider_ttl_unconfirmed": "capacity_provider_ttl_unconfirmed",
     "provider_preparation_retry_limit": "capacity_provider_preparation_retry_limit",
     "gpu_busy": "capacity_gpu_busy",
+    "matching_slot_pending": "capacity_matching_slot_pending",
+    "worker_readiness_unconfirmed": "capacity_worker_readiness_unconfirmed",
     "searching": "capacity_searching_gpu",
     "bootstrap_repair_required": "capacity_bootstrap_repair_required",
     "queued_task_repair_required": "capacity_queued_task_repair_required",

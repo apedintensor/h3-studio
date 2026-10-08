@@ -201,6 +201,28 @@ class SystemDiagnosisTests(unittest.TestCase):
         self.assertTrue(result['system_package_diagnostics']['truncated'])
         self.assertNotIn('SECRET', json.dumps(result))
 
+    def test_report_projects_only_static_download_cause_and_stop_certainty(self):
+        value = {'state': 'failed', 'phase': 'setup_failed', 'failure_phase': 'model_download',
+            'code': 'model_download_stop_unconfirmed', 'error_type': 'ValueError',
+            'download_failure': {'error_code': 'model_download_size_mismatch', 'stop_status': 'unconfirmed',
+                                 'url': 'https://private.invalid/?token=SECRET'}}
+        (self.root/'setup-status.json').write_text(json.dumps(value))
+        (self.root/'sixnine-bootstrap-identity.json').write_text('{}')
+        def execute(script, **kwargs):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(compile(script.replace('/workspace/h3-studio', self.root.as_posix()), '<offline-report>', 'exec'), {})
+            return json.loads(output.getvalue())
+        self.host.run = execute
+        result = self.host.report()
+        self.assertEqual(result['error_code'], 'model_download_stop_unconfirmed')
+        self.assertEqual(result['download_failure'],
+            {'error_code': 'model_download_size_mismatch', 'stop_status': 'unconfirmed'})
+        self.assertNotIn('SECRET', json.dumps(result))
+        value['download_failure']['error_code'] = {'untrusted': 'SECRET'}
+        (self.root/'setup-status.json').write_text(json.dumps(value))
+        self.assertNotIn('download_failure', self.host.report())
+
     def test_preupload_inventory_is_saved_before_archive_transfer_and_not_overwritten(self):
         files = {name: b'{}' for name in SOURCE_NAMES}
         inventory = {'packages': {'libc6:amd64': '2.35-0ubuntu3.8', 'openssl': '3.0.2',

@@ -147,6 +147,13 @@ deadlines, disk/cache guards and parent-death termination bound preparation; SDK
 partials never authorize a second bootstrap or job submission. Only safe completed
 file/byte counts and static errors enter status. Native SDK logs are discarded,
 and the child must be stopped/reaped before local preparation can be idle.
+The owner's separate failure receipt retains the original static download error
+and `stop_status` (`confirmed`, `unconfirmed`, or `not_observed` when no child
+handle was returned). Bootstrap and retained CPU diagnostics project those same
+bounded fields. Failed stop/reap keeps `model_download_stop_unconfirmed` as the
+outward error; these diagnostic fields never replace fresh process/idle proof,
+authorize replay, or expose SDK exception text. Receipt-write failure still
+attempts child cleanup and cannot mask the original safe cause.
 Transfer completion does not certify model bytes: the launcher acquires exclusive
 journal/slot ownership, then performs full source/configuration/environment and
 model size/hash verification before Session initialization or HTTP readiness.
@@ -226,6 +233,17 @@ drain fence; restart replays that same evidence before activation. Missing
 private diagnostic files cannot clear a committed hold. Controller status
 names the held intents and reports repair-required when none remains usable,
 without changing an unknown attempt into a new waiting job.
+The member readiness projection reads only each current exact member binding,
+matching Worker identity/spec hash, registration expiry, drain/current-job and
+unresolved-attempt evidence. Raw rental states remain unchanged: `starting`
+does not imply that an already registered Worker is still loading. The status
+lists ready, busy, preparing, unavailable, held and unknown members separately;
+a healthy sibling stays visible alongside explicit rental, budget or repair
+blockers. Ready counts describe observed slots, not eligibility for any given
+job. A remaining waiter may report `capacity_matching_slot_pending`, while
+missing current readiness reports `capacity_worker_readiness_unconfirmed`;
+only existing admission can activate a compatible job. These observations do
+not establish upstream stop proof, new rental permission or physical isolation.
 Unknown/cancel/collection obligations prevent pool-idle shutdown but do not, by
 themselves, create new redundancy demand. Positive waiting/queued/claimed/
 submitting/running work supplies that demand. Drafts and preflight remain inert.
