@@ -68,6 +68,18 @@ def selected_policy(settings, *, profile_id=None, recipe_id=None):
     return read_profiles(getattr(settings, "execution_profiles_file", None)).get((profile_id, recipe_id))
 
 
+def default_profile_id(settings, profiles=None):
+    """Only an explicitly configured, current FL binding can seed a new draft."""
+    identity = getattr(settings, "default_deployment_profile_id", None)
+    if identity is None:
+        return None
+    for profile in public_profiles(settings) if profiles is None else profiles:
+        support = profile.get("generation_support", {}).get("fl", {})
+        if profile["id"] == identity and support.get("configured") and support.get("enabled"):
+            return identity
+    return None
+
+
 def public_profiles(settings):
     from .runtime_catalog import public_catalog
     from .inference.wangp_profile_compiler import control_schema

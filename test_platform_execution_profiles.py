@@ -58,6 +58,52 @@ class ExecutionProfileTests(unittest.TestCase):
     def write(self):
         self.path.write_text(json.dumps({"schema_version": 1, "policies": self.values}), encoding="utf-8")
 
+    def test_explicit_default_seeds_only_new_sessions_with_exact_profile_controls(self):
+        from studio_platform.quick_chat import default_next_settings, settings_check
+        from studio_platform.inference.wangp_profile_compiler import control_schema
+        settings = replace(self.settings, default_deployment_profile_id=PRUNED)
+        expected = default_next_settings(settings)
+        self.assertEqual(expected['deployment_profile_id'], PRUNED)
+        self.assertEqual(expected['controls'], {k:v['default'] for k,v in control_schema(PRUNED,'fl').items() if 'default' in v})
+        self.assertEqual(expected['controls']['steps'],20)
+        self.assertEqual(expected['controls']['resolution'],'480P')
+        settings_check(expected)
+        with TestClient(create_app(settings, repository=self.repo)) as client:
+            client.post('/api/auth/login',json={'username':'superdan'}).raise_for_status()
+            schema = client.get('/v1/quick-chat/schema').json()
+            self.assertEqual(schema['capabilities']['default_deployment_profile_id'],PRUNED)
+            self.assertEqual(schema['default_next_settings'],expected)
+            headers = {'Idempotency-Key':'new-profile-default'}
+            response = client.post('/v1/quick-chat/sessions',json={'title':'Default profile'},headers=headers)
+            response.raise_for_status()
+            original=response.json()['session']
+            self.assertEqual(original['next_settings'],expected)
+            self.values[0]['enabled']=False
+            self.write()
+            schema = client.get('/v1/quick-chat/schema').json()
+            self.assertIsNone(schema['capabilities']['default_deployment_profile_id'])
+            self.assertNotIn('deployment_profile_id',schema['default_next_settings'])
+            replay=client.post('/v1/quick-chat/sessions',json={'title':'Default profile'},headers=headers)
+            replay.raise_for_status()
+            self.assertEqual(replay.json()['session'],original)
+            self.assertEqual(client.get('/v1/quick-chat/sessions/'+original['id']).json()['session'],original)
+
+    def test_default_never_selects_first_available_profile_or_enables_generation(self):
+        from studio_platform.quick_chat import default_next_settings, DEFAULT_SETTINGS
+        from studio_platform.execution_profiles import default_profile_id
+        choices = [self.settings, replace(self.settings,default_deployment_profile_id=PRUNED,generation_enabled=False),
+            replace(self.settings,default_deployment_profile_id=PRUNED,execution_profiles_file=None)]
+        for settings in choices:
+            self.assertIsNone(default_profile_id(settings))
+            self.assertEqual(default_next_settings(settings),DEFAULT_SETTINGS)
+        self.values[0]['qualification']['expires_at']=self.repo.clock()-1
+        self.write()
+        settings=replace(self.settings,default_deployment_profile_id=PRUNED)
+        self.assertIsNone(default_profile_id(settings))
+        self.assertEqual(default_next_settings(settings),DEFAULT_SETTINGS)
+        with self.assertRaises(ValueError):
+            replace(self.settings,default_deployment_profile_id='invented-default')
+
     def compiled(self, profile=PRUNED):
         return compile_request(generation_request(deployment_profile_id=profile,
             controls={"duration": 5, "resolution": "480P", "steps": 20, "seed": "42"}),
