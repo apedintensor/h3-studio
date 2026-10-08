@@ -43,7 +43,7 @@ def public_catalog():
 def timing_hint(profile_id, mode, width, height, frames, fps, steps, roles):
     """Exact joint-envelope evidence only. No estimate or interpolation."""
     profile = get_profile(profile_id)
-    if (mode not in {"fl", "ref"} or any(type(v) is not int for v in (width, height, frames, fps, steps))
+    if (not isinstance(mode, str) or mode not in {"fl", "ref"} or any(type(v) is not int for v in (width, height, frames, fps, steps))
             or not isinstance(roles, (list, tuple, set, frozenset))
             or any(not isinstance(role, str) for role in roles) or len(roles) != len(set(roles))):
         return None

@@ -82,17 +82,24 @@ def shutdown_owned_host(host, session, *, grace_seconds=180, terminate=None,
 
 def resolve_inputs(prepared, inputs, manifest=None):
     settings = prepared.settings
+    profile_id = None
     if manifest is not None:
         from ..inference.wangp_compiler import COMPILER_ID as FL_COMPILER_ID, PROFILE_ID as FL_PROFILE_ID
         from ..inference.wangp_ref_compiler import COMPILER_ID as REF_COMPILER_ID, PROFILE_ID as REF_PROFILE_ID
+        profile_id = manifest.document.get("deployment_profile_id")
         model = {(FL_COMPILER_ID, FL_PROFILE_ID): "minimax_h3_fl2va",
                  (REF_COMPILER_ID, REF_PROFILE_ID): "minimax_h3_ref2va"}.get(
             (manifest.document["compiler_id"], manifest.document["profile_id"]))
+        if profile_id is not None:
+            from ..inference.wangp_profile_compiler import validate_prepared
+            from ..runtime_catalog import model_for
+            validate_prepared(prepared, manifest)
+            model = model_for(profile_id, manifest.document['mode'])['model_type']
         if model is None or settings.get("model_type") != model or prepared.manifest_digest != manifest.digest:
             raise ValueError("wangp_manifest_binding_mismatch")
     handles = {item.handle: item for item in prepared.inputs}
     used = set()
-    if settings.get("model_type") == "minimax_h3_ref2va":
+    if settings.get("model_type") in {"minimax_h3_ref2va", "minimax_h3_ref2va_pruned"}:
         if any(settings.get(field) is not None for field in (
                 "image_start", "image_end", "video_source", "audio_source", "video_guide2",
                 "video_guide3", "audio_guide2", "audio_guide3")):
@@ -104,6 +111,8 @@ def resolve_inputs(prepared, inputs, manifest=None):
             used.add(handle)
             if kind == "image":
                 return str(inputs.image_path(handles[handle], reference=True))
+            if profile_id is not None:
+                return str(getattr(inputs, kind + "_path")(handles[handle], deployment_profile_id=profile_id))
             return str(getattr(inputs, kind + "_path")(handles[handle]))
         references = settings.get("image_refs")
         if references is not None:
@@ -181,7 +190,10 @@ def main(argv=None):
         # Upstream console output is not an authorized channel for user prompts.
         with open(os.devnull, "w") as quiet, redirect_stdout(quiet), redirect_stderr(quiet):
             session_initialization_started = True
-            pending.delegate = create_session(args.runtime_root, args.config, output)
+            if manifest.document.get('deployment_profile_id') is not None:
+                pending.delegate = create_session(args.runtime_root, args.config, output, manifest=manifest)
+            else:
+                pending.delegate = create_session(args.runtime_root, args.config, output)
             import uvicorn
             uvicorn.run(create_app(host, inputs, token=token), host="127.0.0.1", port=args.port,
                         workers=1, access_log=False, log_level="critical", proxy_headers=False)
