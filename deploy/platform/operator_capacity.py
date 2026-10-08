@@ -33,6 +33,7 @@ METADATA = Path('/srv/sixnine/lium-runtime-import.json')
 SERVICE = 'operator-controller'
 FACTORY = 'studio_platform.operator_runtime:create_controller_from_stdin'
 MODULE = 'studio_platform.operator_controller'
+CANONICAL_ENTRYPOINT = 'from studio_platform.operator_controller import main; raise SystemExit(main())'
 LABEL = 'com.sixnine.operator.prepared-hash'
 CPU_HEALTH = "import json,urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8845/healthz',timeout=5)); assert h['auth_ready'] and not h['generation_enabled'] and not h['render_enabled'] and not h['cloud_creation_enabled'] and h['execution_backend']=='disabled'"
 GPU_HEALTH = CPU_HEALTH.replace("not h['generation_enabled']", "h['generation_enabled']").replace("=='disabled'", "=='wangp-worker'")
@@ -393,7 +394,9 @@ def launch(directory,environment,runtime,pin, *, loader_factory=None,popen=subpr
         release.require(len(payload)<=24576,'operator_credential_envelope_limit')
         args = [release.DOCKER,'--host','unix:///var/run/docker.sock',*compose_args(directory,'run','-T',
             '--no-deps','--name',pin['container_name'],'--label',LABEL+'='+pin['prepared_hash'],
-            '--entrypoint','python',SERVICE,'-m',MODULE,'--factory',FACTORY,'--config',RUNTIME.as_posix(),'--enabled')]
+            # Import main canonically: -m defines a second __main__ class that
+            # fails the factory-result isinstance check before the first tick.
+            '--entrypoint','python',SERVICE,'-c',CANONICAL_ENTRYPOINT,'--factory',FACTORY,'--config',RUNTIME.as_posix(),'--enabled')]
         process = popen(args,env=environment,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,start_new_session=True)
         try: process.stdin.write(payload); process.stdin.close()
