@@ -7,6 +7,7 @@ import tempfile
 import time
 import types
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("pilot", Path(__file__).with_name("h3_5090_pilot_runtime.py"))
 pilot = importlib.util.module_from_spec(spec)
@@ -119,6 +120,21 @@ class PilotTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "deadline_elapsed"):
             pilot.run_tasks(session, [self.task], self.root, self.outputs, self.torch, time.time()-1)
         self.assertFalse(session.calls)
+
+    def test_asset_checks_only_pending_modes_but_always_hashes_shared_components(self):
+        assets = []
+        for name in ("fl.bin", "ref.bin", "shared.bin"):
+            path = self.root / name
+            path.write_bytes(name.encode())
+            assets.append((name, path.stat().st_size, pilot.sha256(path)))
+        (self.root / "ref.bin").unlink()
+        with patch.object(pilot, "ASSETS", assets):
+            self.assertEqual(pilot.verify_assets(self.root, modes={"fl"}), ["fl.bin", "shared.bin"])
+            with self.assertRaisesRegex(ValueError, "missing_or_wrong_size_asset:ref.bin"):
+                pilot.verify_assets(self.root, modes={"fl", "ref"})
+            (self.root / "shared.bin").write_bytes(b"changed!!!")
+            with self.assertRaisesRegex(ValueError, "asset_hash_mismatch:shared.bin"):
+                pilot.verify_assets(self.root, modes={"fl"})
 
 
 if __name__ == "__main__":

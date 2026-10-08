@@ -145,8 +145,13 @@ def asset_manifest():
                       for name, size, digest in ASSETS]}
 
 
-def verify_assets(root):
-    for name, size, digest in ASSETS:
+def verify_assets(root, modes=None):
+    modes = set(MODEL_TYPES if modes is None else modes)
+    if not modes or modes - MODEL_TYPES.keys():
+        raise ValueError("asset_verification_modes_invalid")
+    required = [ASSETS[index] for index, mode in enumerate(("fl", "ref")) if mode in modes]
+    required.extend(ASSETS[2:])
+    for name, size, digest in required:
         path = root / name
         if not path.is_file() or path.is_symlink() or path.stat().st_size != size:
             raise ValueError("missing_or_wrong_size_asset:" + name)
@@ -158,6 +163,7 @@ def verify_assets(root):
             actual = hashlib.sha1(b"blob " + str(size).encode() + b"\0" + path.read_bytes()).hexdigest()
         if actual != digest:
             raise ValueError("asset_hash_mismatch:" + name)
+    return [name for name, _, _ in required]
 
 
 def runtime_config(models):
@@ -483,7 +489,8 @@ def run(args):
             raise ValueError("authorization_deadline_elapsed")
         for task in pending:
             verify_input_media(task)
-        verify_assets(models)
+        pending_modes = sorted({task["mode"] for task in pending})
+        verified_assets = verify_assets(models, modes=pending_modes)
         verified = time.monotonic()
         config = runtime_config(models)
         config_path = run_root / "wgp_config.json"
@@ -519,6 +526,7 @@ def run(args):
             if module.transformer_quantization != "int8" or module.text_encoder_quantization != "int8":
                 raise ValueError("INT8_runtime_quantization_mismatch")
         write_json(run_root / "preflight.json", {"recipe": asset_manifest(), "environment": observed,
+            "verified_modes": pending_modes, "verified_asset_paths": verified_assets,
             "config": config, "verification_seconds": verified-started,
             "runtime_initialization_seconds": time.monotonic()-verified,
             "note": "Runtime import readiness is not inference success."})
