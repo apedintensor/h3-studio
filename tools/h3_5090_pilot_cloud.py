@@ -53,7 +53,7 @@ def identity(value):
 
 def number(value):
     try:
-        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
             raise ValueError
         result = Decimal(str(value))
         if not result.is_finite() or result < 0:

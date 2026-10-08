@@ -1,6 +1,7 @@
 """Finite pilot guard tests. Fake credentials, HTTP and provider time only."""
 import base64
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,7 +10,7 @@ import unittest
 
 import httpx
 from tools.h3_5090_pilot_cloud import (
-    ExactPilotProvider, Pilot, PilotError, qualify, public_rows,
+    ExactPilotProvider, Pilot, PilotError, number, qualify, public_rows,
 )
 
 EXECUTOR = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -140,6 +141,21 @@ class PilotTests(unittest.TestCase):
             with self.assertRaises(PilotError):
                 self.rent()
         self.assertEqual(self.count("POST", "/rent"), 0)
+
+    def test_numeric_json_price_is_provider_decimal_and_selects_exact_node(self):
+        self.auth_price = 0.75  # provider JSON decoder uses parse_float=Decimal
+        provider = self.factory(enabled=True, fetch=self.feed, clock=lambda: self.now)
+        try:
+            value = provider._rows("executors?available=true")[0]["price_per_gpu"]
+            self.assertIsInstance(value, Decimal)
+            self.assertEqual(number(value), Decimal("0.75"))
+        finally:
+            provider.close()
+        self.assertTrue(self.rent()["ttl_verified"])
+        self.assertEqual(self.count("POST", "/rent"), 1)
+        for invalid in (Decimal("NaN"), Decimal("Infinity"), Decimal("-0.01"), True):
+            with self.assertRaises(PilotError):
+                number(invalid)
 
     def test_candidate_change_after_preflight_is_proven_not_submitted(self):
         original = self.feed
