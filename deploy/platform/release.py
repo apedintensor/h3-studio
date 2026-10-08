@@ -330,12 +330,34 @@ def app_admission_overlay(root):
         "healthcheck": {"test": ["CMD", "python", "-c", health]}}}}
 
 
+def operator_release_fence(root):
+    """No platform replacement during a pinned or uncertain operator session.
+
+Only the protected host helper marks a session inactive after its exact local
+controller has exited and the existing database has no execution obligations.
+An absent marker does not authorize replacing an independently running process.
+"""
+    path = root/'operator-capacity'/'active.json'
+    if path.exists() or path.is_symlink():
+        protected_directory(path.parent)
+        value = _protected_json(path,maximum=16384)
+        require(type(value.get('version')) is int and value['version']==1
+            and value.get('active') is False and value.get('state')=='restored'
+            and value.get('admission')=='closed', 'operator_capacity_requires_safe_restore')
+    environment = {'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','LANG':'C.UTF-8',
+        'DOCKER_CONFIG':'/opt/sixnine-release/docker-config'}
+    running = command(['ps','--quiet','--filter','label=com.docker.compose.project=sixnine-platform',
+        '--filter','label=com.docker.compose.service=operator-controller'],environment=environment,timeout=20)
+    require(not running.strip(),'operator_controller_still_running')
+
+
 def gpu_deployment_context(root, target_manifest=None):
     """Validate a pinned v2 controller without changing its lifecycle or ledger.
 
     Caller holds release.lock. Old/unknown barriers remain strict; compatibility
     permits an app replacement, never a controller restart or policy change.
     """
+    operator_release_fence(root)
     context = None
     for folder in ("gpu-acceptance", "gpu-scaler"):
         path = root / folder / "active.json"
@@ -482,9 +504,23 @@ def current_application(root=ROOT):
     return commit, directory, environment
 
 
-def restore_current_cpu_locked(root=ROOT):
+def restore_current_cpu_locked(root=ROOT, *, operator_pin=None):
     """Caller holds release.lock; never reuse a controller's old app directory."""
+    if operator_pin is None:
+        operator_release_fence(root)
+    else:
+        # Only the protected operator helper closes its own admission. This
+        # exception never authorizes a different app image, schema or lifecycle.
+        protected_directory(root/'operator-capacity')
+        require(_protected_json(root/'operator-capacity'/'active.json')==operator_pin
+            and operator_pin.get('version')==1 and operator_pin.get('active') is True
+            and operator_pin.get('admission')=='closed', 'operator_admission_pin_invalid')
     commit, directory, environment = current_application(root)
+    if operator_pin is not None:
+        require(commit==operator_pin.get('commit'), 'operator_admission_release_changed')
+        image=json.loads(command(['image','inspect',environment['SIXNINE_IMAGE']],environment=environment))
+        require(isinstance(image,list) and len(image)==1 and image[0].get('Id')==operator_pin.get('image_id'),
+            'operator_admission_image_changed')
     application_compose(directory, environment, "up", "-d", "--no-deps", "app")
     wait_ready(directory, environment)
     expected = manifest(directory, commit)

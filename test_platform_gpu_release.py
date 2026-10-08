@@ -150,7 +150,8 @@ class CurrentApplicationTests(unittest.TestCase):
     def test_restore_resolves_current_app_and_never_replays_execution_image(self):
         current = Path('/srv/sixnine/releases')/NEW
         expected = {'image_id': IMAGE}
-        with patch.object(release, 'current_application', return_value=(NEW, current, {'SIXNINE_IMAGE': NEW})), \
+        with patch.object(release, 'operator_release_fence'), \
+                patch.object(release, 'current_application', return_value=(NEW, current, {'SIXNINE_IMAGE': NEW})), \
                 patch.object(release, 'application_compose') as compose, patch.object(release, 'wait_ready'), \
                 patch.object(release, 'manifest', return_value=expected), \
                 patch.object(release, 'validate_image_archive', return_value={IMAGE}), \
