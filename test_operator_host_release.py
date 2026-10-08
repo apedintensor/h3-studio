@@ -96,6 +96,32 @@ class HostBoundaryTests(unittest.TestCase):
         self.assertEqual(options['env'],{'PATH':'/usr/bin'})
         self.assertEqual(options['stdout'],subprocess.DEVNULL)
         self.assertIn('--enabled',args[0]);self.assertNotIn('--rm',args[0])
+        position=args[0].index(host.SERVICE)
+        self.assertEqual(args[0][position+1:position+3],['-c',host.CANONICAL_ENTRYPOINT])
+
+    def test_real_child_entrypoints_accept_factory_class_before_first_tick(self):
+        # Real Python process/import behavior matters: calling main in the test
+        # process never reproduced the __main__/canonical class split from -m.
+        factory=self.root/'offline_host_factory.py'
+        factory.write_text('''def create(path):
+    from studio_platform.operator_controller import OperatorController
+    controller = object.__new__(OperatorController)
+    controller.enabled = True
+    def tick():
+        print("OFFLINE_FIRST_TICK_REACHED", flush=True)
+        raise SystemExit(42)
+    controller.tick = tick
+    return controller
+''')
+        repo=Path(__file__).resolve().parent
+        environment=dict(os.environ,PYTHONPATH=os.pathsep.join((str(self.root),str(repo))))
+        for entry in (['-c',host.CANONICAL_ENTRYPOINT],['-m',host.MODULE]):
+            with self.subTest(entry=entry):
+                result=subprocess.run([sys.executable,*entry,
+                    '--factory','offline_host_factory:create','--config','unused','--enabled'],
+                    cwd=repo,env=environment,capture_output=True,text=True,timeout=20)
+                self.assertEqual(result.returncode,42,result.stdout)
+                self.assertEqual(result.stdout.strip(),'OFFLINE_FIRST_TICK_REACHED')
 
     def test_stdin_delivery_uncertainty_never_kills_or_relaunches(self):
         loader=Mock(return_value=NS(service='lium',profile='lium--rig-root',base_url='https://lium.io/api',

@@ -549,4 +549,7 @@ def main(argv=None):
 
 
 if __name__=="__main__":
-    raise SystemExit(main())
+    # Factories import the canonical OperatorController class. Running the
+    # implementation as __main__ would otherwise compare distinct class types.
+    from studio_platform.operator_controller import main as canonical_main
+    raise SystemExit(canonical_main())
