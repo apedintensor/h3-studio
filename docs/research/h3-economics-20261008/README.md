@@ -222,7 +222,7 @@ At730 continuously billed hours, compute-only one-card cost is5090$430.70–620.
 
 ## 7. Proposed comparison order and acceptance gates
 
-This is a research recommendation. It does not change the selected runtime or authorize an experiment.
+The broad cohorts below are historical research alternatives, not the current execution queue. The user's later 2026-10-08 direction selects inexpensive RTX 5090 / INT8 FL2VA and Ref2VA for future tests: see [DEC-011](../../../DECISIONS.md#dec-011--use-rtx-5090-and-int8-for-future-low-cost-h3-tests) and the [bounded pilot proposal](5090-test-plan.md). Other hardware/acceleration cohorts are deferred unless explicitly selected later. Neither document authorizes an experiment to start.
 
 1. **Remove avoidable preparation.** Existing[#61](https://github.com/apedintensor/h3-studio/issues/61) covers prepared dependency image identity. Model cache/volume locality needs separate measured design under[#22](https://github.com/apedintensor/h3-studio/issues/22); a prebuilt Python image alone does not eliminate model downloads. Do not assume a mounted network volume has local-NVMe bandwidth or exists in every region.
 2. **Full-control cohort:** matched Base FL and REF on5090 versus PRO6000; fix component files, precision, steps, scheduler and output framing. If an identical recipe does not fit, record that boundary, then introduce a separately named lower-memory recipe. H100 is a price-dependent alternate. Evaluate H200/B200 only for a demonstrated envelope/latency need.

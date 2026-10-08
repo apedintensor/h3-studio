@@ -136,6 +136,7 @@ The initial text-only Base proof does not qualify REF or last-frame fidelity. Co
 
 D3's delivery direction is an explicit, frozen native-frame policy for new separately qualified WanGP configurations; existing accepted jobs keep their requested-duration export. Worker and cold-start identities must distinguish the delivery capability. Preserve full native video/audio without silently retiming; see [the output contract](GENERATION-CONTRACT.md#6-output-contract). This follow-up does not change the first text-only proof's operational configuration or establish real last-image fidelity.
 Quantized or distilled variants are separate quality profiles; their speed does not prove full Base capability parity.
+User decision, 2026-10-08 ([DEC-011](DECISIONS.md#dec-011--use-rtx-5090-and-int8-for-future-low-cost-h3-tests)): future inexpensive tests target **RTX 5090 with INT8 FL2VA and Ref2VA**. Review the [bounded machine/startup/panel proposal](docs/research/h3-economics-20261008/5090-test-plan.md) before execution. Pruning, exact memory limits and image selection remain proposed. The previous BF16 recipe remains historical evidence and the immutable route for its accepted work; it is not the default justification for more high-end GPU tests. An operator panel will reuse the existing controller and ledger; its proposed manual-capacity controls are not implemented or enabled by this decision.
 An execution slot may use one or several GPUs. Two single-GPU replicas are different from one tensor-parallel two-GPU slot.
 A first/last-frame-only node and a reference-only node do not provide redundancy for either individual capability.
 
@@ -166,7 +167,7 @@ G must preserve the approved Quick Chat mock and current user decisions. Do not 
 
 ## 9. First A/B/D batch and authorization boundaries
 
-The first batch fixes one supported Base profile and aligns capabilities, admission, bootstrap, and worker identity.
+The original first batch fixed one BF16 Base profile and aligned capabilities, admission, bootstrap, and worker identity. Its outstanding recovery gates remain. Future test prioritization is the separately bound 5090/INT8 direction in DEC-011; review its proposal before running it, without changing accepted historical recipes.
 The sequence is A1 baseline → A2 contract → B plus D integration → C recovery acceptance → public B/D proof, followed by E/G. C failure semantics are designed from the beginning, not added after paid work.
 Extract B's service and existing Comfy adapter boundaries without changing public semantics, task identity, or the rental ledger; integrate upstream WanGP behind that same boundary. Comfy remains the old-task/rollback baseline, not a competing new feature track.
 Add truthful phases and reasons through the existing UI/API rather than redesigning the creation experience.
