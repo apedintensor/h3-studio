@@ -31,8 +31,21 @@ export function staleSnapshot(snapshot,now=Date.now()){
 export function allowed(snapshot,permission,now=Date.now()){
   return !staleSnapshot(snapshot,now)&&snapshot.operator?.permissions?.[permission]===true;
 }
-export function profileSelection(profile,selection){
-  return {...selection,runtime_profile_id:profile?.id||'',gpu_type:profile?.gpu_models?.[0]||'',gpu_count:profile?.gpu_count_options?.[0]||1,filters:{...selection.filters,min_ram_gib:Math.ceil((profile?.minimum_ram_bytes||0)/1024**3),min_disk_gib:Math.ceil((profile?.minimum_disk_bytes||0)/1024**3)}};
+export function profileSelection(profile,selection,customFilters=false){
+  const filters=customFilters?{...selection.filters}:{allowed_countries:[]};
+  for(const [key,bytes] of [['min_ram_gib',profile?.minimum_ram_bytes],['min_disk_gib',profile?.minimum_disk_bytes]]){
+    if(Number.isFinite(bytes)&&bytes>0)filters[key]=Math.ceil(bytes/1024**3);else delete filters[key];
+  }
+  if(!customFilters)for(const [key,value] of [['min_download_mbps',profile?.hardware_filters?.minimum_download_mbps],['max_price_per_gpu_hour_microusd',profile?.hardware_filters?.maximum_price_per_gpu_hour_microusd]]){
+    if(Number.isFinite(value)&&value>0)filters[key]=value;
+  }
+  return {...selection,runtime_profile_id:profile?.id||'',gpu_type:profile?.gpu_models?.[0]||'',gpu_count:profile?.gpu_count_options?.[0]||1,filters};
+}
+export function operatorFilterEdit(filters,key,value){
+  const next={...filters};if(value==null||value==='')delete next[key];else next[key]=value;return next;
+}
+export function previewOperatorSelection(selection,preview){
+  return preview?.selection?{...preview.selection,filters:{...preview.selection.filters}}:selection;
 }
 export function runtimeDuration(policy,reportedMinimum=null,value=null){
   const maximumMinutes=Number.isFinite(policy?.max_ttl_seconds)?Math.floor(policy.max_ttl_seconds/60):null;
@@ -43,7 +56,7 @@ export function runtimeDuration(policy,reportedMinimum=null,value=null){
   return {minimumMinutes,maximumMinutes,suggestedSeconds,problem};
 }
 export function initialOperatorSelection(policy){
-  return {runtime_profile_id:'',mode:'fl',gpu_type:'',node_count:1,gpu_count:1,ttl_seconds:runtimeDuration(policy).suggestedSeconds??0,filters:{min_ram_gib:0,min_disk_gib:0,min_download_mbps:500,max_price_per_gpu_hour_microusd:2000000,allowed_countries:[]}};
+  return {runtime_profile_id:'',mode:'fl',gpu_type:'',node_count:1,gpu_count:1,ttl_seconds:runtimeDuration(policy).suggestedSeconds??0,filters:{allowed_countries:[]}};
 }
 export function operatorStartPayload(selection,customFilters=false){
   if(customFilters)return selection;

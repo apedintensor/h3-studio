@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createOperatorClient} from './operator-client.js';
 import {createOperatorController} from './operator-controller.js';
-import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload} from './operator-model.js';
+import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload,operatorFilterEdit,previewOperatorSelection} from './operator-model.js';
 import {recipeFor,effectiveControlSchema,effectiveLimits,clipLimits,inputProblems} from './quick-chat-model.js';
 
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
@@ -51,10 +51,45 @@ test('inventory and preview preserve explicit FL/REF mode without initiating ren
   client.setAccount('owner');const selection={runtime_profile_id:'p',mode:'ref',gpu_type:'GPU exact',gpu_count:2,node_count:1,ttl_seconds:3600};await client.offers(selection);await client.preview(selection);
   const query=new URL(requests[0].path,'https://local.invalid').searchParams;assert.equal(query.get('mode'),'ref');assert.equal(query.get('gpu_count'),'2');assert.deepEqual(JSON.parse(requests[1].options.body),selection);assert.equal(requests.some(r=>r.path.endsWith('/starts')),false);
 });
-test('deployment profile selects only reported GPU topology, preserving price/TTL and authored node count',()=>{
+test('custom deployment profile selects reported GPU topology while preserving authored price/TTL and node count',()=>{
   const selection={node_count:2,ttl_seconds:1800,filters:{max_price_per_gpu_hour_microusd:1500000}};
-  const next=profileSelection({id:'pro-bf16',gpu_models:['PRO exact'],gpu_count_options:[2],minimum_ram_bytes:256*1024**3,minimum_disk_bytes:350*1024**3},selection);
+  const next=profileSelection({id:'pro-bf16',gpu_models:['PRO exact'],gpu_count_options:[2],minimum_ram_bytes:256*1024**3,minimum_disk_bytes:350*1024**3,hardware_filters:{minimum_download_mbps:500,maximum_price_per_gpu_hour_microusd:2000000}},selection,true);
   assert.equal(next.gpu_count,2);assert.equal(next.gpu_type,'PRO exact');assert.equal(next.filters.min_ram_gib,256);assert.equal(next.node_count,2);assert.equal(next.ttl_seconds,1800);assert.equal(next.filters.max_price_per_gpu_hour_microusd,1500000);
+  assert.equal(Object.hasOwn(next.filters,'min_download_mbps'),false);
+});
+test('catalog filters supply profile-specific defaults without leaking another profile or CPU requirement',()=>{
+  const initial=initialOperatorSelection({max_ttl_seconds:10800});
+  assert.deepEqual(initial.filters,{allowed_countries:[]});
+  const primary={id:'5090',gpu_models:['RTX 5090'],gpu_count_options:[1],minimum_ram_bytes:96*1024**3,minimum_disk_bytes:128*1024**3,hardware_filters:{minimum_cpu_cores:12,minimum_download_mbps:200,maximum_price_per_gpu_hour_microusd:850000}};
+  const selected=profileSelection(primary,initial);
+  assert.deepEqual(selected.filters,{allowed_countries:[],min_ram_gib:96,min_disk_gib:128,min_download_mbps:200,max_price_per_gpu_hour_microusd:850000});
+  assert.equal(Object.hasOwn(operatorStartPayload(selected),'filters'),false);
+  const pro=profileSelection({...primary,id:'pro',minimum_ram_bytes:256*1024**3,minimum_disk_bytes:350*1024**3,hardware_filters:{minimum_download_mbps:500,maximum_price_per_gpu_hour_microusd:2000000}},selected);
+  assert.deepEqual(pro.filters,{allowed_countries:[],min_ram_gib:256,min_disk_gib:350,min_download_mbps:500,max_price_per_gpu_hour_microusd:2000000});
+  const noNetwork=profileSelection({...primary,hardware_filters:{maximum_price_per_gpu_hour_microusd:850000}},pro);
+  assert.equal(Object.hasOwn(noNetwork.filters,'min_download_mbps'),false);
+});
+test('preview replaces catalog suggestions with exact server filters, including old deployed defaults and absent bandwidth',()=>{
+  const selection={...initialOperatorSelection({max_ttl_seconds:10800}),filters:{min_ram_gib:96,min_disk_gib:128,min_download_mbps:200,allowed_countries:[]}};
+  const oldPreview={selection:{...selection,filters:{min_ram_gib:96,min_disk_gib:250,min_download_mbps:500}}};
+  assert.deepEqual(previewOperatorSelection(selection,oldPreview).filters,oldPreview.selection.filters);
+  const noNetworkPreview={selection:{...selection,filters:{min_ram_gib:96,min_disk_gib:128}}};
+  const applied=previewOperatorSelection(selection,noNetworkPreview);
+  assert.deepEqual(applied.filters,noNetworkPreview.selection.filters);
+  assert.equal(Object.hasOwn(applied.filters,'min_download_mbps'),false);
+  assert.equal(Object.hasOwn(applied.filters,'allowed_countries'),false);
+  assert.notEqual(applied.filters,noNetworkPreview.selection.filters);
+  assert.equal(selection.filters.min_download_mbps,200);
+  assert.equal(previewOperatorSelection(selection,{}),selection);
+});
+test('blank optional custom filters are omitted while explicit numeric values still reach server validation',()=>{
+  const selection={...initialOperatorSelection({max_ttl_seconds:10800}),filters:{min_download_mbps:200,min_ram_gib:96}};
+  selection.filters=operatorFilterEdit(selection.filters,'min_download_mbps','');
+  assert.equal(Object.hasOwn(operatorStartPayload(selection,true).filters,'min_download_mbps'),false);
+  assert.equal(selection.filters.min_ram_gib,96);
+  assert.deepEqual(operatorFilterEdit({min_download_mbps:200},'min_download_mbps',null),{});
+  assert.equal(operatorFilterEdit({},'min_download_mbps',0).min_download_mbps,0);
+  assert.equal(operatorFilterEdit({},'min_download_mbps',-1).min_download_mbps,-1);
 });
 test('new operator run uses a policy-bounded 180-minute default and reports provider minimum without changing an override',()=>{
   assert.equal(initialOperatorSelection({max_ttl_seconds:14400}).ttl_seconds,10800);
