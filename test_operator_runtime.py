@@ -179,3 +179,7 @@ class RuntimeTests(LedgerCase):
         with patch.dict("os.environ",{"H3_OPERATOR_RUNTIME_CONFIG":str(self.path)}):
             registry=OperatorRegistry.from_environment()
         self.assertEqual(len(registry.bindings),1)
+        with patch.dict("os.environ",{"H3_OPERATOR_RUNTIME_CONFIG":str(self.path),
+                "H3_OPERATOR_CAPACITY_REGISTRY":str(self.registry_path)}):
+            with self.assertRaisesRegex(OperatorError,"configuration_conflict"):
+                OperatorRegistry.from_environment()

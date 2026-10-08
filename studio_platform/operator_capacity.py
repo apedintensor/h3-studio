@@ -237,10 +237,11 @@ class OperatorRegistry:
     @classmethod
     def from_environment(cls, *, catalog=None, offers=None):
         runtime=os.environ.get("H3_OPERATOR_RUNTIME_CONFIG", "").strip()
+        source=os.environ.get("H3_OPERATOR_CAPACITY_REGISTRY", "").strip()
+        require(not (runtime and source),"operator_registry_configuration_conflict",422)
         if runtime:
             from .operator_runtime import create_registry
             return create_registry(runtime)
-        source=os.environ.get("H3_OPERATOR_CAPACITY_REGISTRY", "").strip()
         return cls.from_file(source,catalog=catalog,offers=offers) if source else cls(catalog=catalog,offers=offers)
 
 
