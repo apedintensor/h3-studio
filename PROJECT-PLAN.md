@@ -53,6 +53,7 @@ The incremental boundaries are:
 
 Old entry points remain compatibility or retirement candidates until callers, accepted work, assets, billing, and rollback are accounted for.
 Similar names do not prove duplication: `autoscale` recommends capacity, `scaler` coordinates rental side effects, and `fleet` supervises execution processes.
+The operator console requested on 2026-10-09 adds explicit manual capacity intents to these same boundaries and ledgers, with multiple immutable deployment profiles and measured timing hints. See [OPERATOR-CAPACITY-CONTRACT.md](OPERATOR-CAPACITY-CONTRACT.md) and [E3 #71](https://github.com/apedintensor/h3-studio/issues/71); catalogued experiments are not live qualification.
 `DrainSafeRunner` must continue reconciliation and collection after new work is stopped.
 `production_scaler` is an on-demand dependency; `production_worker` is a separate historical acceptance entry point.
 

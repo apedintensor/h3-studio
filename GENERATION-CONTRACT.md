@@ -1,5 +1,7 @@
 # Generation lifecycle and compatibility contract
 
+Additive manual-capacity/profile selection contract (2026-10-09): [OPERATOR-CAPACITY-CONTRACT.md](OPERATOR-CAPACITY-CONTRACT.md). Optional explicit deployment identity preserves the legacy route when omitted and never changes accepted requests.
+
 Version: **generation-contract-v1**, frozen 2026-10-06 for A2 ([#11](https://github.com/apedintensor/h3-studio/issues/11)).
 Baseline: [CURRENT-BASELINE.md](CURRENT-BASELINE.md). Direction: [PROJECT-PLAN.md](PROJECT-PLAN.md). Decision rationale: [DECISIONS.md](DECISIONS.md).
 Source-status wording reviewed against PR #25 / merge `d8c811db79683507a959d3260cdf99b072d0022e` on 2026-10-08; the v1 API and recovery semantics are unchanged. This editorial review is not a production observation.

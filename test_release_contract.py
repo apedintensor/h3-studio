@@ -46,6 +46,16 @@ class CompatibilityFingerprints(unittest.TestCase):
         (self.root / 'studio_platform/api.py').write_bytes(b'first\r\nsecond\r\n')
         self.assertEqual(before, build_contracts(self.root))
 
+    def test_runtime_profile_data_changes_both_compatibility_fingerprints(self):
+        profiles = [name for name in FIXED if name.startswith('deploy/wangp/profiles/')]
+        self.assertEqual(len(profiles), 3)
+        for name in profiles:
+            before = build_contracts(self.root)
+            (self.root / name).write_text('changed model/component/runtime binding')
+            after = build_contracts(self.root)
+            self.assertNotEqual(before['api_compatibility'], after['api_compatibility'])
+            self.assertNotEqual(before['worker_compatibility'], after['worker_compatibility'])
+
     def test_missing_required_input_fails_closed(self):
         (self.root / 'requirements.lock.txt').unlink()
         with self.assertRaises(FileNotFoundError):

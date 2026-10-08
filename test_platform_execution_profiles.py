@@ -1,0 +1,206 @@
+"""Exact profile selection through shared admission; temporary SQL, no GPU calls."""
+import copy
+from dataclasses import replace
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+from fastapi.testclient import TestClient
+
+from studio_platform.api import create_app
+from studio_platform.capabilities import compile_request
+from studio_platform.control import WorkerControl, WorkerSpec
+from studio_platform.execution_policy import ExecutionPolicies
+from studio_platform.execution_profiles import read_profiles
+from studio_platform.repository import Repository, Scope
+from studio_platform.runtime_catalog import get_profile, engine_manifest
+from studio_platform.qualification_profiles import MULTIMODAL_INPUT_LIMITS, QUEUED_TASK_PROFILE
+from studio_platform.settings import Settings
+from test_platform_api import generation_request
+from test_platform_execution_policy import policy
+
+PRUNED = "h3-pruned-rank8-int8-quanto-int8-vae-int8-sdpa-p4-lowram-v1"
+INT8 = "h3-unpruned33b-int8-qwenbf16-vaefp16-sdpa-p3-lowram-v1"
+
+
+class ExecutionProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = Repository("sqlite:///" + (self.root / "test.sqlite").as_posix())
+        self.repo.create_schema()
+        self.addCleanup(self.repo.close)
+        self.path = self.root / "profiles.json"
+        self.settings = Settings(self.root, auth_mode="local-test", execution_backend="wangp-worker",
+            generation_enabled=True, execution_profiles_file=self.path)
+        self.scope = Scope("sixnine", "superdan", "story-one")
+        self.repo.configure_capacity(max_instances=4, max_physical_gpus=4)
+        for key, owner in (("test-tenant:sixnine", None), ("test-owner:sixnine:superdan", "superdan")):
+            self.repo.configure_budget(key, tenant_id="sixnine", owner_id=owner, limit_microusd=10_000_000)
+        self.values = []
+        for i, profile_id in enumerate((PRUNED, INT8)):
+            value = policy(self.repo.clock())
+            value.update(deployment_profile_id=profile_id, model_id=get_profile(profile_id)["model_id"],
+                backend="wangp-worker", pool=f"profile-pool-{i}", configuration_id=f"profile-config-{i}",
+                recipe_ids=["h3-base-fl2va-v1"], engine_manifest_digest=engine_manifest(profile_id, "fl").digest,
+                output_delivery="native-frames-v1")
+            value["qualification"].update(status="runtime_required", profile=QUEUED_TASK_PROFILE)
+            value["envelope"].update(max_duration_seconds=124/24, max_reference_files=0, max_guides=0,
+                input_limits=copy.deepcopy(MULTIMODAL_INPUT_LIMITS))
+            value["envelope"]["input_limits"].update(guide_kinds=[], guide_recipe_ids=[])
+            value["envelope"]["controls"] = {"sampler_name": ["euler"], "scheduler": ["auto"],
+                "video_decode": ["tiled"], "audio_decode": ["normal"], "encoder_device": ["default"]}
+            self.values.append(value)
+        self.write()
+
+    def write(self):
+        self.path.write_text(json.dumps({"schema_version": 1, "policies": self.values}), encoding="utf-8")
+
+    def compiled(self, profile=PRUNED):
+        return compile_request(generation_request(deployment_profile_id=profile,
+            controls={"duration": 5, "resolution": "480P", "steps": 20, "seed": "42"}),
+            lambda _: None, backend="wangp-worker")
+
+    def register(self, i):
+        p = self.values[i]
+        control = WorkerControl(self.repo)
+        spec = WorkerSpec(f"worker-{i}", p["pool"], "test-only", f"instance-{i}", (f"gpu-{i}",),
+            tuple(p["recipe_ids"]), p["model_id"], p["configuration_id"], "wangp-worker", p["engine_manifest_digest"],
+            output_delivery="native-frames-v1")
+        control.register(spec)
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        return spec
+
+    def test_different_ready_profile_never_substitutes_and_exact_one_admits(self):
+        self.register(1)
+        compiled, fingerprint = self.compiled()
+        self.assertEqual(compiled["request"]["model"], "MiniMax-H3-Pruned-Rank8-INT8")
+        policies = ExecutionPolicies(self.settings, self.repo)
+        self.assertFalse(policies.evaluate(compiled, self.scope, fingerprint).execution["enabled"])
+        self.register(0)
+        admitted = policies.evaluate(compiled, self.scope, fingerprint)
+        self.assertTrue(admitted.execution["enabled"], admitted.execution)
+        self.assertEqual(admitted.execution["pool"], self.values[0]["pool"])
+        job = {"request": compiled, "execution_plan": admitted.execution, "tenant_id": "sixnine"}
+        self.assertTrue(policies.activation_allowed(job))
+        changed = copy.deepcopy(job)
+        changed["request"]["deployment_profile_id"] = INT8
+        self.assertFalse(policies.activation_allowed(changed))
+        self.values[0]["enabled"] = False
+        self.write()
+        self.assertFalse(policies.activation_allowed(job))
+
+    def test_profile_config_absence_invalid_id_and_ambiguous_bindings_fail_closed(self):
+        compiled, fingerprint = self.compiled()
+        policies = ExecutionPolicies(replace(self.settings, execution_profiles_file=None), self.repo)
+        self.assertFalse(policies.evaluate(compiled, self.scope, fingerprint).execution["enabled"])
+        with self.assertRaises(ValueError):
+            self.compiled("invented-profile")
+        self.values.append(copy.deepcopy(self.values[0]))
+        self.write()
+        with self.assertRaises(ValueError):
+            read_profiles(self.path)
+
+    def test_profile_admission_and_native_outputs_cover_every_recorded_case(self):
+        from studio_platform.runtime_catalog import PROFILE_IDS
+        from studio_platform.execution_policy import validate_policy
+        from studio_platform.inference.outputs import native_delivery_spec
+        from test_platform_wangp_profiles import job_for
+        from studio_platform.execution_profiles import tested_envelope
+        from studio_platform.repository import request_hash
+        self.repo.configure_capacity(max_instances=32,max_physical_gpus=32)
+        ordinal = 0
+        for profile_id in PROFILE_IDS:
+            for case in get_profile(profile_id)['verified_cases']:
+                with self.subTest(profile=profile_id, case=case['id']):
+                    job, manifest = job_for(profile_id, case)
+                    output = native_delivery_spec(job['request'])
+                    self.assertEqual(output['frame_count'], 124)
+                    self.assertEqual(output['duration_s'],124/24)
+                    value = copy.deepcopy(self.values[0])
+                    value.update(deployment_profile_id=profile_id, model_id=get_profile(profile_id)['model_id'],
+                        recipe_ids=[manifest.document['generation_recipe_id']], engine_manifest_digest=manifest.digest)
+                    value['envelope'] = tested_envelope(profile_id,case['mode'])
+                    ordinal += 1
+                    value.update(configuration_id=f'case-config-{ordinal}',pool=f'case-pool-{ordinal}')
+                    validate_policy(value)
+                    self.values=[value]
+                    self.write()
+                    spec=WorkerSpec(f'case-worker-{ordinal}',value['pool'],'test-only',f'instance-{ordinal}',
+                        (f'gpu-{ordinal}',),tuple(value['recipe_ids']),value['model_id'],value['configuration_id'],
+                        'wangp-worker',value['engine_manifest_digest'],output_delivery='native-frames-v1')
+                    control=WorkerControl(self.repo)
+                    control.register(spec)
+                    control.mark_ready(spec.worker_id,upstream_idle_confirmed=True)
+                    native=job['request']['request']
+                    inputs=copy.deepcopy(native['inputs'])
+                    inputs['videos']=[{'asset_id':identity,'include_audio':False} for identity in inputs['videos']]
+                    body=generation_request(recipe_id=value['recipe_ids'][0],deployment_profile_id=profile_id,
+                        controls={k:native[k] for k in ('duration','resolution','steps','seed')},inputs=inputs)
+                    compiled,fingerprint=compile_request(body,job['request']['assets'].__getitem__,backend='wangp-worker')
+                    admitted=ExecutionPolicies(self.settings,self.repo).evaluate(compiled,self.scope,fingerprint)
+                    self.assertTrue(admitted.execution['enabled'],admitted.execution['blockers'])
+
+    def test_explicit_pruned_api_defaults_compile_without_legacy_768p_fallback(self):
+        compiled,_=compile_request(generation_request(deployment_profile_id=PRUNED,controls={}),
+            lambda _:None,backend='wangp-worker')
+        self.assertEqual(compiled['output_spec']['height'],480)
+
+    def test_invalid_legacy_policy_does_not_hide_independent_profiles(self):
+        legacy=self.root/'legacy.json'
+        legacy.write_text('{invalid',encoding='utf-8')
+        selected=read_profiles(self.path)[(PRUNED,'h3-base-fl2va-v1')]
+        self.assertEqual(selected['deployment_profile_id'],PRUNED)
+        self.register(0)
+        policies=ExecutionPolicies(replace(self.settings,execution_policy_file=legacy),self.repo)
+        compiled,fingerprint=self.compiled()
+        self.assertTrue(policies.evaluate(compiled,self.scope,fingerprint).execution['enabled'])
+
+    def test_operator_routes_use_cookie_owner_and_same_origin_boundary(self):
+        settings=replace(self.settings,operator_capacity_owners=('superdan',))
+        with TestClient(create_app(settings,repository=self.repo)) as client:
+            client.post('/api/auth/login',json={'username':'supervan'}).raise_for_status()
+            self.assertFalse(client.get('/api/auth/me').json()['operator_capacity']['view'])
+            self.assertEqual(client.get('/v1/operator/capacity/state').status_code,403)
+            client.post('/api/auth/login',json={'username':'superdan'}).raise_for_status()
+            self.assertTrue(client.get('/api/auth/me').json()['operator_capacity']['view'])
+            state=client.get('/v1/operator/capacity/state')
+            self.assertEqual(state.status_code,200)
+            self.assertEqual(client.post('/v1/operator/capacity/previews',json={},
+                headers={'Origin':'https://unrelated.invalid'}).status_code,403)
+            catalog=client.get('/v1/operator/capacity/catalog').json()
+            self.assertEqual(len(catalog['profiles']),3)
+            self.assertTrue(all('runtime' not in profile for profile in catalog['profiles']))
+
+    def test_quick_chat_selection_survives_turn_projection_revision_and_preflight(self):
+        app = create_app(self.settings, repository=self.repo)
+        with TestClient(app) as client:
+            client.post("/api/auth/login", json={"username": "superdan"}).raise_for_status()
+            prefix = "/v1/quick-chat/sessions"
+            session = client.post(prefix, json={}, headers={"Idempotency-Key": "new-session"}).json()["session"]
+            base = prefix + "/" + session["id"]
+            settings = {"recipe_id": "h3-base-fl2va-v1", "controls": {"resolution": "480P", "duration": 5, "steps": 20},
+                "copies": 1, "deployment_profile_id": PRUNED}
+            saved = client.patch(base, json={"expected_version": session["version"], "next_settings": settings},
+                headers={"Idempotency-Key": "select-profile"})
+            saved.raise_for_status()
+            current = client.get(base).json()["session"]
+            turn = client.post(base + "/turns", json={"expected_version": current["version"],
+                "text": "A fictional swordsman leaps across rooftops.", "model_id": current["model_id"],
+                "assistant_mode": "none", "create_card": True}, headers={"Idempotency-Key": "turn-card"})
+            turn.raise_for_status()
+            card = client.get(base + "/cards/" + turn.json()["card_id"]).json()
+            revision = client.get(base + "/revisions/" + card["current_revision_id"]).json()
+            self.assertEqual(revision["deployment_profile_id"], PRUNED)
+            pf = client.post(base + "/revisions/" + revision["id"] + "/preflights", json={
+                "revision_hash": revision["input_hash"], "capabilities_version": "sixnine-h3-base-20261004-v1"},
+                headers={"Idempotency-Key": "preflight-profile"})
+            pf.raise_for_status()
+            self.assertIn(PRUNED, pf.text)
+            self.assertIn("MiniMax-H3-Pruned-Rank8-INT8", pf.text)
+
+
+if __name__ == "__main__":
+    unittest.main()

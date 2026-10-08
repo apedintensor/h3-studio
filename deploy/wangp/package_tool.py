@@ -23,6 +23,7 @@ from studio_platform.runtime_hosts.wangp_environment import (
     regular_file, system_packages, verify_source)
 
 PRIVATE_FILES = (
+    "comfy_workflow.py",
     "studio_platform/__init__.py", "studio_platform/storage.py", "studio_platform/storage_config.py",
     "studio_platform/media_process.py",
     "studio_platform/inference/__init__.py", "studio_platform/inference/protocol.py",
@@ -35,6 +36,11 @@ PRIVATE_FILES = (
     "studio_platform/runtime_hosts/wangp_launcher.py", "studio_platform/runtime_hosts/wangp_environment.py",
     "studio_platform/runtime_hosts/wangp_system_restore.py",
     "studio_platform/runtime_hosts/wangp_download.py",
+    "studio_platform/runtime_catalog.py", "studio_platform/inference/wangp_profile_compiler.py",
+    "studio_platform/runtime_hosts/wangp_profile_bootstrap.py",
+    "deploy/wangp/profiles/h3-pruned-rank8-int8-quanto-int8-vae-int8-sdpa-p4-lowram-v1.json",
+    "deploy/wangp/profiles/h3-unpruned33b-int8-qwenbf16-vaefp16-sdpa-p3-lowram-v1.json",
+    "deploy/wangp/profiles/h3-unpruned33b-bf16-qwenbf16-vaefp16-sdpa-p3-splitqkv-v2.json",
     "deploy/wangp/probe_gpu.py",
 )
 

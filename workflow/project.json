@@ -70,6 +70,14 @@
     }
   },
   "tasks": {
+    "E3": {
+      "number": 71,
+      "node_id": "I_kwDOU6TGZc8AAAABV4V05A",
+      "url": "https://github.com/apedintensor/h3-studio/issues/71",
+      "title": "[E3] Deliver operator-managed GPU capacity and tested H3 profiles",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_azVU",
+      "depends_on": ["D2", "D4", "G1"]
+    },
     "A0": {
       "number": 9,
       "node_id": "I_kwDOU6TGZc8AAAABVQaziA",

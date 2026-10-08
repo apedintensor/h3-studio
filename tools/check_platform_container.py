@@ -176,6 +176,15 @@ def check_roughcut(client, app, project, root):
 
 
 def main():
+    # Read these from this exact container image, not the checkout. Catalog
+    # metadata is not GPU/production qualification or deployment authority.
+    from studio_platform.runtime_catalog import PROFILE_IDS, public_catalog, engine_manifest
+    catalog = public_catalog()
+    assert {profile['id'] for profile in catalog['profiles']} == set(PROFILE_IDS)
+    for profile in catalog['profiles']:
+        assert profile['verified_cases'] and profile['validation']['production_adapter_verified'] is False
+        for mode in ('fl', 'ref'):
+            assert engine_manifest(profile['id'], mode).document['production_adapter_verified'] is False
     assert os.getuid() == 10001, "Production image must run unprivileged"
     root = Path("/data")
     assert root.is_dir() and not (root/"platform.sqlite3").exists(), "Only fresh disposable data is allowed"

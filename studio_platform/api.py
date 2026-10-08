@@ -35,13 +35,14 @@ from .agent_connect_routes import EXCHANGE_PATH, register_routes as register_age
 from .frontend import FRONTEND_CONTRACT, STATIC_CACHE_SCOPE_KEY, is_public_frontend
 from .generation_admission import GenerationAdmission, reject_managed
 from .generation_services import GenerationAccess, GenerationPlanning, GenerationRead
+from .operator_capacity import OperatorRegistry  # Register additive tables before create_schema.
 
 COOKIE = "sixnine_session"
 TERMINAL = {"succeeded", "failed", "cancelled"}
 
 
 def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_hooks=None,
-               assistant=None, assistant_enabled=False):
+               assistant=None, assistant_enabled=False, operator_registry=None):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     repo = repository or Repository(settings.database_url)
     repo.create_schema()
@@ -242,6 +243,8 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
         principal = request.state.principal
         return {"username": principal.owner, "actor_id": principal.actor_id, "machine": principal.machine,
                 "authentication": settings.auth_mode, "scopes": list(principal.scopes),
+                "operator_capacity": {name: not principal.machine and principal.owner in settings.operator_capacity_owners
+                    for name in ("view", "start", "drain", "stop", "update_policy")},
                 "all_projects": principal.all_projects, "project_ids": list(principal.project_ids)}
 
     @app.post("/api/auth/logout")
@@ -582,6 +585,12 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
     register_guided_routes(app)
     from .agent_discovery import register_routes as register_agent_discovery_routes
     register_agent_discovery_routes(app)
+    from .operator_routes import register_routes as register_operator_routes
+    from .runtime_catalog import public_catalog
+    registry = operator_registry
+    if registry is None:
+        registry = OperatorRegistry.from_environment(catalog=public_catalog)
+    register_operator_routes(app, registry=registry)
     from .frontend import register_routes as register_frontend_routes
     register_frontend_routes(app)
     # Last-added middleware is outermost, including the authentication guard.

@@ -109,6 +109,9 @@ def input_entries(inputs, *, allow_duplicates=False):
 
 
 def prepare_patch(action, resolve):
+    if action.get("deployment_profile_id") is not None:
+        from .runtime_catalog import get_profile
+        get_profile(action["deployment_profile_id"])
     if "recipe_id" in action and (not isinstance(action["recipe_id"], str) or action["recipe_id"] not in RECIPES):
         raise ValueError("未支持的生成recipe_id")
     if "prompt" in action and (not isinstance(action["prompt"], str) or len(action["prompt"]) > 12000):
@@ -133,6 +136,8 @@ def configure(project, action, sources):
     h3 = shot["data"].setdefault("h3", {})
     if "recipe_id" in action:
         h3["recipeId"] = action["recipe_id"]
+    if "deployment_profile_id" in action:
+        h3["deploymentProfileId"] = action["deployment_profile_id"]
     if "prompt" in action:
         shot["data"]["prompt"] = action["prompt"]
     if "controls" in action:
@@ -352,6 +357,8 @@ def read_draft(project, shot_id, *, recipes=None):
     draft = {"recipe_id": recipe["id"] if recipe else h3.get("recipeId"),
              "prompt": shot["data"].get("prompt", shot.get("description", "")),
              "controls": copy.deepcopy(h3.get("controls", {})), "inputs": inputs}
+    if h3.get("deploymentProfileId") is not None:
+        draft["deployment_profile_id"] = h3["deploymentProfileId"]
     return draft, list(dict.fromkeys(issues))
 
 
@@ -362,6 +369,12 @@ def plan_body(project, shot_id, capabilities, derive):
     recipe = next((r for r in capabilities["recipes"] if r["id"] == draft["recipe_id"]), None)
     if not recipe:
         raise ValueError("草稿配方已不可用，请明确选择后重新预检")
+    if draft.get("deployment_profile_id") is not None:
+        from .runtime_catalog import get_profile
+        from .inference.wangp_profile_compiler import control_schema as profile_schema
+        get_profile(draft["deployment_profile_id"])
+        recipe = {**recipe, "controls": profile_schema(draft["deployment_profile_id"], recipe["mode"]),
+                  "deployment_preset": {}}
     if not isinstance(draft["prompt"], str) or not draft["prompt"].strip():
         raise ValueError("先写清这个镜头的画面与动作")
     shot = shot_entity(project, shot_id)
@@ -422,5 +435,6 @@ def plan_body(project, shot_id, capabilities, derive):
     return {"client_ref": {"project_id": project["id"], "shot_id": shot_id, "shot_version": shot["version"],
                 "scene_id": scene["id"], "chapter_id": scene["parentId"]},
             "recipe_id": recipe["id"], "capabilities_version": capabilities["capabilities_version"],
+            **({"deployment_profile_id": draft["deployment_profile_id"]} if draft.get("deployment_profile_id") else {}),
             "prompt": draft["prompt"].strip(), "controls": controls, "inputs": inputs,
             "client_edit": {"edit_duration_s": shot["data"].get("seconds", 5)}}

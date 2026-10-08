@@ -60,6 +60,8 @@ class Settings:
     frontend_dir: Path | None = None
     frontend_release_dir: Path | None = None
     execution_policy_file: Path | None = None
+    execution_profiles_file: Path | None = None
+    operator_capacity_owners: tuple[str, ...] = ()
     render_enabled: bool = False
     recovery_backends: tuple[str, ...] = ()
 
@@ -72,6 +74,12 @@ class Settings:
             object.__setattr__(self, "frontend_release_dir", validate_release_directory(self.frontend_release_dir))
         if self.execution_policy_file is not None and not Path(self.execution_policy_file).is_absolute():
             raise ValueError("Execution policy path must be absolute")
+        if self.execution_profiles_file is not None and not Path(self.execution_profiles_file).is_absolute():
+            raise ValueError("Execution profiles path must be absolute")
+        if (not isinstance(self.operator_capacity_owners, tuple)
+                or len(set(self.operator_capacity_owners)) != len(self.operator_capacity_owners)
+                or any(not isinstance(v, str) or v not in {"superdan", "supervan"} for v in self.operator_capacity_owners)):
+            raise ValueError("Operator capacity identities must be explicit existing accounts")
         if not self.database_url:
             object.__setattr__(self, "database_url", "sqlite:///" + (self.data_dir / "platform.sqlite3").as_posix())
         if self.auth_mode not in {"password", "local-test"}:
@@ -127,6 +135,8 @@ class Settings:
             frontend_dir=Path(os.environ["SIXNINE_FRONTEND_DIR"]) if os.environ.get("SIXNINE_FRONTEND_DIR") else None,
             frontend_release_dir=Path(os.environ["SIXNINE_FRONTEND_RELEASE_DIR"]) if os.environ.get("SIXNINE_FRONTEND_RELEASE_DIR") else None,
             execution_policy_file=Path(os.environ["SIXNINE_EXECUTION_POLICY_FILE"]) if os.environ.get("SIXNINE_EXECUTION_POLICY_FILE") else None,
+            execution_profiles_file=Path(os.environ["SIXNINE_EXECUTION_PROFILES_FILE"]) if os.environ.get("SIXNINE_EXECUTION_PROFILES_FILE") else None,
+            operator_capacity_owners=tuple(x.strip() for x in os.environ.get("SIXNINE_OPERATOR_CAPACITY_OWNERS", "").split(",") if x.strip()),
             render_enabled=os.environ.get("SIXNINE_RENDER_ENABLED", "0") == "1",
             recovery_backends=tuple(x.strip() for x in os.environ.get("SIXNINE_RECOVERY_BACKENDS", "").split(",") if x.strip()),
         )

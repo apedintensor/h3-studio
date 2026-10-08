@@ -48,7 +48,7 @@ Keep IDs stable. A material reversal receives a new decision ID and a `supersede
 ## DEC-005 — Start capacity from confirmed demand; serve the first ready slot
 
 - **Status / scope:** Accepted target; demand admission and eventual pool behavior.
-- **Decision:** Preflight, assistant responses and job cards do not start paid video inference or provision GPUs. Explicitly confirmed queued work creates demand. Use the accepted task once for the first authorized real path and deliver its result to its owner. Serve from the first matching ready slot; the later redundancy target is two independent nodes, with no always-on GPU and shutdown after **600 seconds without pool obligations**. Unknown/running/collection obligations cannot be erased to declare idle.
+- **Decision:** Preflight, assistant responses and job cards do not start paid video inference or provision GPUs. Explicitly confirmed queued work creates demand. DEC-012 additionally permits explicit operator manual capacity intents without a synthetic video job. Use the accepted task once for the first authorized real path and deliver its result to its owner. Serve from the first matching ready slot; the later redundancy target is two independent nodes, with no always-on GPU by default and shutdown after **600 seconds without pool obligations**. Unknown/running/collection obligations cannot be erased to declare idle.
 - **Why:** The documented target makes useful service possible before the second node is ready and avoids duplicating the user's task as a benchmark.
 - **Alternatives:** Always-on capacity and requiring dual-node acceptance before the initial single-slot proof are outside the accepted target. Two replicas are not tensor parallelism or complementary capability coverage.
 - **Revisit when:** Measured wait times, reliability requirements or explicit operating authority justify a different idle or redundancy policy; record it as validated policy, not an unreviewed counter change.
@@ -99,12 +99,21 @@ Keep IDs stable. A material reversal receives a new decision ID and a `supersede
 - **Revisit when:** Coordination or evidence failures expose a specific missing rule; update the shared workflow without creating a second process or treating inactivity as abandonment.
 - **Evidence / current contract:** [Pinned workflow][P-workflow], [PR #30](https://github.com/apedintensor/h3-studio/pull/30); [current workflow](WORKFLOW.md). The stable required `test` check and exact release rules remain defined there.
 
+## DEC-012 — Add explicit operator-managed capacity and tested profile choices
+
+- **Status / scope:** Accepted user direction, 2026-10-09; manual GPU console and explicit recipe selection. Extends DEC-005 without changing accepted tasks or automatic capacity authority.
+- **Decision:** Start with Lium and the three tested deployment profiles. The user accepts pruned rank8 INT8 after reviewing results. Operators can request machines independently of user jobs, choose per-machine configuration and set bounded total capacity. Reuse the existing scaler, rental ledger, workers and shared generation API. Keep node billing separate from GPU slot identity. Quick Chat and Agent requests select an explicit deployment profile and reach matching workers.
+- **Why:** The user wants control over costs and hardware, and a direct path from a manually started machine to useful generation. Hardware/precision choices and preparation state need to be visible.
+- **Alternatives:** No separate experiment scheduler, fake video demand, silent precision substitution, or second business backend. Other providers remain later adapters; displaying one does not establish support.
+- **Revisit when:** Measured demand or a different provider requires a new deployment profile/topology. Preserve exact accepted identity and original accounting.
+- **Contract / evidence:** [Operator capacity contract](OPERATOR-CAPACITY-CONTRACT.md), [E3 #71](https://github.com/apedintensor/h3-studio/issues/71). Native timing evidence does not establish a production deployment or guarantee.
+
 ## DEC-011 — Use RTX 5090 and INT8 for future low-cost H3 tests
 
 - **Status / scope:** Accepted user direction, 2026-10-08; future tests prioritize inexpensive RTX 5090 INT8 for both FL2VA and Ref2VA. Supersedes DEC-003's future hardware/precision priority, not historical acceptance, immutable jobs or required recovery gates.
 - **Decision:** Present a bounded machine/filter/startup test proposal before execution, then use measured findings to design an operator panel. Retain the existing WanGP adapter, business API and single capacity/rental authority. Do not silently upgrade to expensive GPUs or change an accepted BF16 request into INT8.
 - **Why:** The user wants an inexpensive working service and direct visibility/control over machine configuration and preparation, after substantial time was spent on cold setup.
-- **Proposed, not selected:** Pruned 20B versus original 33B INT8, exact component settings, RAM thresholds, images, finite limits and manual-capacity UI/API. The linked proposal recommends an explicitly named pruned candidate; INT8 authorization alone is not approval of pruning or demonstrated full-control parity.
+- **Subsequent selection:** The 2026-10-09 user direction accepts the tested pruned rank8 INT8 recipe and requests an operator console (DEC-012). Exact experiment scope and limits remain evidence-bound; this is not full-control parity or production qualification.
 - **Revisit when:** The user changes priority, or measured failures require revising the proposed memory/control envelope. Hardware/recipe changes remain explicit; existing jobs and cumulative costs survive.
 - **Evidence / proposal:** [User-direction planning claim](https://github.com/apedintensor/h3-studio/issues/22#issuecomment-6056468134); [5090 pilot and panel proposal](docs/research/h3-economics-20261008/5090-test-plan.md). No GPU, image build, model download or production change is authorized by this record.
 

@@ -40,9 +40,15 @@ def positive(value, maximum):
 
 def validate_policy(value):
     """Reject ambiguous/misspelled operator settings rather than broadening them."""
-    if not isinstance(value, dict) or not FIELDS <= set(value) or set(value) - FIELDS - {"engine_manifest_digest", "output_delivery"}:
+    if not isinstance(value, dict) or not FIELDS <= set(value) or set(value) - FIELDS - {"engine_manifest_digest", "output_delivery", "deployment_profile_id"}:
         raise ValueError("Invalid execution policy fields")
-    if (value["id"] != POLICY or value["model_id"] != MODEL or value["backend"] not in REAL_GPU_BACKENDS
+    expected_model = MODEL
+    if "deployment_profile_id" in value:
+        from .runtime_catalog import get_profile
+        expected_model = get_profile(value["deployment_profile_id"])["model_id"]
+        if value["backend"] != "wangp-worker" or len(value["recipe_ids"]) != 1:
+            raise ValueError("Deployment profiles require an explicit WanGP mode")
+    if (value["id"] != POLICY or value["model_id"] != expected_model or value["backend"] not in REAL_GPU_BACKENDS
             or type(value["enabled"]) is not bool):
         raise ValueError("Invalid execution policy identity")
     validate_delivery_policy(value["backend"], value.get("output_delivery", ""))
@@ -106,7 +112,10 @@ def validate_policy(value):
         limits = envelope.get("input_limits")
         if limits is None or not set(recipes) <= set(PROFILE_RECIPES[qualification["profile"]]):
             raise ValueError("Runtime qualification requires its explicit input scope")
-        for field, maximum in MULTIMODAL_INPUT_LIMITS.items():
+        maxima = dict(MULTIMODAL_INPUT_LIMITS)
+        if "deployment_profile_id" in value:
+            maxima.update(max_audio_duration_seconds=5.2)
+        for field, maximum in maxima.items():
             if isinstance(maximum, list):
                 outside = not set(limits[field]) <= set(maximum)
             elif isinstance(maximum, bool):
@@ -127,7 +136,24 @@ def validate_policy(value):
         raise ValueError("Explicit execution control families required")
     if any(not isinstance(options, list) or not options or any(not isinstance(x, str) or len(x)>80 for x in options) for options in controls.values()):
         raise ValueError("Invalid execution control values")
-    if value["backend"] == "wangp-worker" and recipes == ["h3-base-ref2va-v1"]:
+    if "deployment_profile_id" in value:
+        from .runtime_catalog import engine_manifest, get_profile
+        mode = "fl" if recipes == ["h3-base-fl2va-v1"] else "ref"
+        profile = get_profile(value["deployment_profile_id"])
+        cases = [c for c in profile["verified_cases"] if c["mode"] == mode]
+        if (value.get("output_delivery") != "native-frames-v1"
+                or qualification.get("profile") != QUEUED_TASK_PROFILE
+                or value["engine_manifest_digest"] != engine_manifest(profile["id"], mode).digest
+                or envelope["max_pixels"] > max(c["width"]*c["height"] for c in cases)
+                or envelope["max_steps"] > max(c["steps"] for c in cases)
+                or envelope["max_duration_seconds"] > 124/24 + 1e-6
+                or envelope["max_reference_files"] > (3 if mode == "ref" else 2)
+                or envelope["max_guides"] != 0
+                or mode == "ref" and envelope["allow_first_last"]):
+            raise ValueError("Deployment profile envelope exceeds tested scope")
+        # Marginal limits only restrict admission; the compiler additionally
+        # checks the exact measured combination of mode, controls and inputs.
+    elif value["backend"] == "wangp-worker" and recipes == ["h3-base-ref2va-v1"]:
         from .inference.wangp_ref_compiler import validate_envelope
         if (recipes != ["h3-base-ref2va-v1"] or value.get("output_delivery") != "native-frames-v1"
                 or qualification.get("profile") != QUEUED_TASK_PROFILE):
@@ -324,7 +350,8 @@ class ExecutionPolicies:
             base["blockers"].append("尚未接入此执行方式")
             return Admission(base, 0, now+900, unknown)
         try:
-            policy = read_policy(self.settings.execution_policy_file)
+            from .execution_profiles import selected_policy
+            policy = selected_policy(self.settings, profile_id=compiled.get("deployment_profile_id"), recipe_id=compiled["recipe_id"])
         except ValueError:
             policy = None
         if policy is None:
@@ -448,6 +475,8 @@ class ExecutionPolicies:
         base["admission_state"] = "blocked" if blockers else "waiting_capacity" if approval else "queued"
         if backend == "wangp-worker":
             base["engine_manifest_digest"] = policy["engine_manifest_digest"]
+        if compiled.get("deployment_profile_id") is not None:
+            base["deployment_profile_id"] = compiled["deployment_profile_id"]
         if "output_delivery" in policy:
             base.update(output_delivery=policy["output_delivery"], delivery_spec=native_delivery_spec(compiled))
         if approval:
@@ -491,7 +520,14 @@ class ExecutionPolicies:
         if not self.settings.generation_enabled or self.settings.execution_backend not in REAL_GPU_BACKENDS:
             return False
         try:
-            policy = read_policy(self.settings.execution_policy_file)
+            from .execution_profiles import read_profiles
+            try:
+                legacy = read_policy(self.settings.execution_policy_file)
+            except (ValueError, OSError):
+                legacy = None
+            policies = [legacy]
+            policies.extend(read_profiles(getattr(self.settings, "execution_profiles_file", None)).values())
+            policy = next((p for p in policies if p and request_hash(p) == payload["policy_hash"]), None)
             if policy is None:
                 return False
             now, qualification, quote = self.repo.clock(), policy["qualification"], policy["reservation"]
@@ -551,7 +587,9 @@ class ExecutionPolicies:
         if self.settings.execution_backend not in REAL_GPU_BACKENDS:
             return False
         try:
-            policy = read_policy(self.settings.execution_policy_file)
+            from .execution_profiles import selected_policy
+            policy = selected_policy(self.settings, profile_id=job.get("request", {}).get("deployment_profile_id"),
+                recipe_id=job.get("request", {}).get("recipe_id"))
             if policy is None:
                 return False
             qualification = policy["qualification"]
@@ -560,6 +598,7 @@ class ExecutionPolicies:
                 job.get("request", {}).get("output_spec", {}).get("actual_duration"))
             now = self.repo.clock()
             return bool(policy["backend"] == self.settings.execution_backend
+                and execution.get("deployment_profile_id") == job.get("request", {}).get("deployment_profile_id")
                 and execution.get("output_delivery", "") == policy.get("output_delivery", "")
                 and (policy["backend"] != "wangp-worker" or execution.get("engine_manifest_digest") == policy["engine_manifest_digest"])
                 and policy["enabled"] and execution.get("policy_hash") == request_hash(policy)

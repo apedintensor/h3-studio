@@ -20,6 +20,7 @@ def agent_contract():
         "media_scopes": ["assets:read", "assets:write"], "generation_scopes": ["jobs:read", "jobs:write"],
         "generation_authority": "A card or preflight does not start generation. Confirm only within the user's authorization; an HTTP202 is not inference success.",
         "same_session": "Materials and next_settings are visible authoring state. Revisions freeze their own explicit inputs and seeds. Different sessions are isolated.",
+        "deployment_profiles": "Read capabilities.deployment_profiles. Set top-level deployment_profile_id on next_settings or card creation/revision to choose exact model precision/hardware recipe. Null or omission retains legacy routing. Catalog measurements are historical; preflight checks current matching workers. Ordinary generation keys do not grant operator rental access.",
         "replay": "Persist each write body and Idempotency-Key. Replaying the same revision's initial confirmation across Agents returns its original submission/items/jobs, not new variations.",
         "examples": {
             "session": {"method": "POST", "path": PREFIX, "body": {"title": "My video"}},

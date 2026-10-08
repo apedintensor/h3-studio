@@ -33,7 +33,10 @@ COMFY_REVISION = "e9027f2b30f37bb3052714eb08fcf479542f4fc0"
 
 # These are literals emitted by the pinned bootstrap, not arbitrary exception
 # messages/classes from a remote machine. Unknown values are explicitly masked.
-BOOT_FAILURE_CODES = frozenset({"InternalSetupFailure", "SubprocessTimeout", "SubprocessFailed",
+BOOT_FAILURE_CODES = frozenset({"native_profile_python31214_linux_required", "wangp_runtime_source_mismatch",
+    "wangp_runtime_source_modified", "wangp_runtime_requirements_mismatch", "wangp_runtime_untracked_code",
+    "wangp_runtime_dependency_mismatch", "wangp_profile_cache_lock_timeout", "wangp_profile_manifest_mismatch",
+    "InternalSetupFailure", "SubprocessTimeout", "SubprocessFailed",
     "CUDAUnavailable", "ExistingComfyDirectoryIsNotCheckout", "ExistingComfyCheckoutModified",
     "ComfyRevisionMismatch", "RequiredComfyFlagMissing", "ImageTorchMissing", "ImageTorchChanged",
     "XetRequiredForLargeWeights", "InsufficientCacheDiskSpace", "DownloadedFileSizeMismatch",
@@ -59,7 +62,7 @@ BOOT_FAILURE_TYPES = frozenset({"SetupError", "RuntimeError", "ValueError", "Typ
     "ReadTimeout", "ConnectTimeout", "ConnectError", "SSLError", "HfHubHTTPError",
     "LocalEntryNotFoundError", "EntryNotFoundError", "RepositoryNotFoundError", "RevisionNotFoundError",
     "XetDownloadError", "XetError", "JSONDecodeError"})
-BOOT_PHASES = frozenset({"preflight", "clone_comfy", "fetch_comfy", "pin_comfy", "install_dependencies",
+BOOT_PHASES = frozenset({"model_download_waiting_for_shared_cache", "preflight", "clone_comfy", "fetch_comfy", "pin_comfy", "install_dependencies",
     "download_preflight", "download_file", "weights_ready", "start_comfy", "comfy_ready", "failed", "download",
     "checking_package", "dependency_download", "dependency_unpack", "dependency_install", "model_download",
     "runtime_verification", "runtime_start", "runtime_ready", "runtime_start_unknown", "setup_failed",
@@ -129,6 +132,10 @@ class BootConfig:
     execution_backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
     output_delivery: str = ""
+    deployment_profile_id: str = ""
+    runtime_python: str = "/opt/conda/bin/python"
+    profile_slot_index: int = -1
+    expected_host_gpus: int = 1
 
     def __post_init__(self):
         from .inference.outputs import validate_delivery_policy
@@ -142,8 +149,23 @@ class BootConfig:
         for field in ("enabled", "trust_first_host_key", "smoke_enabled", "fleet_enabled"):
             if type(getattr(self, field)) is not bool:
                 raise ValueError("invalid_bootstrap_switch")
+        expected_model = "MiniMax-H3-Base-BF16"
+        if self.deployment_profile_id:
+            from .runtime_catalog import get_profile
+            expected_model = get_profile(self.deployment_profile_id)["model_id"]
+            if self.execution_backend != "wangp-worker" or self.output_delivery != "native-frames-v1":
+                raise ValueError("bootstrap_profile_requires_native_wangp")
+        if self.runtime_python not in {"/opt/conda/bin/python", "/venv/main/bin/python"}:
+            raise ValueError("bootstrap_runtime_python_unsupported")
+        if not self.deployment_profile_id and self.runtime_python != "/opt/conda/bin/python":
+            raise ValueError("legacy_bootstrap_python_changed")
+        if (type(self.expected_host_gpus) is not int or not 1 <= self.expected_host_gpus <= 8
+                or type(self.profile_slot_index) is not int
+                or self.deployment_profile_id and not 0 <= self.profile_slot_index < self.expected_host_gpus
+                or not self.deployment_profile_id and (self.profile_slot_index != -1 or self.expected_host_gpus != 1)):
+            raise ValueError("bootstrap_explicit_slot_topology_required")
         if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", self.configuration_id)
-                or self.model_id != "MiniMax-H3-Base-BF16"
+                or self.model_id != expected_model
                 or type(self.min_gpu_bytes) is not int or self.min_gpu_bytes < 30*1024**3
                 or type(self.minimum_remaining_s) is not int or not 120 <= self.minimum_remaining_s <= 7200
                 or self.recipe_ids not in (("h3-base-fl2va-v1",), ("h3-base-fl2va-v1", "h3-base-ref2va-v1"))
@@ -569,6 +591,11 @@ class BootController:
             value.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
         if self.config.output_delivery:
             value["output_delivery"] = self.config.output_delivery
+        if self.config.deployment_profile_id:
+            value["deployment_profile_id"] = self.config.deployment_profile_id
+            value["runtime_python"] = self.config.runtime_python
+            value["profile_slot_index"] = self.config.profile_slot_index
+            value["expected_host_gpus"] = self.config.expected_host_gpus
         return value
 
     def _connect_backend(self, intent, directory, state):
@@ -603,7 +630,9 @@ class BootController:
                 return {"state": "bootstrap_locked"}
             with self.repo.engine.connect() as conn:
                 intent = conn.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().first()
-            if intent is None or intent["provider"] != "lium" or not intent["provider_instance_id"] or intent["physical_gpus"] != 1:
+            if (intent is None or intent["provider"] != "lium" or not intent["provider_instance_id"]
+                    or intent["physical_gpus"] != self.config.expected_host_gpus
+                    or self.config.profile_slot_index >= intent["slots"]):
                 raise BootError("bootstrap_requires_reserved_single_gpu_lium_intent")
             self.bound_instance = intent["provider_instance_id"]
             if intent["state"] in {"draining", "destroying", "destroyed"}:
