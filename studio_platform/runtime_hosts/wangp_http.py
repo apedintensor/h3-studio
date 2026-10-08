@@ -133,13 +133,18 @@ class StagedInputs:
         except (subprocess.SubprocessError, OSError, ValueError, KeyError, TypeError):
             raise ValueError("wangp_ref_media_probe_rejected") from None
 
-    def video_path(self, descriptor):
+    def video_path(self, descriptor, *, deployment_profile_id=None):
+        counts = (56, 73)
+        if deployment_profile_id is not None:
+            from ..runtime_catalog import get_profile
+            get_profile(deployment_profile_id)  # Unknown IDs never widen admission.
+            counts = (56,)
         stream, _ = self._probe_reference(descriptor, "video")
         try:
             self._reference_dimensions(stream["width"], stream["height"])
             count = int(stream["nb_read_frames"])
             duration = float(stream["duration"])
-            if (stream["codec_name"] != "h264" or count not in (56, 73)
+            if (stream["codec_name"] != "h264" or count not in counts
                     or Fraction(stream["avg_frame_rate"]) != 24 or Fraction(stream["r_frame_rate"]) != 24
                     or not math.isfinite(duration) or abs(duration-count/24) > .00001):
                 raise ValueError()
@@ -147,11 +152,16 @@ class StagedInputs:
             raise ValueError("wangp_ref_normalized_silent_video_required") from None
         return self._typed_copy(descriptor, "videos", ".mp4")
 
-    def audio_path(self, descriptor):
+    def audio_path(self, descriptor, *, deployment_profile_id=None):
+        maximum = 3
+        if deployment_profile_id is not None:
+            from ..runtime_catalog import get_profile
+            get_profile(deployment_profile_id)
+            maximum = 5.2
         stream, info = self._probe_reference(descriptor, "audio")
         try:
             if (stream["codec_name"] != "pcm_s16le" or int(stream["sample_rate"]) != 32000
-                    or stream["channels"] != 2 or not 2 <= float(info["duration"]) <= 3):
+                    or stream["channels"] != 2 or not 2 <= float(info["duration"]) <= maximum):
                 raise ValueError()
         except (ValueError, KeyError, TypeError, OverflowError):
             raise ValueError("wangp_ref_normalized_audio_required") from None

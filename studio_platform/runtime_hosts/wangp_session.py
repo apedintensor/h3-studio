@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -56,13 +57,18 @@ def _contained_file(root: Path, path: Path) -> Path:
     return target
 
 
-def _check_config(path, model_root=None):
+def _check_config(path, model_root=None, deployment_profile_id=None):
     path = Path(path).resolve(strict=True)
     if path.name != "wgp_config.json":
         raise ValueError("wangp_config_filename_invalid")
     data = json.loads(path.read_text(encoding="utf-8"))
-    if (not isinstance(data, dict) or set(data) != set(REQUIRED_CONFIG) | {"checkpoints_paths"}
-            or any(data.get(key) != value for key, value in REQUIRED_CONFIG.items())):
+    required = REQUIRED_CONFIG
+    if deployment_profile_id is not None:
+        from ..runtime_catalog import get_profile
+        required = get_profile(deployment_profile_id)['runtime']['config']
+    if (not isinstance(data, dict) or set(data) != set(required) | {"checkpoints_paths"}
+            or any(json.dumps(data.get(key), sort_keys=True) != json.dumps(value, sort_keys=True)
+                   for key, value in required.items())):
         raise ValueError("wangp_runtime_config_mismatch")
     paths = data.get("checkpoints_paths")
     if (not isinstance(paths, list) or len(paths) != 1 or not isinstance(paths[0], str)
@@ -83,8 +89,12 @@ The returned evidence contains no runtime environment or configuration values.
 """
     root = Path(runtime_root).resolve(strict=True)
     models = Path(model_root).resolve(strict=True)
-    config = _check_config(config_path, models)
     manifest = EngineManifest.from_dict(json.loads(Path(manifest_path).read_text(encoding="utf-8")))
+    profile = None
+    if manifest.document.get('deployment_profile_id') is not None:
+        from ..runtime_catalog import validate_manifest
+        profile = validate_manifest(manifest)
+    config = _check_config(config_path, models, profile['id'] if profile else None)
     environment_evidence = {}
     if manifest.document.get("runtime_digest_kind") == "sixnine-environment-lock-sha256":
         from .wangp_environment import verify_bound_environment
@@ -97,15 +107,20 @@ The returned evidence contains no runtime environment or configuration values.
                                   check=True, capture_output=True, text=True).stdout.strip()
         if revision != UPSTREAM_REVISION:
             raise ValueError("wangp_runtime_source_mismatch")
-        for args in (["diff", "--quiet", "HEAD", "--"], ["diff", "--cached", "--quiet", "HEAD", "--"]):
+        # Pilot image modified installation metadata only; executable source and
+        # the exact requirements bytes remain pinned for the new native profiles.
+        extra = [":(exclude)requirements.txt"] if profile else []
+        for args in (["diff", "--quiet", "HEAD", "--", *extra], ["diff", "--cached", "--quiet", "HEAD", "--", *extra]):
             if subprocess.run(["git", "-C", str(root), *args], capture_output=True).returncode:
                 raise ValueError("wangp_runtime_source_modified")
+        if profile and hashlib.sha256((root/'requirements.txt').read_bytes()).hexdigest() != profile['runtime']['requirements_sha256']:
+            raise ValueError('wangp_runtime_requirements_mismatch')
         untracked = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
                                   check=True, capture_output=True).stdout.decode().split("\0")
         if any(Path(name).suffix.lower() in {".py", ".pyd", ".so"} for name in untracked if name):
             raise ValueError("wangp_runtime_untracked_code")
     versions = {}
-    for package, required in CORE_VERSIONS.items():
+    for package, required in (profile['runtime']['core_versions'] if profile else CORE_VERSIONS).items():
         version = importlib.metadata.version(package)
         if version != required:
             raise ValueError("wangp_runtime_dependency_mismatch")
@@ -132,8 +147,11 @@ The returned evidence contains no runtime environment or configuration values.
             "inference_verified": False, **environment_evidence}
 
 
-def config_for_model_root(model_root):
+def config_for_model_root(model_root, deployment_profile_id=None):
     """Non-secret explicit startup configuration; caller writes wgp_config.json."""
+    if deployment_profile_id is not None:
+        from ..runtime_catalog import runtime_config
+        return runtime_config(deployment_profile_id, model_root)
     return {**REQUIRED_CONFIG, "checkpoints_paths": [str(Path(model_root).resolve(strict=True))]}
 
 
@@ -153,10 +171,129 @@ def _upstream_worker_alive():
                for thread in threading.enumerate())
 
 
+def _lock_profile_device(torch, profile):
+    """One explicit visible device and one owned process per physical GPU."""
+    import fcntl
+    import stat
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise ValueError('wangp_profile_one_visible_gpu_required')
+    properties = torch.cuda.get_device_properties(0)
+    name = torch.cuda.get_device_name(0)
+    pruned = profile['model_id'] == 'MiniMax-H3-Pruned-Rank8-INT8'
+    accepted = (re.fullmatch(r'(?:NVIDIA\s+)?(?:GeForce\s+)?RTX\s+5090', name)
+                if pruned else re.fullmatch(r'(?:NVIDIA\s+)?RTX\s+PRO\s+6000\s+Blackwell\s+(?:Server|Workstation)\s+Edition', name))
+    low, high = (30, 34) if pruned else (90, 100)
+    if (not accepted or torch.cuda.get_device_capability(0) != (12, 0)
+            or not low*1024**3 <= properties.total_memory <= high*1024**3):
+        raise ValueError('wangp_profile_gpu_mismatch')
+    uuid = str(getattr(properties,'uuid',''))
+    if not re.fullmatch(r'(?:GPU-)?[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}',uuid):
+        raise ValueError('wangp_profile_gpu_identity_required')
+    uuid = uuid.removeprefix('GPU-').lower()
+    fd = os.open('/tmp/sixnine-wangp-gpu-'+uuid+'.lock', os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW, 0o600)
+    stream = os.fdopen(fd,'a+')
+    try:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError('wangp_profile_gpu_lock_invalid')
+        fcntl.flock(stream.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except Exception:
+        stream.close()
+        raise
+    return stream
+
+
+def _profile_memory_admission(torch, profile):
+    """Cold-start gate from the measured pilot; clean file cache is reclaimable."""
+    info = {line.split(':',1)[0]: int(line.split()[1])*1024
+            for line in Path('/proc/meminfo').read_text().splitlines()}
+    group = Path('/sys/fs/cgroup')
+    limit_text = (group/'memory.max').read_text().strip()
+    used = int((group/'memory.current').read_text())
+    fields = dict((key,int(value)) for key,value in
+                  (line.split() for line in (group/'memory.stat').read_text().splitlines()))
+    file_bytes = max(0,fields.get('file',0)-fields.get('shmem',0))
+    lru = max(0,fields.get('active_file',0)+fields.get('inactive_file',0))
+    exclusions = sum(max(0,fields.get(k,0)) for k in ('file_dirty','file_writeback','unevictable'))
+    reclaimable = max(0,min(file_bytes,lru)-exclusions)
+    available = info['MemAvailable']
+    if limit_text != 'max':
+        limit = int(limit_text)
+        available = min(available,limit,max(0,limit-used+reclaimable))
+    free,_ = torch.cuda.mem_get_info(0)
+    if (available < profile['runtime']['minimum_available_ram_bytes']
+            or free < profile['minimum_free_vram_bytes']):
+        raise ValueError('wangp_profile_memory_headroom_insufficient')
+
+
+def _audit_profile_runtime(session, manifest, requested, *, loaded=False):
+    """Attest actual selection and BF16 QKV layout; no config-string fallback."""
+    from ..runtime_catalog import validate_manifest, model_for
+    from ..inference.wangp_contract import canonical_json
+    profile = validate_manifest(manifest)
+    doc, runtime = manifest.document, profile['runtime']
+    module = session._ensure_runtime().module
+    if any(canonical_json(module.server_config.get(k)) != canonical_json(v) for k,v in requested.items()):
+        raise ValueError('wangp_profile_effective_config_changed')
+    if (module.transformer_quantization != requested['transformer_quantization']
+            or module.text_encoder_quantization != requested['text_encoder_quantization']
+            or module.default_profile_video != runtime['memory_profile']
+            or getattr(getattr(module,'int8_backend',None),'_backend',None) != runtime['effective_int8_backend']):
+        raise ValueError('wangp_profile_effective_backend_changed')
+    model = model_for(profile['id'],doc['mode'])['model_type']
+    definition = session.get_model_def(model)
+    if not isinstance(definition,dict) or definition.get('architecture') != model:
+        raise ValueError('wangp_profile_model_definition_changed')
+    effective = definition.copy()
+    groups = module.get_model_config_groups(model,definition)
+    for _,_,settings in module.model_config_groups.selected_model_configs(groups,runtime['task_config']):
+        effective.update(settings)
+    components = doc['components']
+    transformer = components['transformer']['files'][0]['path']
+    encoder = components['text_encoder']['files'][0]['path']
+    selected = module.get_model_filename(model,quantization=requested['transformer_quantization'],
+        dtype_policy='bf16',model_def=effective)
+    selected_encoder = module.get_model_filename(model,quantization=requested['text_encoder_quantization'],
+        dtype_policy='bf16',URLs=effective.get('text_encoder_URLs',[]))
+    if (not str(selected).endswith('/'+transformer) or not str(selected_encoder).endswith('/'+encoder)
+            or effective.get('video_vae_file') != components['video_vae']['files'][0]['path']
+            or effective.get('audio_vae_file',components['audio_vae']['files'][0]['path']) != components['audio_vae']['files'][0]['path']
+            or effective.get('qkv_splitting') is not runtime['qkv_splitting']
+            or any(effective.get(k) for k in ('pdd','vdn','auto_quantize'))):
+        raise ValueError('wangp_profile_component_selection_changed')
+    root = Path(requested['checkpoints_paths'][0]).resolve(strict=True)
+    resolved = {transformer:module.fl.get_local_model_filename(selected),
+                encoder:module.fl.get_local_model_filename(selected_encoder,extra_paths='Qwen3-VL-32B-Instruct')}
+    for component in components.values():
+        for record in component['files']:
+            name = record['path']
+            if name not in resolved:
+                resolved[name] = module.fl.locate_file(name)
+    for name,path in resolved.items():
+        if path is None or Path(path).resolve(strict=True) != _contained_file(root,Path(name)):
+            raise ValueError('wangp_profile_resolved_component_changed')
+    if loaded:
+        if (module.loaded_profile != runtime['memory_profile'] or module.loaded_config != runtime['task_config']
+                or module.transformer_type != model):
+            raise ValueError('wangp_profile_loaded_config_changed')
+        transformer_object = module.wan_model.transformer
+        attention = transformer_object.blocks[0].attn
+        split = runtime['qkv_splitting']
+        if (bool(transformer_object.split_linear_modules_map) != split
+                or all(hasattr(attention,k) for k in ('q_proj','k_proj','v_proj')) != split
+                or hasattr(attention,'qkv_proj') == split):
+            raise ValueError('wangp_profile_loaded_qkv_changed')
+        if profile['model_id'] != 'MiniMax-H3-Pruned-Rank8-INT8':
+            checkpoint = transformer_object.h3_checkpoint_info
+            if checkpoint.get('compressed_modulation') is not False or checkpoint.get('time_embed_dim') != 2688:
+                raise ValueError('wangp_profile_loaded_unpruned_mismatch')
+
+
 class _SessionHandle:
-    def __init__(self, job, output_root, audio_writer, worker_alive, quiesce):
+    def __init__(self, job, output_root, audio_writer, worker_alive, quiesce, result_audit=None):
         self.job, self.root, self.audio_writer = job, output_root, audio_writer
         self.worker_alive, self.quiesce = worker_alive, quiesce
+        self.result_audit = result_audit
         self._stop_verified = False
         self._observation = None
         self._lock = threading.Lock()
@@ -189,6 +326,8 @@ class _SessionHandle:
             if (result.total_tasks != 1 or result.successful_tasks != 1 or result.failed_tasks != 0
                     or result.errors or len(result.generated_files) != 1):
                 raise BackendError("wangp_result_shape_invalid")
+            if self.result_audit is not None:
+                self.result_audit()
             video = _contained_file(self.root, Path(result.generated_files[0]))
             if video.suffix.lower() != ".mp4" or video.stat().st_size <= 0:
                 raise BackendError("wangp_video_output_missing")
@@ -215,13 +354,19 @@ class _SessionHandle:
 
 class PinnedWanGPSession:
     def __init__(self, session, output_root, *, quiesce,
-                 audio_writer=_write_float_wav, worker_alive=_upstream_worker_alive):
+                 audio_writer=_write_float_wav, worker_alive=_upstream_worker_alive,
+                 manifest=None, before_submit=None, result_audit=None, device_lock=None):
         if not callable(quiesce) or not callable(worker_alive):
             raise ValueError("wangp_runtime_stop_probe_required")
         self.session = session
         self.output_root = Path(output_root).resolve(strict=True)
         self.audio_writer = audio_writer
         self.worker_alive, self.quiesce = worker_alive, quiesce
+        self.manifest, self.before_submit, self.result_audit = manifest, before_submit, result_audit
+        self.device_lock = device_lock
+        if manifest is not None:
+            from ..runtime_catalog import validate_manifest
+            validate_manifest(manifest)
         self._lifecycle_lock = threading.RLock()
         self._closed = False
 
@@ -234,12 +379,19 @@ class PinnedWanGPSession:
                 raise NotReady("wangp_session_busy")
             # Pristine computed defaults, not mutable GUI defaults/previous-job state.
             model = settings.get("model_type", "minimax_h3_fl2va")
-            if model not in {"minimax_h3_fl2va", "minimax_h3_ref2va"}:
+            allowed = {"minimax_h3_fl2va", "minimax_h3_ref2va"}
+            if self.manifest is not None:
+                from ..runtime_catalog import model_for
+                doc = self.manifest.document
+                allowed = {model_for(doc['deployment_profile_id'], doc['mode'])['model_type']}
+            if model not in allowed:
                 raise ValueError("wangp_session_model_unsupported")
+            if self.before_submit is not None:
+                self.before_submit()
             values = self.session.get_default_settings(model)
             values.update(copy.deepcopy(dict(settings)))
             job = self.session.submit_task(values)
-            return _SessionHandle(job, self.output_root, self.audio_writer, self.worker_alive, self.quiesce)
+            return _SessionHandle(job, self.output_root, self.audio_writer, self.worker_alive, self.quiesce, self.result_audit)
 
     def close_when_idle(self):
         """Unload only an idle runtime; never manufacture cancellation/stop proof."""
@@ -251,22 +403,41 @@ class PinnedWanGPSession:
             self.quiesce()
             self.session.close()
             self._closed = True
+            if self.device_lock is not None:
+                self.device_lock.close()
 
 
-def create_session(runtime_root, config_path, output_dir):
+def create_session(runtime_root, config_path, output_dir, *, manifest=None):
     """Call only after verify_runtime on an isolated, authorized engine process."""
     root = Path(runtime_root).resolve(strict=True)
-    _check_config(config_path)
+    profile = None
+    if manifest is not None:
+        from ..runtime_catalog import validate_manifest
+        profile = validate_manifest(manifest)
+    config = _check_config(config_path, deployment_profile_id=profile['id'] if profile else None)
     output = Path(output_dir).resolve(strict=True)
     existing = sys.modules.get("shared")
     if existing is not None and not Path(existing.__file__).resolve().is_relative_to(root):
         raise ValueError("wangp_runtime_import_collision")
     sys.path.insert(0, str(root))
+    device_lock = None
+    if profile:
+        mmgp = importlib.import_module('mmgp')
+        if not Path(mmgp.__file__).resolve().is_relative_to(root):
+            raise ValueError('wangp_runtime_import_collision')
+        torch = importlib.import_module('torch')
+        device_lock = _lock_profile_device(torch, profile)
+        _profile_memory_admission(torch, profile)
     module = importlib.import_module("shared.api")
     if not Path(module.__file__).resolve().is_relative_to(root):
         raise ValueError("wangp_runtime_import_collision")
     session = module.init(root=root, config_path=config_path, output_dir=output,
-        cli_args=["--attention", "sdpa", "--profile", "4"], console_output=False,
+        cli_args=profile['runtime']['cli_args'] if profile else ["--attention", "sdpa", "--profile", "4"], console_output=False,
         console_isatty=False, webui_state=None)
     torch = importlib.import_module("torch")
+    if profile:
+        audit = lambda loaded=False: _audit_profile_runtime(session, manifest, config, loaded=loaded)
+        audit()
+        return PinnedWanGPSession(session, output, quiesce=torch.cuda.synchronize, manifest=manifest,
+            before_submit=audit, result_audit=lambda: audit(loaded=True), device_lock=device_lock)
     return PinnedWanGPSession(session, output, quiesce=torch.cuda.synchronize)

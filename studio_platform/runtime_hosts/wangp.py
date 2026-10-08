@@ -29,6 +29,9 @@ class WanGPHost:
         if (manifest.digest != journal.manifest_digest or type(max_artifact_bytes) is not int
                 or max_artifact_bytes <= 0 or not 0 < max_transfer_seconds < float("inf")):
             raise ValueError("wangp_invalid_host_configuration")
+        if manifest.document.get('deployment_profile_id') is not None:
+            from ..runtime_catalog import validate_manifest
+            validate_manifest(manifest)
         self.session, self.journal, self.manifest = session, journal, manifest
         self.output_root = checked_directory(output_root)
         self.sealed_root = checked_directory(sealed_root, create=True)
@@ -101,6 +104,9 @@ class WanGPHost:
             if prepared.inputs and self.settings_resolver is None:
                 raise BackendError("wangp_input_resolver_required")
             try:
+                if self.manifest.document.get('deployment_profile_id') is not None:
+                    from ..inference.wangp_profile_compiler import validate_prepared
+                    validate_prepared(prepared, self.manifest)
                 settings = (self.settings_resolver(prepared) if self.settings_resolver
                             else prepared.settings)
                 settings = _object(canonical_json(settings))
