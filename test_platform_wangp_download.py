@@ -294,6 +294,76 @@ class DownloadTests(unittest.TestCase):
         stop.assert_called_once_with(child)
         child.poll.assert_not_called()  # failure is actionable before an exit acknowledgement
 
+    def test_failed_stop_preserves_initiating_failure_and_owner_receipt_without_relaunch(self):
+        value = self.receipt()
+        value.update(state="failed", code="model_download_size_mismatch")
+        child = NS(poll=Mock(return_value=None))
+        def launch(command, **kwargs):
+            fetch.write_progress(command[command.index("--progress") + 1], value)
+            return child
+        launcher = Mock(side_effect=launch)
+        stop = Mock(side_effect=ValueError("model_download_stop_unconfirmed"))
+        with self.assertRaisesRegex(fetch.DownloadFailure, "^model_download_stop_unconfirmed$") as caught:
+            self.run_child(launcher, stop=stop)
+        expected = {"error_code": "model_download_size_mismatch", "stop_status": "unconfirmed"}
+        self.assertEqual(caught.exception.diagnosis, expected)
+        failure = self.root / "download-state/failure.json"
+        saved = json.loads(failure.read_text())
+        self.assertEqual(saved, {"state": "failed", "manifest_digest": self.digest,
+            "error_code": "model_download_stop_unconfirmed", "download_failure": expected})
+        # A native peer's late progress cannot overwrite the owner's stop facts.
+        fetch.write_progress(self.root / "download-state/progress.json", self.receipt())
+        self.assertEqual(json.loads(failure.read_text()), saved)
+        with self.assertRaisesRegex(ValueError, "state_exists"):
+            self.run_child(launcher, stop=stop)
+        launcher.assert_called_once(); stop.assert_called_once_with(child)
+
+    def test_raw_failure_and_failed_stop_messages_are_never_retained(self):
+        child = NS(poll=Mock(side_effect=RuntimeError("https://signed.invalid/?token=SECRET")))
+        stop = Mock(side_effect=OSError("SECRET private process details"))
+        with self.assertRaisesRegex(fetch.DownloadFailure, "stop_unconfirmed") as caught:
+            self.run_child(Mock(return_value=child), stop=stop)
+        self.assertEqual(caught.exception.diagnosis,
+            {"error_code": "model_download_failed", "stop_status": "unconfirmed"})
+        raw = (self.root / "download-state/failure.json").read_text()
+        self.assertNotIn("SECRET", raw); self.assertNotIn("signed.invalid", raw)
+
+    def test_confirmed_stop_keeps_original_timeout_and_explicit_proof(self):
+        child = NS(poll=lambda: None)
+        clock = iter([0, 2]); stop = Mock()
+        with self.assertRaisesRegex(fetch.DownloadFailure, "^model_download_timeout$") as caught:
+            self.run_child(Mock(return_value=child), timeout=1, clock=lambda: next(clock), stop=stop)
+        self.assertEqual(caught.exception.diagnosis,
+            {"error_code": "model_download_timeout", "stop_status": "confirmed"})
+        saved = json.loads((self.root / "download-state/failure.json").read_text())
+        self.assertEqual(saved["download_failure"], caught.exception.diagnosis)
+        stop.assert_called_once_with(child)
+
+    def test_failure_receipt_write_error_cannot_prevent_stop_or_mask_original(self):
+        child = NS(poll=Mock(side_effect=ValueError("model_download_cache_limit")))
+        stop = Mock(side_effect=OSError("SECRET"))
+        with patch.object(fetch, "record_failure", side_effect=OSError("private full disk")), \
+                self.assertRaisesRegex(fetch.DownloadFailure, "stop_unconfirmed") as caught:
+            self.run_child(Mock(return_value=child), stop=stop)
+        self.assertEqual(caught.exception.diagnosis["error_code"], "model_download_cache_limit")
+        stop.assert_called_once_with(child)
+
+    def test_no_child_handle_is_not_reported_as_confirmed_stop(self):
+        stop = Mock()
+        with self.assertRaisesRegex(fetch.DownloadFailure, "^model_download_failed$") as caught:
+            self.run_child(Mock(side_effect=OSError("private launch details")), stop=stop)
+        self.assertEqual(caught.exception.diagnosis,
+            {"error_code": "model_download_failed", "stop_status": "not_observed"})
+        stop.assert_not_called()
+
+    def test_keyboard_interrupt_remains_interrupt_after_stop(self):
+        child = NS(poll=Mock(side_effect=KeyboardInterrupt)); stop = Mock()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_child(Mock(return_value=child), stop=stop)
+        self.assertEqual(json.loads((self.root / "download-state/failure.json").read_text())["download_failure"],
+            {"error_code": "model_download_failed", "stop_status": "confirmed"})
+        stop.assert_called_once_with(child)
+
     def test_cache_overflow_stops_child(self):
         child = NS(poll=lambda: None)
         def launch(*args, **kwargs):

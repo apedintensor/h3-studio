@@ -37,6 +37,26 @@ SAFE_ERRORS = frozenset({"model_download_manifest_invalid", "model_download_mani
     "model_download_failed", "model_download_timeout", "model_download_cache_limit",
     "model_download_progress_invalid", "model_download_stop_unconfirmed", "model_download_state_exists",
     "model_download_owner_unconfirmed"})
+STOP_STATUSES = frozenset({"confirmed", "unconfirmed", "not_observed"})
+
+
+def safe_download_failure(value):
+    """Diagnostic facts only; these never substitute for controller idle proof."""
+    if (not isinstance(value, dict) or not isinstance(value.get("error_code"), str)
+            or value["error_code"] not in SAFE_ERRORS or not isinstance(value.get("stop_status"), str)
+            or value["stop_status"] not in STOP_STATUSES):
+        return None
+    return {"error_code": value["error_code"], "stop_status": value["stop_status"]}
+
+
+class DownloadFailure(ValueError):
+    def __init__(self, error_code, stop_status):
+        self.diagnosis = safe_download_failure({"error_code": error_code, "stop_status": stop_status})
+        if self.diagnosis is None:
+            raise ValueError("model_download_progress_invalid")
+        # Stop uncertainty remains the outward failure. Preserve its initiating
+        # cause separately, never downgrade this to an ordinary stopped failure.
+        super().__init__("model_download_stop_unconfirmed" if stop_status == "unconfirmed" else error_code)
 
 
 def path_checked(value):
@@ -114,6 +134,18 @@ def write_progress(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def record_failure(state, expected_digest, error):
+    """The owner has a separate file; a still-running child cannot overwrite it."""
+    write_progress(state / "failure.json", {"state": "failed", "manifest_digest": expected_digest,
+        "error_code": str(error), "download_failure": error.diagnosis})
+    if os.name == "posix":
+        fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def download_environment(environment, state_root):
@@ -325,10 +357,29 @@ def run_download(python, source, manifest_path, expected_digest, model_root, sta
                 # every model. A downloader receipt never certifies model bytes.
                 return value
             sleep(.25)
-    except BaseException:
+    except BaseException as original:
+        error_code = safe_error(original)
+        # No returned Popen handle is not proof that a process never existed.
+        failure = DownloadFailure(error_code, "unconfirmed" if child is not None else "not_observed")
+        try:
+            record_failure(state, expected_digest, failure)
+        except Exception:
+            # A full/broken disk must not prevent stopping the exact child or
+            # replace either safe cause. Bootstrap can still retain the fields.
+            pass
         if child is not None:
-            stop(child)
-        raise
+            try:
+                stop(child)
+            except BaseException:
+                raise failure from None
+            failure = DownloadFailure(error_code, "confirmed")
+            try:
+                record_failure(state, expected_digest, failure)
+            except Exception:
+                pass  # An earlier unconfirmed receipt remains conservative.
+        if not isinstance(original, Exception):
+            raise  # Preserve KeyboardInterrupt/SystemExit after cleanup.
+        raise failure from None
 
 
 def main(argv=None, *, guard=child_guard):

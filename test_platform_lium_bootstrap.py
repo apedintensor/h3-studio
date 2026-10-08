@@ -304,6 +304,30 @@ class BootTests(ledger.LedgerCase):
         self.assertEqual(len(diagnosis["failure_details"]), 5)
         self.assertNotIn("SECRET", json.dumps(diagnosis))
 
+    def test_download_stop_uncertainty_and_original_cause_survive_retained_cpu_receipts(self):
+        self.host.state = "failed"
+        self.host.patch = {"phase": "setup_failed", "failure_phase": "model_download",
+            "error_code": "model_download_stop_unconfirmed", "error_type": "ValueError",
+            "download_failure": {"error_code": "model_download_timeout", "stop_status": "unconfirmed",
+                                 "sdk_log": "SECRET"}}
+        result = self.tick(self.controller())
+        self.assertEqual(result["state"], "bootstrap_failed")
+        self.assertEqual(result["error_code"], "model_download_stop_unconfirmed")
+        self.assertEqual(result["download_failure"],
+            {"error_code": "model_download_timeout", "stop_status": "unconfirmed"})
+        self.host.state = "ready"  # Later reports cannot erase the durable failure.
+        self.assertEqual(self.tick(self.controller()), result)
+        self.repo.update_instance(self.intent["id"], "draining")
+        self.repo.update_instance(self.intent["id"], "destroying")
+        self.repo.update_instance(self.intent["id"], "destroyed", destruction_confirmed=True)
+        self.assertEqual(self.controller().status(self.intent["id"]), result)
+        folder = self.config.work_dir/self.intent["id"]
+        for name in ("bootstrap-state.json", "bootstrap-status.json"):
+            raw = (folder/name).read_text()
+            self.assertNotIn("SECRET", raw)
+            self.assertIn('"stop_status": "unconfirmed"', raw)
+        self.assertEqual((self.host.starts, self.backend.submissions), (1, 0))
+
     def test_system_package_diagnostics_survive_cpu_restart_and_node_destruction(self):
         self.host.state = "failed"
         packages = {"total": 1, "truncated": False, "mismatches": [

@@ -255,10 +255,14 @@ def install(config, slot_key, token_file, *, launch=True):
             raise ValueError("runtime_import_receipt_mismatch")
         model_root = checked_path(config["model_root"])
         model_root.mkdir(parents=True, exist_ok=True)
-        from studio_platform.runtime_hosts.wangp_download import run_download
+        from studio_platform.runtime_hosts.wangp_download import DownloadFailure, run_download, safe_download_failure
         status("model_download")
-        run_download(python, source, config["manifest_path"], manifest_digest,
-                     model_root, base / "model-download", environment, status)
+        try:
+            run_download(python, source, config["manifest_path"], manifest_digest,
+                         model_root, base / "model-download", environment, status)
+        except DownloadFailure as error:
+            failure_diagnostics["download_failure"] = safe_download_failure(error.diagnosis)
+            raise ValueError(str(error)) from None
         runtime_config = checked_path(config["config_path"])
         runtime_config.parent.mkdir(parents=True, exist_ok=True)
         with runtime_config.open("x", encoding="utf-8") as target:

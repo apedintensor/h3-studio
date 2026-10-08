@@ -186,6 +186,31 @@ class PackageTests(unittest.TestCase):
         self.assertFalse(Path(value["config_path"]).exists())
         self.assertTrue((Path(value["install_root"]) / "wangp-bootstrap-started.json").exists())
 
+    def test_download_failure_and_unconfirmed_stop_reach_durable_setup_status(self):
+        from studio_platform.runtime_hosts import wangp_download
+        value, imported = self.prepared_import_fixture()
+        failure = wangp_download.DownloadFailure("model_download_disk_headroom", "unconfirmed")
+        with patch.object(bootstrap.platform, "system", return_value="Linux"), \
+                patch.object(bootstrap.platform, "python_version", return_value=env.PYTHON), \
+                patch.object(bootstrap.sys, "path", list(bootstrap.sys.path)), \
+                patch.object(bootstrap, "extract", side_effect=lambda _, directory, **kw: directory.mkdir()), \
+                patch.object(env, "system_packages", return_value=self.lock["system_packages"]), \
+                patch.object(bootstrap.subprocess, "run", return_value=SimpleNamespace(returncode=0,
+                    stdout=json.dumps(imported))) as run, \
+                patch.object(bootstrap.subprocess, "Popen") as launch, \
+                patch.object(wangp_download, "run_download", side_effect=failure) as transfer:
+            result = bootstrap.install(value, "test-slot", str(self.root / "token"))
+        self.assertEqual((result["state"], result["failure_phase"], result["code"], result["error_type"]),
+            ("failed", "model_download", "model_download_stop_unconfirmed", "ValueError"))
+        self.assertEqual(result["download_failure"], failure.diagnosis)
+        self.assertEqual(json.loads(Path(value["status_path"]).read_text()), result)
+        self.assertEqual(run.call_count, 2); transfer.assert_called_once(); launch.assert_not_called()
+        self.assertFalse(Path(value["config_path"]).exists())
+        with patch.object(wangp_download, "run_download", side_effect=AssertionError("no replay")):
+            self.assertEqual(bootstrap.install(value, "test-slot", str(self.root / "token")),
+                {"state": "reconcile_required", "code": "bootstrap_marker_exists"})
+        self.assertEqual(json.loads(Path(value["status_path"]).read_text()), result)
+
     def bootstrap_after_download(self, *, launch=True, receipt="valid", ready_incarnation="a"*32):
         from studio_platform.inference.wangp_contract import EngineManifest
         from studio_platform.runtime_hosts import wangp_download, wangp_launcher
