@@ -21,6 +21,8 @@ from studio_platform.backup import backup_postgres_engine, backup_postgres_local
 from studio_platform.queue import TaskQueue
 from studio_platform.repository import Repository, Scope, capacity_approvals, capacity_waiters, capacity_cycles, budget_accounts, scaler_actions
 from studio_platform.storage import LocalObjectStore
+from studio_platform.project_activity import activity, metadata as activity_metadata, append_activity
+from studio_platform.auth import Principal
 from test_platform_assets import png
 from test_platform_repository import LedgerCase
 
@@ -49,8 +51,12 @@ class PostgresPortableBackupTests(LedgerCase):
         self.repo.update_instance(self.intent["id"], "creating")
         self.repo.update_instance(self.intent["id"], "creation_unknown")
         Auth(self.repo.engine, tenant=self.scope.tenant_id)
+        activity_metadata.create_all(self.repo.engine)
         self.canary = "synthetic-auth-bytes-never-export-to-backup"
         with self.repo.engine.begin() as conn:
+            append_activity(conn,tenant_id=self.scope.tenant_id,principal=Principal("superdan","superdan"),
+                project_id="project-1",version=1,occurred_at=1234.5,before={},
+                after={"entities":[{"id":"shot-one"}]},actions=[{"op":"entity.update","entity_id":"shot-one"}])
             conn.execute(insert(accounts).values(tenant=self.scope.tenant_id, username="superdan", password_hash=self.canary, disabled=0, updated=1))
             conn.execute(insert(sessions).values(tenant=self.scope.tenant_id, token_hash=self.canary, username="superdan",
                 auth_mode="password", created=1, expires=9000, password_version=1))
@@ -78,6 +84,9 @@ class PostgresPortableBackupTests(LedgerCase):
                 # different connection. The backup must see none of them.
                 self.repo.put_document(self.scope, "project", "project-1", {"title": "Concurrent replacement"}, expected_version=1)
                 late.append(self.assets.upload("superdan", "project-1", io.BytesIO(png()), "late.png"))
+                with self.repo.engine.begin() as second:
+                    append_activity(second,tenant_id=self.scope.tenant_id,principal=Principal("superdan","superdan"),
+                        project_id="project-1",version=2,occurred_at=2345.5,before={},after={},event_type="project.saved")
         event.listen(self.repo.engine, "after_cursor_execute", after_query)
         target = self.root/"portable-backup"
         try:
@@ -90,6 +99,7 @@ class PostgresPortableBackupTests(LedgerCase):
         manifest = verify_local(target)
         self.assertEqual(manifest["source_database"], "postgresql")
         self.assertEqual(manifest["tables"]["platform_assets"], 1)
+        self.assertEqual(manifest["tables"]["platform_project_activity"],1)
         with closing(sqlite3.connect(target/"database.sqlite3")) as db:
             raw = db.execute("SELECT payload FROM platform_documents").fetchone()[0]
             self.assertEqual(json.loads(raw)["title"], "Snapshot original")
@@ -106,6 +116,13 @@ class PostgresPortableBackupTests(LedgerCase):
             self.assertEqual(restored.get_job(self.scope, self.job_row["id"])["status"], "recovery_hold")
             self.assertEqual(TaskQueue(restored).get_attempt(self.scope, self.job_row["id"])["upstream_task_id"], "fake-upstream-needs-review")
             with restored.engine.connect() as conn:
+                saved=list(conn.execute(select(activity)).mappings())
+                self.assertEqual(len(saved),1)
+                self.assertEqual((saved[0]["tenant_id"],saved[0]["owner_id"],saved[0]["project_id"],saved[0]["project_version"]),
+                                 (self.scope.tenant_id,"superdan","project-1",1))
+                self.assertEqual(saved[0]["operations"],["entity.update"])
+                self.assertEqual(saved[0]["target_entity_ids"],["shot-one"])
+                self.assertEqual(saved[0]["occurred_at"],1234.5)
                 self.assertEqual(conn.execute(select(capacity_approvals.c.enabled)).scalar_one(), 0)
                 self.assertEqual(conn.execute(select(capacity_waiters.c.state)).scalar_one(), "recovery_hold")
                 self.assertEqual(conn.execute(select(capacity_cycles.c.intent_id)).scalar_one(), self.intent["id"])
@@ -123,6 +140,7 @@ class PostgresPortableBackupTests(LedgerCase):
         self.assertEqual(self.repo.get_job(self.scope, self.job_row["id"])["status"], "running")
         with self.repo.engine.connect() as conn:
             self.assertEqual(conn.execute(select(capacity_approvals.c.enabled)).scalar_one(), 1)
+            self.assertEqual(list(conn.execute(select(activity.c.project_version).order_by(activity.c.project_version)).scalars()),[1,2])
 
     def test_interrupted_snapshot_or_missing_media_never_publishes_manifest(self):
         target = self.root/"failed-snapshot"

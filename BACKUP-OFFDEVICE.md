@@ -23,6 +23,11 @@ The snapshot covers published database-to-media references. Authentication,
 Agent credentials, live sessions, staging, orphan objects, and uncommitted
 writer output are excluded. Unresolved operations remain obligations; their
 unique staging bytes need separate preservation before migration/deletion.
+Project editing activity is business history and is included with its exact
+tenant/owner/project/version identity, safe actor display fields and structured
+operations/targets. Older backups without that table restore with empty history.
+Unknown tables or changed columns still require review; this does not expand
+the authentication exclusion into a general ignore-unknown rule.
 
 ## Explicit AWS destination and authority
 
