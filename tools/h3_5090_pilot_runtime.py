@@ -9,6 +9,7 @@ new task identity after diagnosing a failure. Completed artifacts are rehashed.
 from __future__ import annotations
 
 import argparse
+from fractions import Fraction
 import hashlib
 import importlib
 import importlib.metadata
@@ -27,6 +28,7 @@ REVISION = "0e58385fbde7ff102d276e4a9e490845de76b4ea"
 MODEL_REVISION = "adc81ccb71352192214d83d5fafb9487e860be39"
 RECIPE = "h3-pruned-rank8-int8-quanto-int8-vae-int8-sdpa-p4-lowram-v1"
 MODEL_TYPES = {"fl": "minimax_h3_fl2va_pruned", "ref": "minimax_h3_ref2va_pruned"}
+COLLECTION_RESERVE_SECONDS = 30
 # Public HF tree metadata at MODEL_REVISION; no weights were fetched to author this file.
 ASSETS = [
     ("MiniMax-H3-FL2VA-pruned_rank8_int8_convrot.safetensors", 21057674787, "30ff400f974b11a1ef13d216c5d9f6439a9c10322a3988b0374a39672ce286f0"),
@@ -339,6 +341,38 @@ def resource_admission(torch, enforce=True):
     return data
 
 
+def check_output_duration(value, task, label):
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("output_duration_invalid:" + label) from None
+    # One video frame, plus one millisecond of container timestamp rounding.
+    if not math.isfinite(duration) or abs(duration - task["frames"] / 24) > 1 / 24 + 0.001:
+        raise ValueError("output_duration_mismatch:" + label)
+
+
+def validate_output_probe(probe, task):
+    vstreams = [s for s in probe["streams"] if s["codec_type"] == "video"]
+    astreams = [s for s in probe["streams"] if s["codec_type"] == "audio"]
+    width, height = map(int, task["resolution"].split("x"))
+    if (len(vstreams) != 1 or len(astreams) != 1 or vstreams[0]["width"] != width
+            or vstreams[0]["height"] != height or int(vstreams[0].get("nb_frames", 0)) != task["frames"]):
+        raise ValueError("output_media_shape_mismatch")
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            fps = Fraction(vstreams[0].get(key, "0/1"))
+        except (TypeError, ValueError, ZeroDivisionError):
+            raise ValueError("output_frame_rate_invalid:" + key) from None
+        if fps != 24:
+            raise ValueError("output_frame_rate_mismatch:" + key)
+    audio = astreams[0]
+    if int(audio.get("sample_rate", 0)) != 32000 or audio.get("channels") != 2:
+        raise ValueError("output_audio_must_be_32k_stereo")
+    check_output_duration(vstreams[0].get("duration"), task, "video")
+    check_output_duration(audio.get("duration"), task, "audio")
+    check_output_duration(probe.get("format", {}).get("duration"), task, "container")
+
+
 def output_records(result, output_dir, task):
     if (not result.success or result.cancelled or result.errors or result.total_tasks != 1
             or result.successful_tasks != 1 or result.failed_tasks != 0 or len(result.generated_files) != 1):
@@ -355,16 +389,16 @@ def output_records(result, output_dir, task):
     audio = np.asarray(matches[0].audio_tensor, dtype=np.float32)
     if audio.ndim != 2 or audio.shape[1] != 2 or not audio.shape[0] or not np.isfinite(audio).all():
         raise ValueError("invalid_generated_audio")
+    check_output_duration(audio.shape[0] / 32000, task, "independent_audio_samples")
     wav = video.with_name(video.stem + "-generated.wav")
     soundfile.write(str(wav), audio, 32000, format="WAV", subtype="FLOAT")
+    wav_info = soundfile.info(str(wav))
+    if wav_info.samplerate != 32000 or wav_info.channels != 2 or wav_info.frames != audio.shape[0]:
+        raise ValueError("independent_WAV_shape_mismatch")
+    check_output_duration(wav_info.duration, task, "independent_WAV")
     probe = json.loads(command(["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(video)]))
-    vstreams = [s for s in probe["streams"] if s["codec_type"] == "video"]
-    astreams = [s for s in probe["streams"] if s["codec_type"] == "audio"]
-    width, height = map(int, task["resolution"].split("x"))
-    if (len(vstreams) != 1 or not astreams or vstreams[0]["width"] != width
-            or vstreams[0]["height"] != height or int(vstreams[0].get("nb_frames", 0)) != task["frames"]):
-        raise ValueError("output_media_shape_mismatch")
-    command(["ffmpeg", "-v", "error", "-i", str(video), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
+    validate_output_probe(probe, task)
+    command(["ffmpeg", "-v", "error", "-xerror", "-i", str(video), "-map", "0:v:0", "-map", "0:a:0", "-f", "null", "-"])
     records = []
     for kind, path in (("video", video), ("audio", wav)):
         with path.open("r+b") as stream:
@@ -401,6 +435,20 @@ class PhaseRecorder:
             return {"phase": self.last_phase, "current_step": self.step, "phase_transitions": list(self.phases)}
 
 
+def defer_for_deadline(task, run_root, deadline):
+    now = time.time()
+    required = task.get("timeout_seconds", 900) + COLLECTION_RESERVE_SECONDS
+    if deadline - now >= required:
+        return None
+    state = {"state": "deferred_unstarted", "reason": "insufficient_deadline_window",
+             "task_id": task["id"], "task_digest": task_digest(task), "observed_epoch": now,
+             "deadline_epoch": deadline, "remaining_seconds": deadline - now,
+             "required_seconds": required, "collection_reserve_seconds": COLLECTION_RESERVE_SECONDS}
+    # A deferral is not a submission receipt; this task remains safe to start later.
+    write_json(run_root / "deferrals" / (task["id"] + ".json"), state)
+    return state
+
+
 def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=output_records):
     previous_mode = None
     for task in tasks:
@@ -408,8 +456,9 @@ def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=out
         receipt = run_root / "receipts" / (task["id"] + ".json")
         if completed_or_refuse(receipt, identity):
             continue
-        if time.time() >= deadline:
-            raise ValueError("authorization_deadline_elapsed")
+        deferred = defer_for_deadline(task, run_root, deadline)
+        if deferred:
+            return deferred
         for item in task.get("inputs", {}).values():
             if sha256(item["path"]) != item["sha256"]:
                 raise ValueError("input_hash_mismatch")
@@ -423,6 +472,9 @@ def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=out
         state = {"task_digest": identity, "recipe": RECIPE, "task_id": task["id"],
                  "mode": task["mode"], "steps": task["steps"], "state": "dispatch_intent",
                  "started_epoch": time.time(), "memory_before": memory_snapshot(torch)}
+        deferred = defer_for_deadline(task, run_root, deadline)
+        if deferred:
+            return deferred
         write_json(receipt, state)  # Durable BEFORE calling the upstream submission.
         started = time.monotonic()
         phases = PhaseRecorder()
@@ -431,7 +483,7 @@ def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=out
             job = session.submit_task(settings, callbacks=phases)
             state["state"] = "running"
             write_json(receipt, state)
-            limit = min(deadline, time.time() + task.get("timeout_seconds", 900))
+            limit = min(deadline - COLLECTION_RESERVE_SECONDS, time.time() + task.get("timeout_seconds", 900))
             while not job.done:
                 write_json(run_root / "progress.json", {"task_id": task["id"], "state": "running",
                     "elapsed_seconds": time.monotonic() - started, "memory": memory_snapshot(torch), **phases.snapshot()})
@@ -462,6 +514,7 @@ def run_tasks(session, tasks, run_root, output_dir, torch, deadline, collect=out
                          memory_after=memory_snapshot(torch))
             write_json(receipt, state)
             raise
+    return {"state": "complete", "tasks": len(tasks)}
 
 
 def run(args):
@@ -536,9 +589,9 @@ def run(args):
             "config": config, "verification_seconds": verified-started,
             "runtime_initialization_seconds": time.monotonic()-verified,
             "note": "Runtime import readiness is not inference success."})
-        run_tasks(session, tasks, run_root, output, torch, args.deadline_epoch)
+        outcome = run_tasks(session, tasks, run_root, output, torch, args.deadline_epoch)
         session.close()
-        print(canonical({"state": "complete", "tasks": len(tasks), "total_seconds": time.monotonic()-started}))
+        print(canonical({**outcome, "total_seconds": time.monotonic()-started}))
 
 
 def main():
