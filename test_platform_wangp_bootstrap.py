@@ -230,7 +230,10 @@ class SystemDiagnosisTests(unittest.TestCase):
         def query(script, **kwargs):
             return inventory if 'dpkg-query' in script else {'ok': True}
         self.host.run = Mock(side_effect=query)
-        remote = SimpleNamespace(open=lambda name, mode: io.BytesIO(files[Path(name).name]))
+        class SourceHandle(io.BytesIO):
+            def chmod(self, mode):
+                self.permissions = mode
+        remote = SimpleNamespace(open=lambda name, mode: SourceHandle(files[Path(name).name]))
         self.host.client = SimpleNamespace(open_sftp=lambda: contextlib.nullcontext(remote))
         record_path = self.host.config.work_dir/'os-observations'/(POD+'.json')
         saved = []

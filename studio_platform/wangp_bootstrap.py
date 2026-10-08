@@ -189,8 +189,13 @@ class WanGPSSHHost(SSHHost):
                     with sftp.open(target, 'rb') as f:
                         if f.read(len(data)+1) != data:
                             raise BootError('bootstrap_existing_source_mismatch')
+                        # A provider's umask may leave uploaded configuration
+                        # group-writable. Tighten the already verified handle,
+                        # never weaken the runtime's strict document reader.
+                        f.chmod(0o600)
                 except FileNotFoundError:
                     with sftp.open(target, 'wx') as f:
+                        f.chmod(0o600)
                         f.write(data)
         dependency = dependency_source(self.config, json.loads(files['wangp-runtime.json']))
         if dependency is not None:
