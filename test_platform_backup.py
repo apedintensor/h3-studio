@@ -13,7 +13,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from sqlalchemy import insert
+from sqlalchemy import insert, select
 
 from studio_platform.backup import backup_local, verify_local, restore_local, dump_postgres, BackupError
 from studio_platform.assets import AssetService, AssetNotFound
@@ -162,6 +162,63 @@ class BackupTests(unittest.TestCase):
             db.execute("CREATE TABLE unreviewed_secrets(value TEXT)")
             db.execute("INSERT INTO unreviewed_secrets VALUES (?)", (self.canary,))
         with self.assertRaises(BackupError):
+            self.backup()
+        self.assertFalse((self.root/"backup").exists())
+
+    def test_application_activity_schema_and_history_survive_isolated_restore(self):
+        from studio_platform.api import create_app
+        from studio_platform.settings import Settings
+        from studio_platform.auth import Principal
+        from studio_platform.project_activity import activity, append_activity
+        # Exercise the actual API schema constructors, not only Repository's
+        # narrower table set that previously concealed this production omission.
+        create_app(Settings(data_dir=self.live),repository=self.repo,storage=self.store)
+        with self.repo.engine.begin() as conn:
+            for tenant,owner in (("sixnine","superdan"),("sixnine","supervan"),("other-tenant","superdan")):
+                append_activity(conn,tenant_id=tenant,principal=Principal(owner,owner),
+                    project_id="my-project",version=2,occurred_at=1234.5,
+                    before={"entities":[]},after={"entities":[{"id":"shot-one","title":"private scene"}]},
+                    actions=[{"op":"entity.update","entity_id":"shot-one","patch":{"prompt":"not audit content"}}])
+            expected=[dict(row) for row in conn.execute(select(activity).order_by(activity.c.tenant_id,activity.c.owner_id)).mappings()]
+        source=self.backup()
+        self.assertEqual(verify_local(source)["tables"]["platform_project_activity"],3)
+        destination=self.root/"activity-recovery"
+        restored_result=restore_local(source,destination)
+        restored=Repository("sqlite:///"+(destination/"platform.sqlite3").as_posix())
+        self.addCleanup(restored.close)
+        with restored.engine.connect() as conn:
+            actual=[dict(row) for row in conn.execute(select(activity).order_by(activity.c.tenant_id,activity.c.owner_id)).mappings()]
+            mine=list(conn.execute(select(activity).where(activity.c.tenant_id=="sixnine",activity.c.owner_id=="superdan")).mappings())
+        self.assertEqual(actual,expected)
+        self.assertEqual(len(mine),1)
+        self.assertEqual(mine[0]["operations"],["entity.update"])
+        self.assertEqual(mine[0]["target_entity_ids"],["shot-one"])
+        self.assertNotIn("not audit content",json.dumps(actual))
+        self.assertNotIn(self.canary.encode(),(source/"database.sqlite3").read_bytes())
+        self.assertFalse(restored_result["execution_enabled"])
+        self.assertEqual(restored.get_job(self.scope,self.job["id"])["status"],"recovery_hold")
+
+    def test_older_backup_without_activity_restores_empty_history_without_source_change(self):
+        source=self.backup()
+        with closing(sqlite3.connect(source/"database.sqlite3")) as db,db:
+            db.execute("DROP TABLE platform_project_activity")
+        manifest=json.loads((source/"manifest.json").read_text())
+        manifest["tables"].pop("platform_project_activity")
+        manifest["database_sha256"]=hashlib.sha256((source/"database.sqlite3").read_bytes()).hexdigest()
+        (source/"manifest.json").write_text(json.dumps(manifest))
+        original=(source/"database.sqlite3").read_bytes()
+        destination=self.root/"older-activity-recovery"
+        restore_local(source,destination)
+        with closing(sqlite3.connect(destination/"platform.sqlite3")) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM platform_project_activity").fetchone()[0],0)
+        self.assertEqual((source/"database.sqlite3").read_bytes(),original)
+
+    def test_activity_column_drift_still_refuses_without_publishing_backup(self):
+        from studio_platform.project_activity import metadata
+        metadata.create_all(self.repo.engine)
+        with self.repo.engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE platform_project_activity ADD COLUMN unreviewed_private TEXT")
+        with self.assertRaisesRegex(BackupError,"backup_database_version_mismatch"):
             self.backup()
         self.assertFalse((self.root/"backup").exists())
 
