@@ -332,25 +332,35 @@ def memory_snapshot(torch=None):
     return values
 
 
+def cgroup_ram_headroom(host_available, limit, usage, fields):
+    # File includes tmpfs/shmem; neither that nor dirty/writeback/pinned pages is
+    # immediately reclaimable model cache. The LRU bound includes active clean files.
+    file_bytes = max(0, fields.get("file", 0) - fields.get("shmem", 0))
+    lru_file = max(0, fields.get("active_file", 0) + fields.get("inactive_file", 0))
+    exclusions = sum(max(0, fields.get(key, 0)) for key in ("file_dirty", "file_writeback", "unevictable"))
+    reclaimable = max(0, min(file_bytes, lru_file) - exclusions)
+    available = host_available
+    if isinstance(limit, int) and isinstance(usage, int):
+        available = min(host_available, limit, max(0, limit - usage + reclaimable))
+    return available, reclaimable
+
+
 def resource_admission(torch, enforce=True):
     info = {}
     for line in Path("/proc/meminfo").read_text().splitlines():
         key, value, *_ = line.split()
         info[key.rstrip(":")] = int(value) * 1024
-    available = info["MemAvailable"]
     snapshot = memory_snapshot(torch)
     limit = snapshot.get("cgroup_memory.max")
     usage = snapshot.get("cgroup_memory.current")
     stat = Path("/sys/fs/cgroup/memory.stat")
-    inactive_file = 0
+    fields = {}
     if stat.exists():
-        fields = dict(line.split() for line in stat.read_text().splitlines())
-        inactive_file = int(fields.get("inactive_file", 0))
-    if isinstance(limit, int) and isinstance(usage, int):
-        # Inactive file cache is reclaimable; it must not count like anonymous RAM.
-        available = min(available, max(0, limit-usage+inactive_file))
+        fields = {key: int(value) for key, value in (line.split() for line in stat.read_text().splitlines())}
+    available, reclaimable = cgroup_ram_headroom(info["MemAvailable"], limit, usage, fields)
     free_gpu, total_gpu = torch.cuda.mem_get_info(0)
     data = {"effective_available_ram_bytes": available, "host_mem_available_bytes": info["MemAvailable"],
+            "cgroup_reclaimable_clean_file_bytes": reclaimable, "cgroup_memory_stat": fields,
             "gpu_free_bytes": free_gpu, "gpu_total_bytes": total_gpu, "memory": snapshot,
             "required_available_ram_gib": 96, "required_free_gpu_gib": 28}
     if enforce and (available < 96 * 1024**3 or free_gpu < 28 * 1024**3):

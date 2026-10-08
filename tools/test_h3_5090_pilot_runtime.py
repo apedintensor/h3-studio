@@ -224,6 +224,25 @@ class PilotTests(unittest.TestCase):
                 pilot.prepare_runtime_config(path, requested)
             self.assertEqual(json.loads(path.read_text()), change)
 
+    def test_active_clean_file_cache_is_reclaimable_and_availability_is_bounded(self):
+        fields = {"anon": 3567616, "file": 67471482880, "shmem": 0,
+                  "file_dirty": 4096, "file_writeback": 0, "file_mapped": 2170880,
+                  "inactive_file": 39544774656, "active_file": 27926704128, "unevictable": 0}
+        available, reclaimable = pilot.cgroup_ram_headroom(113770000000, 112742891520, 67767894016, fields)
+        self.assertEqual(reclaimable, min(fields["file"], fields["active_file"] + fields["inactive_file"]) - 4096)
+        self.assertGreaterEqual(available, 96 * 1024**3)
+        self.assertLessEqual(available, 112742891520)
+        self.assertEqual(pilot.cgroup_ram_headroom(80, 100, 0, fields)[0], 80)
+        self.assertEqual(pilot.cgroup_ram_headroom(200, 100, 0, fields)[0], 100)
+
+    def test_headroom_does_not_credit_anon_shmem_dirty_writeback_or_pinned_pages(self):
+        fields = {"anon": 1000, "file": 80, "shmem": 20, "active_file": 40,
+                  "inactive_file": 40, "file_dirty": 10, "file_writeback": 5, "unevictable": 7}
+        self.assertEqual(pilot.cgroup_ram_headroom(200, 100, 90, fields), (48, 38))
+        self.assertEqual(pilot.cgroup_ram_headroom(200, 100, 90, {"anon": 90}), (10, 0))
+        self.assertEqual(pilot.cgroup_ram_headroom(200, 100, 90,
+            {**fields, "file_dirty": 100}), (10, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
