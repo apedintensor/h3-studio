@@ -252,6 +252,11 @@ class OperatorController:
                     if all(n["runtime_state"]=="ready" for n in owned): self._record_command(command["id"],"completed")
                     elif all(intents[n["intent_id"]]["state"]=="destroyed" for n in owned):
                         self._record_command(command["id"],"blocked","operator_nodes_stopped_before_ready")
+                    elif any(intents[n["intent_id"]]["state"]=="destroyed" for n in owned):
+                        # An authoritative failed/removed allocation is final.
+                        # Keep the surviving identities; never replace it merely
+                        # to make the requested node count appear complete.
+                        self._record_command(command["id"],"partial","operator_partial_capacity")
                     elif any(n["runtime_state"] in {"failed","blocked"} for n in owned):
                         self._record_command(command["id"],"blocked","operator_bootstrap_failed")
                     else: self._record_command(command["id"],"waiting","operator_preparing")
@@ -298,7 +303,12 @@ class OperatorController:
                     connection.execute(update(operator_nodes).where(operator_nodes.c.intent_id==node["intent_id"]).values(
                         runtime_state="observation_failed",updated_at=self.repo.clock()))
         self._summarize_commands()
-        return {"state":"degraded" if errors else "running","commands":len(commands),"nodes":len(nodes),"errors":errors}
+        status="degraded" if errors else "running"
+        with self.repo.transaction() as connection:
+            # A competing controller's newer heartbeat is not ours to overwrite.
+            connection.execute(update(operator_heartbeats).where(operator_heartbeats.c.id=="global",
+                operator_heartbeats.c.controller_id==self.leader_id).values(observed_at=self.repo.clock(),state=status))
+        return {"state":status,"commands":len(commands),"nodes":len(nodes),"errors":errors}
 
 
 def main(argv=None):

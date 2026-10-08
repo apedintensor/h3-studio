@@ -453,3 +453,36 @@ class OperatorTests(LedgerCase):
         self.assertEqual(self.provider.creates,[])
         self.assertEqual(self.repo.list_instance_intents()[0]["state"],"destroyed")
         self.assertEqual(self.repo.get_budget("owner-budget")["reserved_microusd"],0)
+
+    def test_mixed_failed_and_ready_allocations_are_partial_without_replacement(self):
+        original=self.provider.create
+        def one_failure(tag,launch,*,hard_deadline):
+            if not self.provider.creates:
+                self.provider.creates.append((tag,launch,hard_deadline))
+                return ProviderFact("not_created",actual_cost_microusd=0,absence_confirmed=True)
+            return original(tag,launch,hard_deadline=hard_deadline)
+        self.provider.create=one_failure
+        operation=self.create(chosen={**self.chosen,"node_count":2})
+        self.controller.tick()
+        state=self.service.state(self.actor)
+        result=next(op for op in state["operations"] if op["id"]==operation["id"])
+        self.assertEqual(result["state"],"partial")
+        self.assertEqual(result["reason_code"],"operator_partial_capacity")
+        self.assertEqual(len(result["node_ids"]),2)
+        self.assertEqual(state["summary"]["slots_ready"],1)
+        self.controller.tick()
+        self.assertEqual(len(self.provider.creates),2)
+        self.assertEqual(len(self.repo.list_instance_intents()),2)
+        self.assertEqual(self.repo.get_budget("owner-budget")["reserved_microusd"],1_000_000)
+
+    def test_controller_observation_failure_persists_degraded_heartbeat(self):
+        self.create()
+        self.controller.tick()
+        with patch.object(self.controller,"_observe",side_effect=RuntimeError("private-url-must-not-leak")):
+            outcome=self.controller.tick()
+        self.assertEqual(outcome["state"],"degraded")
+        state=self.service.state(self.actor)
+        self.assertEqual(state["controller"]["state"],"degraded")
+        self.assertFalse(state["controller"]["stale"])
+        self.assertEqual(state["nodes"][0]["runtime_state"],"observation_failed")
+        self.assertNotIn("private-url",json.dumps(state))
