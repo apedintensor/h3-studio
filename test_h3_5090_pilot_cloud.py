@@ -1,5 +1,6 @@
 """Finite pilot guard tests. Fake credentials, HTTP and provider time only."""
 import base64
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 import json
@@ -10,7 +11,7 @@ import unittest
 
 import httpx
 from tools.h3_5090_pilot_cloud import (
-    ExactPilotProvider, Pilot, PilotError, number, qualify, public_rows,
+    ExactPilotProvider, Pilot, PilotError, POLICY_5090, POLICY_PRO6000, number, qualify, public_rows,
 )
 
 EXECUTOR = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -45,6 +46,8 @@ class PilotTests(unittest.TestCase):
         self.delete_timeout = False
         self.reset_ttl = False
         self.auth_gpu = "NVIDIA GeForce RTX 5090"
+        self.auth_capacity = 32607
+        self.expected_gpu_count = 1
         self.auth_price = "0.75"
         self.folder = Path(self.temp.name).resolve() / "pilot"
         self.pilot = Pilot(self.folder, fetch=self.feed, factory=self.factory, clock=lambda: self.now)
@@ -70,9 +73,10 @@ class PilotTests(unittest.TestCase):
             if route == "pods":
                 return httpx.Response(200, json=[] if self.removed else self.pods)
             if route == "executors":
-                return httpx.Response(200, json=[{"id": n["id"], "gpu_count": 1,
-                    "available_gpu_count": 1, "price_per_gpu": self.auth_price,
-                    "specs": {"gpu": {"details": [{"name": self.auth_gpu, "capacity": 32607}]}}}
+                return httpx.Response(200, json=[{"id": n["id"], "gpu_count": n["gpu_count"],
+                    "available_gpu_count": n["available_gpu_count"], "price_per_gpu": self.auth_price,
+                    "specs": {"gpu": {"details": [{"name": self.auth_gpu, "capacity": self.auth_capacity}
+                                                   for _ in range(n["gpu_count"])]}}}
                     for n in self.nodes])
             if route == "templates":
                 return httpx.Response(200, json=[{"id": TEMPLATE, "name": "offline-template"}])
@@ -91,7 +95,7 @@ class PilotTests(unittest.TestCase):
             marker = json.loads((self.folder / "rent-journal" / (record["tag"] + ".json")).read_text())
             self.assertEqual(marker["phase"], "post_started")
             self.assertEqual(body["termination_hours"], 2)
-            self.assertEqual(body["gpu_count"], 1)
+            self.assertEqual(body["gpu_count"], self.expected_gpu_count)
             self.pods = [{"id": POD, "name": body["pod_name"], "status": "PENDING",
                 "created_at": stamp(self.now), "removal_scheduled_at": stamp(self.now+7300),
                 "termination_hours": 2, "executor": {"id": EXECUTOR, "executor_ip_address": "8.8.8.8"},
@@ -291,6 +295,134 @@ class PilotTests(unittest.TestCase):
             public_rows({"generated_at": stamp(1), "nodes": []}, 1000)
         self.assertEqual(self.pilot.inventory()["candidates"][0]["rejections"], [])
         self.assertEqual(self.calls, [])
+
+
+class Pro6000PolicyTests(unittest.TestCase):
+    tearDown = PilotTests.tearDown
+    feed = PilotTests.feed
+    factory = PilotTests.factory
+    http = PilotTests.http
+    rent = PilotTests.rent
+    count = PilotTests.count
+
+    def setUp(self):
+        PilotTests.setUp(self)
+        self.nodes = [node(gpu_model="RTX PRO 6000 Blackwell Server Edition", gpu_count=2,
+            available_gpu_count=2, min_rentable_gpu_count=2, gpu_memory_gb=96,
+            ram_gb=283, disk_free_gb=1269, network_download_mbps=2300, price_per_gpu_hour=1.19)]
+        self.auth_gpu = "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+        self.auth_capacity = 97887
+        self.auth_price = 1.19
+        self.expected_gpu_count = 2
+        self.pilot = self.restart()
+
+    def restart(self, policy="pro6000-comparison"):
+        return Pilot(self.folder, policy=policy, fetch=self.feed, factory=self.factory, clock=lambda: self.now)
+
+    def test_dual_card_manifest_reserves_eight_dollars_and_original_two_hour_ttl(self):
+        result = self.rent()
+        self.assertEqual(result["gpu_count"], 2)
+        self.assertEqual(result["reservation_microusd"], 8_000_000)
+        self.assertEqual(result["deadline"], 8200)
+        self.assertTrue(result["ttl_verified"])
+        state = self.pilot.read()
+        self.assertEqual(state["policy"], POLICY_PRO6000.snapshot())
+        provider = self.pilot.provider(state["records"][0], PUBLIC_KEY)
+        try:
+            manifest = next(iter(provider._manifests.values()))
+            self.assertEqual(manifest.max_price_per_gpu_hour_microusd, 2_000_000)
+            self.assertEqual((manifest.gpu_count, manifest.execution_slots, manifest.termination_hours), (2, 2, 2))
+            self.assertEqual(manifest.max_price_per_gpu_hour_microusd * manifest.gpu_count
+                             * manifest.termination_hours, result["reservation_microusd"])
+            with self.assertRaisesRegex(PilotError, "manifest_policy_mismatch"):
+                provider._select_offer(replace(manifest, gpu_count=1, execution_slots=1))
+        finally:
+            provider.close()
+        self.assertTrue(self.restart().rent(EXECUTOR, TEMPLATE, PUBLIC_KEY)["replay_refused"])
+        with self.assertRaisesRegex(PilotError, "rental_count_limit"):
+            self.restart().rent(SECOND, TEMPLATE, PUBLIC_KEY)
+        self.assertEqual(self.count("POST", "/rent"), 1)
+
+    def test_pro_filters_exact_model_topology_capacity_units_and_per_card_price(self):
+        good = self.nodes[0]
+        self.assertEqual(qualify(good, POLICY_PRO6000), [])
+        for name in POLICY_PRO6000.gpu_names:
+            self.assertEqual(qualify({**good, "gpu_model": name}, POLICY_PRO6000), [])
+        for changes in ({"gpu_model": "RTX 6000 Ada"}, {"gpu_model": "RTX PRO 6000 Blackwell"},
+                        {"gpu_count": 1}, {"gpu_count": 4}, {"min_rentable_gpu_count": 1},
+                        {"available_gpu_count": 1}, {"gpu_memory_gb": 80}, {"ram_gb": 256},
+                        {"disk_free_gb": 350}, {"cpu_count": 11}, {"network_download_mbps": 499},
+                        {"price_per_gpu_hour": "2.000001"}):
+            with self.subTest(changes=changes):
+                self.assertTrue(qualify({**good, **changes}, POLICY_PRO6000))
+        self.assertEqual(qualify({**good, "price_per_gpu_hour": 2}, POLICY_PRO6000), [])
+        self.assertTrue(qualify(good, POLICY_5090))
+        self.assertEqual(self.pilot.inventory()["candidates"][0]["rejections"], [])
+        self.assertEqual(self.calls, [])
+
+    def test_authenticated_card_identity_capacity_and_price_fail_before_rent(self):
+        for gpu, capacity, price in (("NVIDIA RTX 6000 Ada Generation", 97887, 1.19),
+                                    (self.auth_gpu, 81920, 1.19), (self.auth_gpu, 97887, 2.01)):
+            self.auth_gpu, self.auth_capacity, self.auth_price = gpu, capacity, price
+            with self.subTest(gpu=gpu, capacity=capacity, price=price), self.assertRaises(PilotError):
+                self.rent()
+        self.assertEqual(self.count("POST", "/rent"), 0)
+        self.assertFalse((self.folder / "pilot.json").exists())
+
+    def test_policy_is_bound_to_directory_and_snapshot_cannot_change(self):
+        self.rent()
+        before = len(self.calls)
+        with self.assertRaisesRegex(PilotError, "policy_mismatch"):
+            self.restart("5090").rent(SECOND, TEMPLATE, PUBLIC_KEY)
+        state = self.pilot.read()
+        state["policy"]["budget_microusd"] += 1
+        with self.assertRaisesRegex(PilotError, "policy_mismatch"):
+            self.pilot.save(state)
+        state = self.pilot.read()
+        self.assertEqual(state["policy"], POLICY_PRO6000.snapshot())
+        with self.assertRaisesRegex(PilotError, "policy_mismatch"):
+            self.restart("5090").save({"version": 2, "purpose": POLICY_5090.purpose,
+                                      "policy": POLICY_5090.snapshot(), "records": []})
+        self.assertEqual(len(self.calls), before)
+        self.assertEqual(len(self.pilot.read()["records"]), 1)
+
+    def test_legacy_5090_journal_remains_readable_but_cannot_be_reused_for_pro(self):
+        legacy = {"version": 1, "purpose": POLICY_5090.purpose, "records": []}
+        original = self.restart("5090")
+        original.save(legacy)
+        self.assertEqual(original.read(), legacy)
+        with self.assertRaisesRegex(PilotError, "policy_mismatch"):
+            self.pilot.rent(EXECUTOR, TEMPLATE, PUBLIC_KEY)
+        self.assertEqual(self.calls, [])
+
+    def test_pro_ttl_drift_requires_explicit_shortening_without_renewal_or_new_rent(self):
+        result = self.rent()
+        self.now += 60
+        self.pods[0].update(status="RUNNING", removal_scheduled_at=stamp(self.now + 7200))
+        before = len(self.calls)
+        record = self.restart().reconcile(result["tag"])["records"][0]
+        self.assertFalse(record["ttl_verified"])
+        self.assertEqual(record["deadline"], result["deadline"])
+        self.assertTrue(all(method == "GET" for method, _, _ in self.calls[before:]))
+        fixed = self.restart().ensure_ttl(result["tag"])
+        self.assertTrue(fixed["ttl_verified"])
+        self.assertEqual(fixed["deadline"], result["deadline"])
+        self.assertLessEqual(self.pilot.read()["records"][0]["verified_removal_at"], result["deadline"])
+        self.assertEqual(self.count("POST", "/rent"), 1)
+
+    def test_unknown_dual_card_post_keeps_full_reservation_and_cannot_replay(self):
+        self.rent_timeout = True
+        result = self.rent()
+        self.assertIsNone(result["actual_cost_microusd"])
+        self.assertEqual(result["reservation_microusd"], 8_000_000)
+        self.assertFalse(result["ttl_verified"])
+        before = len(self.calls)
+        self.assertTrue(self.restart().rent(EXECUTOR, TEMPLATE, PUBLIC_KEY)["replay_refused"])
+        with self.assertRaisesRegex(PilotError, "rental_count_limit"):
+            self.restart().rent(SECOND, TEMPLATE, PUBLIC_KEY)
+        self.assertEqual(len(self.calls), before)
+        self.assertEqual(self.count("POST", "/rent"), 1)
+        self.assertEqual(len(self.pilot.read()["records"]), 1)
 
 
 if __name__ == "__main__":

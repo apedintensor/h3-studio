@@ -1,4 +1,4 @@
-"""Bounded, operator-only cloud helper for ONE standalone 5090 qualification.
+"""Bounded, operator-only cloud helper for a named standalone GPU qualification.
 
 This private experiment journal is subordinate evidence, not the production
 capacity/job ledger. Use one shared --run-dir for the entire approved pilot;
@@ -12,6 +12,7 @@ Provider TTL is independent of this local process; no local watchdog is claimed.
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import ipaddress
@@ -38,8 +39,58 @@ MAX_BYTES = 4 * 1024 * 1024
 GPU_NAMES = {"RTX 5090", "NVIDIA GeForce RTX 5090", "NVIDIA RTX 5090"}
 
 
+@dataclass(frozen=True)
+class PilotPolicy:
+    name: str
+    purpose: str
+    pool_id: str
+    capability: str
+    gpu_names: tuple[str, ...]
+    price_cap_microusd: int
+    budget_microusd: int
+    max_records: int
+    host_gpu_count: int
+    rental_gpu_count: int
+    min_ram_gib: int
+    preferred_ram_gib: int
+    min_disk_gib: int
+    min_public_vram_gb: int
+    min_authenticated_vram_mib: int
+    termination_hours: int = 2
+
+    @property
+    def reservation_microusd(self):
+        return self.price_cap_microusd * self.rental_gpu_count * self.termination_hours
+
+    def snapshot(self):
+        result = asdict(self)
+        result["gpu_names"] = list(self.gpu_names)
+        return result
+
+
+POLICY_5090 = PilotPolicy(
+    "5090", "standalone-5090-qualification-not-production", "h3-5090-pilot", "h3-pruned-int8",
+    tuple(sorted(GPU_NAMES)), PRICE_CAP, BUDGET, MAX_RECORDS, 1, 1, 96, 96, 250, 31, 31_000)
+PRO6000_NAMES = tuple(sorted(
+    prefix + "RTX PRO 6000 Blackwell " + edition + " Edition"
+    for prefix in ("", "NVIDIA ") for edition in ("Server", "Workstation")))
+# Named policies are fixed envelopes, not spending authorization. The root
+# operator must select the approved topology; a multi-card host is one node.
+POLICY_PRO6000 = PilotPolicy(
+    "pro6000-comparison", "standalone-pro6000-dual-card-comparison-not-production",
+    "h3-pro6000-comparison", "h3-unpruned-comparison", PRO6000_NAMES,
+    2_000_000, 8_000_000, 1, 2, 2, 256, 256, 350, 95, 95_000)
+POLICIES = {policy.name: policy for policy in (POLICY_5090, POLICY_PRO6000)}
+
+
 class PilotError(LiumError):
     """Only static codes are returned to the terminal."""
+
+
+def policy_named(name):
+    if not isinstance(name, str) or name not in POLICIES:
+        raise PilotError("unknown_pilot_policy")
+    return POLICIES[name]
 
 
 def identity(value):
@@ -103,32 +154,35 @@ def node_id(row):
     return identity(values[0])
 
 
-def qualify(row):
-    """Conservative decimal-GB conversion; single-GPU hosts only for this pilot.
+def qualify(row, policy=POLICY_5090):
+    """Conservative decimal-GB conversion and exact approved host topology.
 
     This is advertised capacity, NOT a cgroup allocation or runtime proof. Check
     actual RAM/cgroup, CPUs and the cache mount before downloading any weights.
     """
     reasons = []
     checks = (
-        (row.get("gpu_model") in GPU_NAMES, "not_rtx_5090"),
-        (type(row.get("gpu_count")) is int and row["gpu_count"] == 1, "not_single_gpu_host"),
-        (type(row.get("available_gpu_count")) is int and row["available_gpu_count"] >= 1, "no_free_gpu"),
-        (type(row.get("min_rentable_gpu_count")) is int and row["min_rentable_gpu_count"] == 1, "rental_granularity_unconfirmed"),
+        (row.get("gpu_model") in policy.gpu_names, "gpu_model_outside_policy"),
+        (type(row.get("gpu_count")) is int and row["gpu_count"] == policy.host_gpu_count,
+         "not_single_gpu_host" if policy.host_gpu_count == 1 else "host_gpu_count_outside_policy"),
+        (type(row.get("available_gpu_count")) is int
+         and row["available_gpu_count"] >= policy.rental_gpu_count, "no_free_gpu"),
+        (type(row.get("min_rentable_gpu_count")) is int
+         and row["min_rentable_gpu_count"] == policy.rental_gpu_count, "rental_granularity_unconfirmed"),
     )
     reasons.extend(reason for valid, reason in checks if not valid)
     for field, minimum, code in (("cpu_count", 12, "cpu_below_12"),
-            ("ram_gb", Decimal(96 * 1024**3) / 10**9, "ram_below_96_gib"),
-            ("disk_free_gb", Decimal(250 * 1024**3) / 10**9, "free_disk_below_250_gib"),
+            ("ram_gb", Decimal(policy.min_ram_gib * 1024**3) / 10**9, f"ram_below_{policy.min_ram_gib}_gib"),
+            ("disk_free_gb", Decimal(policy.min_disk_gib * 1024**3) / 10**9, f"free_disk_below_{policy.min_disk_gib}_gib"),
             ("network_download_mbps", 500, "download_below_500_mbps"),
-            ("gpu_memory_gb", 31, "vram_below_5090_class")):
+            ("gpu_memory_gb", policy.min_public_vram_gb, "vram_below_policy_class")):
         try:
             if number(row.get(field)) < minimum:
                 reasons.append(code)
         except PilotError:
             reasons.append("unverified_" + field)
     try:
-        if not 0 < number(row.get("price_per_gpu_hour")) <= Decimal("0.85"):
+        if not 0 < number(row.get("price_per_gpu_hour")) <= Decimal(policy.price_cap_microusd) / 1_000_000:
             reasons.append("price_above_cap_or_invalid")
     except PilotError:
         reasons.append("unverified_price")
@@ -136,7 +190,8 @@ def qualify(row):
 
 
 class ExactPilotProvider(LiumProvider):
-    def __init__(self, *, fetch=public_fetch, **kwargs):
+    def __init__(self, *, fetch=public_fetch, policy="5090", **kwargs):
+        self.policy = policy_named(policy)
         super().__init__(**kwargs)
         self.fetch = fetch
 
@@ -146,9 +201,15 @@ class ExactPilotProvider(LiumProvider):
         Do not call the general selector: its exact executor is only a preference
         when GPU filters are enabled, and its direct path does not gate RAM/disk.
         """
+        if (manifest.configuration_id != self.policy.pool_id or manifest.model_id != self.policy.capability
+                or manifest.gpu_count != self.policy.rental_gpu_count
+                or manifest.execution_slots != self.policy.rental_gpu_count
+                or manifest.max_price_per_gpu_hour_microusd != self.policy.price_cap_microusd
+                or manifest.termination_hours != self.policy.termination_hours):
+            raise PilotError("manifest_policy_mismatch")
         matches = [row for row in public_rows(self.fetch(), self.clock())
                    if node_id(row) == manifest.executor_id]
-        if len(matches) != 1 or qualify(matches[0]):
+        if len(matches) != 1 or qualify(matches[0], self.policy):
             raise PilotError("selected_public_node_outside_limits")
         rows = [row for row in self._rows("executors?available=true")
                 if row.get("id") == manifest.executor_id]
@@ -156,12 +217,13 @@ class ExactPilotProvider(LiumProvider):
             raise PilotError("selected_executor_unavailable")
         row = rows[0]
         details = row.get("specs", {}).get("gpu", {}).get("details", [])
-        if (type(row.get("gpu_count")) is not int or row["gpu_count"] != 1
-                or type(row.get("available_gpu_count")) is not int or row["available_gpu_count"] != 1
-                or not 0 < number(row.get("price_per_gpu")) <= Decimal("0.85")
-                or not isinstance(details, list) or len(details) != 1
-                or details[0].get("name") not in GPU_NAMES
-                or number(details[0].get("capacity")) < 31_000):
+        if (type(row.get("gpu_count")) is not int or row["gpu_count"] != self.policy.host_gpu_count
+                or type(row.get("available_gpu_count")) is not int
+                or row["available_gpu_count"] != self.policy.rental_gpu_count
+                or not 0 < number(row.get("price_per_gpu")) <= Decimal(self.policy.price_cap_microusd) / 1_000_000
+                or not isinstance(details, list) or len(details) != self.policy.host_gpu_count
+                or any(gpu.get("name") not in self.policy.gpu_names
+                       or number(gpu.get("capacity")) < self.policy.min_authenticated_vram_mib for gpu in details)):
             raise PilotError("selected_executor_identity_or_price_unconfirmed")
         templates = [row for row in self._rows("templates") if row.get("id") == manifest.template_id]
         if len(templates) != 1:
@@ -170,7 +232,8 @@ class ExactPilotProvider(LiumProvider):
 
 
 class Pilot:
-    def __init__(self, directory, *, fetch=public_fetch, factory=ExactPilotProvider, clock=time.time):
+    def __init__(self, directory, *, policy="5090", fetch=public_fetch, factory=ExactPilotProvider, clock=time.time):
+        self.policy = policy_named(policy)
         self.directory = Path(directory)
         if not self.directory.is_absolute() or self.directory.is_symlink():
             raise PilotError("absolute_private_run_directory_required")
@@ -179,20 +242,35 @@ class Pilot:
         self.fetch, self.factory, self.clock = fetch, factory, clock
         self.lock = RentJournal(self.directory / "locks")
 
+    def _check_policy_binding(self, value):
+        if (value.get("version") == 1 and self.policy == POLICY_5090
+                and value.get("purpose") == POLICY_5090.purpose and "policy" not in value):
+            return  # Historical 5090 journals remain bound to their original envelope.
+        if value.get("version") != 2:
+            raise PilotError("pilot_policy_mismatch")
+        if (value.get("purpose") != self.policy.purpose
+                or json.dumps(value.get("policy"), sort_keys=True, allow_nan=False)
+                != json.dumps(self.policy.snapshot(), sort_keys=True, allow_nan=False)):
+            raise PilotError("pilot_policy_mismatch")
+
     def read(self):
         if not self.path.exists():
-            return {"version": 1, "purpose": "standalone-5090-qualification-not-production", "records": []}
+            return {"version": 2, "purpose": self.policy.purpose,
+                    "policy": self.policy.snapshot(), "records": []}
         if self.path.is_symlink() or self.path.stat().st_size > 131072:
             raise PilotError("pilot_state_invalid")
         value = json.loads(self.path.read_text(encoding="utf-8"))
-        if (value.get("version") != 1 or value.get("purpose") != "standalone-5090-qualification-not-production"
-                or not isinstance(value.get("records"), list) or len(value["records"]) > MAX_RECORDS):
+        self._check_policy_binding(value)
+        if (not isinstance(value.get("records"), list) or len(value["records"]) > self.policy.max_records):
             raise PilotError("pilot_state_invalid")
         tags = set()
         for record in value["records"]:
             tag = identity(record["tag"])
-            if tag in tags or record["deadline"] != record["created_at"] + 7200:
+            if tag in tags or record["deadline"] != record["created_at"] + self.policy.termination_hours * 3600:
                 raise PilotError("pilot_state_invalid")
+            if (value["version"] == 2 and (record.get("gpu_count") != self.policy.rental_gpu_count
+                    or record.get("reservation_microusd") != self.policy.reservation_microusd)):
+                raise PilotError("pilot_record_policy_mismatch")
             tags.add(tag)
             identity(record["executor_id"]); identity(record["template_id"])
             if record.get("pod_id"):
@@ -200,6 +278,9 @@ class Pilot:
         return value
 
     def save(self, state):
+        self._check_policy_binding(state)
+        if self.path.exists():
+            self.read()  # Refuse overwriting a directory bound to another policy.
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         target = self.directory / (".pilot-" + uuid.uuid4().hex + ".next")
         data = json.dumps(state, sort_keys=True, allow_nan=False).encode()
@@ -217,21 +298,26 @@ class Pilot:
     def provider(self, record=None, public_key=None):
         manifests = ()
         if record is not None and public_key is not None:
-            manifests = (LiumManifest("h3-5090-pilot", "h3-pruned-int8", record["executor_id"],
-                record["template_id"], 1, PRICE_CAP, 2, public_key, record["deadline"] + 180,
-                allow_preflight_only_price_cap=True),)
+            manifests = (LiumManifest(self.policy.pool_id, self.policy.capability, record["executor_id"],
+                record["template_id"], self.policy.rental_gpu_count, self.policy.price_cap_microusd,
+                self.policy.termination_hours, public_key, record["deadline"] + 180,
+                allow_preflight_only_price_cap=True, execution_slots=self.policy.rental_gpu_count),)
         return self.factory(enabled=True, manifests=manifests, fetch=self.fetch, clock=self.clock,
-                            journal_dir=self.directory / "rent-journal")
+                            policy=self.policy.name, journal_dir=self.directory / "rent-journal")
 
     def inventory(self):
         result = []
         for row in public_rows(self.fetch(), self.clock()):
-            if row.get("gpu_model") not in GPU_NAMES:
+            if row.get("gpu_model") not in self.policy.gpu_names:
                 continue
-            result.append({"executor_id": node_id(row), "rejections": qualify(row),
+            rejections = qualify(row, self.policy)
+            preferred_ram = ("unverified_ram_gb" not in rejections
+                and number(row.get("ram_gb")) * 10**9 >= self.policy.preferred_ram_gib * 1024**3)
+            result.append({"executor_id": node_id(row), "rejections": rejections,
+                "preferred_ram_met": preferred_ram,
                 **{key: row.get(key) for key in ("gpu_model", "gpu_count", "available_gpu_count", "cpu_count",
-                    "ram_gb", "disk_free_gb", "network_download_mbps", "price_per_gpu_hour")}})
-        return {"candidates": result, "allocation_verified": False}
+                    "min_rentable_gpu_count", "ram_gb", "disk_free_gb", "network_download_mbps", "price_per_gpu_hour")}})
+        return {"policy": self.policy.snapshot(), "candidates": result, "allocation_verified": False}
 
     def overview(self):
         provider = self.provider()
@@ -248,7 +334,7 @@ class Pilot:
     def summary(record):
         return {key: record.get(key) for key in ("tag", "executor_id", "template_id", "pod_id", "phase",
             "created_at", "deadline", "collection_deadline", "ttl_verified", "destroy_started_at",
-            "reservation_microusd", "actual_cost_microusd", "last_error")}
+            "gpu_count", "reservation_microusd", "actual_cost_microusd", "last_error")}
 
     def rent(self, executor_id, template_id, public_key):
         identity(executor_id); identity(template_id)
@@ -259,7 +345,7 @@ class Pilot:
             old = next((row for row in state["records"] if row["executor_id"] == executor_id), None)
             if old:
                 return {"replay_refused": True, **self.summary(old)}
-            if len(state["records"]) >= MAX_RECORDS:
+            if len(state["records"]) >= self.policy.max_records:
                 raise PilotError("pilot_rental_count_limit")
             unresolved = [row for row in state["records"]
                           if row["phase"] not in ("destroyed", "not_created")
@@ -279,18 +365,20 @@ class Pilot:
                 finally:
                     prior_provider.close()
             held = sum(row.get("actual_cost_microusd") if row.get("actual_cost_microusd") is not None
-                       else RESERVATION for row in state["records"])
-            if held + RESERVATION > BUDGET or any(
+                       else self.policy.reservation_microusd for row in state["records"])
+            if held + self.policy.reservation_microusd > self.policy.budget_microusd or any(
                     row["phase"] in ("creating", "unknown", "destroy_unknown")
                     or row["phase"] not in ("destroyed", "not_created")
                         and (row.get("destroy_started_at") or not row.get("ttl_verified"))
                     for row in state["records"]):
                 raise PilotError("pilot_budget_or_unknown_outcome_hold")
             created = self.clock()
+            deadline = created + self.policy.termination_hours * 3600
             record = {"tag": str(uuid.uuid4()), "executor_id": executor_id, "template_id": template_id,
-                      "created_at": created, "deadline": created + 7200, "collection_deadline": created + 6600,
+                      "created_at": created, "deadline": deadline, "collection_deadline": deadline - 600,
                       "phase": "creating", "pod_id": None, "ttl_verified": False,
-                      "reservation_microusd": RESERVATION, "actual_cost_microusd": None}
+                      "gpu_count": self.policy.rental_gpu_count,
+                      "reservation_microusd": self.policy.reservation_microusd, "actual_cost_microusd": None}
             provider = self.provider(record, public_key)
             try:
                 owned = {row.get("pod_id") for row in state["records"]}
@@ -300,10 +388,13 @@ class Pilot:
                         raise PilotError("existing_sixnine_rental_requires_reconciliation")
                 manifest = next(iter(provider._manifests.values()))
                 provider._select_offer(manifest)  # cheap preflight before consuming an attempt
+                launch = LaunchSpec("lium", self.policy.pool_id, self.policy.capability,
+                                    offer_id=executor_id, image_id=template_id)
+                provider.validate_launch(launch, physical_gpus=self.policy.rental_gpu_count,
+                    slots=self.policy.rental_gpu_count, reserved_cost_microusd=self.policy.reservation_microusd,
+                    hard_deadline=record["deadline"] + 180)
                 state["records"].append(record)
                 self.save(state)  # durable single intent BEFORE any mutating request
-                launch = LaunchSpec("lium", "h3-5090-pilot", "h3-pruned-int8",
-                                    offer_id=executor_id, image_id=template_id)
                 try:
                     # Extra coordinator margin prevents the provider's integer
                     # hour floor turning 2h into1h. The absolute TTL remains the
@@ -459,6 +550,8 @@ class Pilot:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True, help="one private durable directory for the entire pilot")
+    parser.add_argument("--policy", choices=tuple(POLICIES), default="5090",
+                        help="fixed approved envelope; use a distinct run directory for each policy")
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("inventory")
     sub.add_parser("overview", help="GET-only safe pod/template identities for the root operator")
@@ -479,7 +572,7 @@ def main(argv=None):
     ttl.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     try:
-        pilot = Pilot(args.run_dir)
+        pilot = Pilot(args.run_dir, policy=args.policy)
         if args.action == "inventory":
             result = pilot.inventory()
         elif args.action == "overview":
