@@ -486,3 +486,25 @@ class OperatorTests(LedgerCase):
         self.assertFalse(state["controller"]["stale"])
         self.assertEqual(state["nodes"][0]["runtime_state"],"observation_failed")
         self.assertNotIn("private-url",json.dumps(state))
+
+    def test_historical_retired_worker_does_not_hold_current_drain_open(self):
+        self.create()
+        self.controller.tick()
+        node=self.service.state(self.actor)["nodes"][0]
+        control=WorkerControl(self.repo)
+        old=control.get(node["slots"][0]["id"])
+        control.retire(old["id"],upstream_idle_confirmed=True)
+        values=dict(old["spec"])
+        values["worker_id"]="replacement-worker"
+        values["physical_gpu_ids"]=tuple(values["physical_gpu_ids"])
+        values["recipe_ids"]=tuple(values["recipe_ids"])
+        control.register(WorkerSpec(**values))
+        control.mark_ready("replacement-worker",upstream_idle_confirmed=True)
+        fresh=self.service.state(self.actor)["nodes"][0]
+        self.service.node_command(self.actor,node["id"],{"expected_version":fresh["version"]},"drain-replacement","drain")
+        self.controller.tick()
+        state=self.service.state(self.actor)
+        self.assertEqual(next(op for op in state["operations"] if op["kind"]=="drain")["state"],"completed")
+        self.assertEqual(control.get(old["id"])["state"],"retired")
+        self.assertEqual(control.get("replacement-worker")["drain_requested"],1)
+        self.assertEqual(self.provider.destroys,[])

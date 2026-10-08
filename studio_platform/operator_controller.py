@@ -263,7 +263,8 @@ class OperatorController:
             else:
                 intent=intents.get(command["payload"]["node_id"])
                 if not intent: continue
-                bound=[w for w in workers if w["provider"]==intent["provider"] and w["instance_id"]==intent["provider_instance_id"]]
+                bound=[w for w in workers if w["provider"]==intent["provider"]
+                    and w["instance_id"]==intent["provider_instance_id"] and w["state"]!="retired"]
                 if intent["state"]=="destroyed" or command["kind"]=="drain" and bound and all(w["drain_requested"] for w in bound):
                     self._record_command(command["id"],"completed")
                 else:
