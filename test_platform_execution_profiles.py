@@ -104,6 +104,28 @@ class ExecutionProfileTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             replace(self.settings,default_deployment_profile_id='invented-default')
 
+    def test_public_direct_card_example_preserves_selected_profile_without_submission(self):
+        settings = replace(self.settings, default_deployment_profile_id=PRUNED)
+        with TestClient(create_app(settings, repository=self.repo)) as client:
+            client.post('/api/auth/login', json={'username':'superdan'}).raise_for_status()
+            example = client.get('/for-agents/guide.json').json()['quick_chat']['examples']['card']
+            session = client.post('/v1/quick-chat/sessions', json={'title':'Documented profile'},
+                headers={'Idempotency-Key':'docs-session'}).json()['session']
+            selected = session['next_settings']
+            replacements = {'{selected_deployment_profile_id}':selected['deployment_profile_id'],
+                '{selected_recipe_id}':selected['recipe_id'], '{selected_controls_object}':selected['controls'],
+                '{complete_prompt}':'A blue cup rotates on a desk.'}
+            body = {key:replacements.get(value,value) if isinstance(value,str) else value
+                for key,value in copy.deepcopy(example['body']).items()}
+            response = client.request(example['method'], example['path'].format(session_id=session['id']),
+                json=body, headers={'Idempotency-Key':'docs-card'})
+            response.raise_for_status()
+            revision = response.json()['revision']
+            self.assertEqual(revision['deployment_profile_id'], PRUNED)
+            self.assertEqual(revision['controls']['steps'], 20)
+            self.assertEqual(revision['controls']['resolution'], '480P')
+            self.assertEqual(client.get('/v1/jobs').json()['jobs'], [])
+
     def compiled(self, profile=PRUNED):
         return compile_request(generation_request(deployment_profile_id=profile,
             controls={"duration": 5, "resolution": "480P", "steps": 20, "seed": "42"}),
