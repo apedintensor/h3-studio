@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 import time
 import uuid
 
@@ -29,6 +30,18 @@ SAFE_ERRORS = frozenset({"global_capacity_disabled", "global_capacity_exceeded",
     "operator_binding_unavailable", "operator_authority_expiring", "operator_bootstrap_unconfigured",
     "operator_deployment_not_qualified", "operator_hourly_cost_limit", "operator_instance_limit",
     "operator_gpu_limit", "operator_unpriced_existing_capacity", "operator_provider_disabled"})
+
+LIFETIME_FRESH_SECONDS = 30
+
+
+def provider_lifetime_current(payload,intent,now):
+    """Shared late-start/worker-admission check of the persisted provider proof."""
+    value=payload.get("lifetime",{}) if isinstance(payload,dict) else {}
+    return bool(value.get("state")=="verified" and value.get("instance_id")==intent["provider_instance_id"]
+        and type(value.get("observed_at")) in (int,float) and math.isfinite(value["observed_at"])
+        and 0<=now-value["observed_at"]<=LIFETIME_FRESH_SECONDS
+        and type(value.get("safe_deadline")) in (int,float) and math.isfinite(value["safe_deadline"])
+        and now<intent["hard_deadline"]<=value["safe_deadline"])
 
 
 def safe_error(error):
@@ -180,9 +193,59 @@ class OperatorController:
                 return bool(self.service._policy(connection)["enabled"] and node and intent
                     and node["desired_state"]=="running" and node["binding_hash"]==binding.fingerprint
                     and intent["pool"]==binding.pool and intent["state"] in {"starting","ready","busy"}
-                    and self.repo.clock()<intent["hard_deadline"]<=current_binding.expires_at)
+                    and self.repo.clock()<intent["hard_deadline"]<=current_binding.expires_at
+                    and provider_lifetime_current(node["payload"],intent,self.repo.clock()))
         except Exception:
             return False
+
+    def _provider_lifetime(self,coordinator,lease,binding,intent):
+        """Shorten the original ledger window; never renew or change reservation.
+
+        Provider inspection is outside the database transaction. Persist only
+        under the same still-current pool fence and exact instance identity.
+        Failure closes new runtime/job admission while existing collection stays.
+        """
+        proof=None
+        try:
+            method=getattr(coordinator.provider,"lifetime",None)
+            require(callable(method),"operator_provider_lifetime_unverified")
+            hours=min(4,math.ceil(binding.max_ttl_seconds/3600))
+            result=method(intent["id"],intent["provider_instance_id"],
+                local_created_at=intent["created_at"],maximum_hours=hours)
+            require(isinstance(result,dict) and result.get("instance_id")==intent["provider_instance_id"]
+                and type(result.get("safe_deadline")) in (int,float) and math.isfinite(result["safe_deadline"])
+                and self.repo.clock()<result["safe_deadline"]<=intent["created_at"]+hours*3600,
+                "operator_provider_lifetime_unverified")
+            proof={"state":"verified","instance_id":intent["provider_instance_id"],
+                "safe_deadline":result["safe_deadline"],"observed_at":self.repo.clock()}
+        except Exception:
+            pass
+        with self.repo.transaction() as connection:
+            coordinator._leader(connection,lease)
+            self.repo._lock_capacity(connection)
+            current=self.repo._locked(connection,select(instance_intents).where(instance_intents.c.id==intent["id"]))
+            node=self.repo._locked(connection,select(operator_nodes).where(operator_nodes.c.intent_id==intent["id"]))
+            require(current and node and current["provider_instance_id"]==intent["provider_instance_id"]
+                and node["binding_hash"]==binding.fingerprint,"operator_binding_changed")
+            previous=node["payload"].get("lifetime",{})
+            if proof:
+                safe=min(current["hard_deadline"],proof["safe_deadline"])
+                # Retain the strictest verified proof even if the provider later
+                # reports a longer window. No observation renews an old node.
+                if type(previous.get("safe_deadline")) in (int,float):
+                    safe=min(safe,previous["safe_deadline"])
+                proof["safe_deadline"]=safe
+                if safe<current["hard_deadline"]:
+                    connection.execute(update(instance_intents).where(instance_intents.c.id==intent["id"]).values(
+                        hard_deadline=safe,updated_at=self.repo.clock()))
+                    self.repo._emit(connection,"operator.capacity.deadline_shortened",intent["id"],
+                        {"intent_id":intent["id"],"hard_deadline":safe})
+            else:
+                proof={"state":"unverified","instance_id":intent["provider_instance_id"],
+                    "safe_deadline":previous.get("safe_deadline"),"observed_at":self.repo.clock()}
+            connection.execute(update(operator_nodes).where(operator_nodes.c.intent_id==intent["id"]).values(
+                payload={**node["payload"],"lifetime":proof},updated_at=self.repo.clock()))
+        return proof["state"]=="verified" and proof["safe_deadline"]>self.repo.clock()
 
     def _observe(self,node):
         binding=self.service.registry.get(node["binding_id"])
@@ -217,9 +280,14 @@ class OperatorController:
         if can_observe:
             lease=coordinator.acquire(binding.pool,self.leader_id)
             if lease is None: return "not_leader"
+            lifetime_verified=self._provider_lifetime(coordinator,lease,binding,intent)
+            intent,latest,action,workers=self._node_snapshot(intent_id)
+            stopping=desired!="running" or intent["hard_deadline"]<=self.repo.clock()
             # Re-check the provider's immutable execution binding when available.
             execution_allowed=getattr(coordinator.provider,"execution_allowed",None)
-            if callable(execution_allowed) and execution_allowed(intent_id,intent["provider_instance_id"]) is not True:
+            if not lifetime_verified and not stopping:
+                runtime="provider_lifetime_unverified"
+            elif callable(execution_allowed) and execution_allowed(intent_id,intent["provider_instance_id"]) is not True:
                 runtime="provider_execution_unverified"
             elif callable(self.boot_factory):
                 if intent_id not in self.boots:

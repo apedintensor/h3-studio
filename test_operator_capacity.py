@@ -13,7 +13,7 @@ from studio_platform.auth import Principal
 from studio_platform.control import WorkerControl, WorkerSpec
 from studio_platform.operator_capacity import (DeploymentBinding, OperatorCapacity, OperatorError, OperatorRegistry,
     operator_commands, operator_nodes, selection)
-from studio_platform.operator_controller import OperatorController, main
+from studio_platform.operator_controller import OperatorController, main, provider_lifetime_current
 from studio_platform.operator_routes import register_routes
 from studio_platform.repository import instance_intents, jobs, registered_workers
 from studio_platform.scaler import LaunchSpec, ProviderFact
@@ -23,6 +23,8 @@ from test_platform_scaler import FakeProvider
 
 class OperatorProvider(FakeProvider):
     provider_id="lium"
+    def lifetime(self,tag,instance_id,*,local_created_at,maximum_hours):
+        return {"instance_id":instance_id,"safe_deadline":local_created_at+maximum_hours*3600}
 
 
 class FakeBoot:
@@ -110,6 +112,85 @@ class OperatorTests(LedgerCase):
         self.assertEqual(preview["minimum_ttl_seconds"],3780)
         self.assertIn({"code":"operator_ttl_below_provider_minimum"},preview["blockers"])
         self.assertFalse(preview["can_start"])
+
+    def test_provider_hour_rounding_shortens_before_boot_without_resetting_money(self):
+        self.registry.bindings[self.binding.binding_id]=replace(self.binding,max_ttl_seconds=7200)
+        self.service.update_policy(self.actor,{**self.policy,"expected_version":1,"max_ttl_seconds":7200})
+        self.provider.lifetime=lambda tag,instance_id,**kw:{"instance_id":instance_id,
+            "safe_deadline":kw["local_created_at"]+3600-600}
+        operation=self.create(chosen={**self.chosen,"ttl_seconds":7200})
+        original_boot=self.controller.boot_factory
+        def check_before_boot(binding,intent,chosen):
+            self.assertEqual(intent["hard_deadline"],self.now+3000)
+            with self.repo.engine.connect() as connection:
+                node=connection.execute(select(operator_nodes).where(operator_nodes.c.intent_id==intent["id"])).mappings().one()
+            self.assertTrue(provider_lifetime_current(node["payload"],intent,self.now))
+            return original_boot(binding,intent,chosen)
+        self.controller.boot_factory=check_before_boot
+        self.controller.tick()
+        intent=self.repo.list_instance_intents()[0]
+        budget=self.repo.get_budget("owner-budget")
+        self.assertEqual(intent["hard_deadline"],4000)
+        with self.repo.engine.connect() as connection:
+            command=connection.execute(select(operator_commands).where(operator_commands.c.id==operation["id"])).mappings().one()
+        self.assertEqual(command["payload"]["hard_deadline"],8200)
+        # A later, longer supplier window never renews a retained node.
+        self.provider.lifetime=lambda tag,instance_id,**kw:{"instance_id":instance_id,"safe_deadline":7000}
+        self.controller.tick()
+        self.assertEqual(self.repo.list_instance_intents()[0]["hard_deadline"],4000)
+        self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+        node=self.service.state(self.actor)["nodes"][0]
+        self.assertEqual(node["provider_safe_deadline"],4000)
+        self.assertEqual(node["provider_lifetime_state"],"verified")
+
+    def test_unknown_or_wrong_lifetime_cannot_publish_workers(self):
+        self.provider.lifetime=lambda *args,**kw:{"instance_id":"wrong","safe_deadline":4000}
+        self.create();self.controller.tick()
+        self.assertFalse(self.controller.boots)
+        node=self.service.state(self.actor)["nodes"][0]
+        self.assertEqual(node["runtime_state"],"provider_lifetime_unverified")
+        self.assertEqual(node["slots"],[])
+        self.assertEqual(node["hard_deadline"],4600)
+        self.assertEqual(len(self.provider.creates),1)
+        def unknown(*args,**kw): raise TimeoutError("not public")
+        self.provider.lifetime=unknown
+        self.controller.tick()
+        self.assertEqual(len(self.provider.creates),1)
+        self.assertFalse(self.controller.boots)
+
+    def test_lifetime_loss_and_staleness_close_late_admission(self):
+        self.create();self.controller.tick()
+        boot=next(iter(self.controller.boots.values()))
+        self.assertTrue(boot.guard())
+        self.now+=31
+        self.assertFalse(boot.guard())
+        self.controller.tick()
+        self.assertTrue(boot.guard())
+        self.provider.lifetime=lambda *args,**kw:None
+        self.controller.tick()
+        self.assertFalse(boot.guard())
+        self.assertEqual(self.service.state(self.actor)["nodes"][0]["provider_lifetime_state"],"unverified")
+
+    def test_lifetime_nan_expired_or_out_of_bound_are_unverified(self):
+        self.create()
+        for value in (float("nan"),True,self.now,self.now+20000):
+            self.provider.lifetime=lambda tag,instance_id,**kw:{"instance_id":instance_id,"safe_deadline":value}
+            self.controller.tick()
+            self.assertFalse(self.controller.boots)
+        self.assertEqual(len(self.provider.creates),1)
+
+    def test_lifetime_response_after_fence_expiry_cannot_shorten_or_start(self):
+        self.create()
+        def expired_lease(tag,instance_id,**kw):
+            self.now+=121
+            return {"instance_id":instance_id,"safe_deadline":4000}
+        self.provider.lifetime=expired_lease
+        self.controller.tick()
+        self.assertFalse(self.controller.boots)
+        self.assertEqual(self.repo.list_instance_intents()[0]["hard_deadline"],4600)
+        with self.repo.engine.connect() as connection:
+            row=connection.execute(select(operator_nodes)).mappings().one()
+        self.assertNotIn("lifetime",row["payload"])
 
     def test_late_guard_rejects_changed_binding_and_original_deadline(self):
         self.create();self.controller.tick()

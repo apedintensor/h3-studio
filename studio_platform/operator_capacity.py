@@ -489,7 +489,11 @@ class OperatorCapacity:
                 "runtime_profile_id":payload["selection"]["runtime_profile_id"],"observed_at":observed,"stale":stale,
                 "mode":payload["selection"]["mode"],
                 "hourly_cost_microusd":payload["hourly_cost_microusd"],"hourly_cost_basis":"approved_ceiling",
-                "hard_deadline":intent["hard_deadline"],"slots":slots,"actions":{"drain":availability,"stop":availability}})
+                "hard_deadline":intent["hard_deadline"],
+                "provider_safe_deadline":payload.get("lifetime",{}).get("safe_deadline"),
+                "provider_lifetime_state":payload.get("lifetime",{}).get("state","unverified"),
+                "provider_lifetime_observed_at":payload.get("lifetime",{}).get("observed_at"),
+                "slots":slots,"actions":{"drain":availability,"stop":availability}})
         age=None if controller is None else now-controller["observed_at"]
         return {"schema_version":1,"observed_at":now,"operator":{"account":actor,"permissions":{
             key:True for key in ("view","start","drain","stop","update_policy")}},"policy":policy,
