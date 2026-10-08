@@ -116,6 +116,7 @@ class DeploymentBinding:
     reservation_per_node_microusd: int
     expires_at: float
     max_ttl_seconds: int = 3600
+    min_ttl_seconds: int = 120
     execution_slots: int = 1
     filters: dict = field(default_factory=dict)
     enabled: bool = False
@@ -133,7 +134,9 @@ class DeploymentBinding:
         require(isinstance(self.engine_manifest_digest, str) and re.fullmatch(r"[0-9a-f]{64}", self.engine_manifest_digest),
                 "operator_binding_manifest_invalid", 422)
         require(positive_int(self.gpu_count,8) and positive_int(self.execution_slots,self.gpu_count)
-                and positive_int(self.max_ttl_seconds,14400,120) and positive_int(self.hourly_cost_microusd,9_000_000_000_000)
+                and positive_int(self.max_ttl_seconds,14400,120)
+                and positive_int(self.min_ttl_seconds,self.max_ttl_seconds,120)
+                and positive_int(self.hourly_cost_microusd,9_000_000_000_000)
                 and positive_int(self.reservation_per_node_microusd,9_000_000_000_000)
                 and type(self.enabled) is bool and type(self.expires_at) in (int,float) and math.isfinite(self.expires_at),
                 "operator_binding_limits_invalid", 422)
@@ -233,6 +236,10 @@ class OperatorRegistry:
 
     @classmethod
     def from_environment(cls, *, catalog=None, offers=None):
+        runtime=os.environ.get("H3_OPERATOR_RUNTIME_CONFIG", "").strip()
+        if runtime:
+            from .operator_runtime import create_registry
+            return create_registry(runtime)
         source=os.environ.get("H3_OPERATOR_CAPACITY_REGISTRY", "").strip()
         return cls.from_file(source,catalog=catalog,offers=offers) if source else cls(catalog=catalog,offers=offers)
 
@@ -350,6 +357,7 @@ class OperatorCapacity:
                 hourly=binding.hourly_cost_microusd*chosen["node_count"]
                 reservation=binding.reservation_per_node_microusd*chosen["node_count"]
                 if not binding.enabled: blockers.append({"code":"operator_deployment_not_qualified"})
+                if chosen["ttl_seconds"]<binding.min_ttl_seconds: blockers.append({"code":"operator_ttl_below_provider_minimum"})
                 if now+chosen["ttl_seconds"]>binding.expires_at: blockers.append({"code":"operator_authority_expiring"})
                 if usage["hourly"]+hourly>policy["max_hourly_cost_microusd"]:
                     blockers.append({"code":"operator_hourly_cost_limit"})
@@ -359,6 +367,7 @@ class OperatorCapacity:
                     "selection":chosen,"can_start":not blockers,"blockers":blockers,
                     "estimated_hourly_cost_microusd":hourly,"reservation_microusd":reservation,
                     "configuration_id":binding.configuration_id if binding else None,
+                    "minimum_ttl_seconds":binding.min_ttl_seconds if binding else None,
                     "recipe_ids":list(binding.recipe_ids) if binding else []}
             private={**public,"binding_id":binding.binding_id if binding else None,
                      "binding_hash":binding.fingerprint if binding else None}
@@ -400,6 +409,7 @@ class OperatorCapacity:
             binding=self.registry.get(value["binding_id"])
             require(binding.enabled and binding.fingerprint==value["binding_hash"],"operator_binding_changed")
             chosen=value["selection"]
+            require(chosen["ttl_seconds"]>=binding.min_ttl_seconds,"operator_ttl_below_provider_minimum")
             require(now+chosen["ttl_seconds"]<=binding.expires_at,"operator_authority_expiring")
             usage=self._committed_capacity(connection)
             require(not usage["unpriced"],"operator_unpriced_existing_capacity")

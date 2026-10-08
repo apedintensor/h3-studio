@@ -35,6 +35,7 @@ class FakeBoot:
     def request_drain(self): self.drained=True
     def cancel_preparation(self): self.cancelled=True
     def close(self): self.closed=True
+    def set_start_guard(self,guard): self.guard=guard
     def tick(self,intent_id,*,stopping=False):
         self.ticks.append((intent_id,stopping))
         if stopping: return "draining"
@@ -85,6 +86,44 @@ class OperatorTests(LedgerCase):
                 lambda:self.service.update_policy(actor,self.policy)):
                 with self.assertRaisesRegex(OperatorError,code): function()
         self.assertTrue(self.service.state(self.actor)["operator"]["permissions"]["start"])
+
+    def test_runtime_start_guard_rejects_stop_disabled_policy_and_expired_lease(self):
+        self.create();self.controller.tick()
+        boot=next(iter(self.controller.boots.values()))
+        self.assertTrue(boot.guard())
+        self.service.update_policy(self.actor,{**self.policy,"expected_version":1,"enabled":False})
+        self.assertFalse(boot.guard())
+        self.service.update_policy(self.actor,{**self.policy,"expected_version":2})
+        self.assertTrue(boot.guard())
+        state=self.service.state(self.actor);node=state["nodes"][0]
+        self.service.node_command(self.actor,node["id"],{"expected_version":node["version"]},"stop-guard","stop")
+        self.assertFalse(boot.guard())
+        with self.repo.transaction() as connection:
+            connection.execute(update(operator_nodes).values(desired_state="running"))
+        self.assertTrue(boot.guard())
+        self.now+=120
+        self.assertFalse(boot.guard())
+
+    def test_provider_minimum_ttl_is_visible_and_blocks_start(self):
+        self.registry.bindings[self.binding.binding_id]=replace(self.binding,max_ttl_seconds=7200,min_ttl_seconds=3780)
+        preview=self.service.preview(self.actor,self.chosen)
+        self.assertEqual(preview["minimum_ttl_seconds"],3780)
+        self.assertIn({"code":"operator_ttl_below_provider_minimum"},preview["blockers"])
+        self.assertFalse(preview["can_start"])
+
+    def test_late_guard_rejects_changed_binding_and_original_deadline(self):
+        self.create();self.controller.tick()
+        boot=next(iter(self.controller.boots.values()))
+        self.assertTrue(boot.guard())
+        self.registry.bindings[self.binding.binding_id]=replace(self.binding,enabled=False)
+        self.assertFalse(boot.guard())
+        self.registry.bindings[self.binding.binding_id]=replace(self.binding,configuration_id="different",
+            launch=replace(self.binding.launch,configuration_id="different"))
+        self.assertFalse(boot.guard())
+        self.registry.bindings[self.binding.binding_id]=self.binding
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).values(hard_deadline=self.now))
+        self.assertFalse(boot.guard())
 
     def test_preview_only_and_no_fake_generation_jobs(self):
         preview=self.service.preview(self.actor,self.chosen)

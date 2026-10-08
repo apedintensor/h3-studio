@@ -166,6 +166,24 @@ class OperatorController:
             and set(worker["spec"].get("recipe_ids",()))==set(binding.recipe_ids)]
         return len(valid)==binding.execution_slots and len({gpu for w in valid for gpu in w["spec"]["physical_gpu_ids"]})==binding.gpu_count
 
+    def _start_guard(self,coordinator,lease,binding,intent_id):
+        """Late upload callbacks must retain the original durable authority."""
+        try:
+            if not self.enabled: return False
+            current_binding=self.service.registry.get(binding.binding_id)
+            if not current_binding.enabled or current_binding.fingerprint!=binding.fingerprint: return False
+            with self.repo.transaction() as connection:
+                coordinator._leader(connection,lease)
+                self.repo._lock_capacity(connection)
+                node=self.repo._locked(connection,select(operator_nodes).where(operator_nodes.c.intent_id==intent_id))
+                intent=self.repo._locked(connection,select(instance_intents).where(instance_intents.c.id==intent_id))
+                return bool(self.service._policy(connection)["enabled"] and node and intent
+                    and node["desired_state"]=="running" and node["binding_hash"]==binding.fingerprint
+                    and intent["pool"]==binding.pool and intent["state"] in {"starting","ready","busy"}
+                    and self.repo.clock()<intent["hard_deadline"]<=current_binding.expires_at)
+        except Exception:
+            return False
+
     def _observe(self,node):
         binding=self.service.registry.get(node["binding_id"])
         require(binding.fingerprint==node["binding_hash"],"operator_binding_changed")
@@ -207,6 +225,9 @@ class OperatorController:
                 if intent_id not in self.boots:
                     self.boots[intent_id]=self.boot_factory(binding,intent,latest["payload"]["selection"])
                 boot=self.boots[intent_id]
+                setter=getattr(boot,"set_start_guard",None)
+                if callable(setter):
+                    setter(lambda:self._start_guard(coordinator,lease,binding,intent_id))
                 if stopping:
                     drain=getattr(boot,"request_drain",None)
                     if callable(drain): drain()
