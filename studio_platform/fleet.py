@@ -181,7 +181,8 @@ def read_config(path):
 
 
 class FleetSupervisor:
-    def __init__(self, config, repository, config_path, *, popen=None, clock=time.monotonic, sleeper=time.sleep):
+    def __init__(self, config, repository, config_path, *, popen=None, clock=time.monotonic, sleeper=time.sleep,
+                 process_ownership=False):
         self.config, self.repo = config, repository
         self.config_path = Path(config_path)
         if not self.config_path.is_absolute():
@@ -193,6 +194,55 @@ class FleetSupervisor:
         self._started = False
         self._finished = False
         self._shutdown_called = False
+        self.process_ownership = process_ownership
+        self.process_tokens = {}
+        self.recovering = False
+
+    def _launch(self, slot, *, recovering=False):
+        argv = [sys.executable, "-m", "studio_platform.fleet", "--config", str(self.config_path),
+            "--slot", slot.spec.worker_id, "--config-hash", self.config.fingerprint()]
+        if self.process_ownership:
+            from .fleet_process import prepare_launch
+            token, observed = prepare_launch(self.config, slot.spec.worker_id, recovering=recovering)
+            if observed is not None:
+                return observed
+            self.process_tokens[slot.spec.worker_id] = token
+            argv += ["--owner-token", token]
+            if recovering:
+                argv += ["--recover-slot"]
+        kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        else:
+            kwargs["start_new_session"] = True
+        return self.popen(argv, **kwargs)
+
+    def recover(self):
+        """Rebind existing registrations, observing or resuming the same owner.
+
+        The caller first validates the saved bootstrap/runtime identity. Missing
+        owner evidence is never replaced, and no drain marker is removed.
+        """
+        if not self.process_ownership or self._started or not self.config.enabled or self.repo is None:
+            raise ValueError("fleet_recovery_not_configured")
+        from .repository import request_hash
+        for slot in self.config.slots:
+            if not slot.enabled:
+                continue
+            worker = self.control.get(slot.spec.worker_id)
+            if worker["spec_hash"] != request_hash(worker_spec_payload(slot.spec)):
+                raise ValueError("fleet_recovery_worker_binding_mismatch")
+        self._started = True
+        self.recovering = True
+        # Partial Popen failure retains every observed/launched child. Never
+        # clear the durable owner token or retry a paid/upstream operation here.
+        for slot in self.config.slots:
+            if slot.enabled:
+                self.children[slot.spec.worker_id] = self._launch(slot, recovering=True)
+        if (self.config.work_dir/"supervisor-drain.flag").exists():
+            self._stop.set()
+        self._save()
+        return self.snapshot()
 
     def snapshot(self):
         children = []
@@ -243,13 +293,7 @@ class FleetSupervisor:
                 flag = directory / "drain.flag"
                 if flag.exists() and not slot.recovery_only:
                     flag.unlink()  # Only our explicit lifecycle marker, never an asset.
-                kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if os.name == "nt":
-                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                else:
-                    kwargs["start_new_session"] = True
-                proc = self.popen([sys.executable, "-m", "studio_platform.fleet", "--config", str(self.config_path),
-                    "--slot", slot.spec.worker_id, "--config-hash", self.config.fingerprint()], **kwargs)
+                proc = self._launch(slot)
                 self.children[slot.spec.worker_id] = proc
             self._save()
             return self.snapshot()
@@ -262,6 +306,8 @@ class FleetSupervisor:
             return self.snapshot()
         if not self._started:
             raise ValueError("fleet_not_started")
+        if self.process_ownership and set(self.children) != {s.spec.worker_id for s in self.config.slots if s.enabled}:
+            raise ValueError("fleet_recovery_incomplete")
         if (self.config.work_dir / "supervisor-drain.flag").exists():
             self._stop.set()
         self.control.recover_expired()
@@ -443,6 +489,8 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--slot")
     parser.add_argument("--config-hash")
+    parser.add_argument("--owner-token", help=argparse.SUPPRESS)
+    parser.add_argument("--recover-slot", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--request-drain", action="store_true")
     args = parser.parse_args(argv)
@@ -462,9 +510,16 @@ def main(argv=None):
         from .settings import Settings
         settings = Settings.from_environment()
         if args.slot:
-            result = run_slot(config, args.slot, settings, once=args.once)
+            if args.recover_slot:
+                raise ValueError("recovery_requires_production_controller")
+            if args.owner_token:
+                from .fleet_process import owned_process
+                with owned_process(config, args.slot, args.owner_token):
+                    result = run_slot(config, args.slot, settings, once=args.once)
+            else:
+                result = run_slot(config, args.slot, settings, once=args.once)
         else:
-            if args.once:
+            if args.once or args.owner_token or args.recover_slot:
                 raise ValueError("supervisor_once_would_leave_unmanaged_children")
             repo = Repository(settings.database_url)
             result = FleetSupervisor(config, repo, args.config).run_forever()

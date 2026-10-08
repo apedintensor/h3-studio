@@ -944,10 +944,14 @@ def main(argv=None):
     actions.add_argument("--status", action="store_true")
     actions.add_argument("--slot", help=argparse.SUPPRESS)
     parser.add_argument("--config-hash", help=argparse.SUPPRESS)
+    parser.add_argument("--owner-token", help=argparse.SUPPRESS)
+    parser.add_argument("--recover-slot", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     repo = provider = loader = controller = None
     handlers = {}
     try:
+        if (args.owner_token is not None or args.recover_slot) and not args.slot:
+            raise ScalerError("finite_child_process_protocol_required")
         if args.config is None:
             if args.enabled or args.credential_stdin or args.request_drain or args.status or args.slot:
                 raise ScalerError("finite_explicit_config_required")
@@ -985,7 +989,8 @@ def main(argv=None):
         verify_sources(config)
         if args.slot:
             from .production_scaler_boot import run_child
-            return run_child(config, args.slot, args.config_hash, settings)
+            return run_child(config, args.slot, args.config_hash, settings,
+                owner_token=args.owner_token, recover_slot=args.recover_slot)
         verify_identity_files(config)
         loader = stdin_loader(config, sys.stdin.buffer) if args.credential_stdin else AwsLiumLoader(config.secret_arn, config.secret_version_id)
         repo = Repository(settings.database_url)  # Existing schema only.

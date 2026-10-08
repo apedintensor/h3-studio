@@ -378,6 +378,53 @@ class ReplacementTests(LedgerCase):
         self.now += 61
         self.assertEqual(self.create()["reason"], "member_replacement_local_stop_unconfirmed")
 
+    def test_observed_lifetime_exit_has_no_invented_pid_and_retains_all_replacement_gates(self):
+        from studio_platform.production_scaler_boot import ProductionBoot
+        from studio_platform.fleet_process import prepare_launch, owned_process, ObservedProcess, PROTOCOL
+        from studio_platform.pool_member_generations import one_receipt
+        from studio_platform.fleet import FleetConfig, SlotConfig
+        from studio_platform.control import WorkerSpec
+        _, _, a, b = self.begin(); self.close_member(a, proof=False)
+        c = self.controller.current.config; row = self.row(a)
+        boot = ProductionBoot(self.repo, self.provider, c, row, self.config.port_start)
+        worker_id = "lium-"+a.replace("-", "")
+        directory = boot.config.work_dir/a; directory.mkdir(parents=True)
+        # The helper proves only local CPU lifetime; actual worker/attempt,
+        # removal, billing and replacement-authority gates remain in SQL.
+        payload = WorkerControl(self.repo).get(worker_id)["spec"]
+        spec = WorkerSpec(**{**payload, "physical_gpu_ids": tuple(payload["physical_gpu_ids"]),
+            "recipe_ids": tuple(payload["recipe_ids"])})
+        from studio_platform.lium_bootstrap import COMFY_REVISION
+        endpoint = f"http://127.0.0.1:{boot.config.local_port}"
+        fleet = FleetConfig(directory/"fleet", (SlotConfig(spec, True, endpoint, (endpoint,), COMFY_REVISION, True),), True, 1)
+        token, _ = prepare_launch(fleet, worker_id)
+        observed = ObservedProcess(fleet, worker_id, token)
+        boot.fleet = SimpleNamespace(config=fleet, children={worker_id: observed})
+        files, _ = boot._sources()
+        (directory/"bootstrap-state.json").write_text(json.dumps({"phase": "fleet_started", "local_port": boot.config.local_port,
+            "identity": boot._identity(row, files)}))
+        boot.host = SimpleNamespace(close=lambda: None)
+        with owned_process(fleet, worker_id, token):
+            self.assertFalse(boot.close_if_safe(destroyed=True))
+        self.assertTrue(boot.close_if_safe(destroyed=True))
+        with self.repo.engine.connect() as conn:
+            proof = one_receipt(conn, a, "member_local_closed")
+        self.assertEqual((proof["kind"], proof["protocol"]), ("owned_fleet_lock_released", PROTOCOL))
+        self.assertNotIn("pid", proof["children"][0])
+        self.assertTrue(proof["children"][0]["cpu_owner_stopped"])
+        self.assertEqual(self.create()["reason"], "member_replacement_backoff")
+        self.now += 61
+        with self.repo.transaction() as conn:
+            receipt = conn.execute(select(scaler_receipts).where(scaler_receipts.c.intent_id == a,
+                scaler_receipts.c.operation == "member_local_closed")).mappings().one()
+            conn.execute(update(scaler_receipts).where(scaler_receipts.c.id == receipt["id"]).values(
+                facts={**proof, "children": [{**proof["children"][0], "cpu_owner_stopped": False}]}))
+        self.assertEqual(self.create()["reason"], "member_replacement_local_stop_unconfirmed")
+        with self.repo.transaction() as conn:
+            conn.execute(update(scaler_receipts).where(scaler_receipts.c.id == receipt["id"]).values(facts=proof))
+        self.assertEqual(self.create()["state"], "creation_observed")
+        self.assertEqual(self.chain()[1]["b"]["intent_id"], b)
+
     def test_restart_failed_preparation_without_owned_transport_cannot_mint_stop_proof(self):
         from studio_platform.production_scaler_boot import ProductionBoot
         from studio_platform.pool_member_generations import one_receipt

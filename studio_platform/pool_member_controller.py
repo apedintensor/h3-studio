@@ -384,6 +384,18 @@ class PoolServiceCycle(FiniteController):
                     and children[0].get("worker_id") == expected["worker_id"]
                     and type(children[0].get("pid")) is int and children[0]["pid"] > 0
                     and type(children[0].get("exit_code")) is int)
+            if proof.get("kind") == "owned_fleet_lock_released":
+                from .fleet_process import PROTOCOL, TOKEN
+                children = proof.get("children")
+                return (proof.get("protocol") == PROTOCOL
+                    and isinstance(proof.get("fleet_hash"), str) and len(proof["fleet_hash"]) == 64
+                    and isinstance(children, list) and len(children) == 1 and isinstance(children[0], dict)
+                    and children[0].get("worker_id") == expected["worker_id"]
+                    and children[0].get("protocol") == PROTOCOL
+                    and children[0].get("fleet_hash") == proof["fleet_hash"]
+                    and isinstance(children[0].get("token"), str) and TOKEN.fullmatch(children[0]["token"]) is not None
+                    and isinstance(children[0].get("boot_id"), str) and bool(children[0]["boot_id"])
+                    and children[0].get("cpu_owner_stopped") is True)
             if proof.get("kind") == "owned_preparation_never_registered":
                 return (proof.get("phase") in ("bootstrap_failed", "staging_failed", "staging_cancelled", "qualification_failed")
                     and connection.execute(select(registered_workers.c.id).where(

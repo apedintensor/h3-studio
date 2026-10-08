@@ -741,7 +741,7 @@ class ProductionBootTests(LedgerCase):
                 engine=self.repo.engine, close=lambda: None, clock=lambda: self.now)), \
                 patch("studio_platform.production_scaler_boot.run_slot", side_effect=fake_slot):
             self.assertEqual(run_child(self.config, self.intent["id"], self.boot.fleet.config.fingerprint(),
-                Settings(Path(self.temp.name)/"data")), 0)
+                Settings(Path(self.temp.name)/"data"), owner_token=argv[argv.index("--owner-token")+1]), 0)
 
     def test_remaining_1000_seconds_runs_wrapper_drain_and_retires_fresh_idle_child(self):
         self.backend.outcome = Outcome("succeeded", "task-test")
@@ -761,11 +761,12 @@ class ProductionBootTests(LedgerCase):
         from studio_platform.production_scaler_boot import run_child
         from studio_platform.storage import LocalObjectStore
         self.backend.outcome = Outcome("succeeded", "task-test")
+        shared = replace(self.config, allowed_owners=["superdan", "supervan"])
+        self.boot.finite = shared
         process = SimpleNamespace(pid=4242, poll=lambda: None, send_signal=lambda value: None)
         with patch.object(self.boot, "_popen_impl", return_value=process):
             self.boot.tick(self.intent["id"])
         self.boot.fleet.config.work_dir.mkdir(exist_ok=True, parents=True)
-        shared = replace(self.config, allowed_owners=["superdan", "supervan"])
         def fake_slot(fleet, worker_id, settings, **kw):
             runner = kw["runner_factory"](self.repo, LocalObjectStore(Path(self.temp.name)/"objects"),
                 Path(self.temp.name)/"child", backend=self.backend, control=WorkerControl(self.repo))
@@ -789,7 +790,8 @@ class ProductionBootTests(LedgerCase):
                 engine=self.repo.engine, close=lambda: None, clock=lambda: self.now)), \
                 patch("studio_platform.production_scaler_boot.run_slot", side_effect=fake_slot):
             self.assertEqual(run_child(shared, self.intent["id"], self.boot.fleet.config.fingerprint(),
-                Settings(Path(self.temp.name)/"data")), 0)
+                Settings(Path(self.temp.name)/"data"),
+                owner_token=self.boot.fleet.process_tokens["lium-"+self.intent["id"].replace("-", "")]), 0)
 
 
 if __name__ == "__main__":

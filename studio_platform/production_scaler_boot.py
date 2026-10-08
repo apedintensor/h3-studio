@@ -81,18 +81,67 @@ class ProductionBoot(BootController):
         self._member_preparation_owner = not preparation_receipt.exists() and not preparation_receipt.is_symlink()
 
     def _fleet(self, config, repo, path):
-        return FleetSupervisor(config, repo, path, popen=self._popen)
+        fleet = FleetSupervisor(config, repo, path, popen=self._popen, process_ownership=True)
+        fleet.controller_hash = self.finite.fingerprint()
+        return fleet
 
     def _popen(self, argv, **kwargs):
         fleet_file = self.config.work_dir/self.intent_id/"fleet.json"
         expected = [sys.executable, "-m", "studio_platform.fleet", "--config", str(fleet_file),
             "--slot", "lium-"+self.intent_id.replace("-", ""), "--config-hash", self.fleet.config.fingerprint()]
+        extra = []
+        if self.fleet.process_ownership:
+            extra = ["--owner-token", self.fleet.process_tokens["lium-"+self.intent_id.replace("-", "")]]
+            if self.fleet.recovering:
+                extra += ["--recover-slot"]
+        expected += extra
         if argv != expected or self.operator_path is None:
             raise BootError("finite_unexpected_child_command")
         # stdin must never inherit the one-shot provider credential pipe.
         kwargs["stdin"] = subprocess.DEVNULL
         return self._popen_impl([sys.executable, "-m", "studio_platform.production_scaler", "--config", str(self.operator_path),
-            "--enabled", "--slot", self.intent_id, "--config-hash", self.fleet.config.fingerprint()], **kwargs)
+            "--enabled", "--slot", self.intent_id, "--config-hash", self.fleet.config.fingerprint(), *extra], **kwargs)
+
+    def _recover_fleet(self, intent, directory, state):
+        from .fleet_process import PROTOCOL
+        if state.get("fleet_process_protocol") != PROTOCOL:
+            return {"state": "fleet_recovery_required", "generation_verified": False}
+        path = directory/"fleet.json"
+        config = read_fleet(path)
+        slot = config.slot("lium-"+intent["id"].replace("-", ""))
+        spec = slot.spec
+        files, _ = self._sources()
+        endpoint = f"http://127.0.0.1:{self.config.local_port}"
+        if (state.get("identity") != self._identity(intent, files)
+                or state.get("local_port") != self.config.local_port
+                or state.get("fleet_config_hash") != config.fingerprint()
+                or state.get("fleet_controller_hash") != self.finite.fingerprint()
+                or config.work_dir != directory/"fleet" or not config.enabled
+                or len(config.slots) != 1 or not slot.enabled or slot.recovery_only
+                or spec.instance_id != intent["provider_instance_id"] or spec.pool != intent["pool"]
+                or spec.configuration_id != self.config.configuration_id
+                or spec.backend != self.config.execution_backend
+                or spec.engine_manifest_digest != self.config.engine_manifest_digest
+                or spec.output_delivery != self.config.output_delivery
+                or spec.recipe_ids != self.config.recipe_ids or spec.model_id != self.finite.launches[0]["model_id"]
+                or state.get("fleet_recipe_ids") != list(self.config.recipe_ids)
+                or spec.physical_gpu_ids != (state["hardware"]["gpu"]["uuid"],)
+                or slot.endpoint != endpoint or slot.allowed_origins != (endpoint,)
+                or self.config.execution_backend == "wangp-worker" and
+                   slot.runtime_config_file != str(directory/"wangp-client.json")):
+            raise BootError("fleet_recovery_identity_conflict")
+        # The pinned adapter reconnect has already verified the original
+        # runtime incarnation. No upload, setup launch or inference is repeated.
+        if self.backend is None or self.host is None:
+            raise BootError("finite_collection_runtime_unconfirmed")
+        self.fleet = self.fleet_factory(config, self.repo, path)
+        self.fleet.recover()
+        state["phase"] = "fleet_started"
+        self._save(directory/"bootstrap-state.json", state)
+        status = self.fleet.tick()
+        return {"state": "fleet_attention_required" if any(c["state"] == "exited" for c in status["children"])
+                else "fleet_running", "fleet": status, "generation_verified": False,
+                "recovered_original_fleet": True}
 
     def request_drain(self):
         self._stopping = True
@@ -136,6 +185,16 @@ class ProductionBoot(BootController):
         self._validate_report(report, manifest)
         self._connect_backend(intent, self.config.work_dir/intent['id'], state)
 
+    def _connect_backend(self, intent, directory, state):
+        from .fleet_process import PROTOCOL
+        if (state.get("fleet_process_protocol") == PROTOCOL
+                and state.get("phase") in ("fleet_starting", "fleet_started")
+                and self.config.execution_backend == "wangp-worker"):
+            import re
+            if not re.fullmatch(r"[0-9a-f]{32}", str(state.get("runtime_incarnation", ""))):
+                raise BootError("wangp_boot_incarnation_changed_reconcile_required")
+        return super()._connect_backend(intent, directory, state)
+
     def tick(self, intent_id, *, stopping=False):
         from .production_scaler import verify_sources
         verify_sources(self.finite)
@@ -167,6 +226,13 @@ class ProductionBoot(BootController):
             if receipt.exists():
                 state = json.loads(receipt.read_text())
                 self.record_preparation_stop(receipt, state)
+                if self.fleet is None and state.get("phase") in ("fleet_starting", "fleet_started"):
+                    from .fleet_process import PROTOCOL
+                    if state.get("fleet_process_protocol") != PROTOCOL:
+                        return {"state": "fleet_recovery_required", "children_done": False}
+                    self._collection_backend(intent, state)
+                    self._recover_fleet(intent, receipt.parent, state)
+                    self.fleet.drain()
                 if state.get("smoke_submission_started") and state.get("phase") not in ("qualified", "qualification_failed", "fleet_starting", "fleet_started"):
                     self._collection_backend(intent, state)
                     result = self._smoke(receipt.parent, receipt, state)
@@ -445,8 +511,8 @@ class ProductionBoot(BootController):
     def children_done(self):
         # A restarted controller has no Popen handles. That is not evidence that
         # an already launched CPU fleet exited, even after its GPU is destroyed.
-        # Only the owning process can currently prove child exit; full fleet
-        # reconstruction remains a separate recovery operation.
+        # Protocol-bound reconstruction supplies a kernel-backed observation;
+        # legacy saved PIDs/absent handles are still not exit evidence.
         try:
             if self.preparation_pending():
                 return False
@@ -547,11 +613,19 @@ class ProductionBoot(BootController):
             expected_workers = {slot.spec.worker_id for slot in self.fleet.config.slots if slot.enabled}
             if expected_workers != {expected["worker_id"]} or set(self.fleet.children) != expected_workers:
                 return None
-            children = [{"worker_id": key, "pid": proc.pid, "exit_code": proc.poll()}
-                        for key, proc in sorted(self.fleet.children.items())]
-            if any(type(child["pid"]) is not int or child["pid"] <= 0 or type(child["exit_code"]) is not int for child in children):
-                return None
-            detail = {"kind": "owned_fleet_exited", "fleet_hash": self.fleet.config.fingerprint(), "children": children}
+            from .fleet_process import ObservedProcess, PROTOCOL
+            if all(isinstance(proc, ObservedProcess) for proc in self.fleet.children.values()):
+                children = [proc.stopped_proof() for proc in self.fleet.children.values()]
+                if any(child is None for child in children):
+                    return None
+                detail = {"kind": "owned_fleet_lock_released", "fleet_hash": self.fleet.config.fingerprint(),
+                    "protocol": PROTOCOL, "children": children}
+            else:
+                children = [{"worker_id": key, "pid": proc.pid, "exit_code": proc.poll()}
+                            for key, proc in sorted(self.fleet.children.items())]
+                if any(type(child["pid"]) is not int or child["pid"] <= 0 or type(child["exit_code"]) is not int for child in children):
+                    return None
+                detail = {"kind": "owned_fleet_exited", "fleet_hash": self.fleet.config.fingerprint(), "children": children}
         else:
             if (not self._member_preparation_owner
                     or state.get("phase") not in ("bootstrap_failed", "staging_failed", "staging_cancelled", "qualification_failed")
@@ -572,9 +646,26 @@ class ProductionBoot(BootController):
         raise BootError("finite_close_requires_confirmed_destroyed_and_children_done")
 
 
-def run_child(config, intent_id, expected_hash, settings):
+def run_child(config, intent_id, expected_hash, settings, *, owner_token=None, recover_slot=False):
+    from .fleet_process import PROTOCOL, owned_process
+    from .production_scaler import ScalerError
+    path = config.work_dir/"boot"/intent_id/"fleet.json"
+    fleet = read_fleet(path)
+    state = json.loads((path.parent/"bootstrap-state.json").read_text())
+    if state.get("fleet_process_protocol") == PROTOCOL:
+        if (state.get("fleet_config_hash") != fleet.fingerprint() or expected_hash != fleet.fingerprint()
+                or state.get("fleet_controller_hash") != config.fingerprint()):
+            raise ScalerError("finite_child_process_binding_changed")
+        with owned_process(fleet, "lium-"+intent_id.replace("-", ""), owner_token):
+            return _run_child(config, intent_id, expected_hash, settings, recover_slot=recover_slot)
+    if owner_token is not None or recover_slot or state.get("fleet_process_protocol") is not None:
+        raise ScalerError("finite_child_process_protocol_required")
+    return _run_child(config, intent_id, expected_hash, settings)
+
+
+def _run_child(config, intent_id, expected_hash, settings, *, recover_slot=False):
     from .drain_safe_runner import DrainSafeRunner
-    from .production_scaler import ScalerError, job_scope_filter, job_scope_allowed
+    from .production_scaler import ScalerError, job_scope_filter, job_scope_allowed, verify_policy
     repo = Repository(settings.database_url)
     try:
         fleet_path = config.work_dir/"boot"/intent_id/"fleet.json"
@@ -599,6 +690,7 @@ def run_child(config, intent_id, expected_hash, settings):
         spec = fleet.slot(worker_id).spec
         if (len(fleet.slots) != 1 or spec.pool != config.pool or spec.configuration_id != config.configuration_id
                 or spec.backend != config.execution_backend or spec.engine_manifest_digest != config.engine_manifest_digest
+                or spec.output_delivery != config.output_delivery
                 or identity.get('backend', 'comfy-worker') != config.execution_backend
                 or identity.get('engine_manifest_digest', '') != config.engine_manifest_digest
                 or spec.instance_id != identity.get("instance_id") or spec.model_id != config.launches[0]["model_id"]
@@ -637,8 +729,46 @@ def run_child(config, intent_id, expected_hash, settings):
                     return 0
         else:
             runner_type, queued_kwargs = DrainSafeRunner, {}
-        return run_slot(fleet, worker_id, settings, repository=repo,
-            runner_factory=lambda *a, **kw: runner_type(*a, stop_new=stop_new, job_allowed=job_allowed,
-                job_filter=predicate, collection_lock_dir=config.work_dir/"collection-lock", **queued_kwargs, **kw)) or 0
+        if recover_slot:
+            control = WorkerControl(repo)
+            worker = control.get(worker_id)
+            from .control import worker_spec_payload
+            from .repository import request_hash
+            if worker["spec_hash"] != request_hash(worker_spec_payload(spec)):
+                raise ScalerError("finite_child_identity_mismatch")
+            may_admit = (not stop_new() and not worker["drain_requested"] and worker["state"] != "retired"
+                and row["state"] in ("starting", "ready", "busy")
+                and not (fleet.work_dir/worker_id/"drain.flag").exists()
+                and settings.generation_enabled and settings.execution_backend == spec.backend)
+            if may_admit:
+                try:
+                    policy = verify_policy(config, settings)
+                    may_admit = (policy["enabled"] is True and policy["qualification"]["expires_at"] > repo.clock()
+                        and policy["reservation"]["expires_at"] > repo.clock())
+                except Exception:
+                    may_admit = False
+            if not may_admit:
+                if not worker["current_job_id"]:
+                    if worker["state"] != "retired":
+                        control.drain(worker_id)
+                    return 0
+                control.require_recovery_binding(spec)
+                allowed = settings.recovery_backends
+                if spec.backend == settings.execution_backend and spec.backend not in allowed:
+                    settings = replace(settings, recovery_backends=(*allowed, spec.backend))
+                elif spec.backend not in allowed:
+                    raise ScalerError("finite_original_backend_recovery_not_allowed")
+                fleet = replace(fleet, slots=(replace(fleet.slot(worker_id),
+                    recovery_only=True, confirmed_idle=False),))
+
+        class ConfiguredRunner(runner_type):
+            def __init__(self, *args, **kwargs):
+                kwargs.setdefault("stop_new", stop_new)
+                kwargs.setdefault("job_allowed", job_allowed)
+                kwargs.setdefault("job_filter", predicate)
+                kwargs.setdefault("collection_lock_dir", config.work_dir/"collection-lock")
+                super().__init__(*args, **queued_kwargs, **kwargs)
+
+        return run_slot(fleet, worker_id, settings, repository=repo, runner_factory=ConfiguredRunner) or 0
     finally:
         repo.close()

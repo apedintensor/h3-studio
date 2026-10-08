@@ -737,7 +737,7 @@ class BootController:
                 return result
             if self.fleet is None:
                 if state["phase"] in {"fleet_starting", "fleet_started"}:
-                    return {"state": "fleet_recovery_required", "generation_verified": not queued_task}
+                    return self._recover_fleet(intent, directory, state)
                 worker_id = "lium-"+intent_id.replace("-", "")
                 endpoint = f"http://127.0.0.1:{self.config.local_port}"
                 slot = self._slot(intent, report, directory)
@@ -755,6 +755,10 @@ class BootController:
                 cfg_path.write_text(json.dumps(value), encoding="utf-8")
                 self.fleet = self.fleet_factory(config, self.repo, cfg_path)
                 state["fleet_recipe_ids"] = list(self.config.recipe_ids)
+                if getattr(self.fleet, "process_ownership", False) is True:
+                    from .fleet_process import PROTOCOL
+                    state.update(fleet_process_protocol=PROTOCOL, fleet_config_hash=config.fingerprint(),
+                        fleet_controller_hash=self.fleet.controller_hash)
                 state["phase"] = "fleet_starting"
                 self._save(receipt, state)
                 self.fleet.start()
@@ -765,6 +769,9 @@ class BootController:
             return {**(result if queued_task else {}), "state": "fleet_attention_required" if attention else "fleet_running", "fleet": fleet_status,
                 "generation_verified": not queued_task,
                 "qualification_scope": "runtime_ready_awaiting_real_task" if queued_task else "single_host_fl2va_4s_480p_audio_smoke_only"}
+
+    def _recover_fleet(self, intent, directory, state):
+        return {"state": "fleet_recovery_required", "generation_verified": False}
 
     def _queued_task_runtime(self, directory, receipt, state):
         """Prove startup identity and idle endpoint, without an inference POST.

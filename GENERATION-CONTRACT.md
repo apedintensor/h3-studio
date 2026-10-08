@@ -124,9 +124,27 @@ digest. The private client also pins the runtime incarnation; generation POSTs
 carry that precondition and a replaced host refuses them before dispatch. Reads
 of original receipts remain available. A transport reconnect reuses the same
 instance, host key, token and local port, including during draining; it does not
-upload, reinstall, restart or resubmit. A complete controller-process restart
-after fleet launch still requires explicit recovery under C2; transport recovery
-must not be reported as acceptance of that wider requirement.
+upload, reinstall, restart or resubmit. Newly launched production fleets record
+`fleet-process-v1`, the exact fleet/controller hashes and a private per-worker
+launch token. The CPU child holds a kernel lifetime lock across registration,
+the runner and cleanup. A replacement controller on the same Linux host/kernel
+boot can observe that live owner without signalling a saved PID; only a released
+lock permits a newly fenced CPU recovery child. A delayed old launch cannot use
+the superseded token. Missing/corrupt/legacy evidence, changed configuration,
+device identity or WanGP incarnation remains a recovery hold. This does not
+adopt historical fleets or recover a copied control directory/host reboot.
+
+Reconstruction reuses the original registrations, tasks, attempts, provider
+instance, runtime, local port and deadlines. A stopped child's original attempt
+can reconcile/collect even when new admission is revoked or draining; a new
+claim still needs the same current policy, scope, engine/delivery binding and
+existing queue/worker fences. Quarantine and drain markers are retained. An
+unknown Popen result is not retried within that controller; a later parent must
+reconcile the durable token. No model/runtime setup or generation is replayed.
+Reconstructed exit evidence reports a released lifetime lock, not an invented
+PID/exit-zero value, and does not replace runtime-idle, attempt-stop, provider
+removal or billing gates. Local CPU/ledger tests and actual controller/GPU
+interruption acceptance remain separate C2 evidence.
 
 WanGP source/dependency staging is a pollable upload-only operation within this
 same controller. Its identity-bound `staging` receipt precedes remote bytes;
