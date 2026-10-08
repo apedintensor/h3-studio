@@ -20,6 +20,22 @@ All measured videos use 124 native frames at 24 fps (about 5.17 s). The catalog 
 
 Example historical task totals, excluding queue/VM start/download: 5090 FL first+last at 480p/20 steps 96.791 s; 5090 REF image+video+audio at 480p/20 steps 161.568 s; PRO INT8 same REF case 151.950 s; PRO BF16 same REF case 193.664 s. These are observations, not completion guarantees. Full samples, source revisions and input roles are in `deploy/wangp/profiles/*.json` and the linked measurement evidence.
 
+### RTX 5090 rental filter policy
+
+The catalog defaults are **96 GiB RAM, 128 GiB free disk and 200 Mbps advertised download bandwidth**. The disk and bandwidth values relax the original 250 GiB / 500 Mbps pilot filters to widen eligible inventory. They are derived operating policy, not newly measured hardware minima. PRO 6000 filters remain unchanged.
+
+The [original 5090 proposal](https://github.com/apedintensor/h3-studio/pull/68) used conservative admission; the [completed 5090 pilot](https://github.com/apedintensor/h3-studio/pull/69) ran on 105 GiB actual cgroup RAM. Its runtime still requires 96 GiB effective available RAM, accounting for reclaimable clean file cache, and 28 GiB free VRAM. A 64 GiB host has not been qualified. The [PRO comparison](https://github.com/apedintensor/h3-studio/pull/70) used a separate 279 GiB shared host and does not establish a smaller 5090 RAM requirement.
+
+Pinned 5090 files total **51,898,376,278 bytes (48.33 GiB)** for one mode and **72,956,051,066 bytes (67.95 GiB)** for both modes. Current operator nodes prepare one selected mode and reuse the pinned image's installed environment. For a split rental, [Lium's allocation rules](https://docs.lium.io/developers/quickstart) divide the pod's disk share between the `/root` volume (two thirds) and container storage (one third). A 128 GiB pod share therefore provides about 85 GiB for `/root/sixnine-cache/models`, leaving about 37 GiB beyond one mode's weights, before temporary files and outputs. It is not 128 GiB of model-cache space. The downloader checks missing-file bytes plus 10 GiB free headroom on the actual cache filesystem and limits its separate cache to 1 GiB. This is a sizing calculation, not a successful run on a 128 GiB allocation; a different image, both-mode cache or environment installation needs its own sizing check.
+
+At a sustained 200 Mbps, the one-mode payload alone would take about **34.6 minutes**; both modes would take **48.6 minutes**, before setup and verification. Advertised provider bandwidth is not measured Hugging Face throughput or an SLA. The lower filter accepts a cold-start latency tradeoff; bootstrap, task-admission and supplier-deadline checks remain in force. Operators must allow sufficient authorized startup time.
+
+Catalog changes do not update protected live provider manifests or immutable deployment bindings automatically. Prepare a matching replacement configuration through the approved release process before using these filters; existing attempts retain their original configuration. These metadata changes do not alter model files, runtime settings or engine-manifest digests.
+
+For this filter-only activation, retain each old binding and its provider manifest; disable the old binding only for new starts. Give the successor a new `binding_id` and immutable provider-manifest path, setting `minimum_disk_gib: 128` / `min_disk_gib: 128` and `min_download_mbps: 200` consistently in the manifest and binding. Preserve `configuration_id`, pool, model/engine/recipe, source hashes, RAM/VRAM, GPU count, price, budget accounts and original expiry/TTL. No generation-policy rewrite or source-package rebuild is necessary solely for these hardware filters. The old binding fingerprint remains unchanged because only its `enabled` flag changes. Do not reload API/controller configuration until the existing protected release barrier proves no owned processes or in-flight obligations will be lost; unresolved restart recovery remains #60. No live configuration is changed by publishing this guide.
+
+Use RAM/disk requirements for the rented pod's proportional share, not the whole host's advertised totals. An eight-GPU host with enough total RAM may still fail the single-GPU requirement. Provider minimum rental counts also apply. Looser disk/network filters do not guarantee that a qualifying one-GPU pod is currently available, and must never trigger a silent switch to four/eight GPUs or a lower RAM allocation.
+
 ## Local product review
 
 From this backend checkout, using the existing Python environment:
