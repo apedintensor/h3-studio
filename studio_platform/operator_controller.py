@@ -11,6 +11,8 @@ import argparse
 import importlib
 import json
 import math
+import signal
+import threading
 import time
 import uuid
 
@@ -64,6 +66,73 @@ class OperatorController:
         require(safe_id(self.leader_id),"operator_controller_identity_invalid",422)
         self.coordinator_factory=coordinator_factory
         self.coordinators,self.boots={},{}
+        self.shutting_down=False
+        self.shutdown_started_at=None
+        self.shutdown_targets=set()
+        self.shutdown_released=set()
+
+    def request_shutdown(self):
+        """Signal-safe intent only. Database/provider work stays in the main loop."""
+        self.shutting_down=True
+
+    def _drain_for_shutdown(self,nodes):
+        if self.shutdown_started_at is None:
+            self.shutdown_started_at=time.monotonic()
+        self.shutdown_targets.update(self.boots)
+        for node in nodes:
+            if node["intent_id"] in self.shutdown_released: continue
+            key=(node["binding_id"],node["binding_hash"])
+            if key not in self.coordinators and node["intent_id"] not in self.boots:
+                continue
+            intent_id=node["intent_id"]
+            coordinator=self.coordinators.get(key)
+            boot=self.boots.get(intent_id)
+            # Local children are ours to drain even after losing provider
+            # leadership. This never authorizes a provider mutation.
+            if boot is not None:
+                drain=getattr(boot,"request_drain",None)
+                if callable(drain): drain()
+            if coordinator is None: continue
+            binding=self.service.registry.get(node["binding_id"])
+            lease=coordinator.acquire(binding.pool,self.leader_id)
+            if lease is None: continue
+            with self.repo.transaction() as connection:
+                coordinator._leader(connection,lease)
+                self.repo._lock_capacity(connection)
+                current=self.repo._locked(connection,select(operator_nodes).where(operator_nodes.c.intent_id==intent_id))
+                intent=self.repo._locked(connection,select(instance_intents).where(instance_intents.c.id==intent_id))
+                if not current or not intent or intent["state"]=="destroyed": continue
+                self.shutdown_targets.add(intent_id)
+                if current["desired_state"]=="running":
+                    connection.execute(update(operator_nodes).where(operator_nodes.c.intent_id==intent_id).values(
+                        desired_state="drained",updated_at=self.repo.clock()))
+                    self.repo._emit(connection,"operator.capacity.controller_draining",intent_id,
+                        {"intent_id":intent_id,"controller_id":self.leader_id})
+
+    def shutdown_status(self):
+        """Release only proven local ownership, never claim supplier cleanup."""
+        if not self.shutting_down: return {"state":"running","local_connections_released":False}
+        pending=[]
+        for intent_id,boot in list(self.boots.items()):
+            if intent_id in self.shutdown_released: continue
+            try:
+                inspect=getattr(boot,"shutdown_status",None)
+                release=getattr(boot,"release_after_drain",None)
+                proof=inspect() if callable(inspect) else None
+                if not isinstance(proof,dict) or proof.get("ownership_known") is not True:
+                    pending.append({"node_id":intent_id,"code":"operator_child_ownership_unconfirmed"})
+                elif proof.get("children_done") is not True:
+                    pending.append({"node_id":intent_id,"code":"operator_collection_still_running"})
+                elif not callable(release):
+                    pending.append({"node_id":intent_id,"code":"operator_local_release_unavailable"})
+                else:
+                    release()
+                    self.shutdown_released.add(intent_id)
+            except Exception:
+                pending.append({"node_id":intent_id,"code":"operator_local_release_unconfirmed"})
+        return {"state":"shutdown_waiting" if pending else "shutdown_complete",
+            "local_connections_released":not pending,"pending":pending,
+            "cloud_removal_confirmed":False,"billing_settled":False}
 
     def _coordinator(self,binding):
         key=(binding.binding_id,binding.fingerprint)
@@ -116,6 +185,7 @@ class OperatorController:
                 {"operation_id":command_id,"state":state,"reason_code":reason})
 
     def _authorize_start(self,connection,command,binding):
+        require(not self.shutting_down,"operator_controller_stopping")
         current=self.repo._locked(connection,select(operator_commands).where(operator_commands.c.id==command["id"]))
         policy=self.service._policy(connection)
         require(current is not None and current["state"] in ACTIVE_COMMANDS,"operator_policy_changed")
@@ -135,12 +205,14 @@ class OperatorController:
         return True
 
     def _start(self,command):
+        if self.shutting_down: return "shutting_down"
         payload=command["payload"]
         binding=self.service.registry.get(payload["binding_id"])
         require(callable(self.boot_factory),"operator_bootstrap_unconfigured")
         coordinator=self._coordinator(binding)
         chosen=payload["selection"]
         for ordinal in range(chosen["node_count"]):
+            if self.shutting_down: return "shutting_down"
             with self.repo.engine.connect() as connection:
                 existing=connection.execute(select(operator_nodes).where(
                     operator_nodes.c.command_id==command["id"],operator_nodes.c.ordinal==ordinal)).mappings().first()
@@ -182,7 +254,7 @@ class OperatorController:
     def _start_guard(self,coordinator,lease,binding,intent_id):
         """Late upload callbacks must retain the original durable authority."""
         try:
-            if not self.enabled: return False
+            if not self.enabled or self.shutting_down: return False
             current_binding=self.service.registry.get(binding.binding_id)
             if not current_binding.enabled or current_binding.fingerprint!=binding.fingerprint: return False
             with self.repo.transaction() as connection:
@@ -289,6 +361,10 @@ class OperatorController:
                 runtime="provider_lifetime_unverified"
             elif callable(execution_allowed) and execution_allowed(intent_id,intent["provider_instance_id"]) is not True:
                 runtime="provider_execution_unverified"
+            elif self.shutting_down and intent_id not in self.boots:
+                # No owned runtime/child exists. Preserve its durable drained
+                # allocation; shutdown must not construct a new boot process.
+                runtime="draining"
             elif callable(self.boot_factory):
                 if intent_id not in self.boots:
                     self.boots[intent_id]=self.boot_factory(binding,intent,latest["payload"]["selection"])
@@ -332,7 +408,7 @@ class OperatorController:
             nodes=list(connection.execute(select(operator_nodes)).mappings())
             intents={row["id"]:row for row in connection.execute(select(instance_intents)).mappings()}
             workers=list(connection.execute(select(registered_workers)).mappings())
-        for command in commands:
+        for command in commands if not self.shutting_down else ():
             if command["kind"]=="start":
                 owned=[row for row in nodes if row["command_id"]==command["id"]]
                 if any(intents[n["intent_id"]]["state"] in {"creating","creation_unknown"} for n in owned):
@@ -376,13 +452,19 @@ class OperatorController:
             except LeaseLost:
                 continue
             except Exception as error:
+                if self.shutting_down: continue
                 self._record_command(command["id"],"blocked",safe_error(error))
         with self.repo.engine.connect() as connection:
             # Includes completed/blocked commands: rentals still need lifecycle
             # reconciliation, pending invoice settlement and conservative cleanup.
             nodes=list(connection.execute(select(operator_nodes)).mappings())
+        if self.shutting_down:
+            self._drain_for_shutdown(nodes)
         errors=0
         for node in nodes:
+            if self.shutting_down and (node["intent_id"] not in self.shutdown_targets
+                    or node["intent_id"] in self.shutdown_released):
+                continue
             try:
                 self._observe(node)
             except LeaseLost:
@@ -393,7 +475,7 @@ class OperatorController:
                     connection.execute(update(operator_nodes).where(operator_nodes.c.intent_id==node["intent_id"]).values(
                         runtime_state="observation_failed",updated_at=self.repo.clock()))
         self._summarize_commands()
-        status="degraded" if errors else "running"
+        status="draining" if self.shutting_down else "degraded" if errors else "running"
         with self.repo.transaction() as connection:
             # A competing controller's newer heartbeat is not ours to overwrite.
             connection.execute(update(operator_heartbeats).where(operator_heartbeats.c.id=="global",
@@ -408,25 +490,62 @@ def main(argv=None):
     parser.add_argument("--enabled",action="store_true")
     parser.add_argument("--once",action="store_true")
     parser.add_argument("--interval",type=int,default=10)
+    parser.add_argument("--shutdown-grace-seconds",type=int,default=900,
+        help="After this grace window report attention required but retain live collection/tunnels")
     args=parser.parse_args(argv)
     if not args.enabled:
         print(json.dumps({"state":"disabled"}))
         return 0
     if not 1<=args.interval<=60: parser.error("interval must be between 1 and 60 seconds")
+    if not 30<=args.shutdown_grace_seconds<=86400: parser.error("shutdown grace must be between 30 and 86400 seconds")
     module,separator,name=args.factory.partition(":")
     if not separator or not name.isidentifier(): parser.error("trusted factory must be module:callable")
+    previous={}
     try:
         controller=getattr(importlib.import_module(module),name)(args.config)
         require(isinstance(controller,OperatorController) and controller.enabled,"operator_controller_configuration_invalid")
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGINT,signal.SIGTERM):
+                previous[signum]=signal.getsignal(signum)
+                signal.signal(signum,lambda *_:controller.request_shutdown())
+        attention_reported=False
         while True:
-            print(json.dumps(controller.tick()),flush=True)
-            if args.once: return 0
-            time.sleep(args.interval)
+            try:
+                print(json.dumps(controller.tick()),flush=True)
+                if args.once and not controller.shutting_down:
+                    controller.request_shutdown()
+                    # Even --once must drain any runtime it just acquired;
+                    # it is not permission to abandon its collectors.
+                    print(json.dumps(controller.tick()),flush=True)
+                if controller.shutting_down:
+                    status=controller.shutdown_status()
+                    print(json.dumps(status),flush=True)
+                    if status["state"]=="shutdown_complete": return 0
+                    if (not attention_reported and controller.shutdown_started_at is not None
+                            and time.monotonic()-controller.shutdown_started_at>=args.shutdown_grace_seconds):
+                        print(json.dumps({"state":"shutdown_attention_required",
+                            "code":"operator_shutdown_requires_recovery","connections_retained":True}),flush=True)
+                        attention_reported=True
+                time.sleep(args.interval)
+            except KeyboardInterrupt:
+                controller.request_shutdown()
+                continue
+            except Exception:
+                # An unexpected controller error must not abandon owned
+                # collectors. Switch to drain and keep the process observable.
+                controller.request_shutdown()
+                print(json.dumps({"state":"shutdown_waiting","code":"operator_controller_error"}),flush=True)
+                try: time.sleep(args.interval)
+                except KeyboardInterrupt: pass
     except KeyboardInterrupt:
-        return 0
+        # Before a controller exists there are no connections owned here.
+        return 1
     except Exception:
         print(json.dumps({"state":"failed","code":"operator_controller_startup_failed"}),flush=True)
         return 1
+    finally:
+        for signum,handler in previous.items():
+            signal.signal(signum,handler)
 
 
 if __name__=="__main__":

@@ -1,6 +1,9 @@
 """Isolated database + injected fake provider; no cloud/model/API requests."""
 from dataclasses import asdict, replace
 import json
+import io
+import signal
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,6 +41,11 @@ class FakeBoot:
     def cancel_preparation(self): self.cancelled=True
     def close(self): self.closed=True
     def set_start_guard(self,guard): self.guard=guard
+    def shutdown_status(self):
+        return {"ownership_known":True,"children_done":self.drained}
+    def release_after_drain(self):
+        if not self.drained: raise ValueError("not_drained")
+        self.closed=True
     def tick(self,intent_id,*,stopping=False):
         self.ticks.append((intent_id,stopping))
         if stopping: return "draining"
@@ -191,6 +199,75 @@ class OperatorTests(LedgerCase):
         with self.repo.engine.connect() as connection:
             row=connection.execute(select(operator_nodes)).mappings().one()
         self.assertNotIn("lifetime",row["payload"])
+
+    def test_shutdown_stops_new_rents_drains_owned_nodes_and_keeps_budget_and_deadline(self):
+        self.create();self.controller.tick()
+        first=self.repo.list_instance_intents()[0]
+        budget=self.repo.get_budget("owner-budget")
+        self.create(key="pending-start")
+        self.controller.request_shutdown()
+        self.assertEqual(self.controller.tick()["state"],"draining")
+        self.assertEqual(len(self.provider.creates),1)
+        node=self.service.state(self.actor)["nodes"][0]
+        self.assertEqual(node["desired_state"],"drained")
+        self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+        self.assertEqual(self.repo.list_instance_intents()[0]["hard_deadline"],first["hard_deadline"])
+        self.assertEqual(self.provider.destroys,[])
+        status=self.controller.shutdown_status()
+        self.assertEqual(status["state"],"shutdown_complete")
+        self.assertFalse(status["cloud_removal_confirmed"])
+        self.assertFalse(status["billing_settled"])
+        self.assertTrue(next(iter(self.controller.boots.values())).closed)
+
+    def test_shutdown_retains_tunnels_for_active_collection_or_unknown_ownership(self):
+        self.create();self.controller.tick()
+        boot=next(iter(self.controller.boots.values()))
+        self.controller.request_shutdown();self.controller.tick()
+        for proof,code in (({"ownership_known":True,"children_done":False},"operator_collection_still_running"),
+                ({"ownership_known":False,"children_done":False},"operator_child_ownership_unconfirmed")):
+            boot.shutdown_status=lambda:proof
+            result=self.controller.shutdown_status()
+            self.assertEqual(result["state"],"shutdown_waiting")
+            self.assertEqual(result["pending"][0]["code"],code)
+            self.assertFalse(boot.closed)
+        boot.shutdown_status=lambda:{"ownership_known":True,"children_done":True}
+        self.assertEqual(self.controller.shutdown_status()["state"],"shutdown_complete")
+
+    def test_sigterm_mid_allocation_does_not_rent_second_node_or_boot_new_runtime(self):
+        self.create(chosen={**self.chosen,"node_count":2})
+        handlers={}
+        self.provider.on_create=lambda _:handlers[signal.SIGTERM](signal.SIGTERM,None)
+        def install(signum,handler): handlers[signum]=handler
+        with patch.dict(sys.modules,{"operator_test_factory":SimpleNamespace(factory=lambda _:self.controller)}), \
+             patch("studio_platform.operator_controller.signal.signal",side_effect=install), \
+             patch("studio_platform.operator_controller.time.sleep",side_effect=AssertionError("must finish")), \
+             patch("sys.stdout",new_callable=io.StringIO) as output:
+            result=main(["--factory","operator_test_factory:factory","--config","unused","--enabled"])
+        self.assertEqual(result,0)
+        self.assertEqual(len(self.provider.creates),1)
+        self.assertFalse(self.controller.boots)
+        self.assertEqual(self.service.state(self.actor)["nodes"][0]["desired_state"],"drained")
+        self.assertIn('"cloud_removal_confirmed": false',output.getvalue())
+
+    def test_cli_grace_timeout_reports_attention_without_closing_live_collectors(self):
+        self.create();self.controller.tick()
+        boot=next(iter(self.controller.boots.values()))
+        proof={"ownership_known":False,"children_done":False}
+        boot.shutdown_status=lambda:dict(proof)
+        self.controller.request_shutdown()
+        self.controller.shutdown_started_at=0
+        def finish_after_report(_):
+            self.assertFalse(boot.closed)
+            proof.update(ownership_known=True,children_done=True)
+        with patch.dict(sys.modules,{"operator_test_factory":SimpleNamespace(factory=lambda _:self.controller)}), \
+             patch("studio_platform.operator_controller.signal.signal"), \
+             patch("studio_platform.operator_controller.time.sleep",side_effect=finish_after_report), \
+             patch("studio_platform.operator_controller.time.monotonic",return_value=31), \
+             patch("sys.stdout",new_callable=io.StringIO) as output:
+            result=main(["--factory","operator_test_factory:factory","--config","unused","--enabled","--shutdown-grace-seconds","30"])
+        self.assertEqual(result,0)
+        self.assertIn('"shutdown_attention_required"',output.getvalue())
+        self.assertTrue(boot.closed)
 
     def test_late_guard_rejects_changed_binding_and_original_deadline(self):
         self.create();self.controller.tick()
