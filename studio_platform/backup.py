@@ -43,7 +43,8 @@ def _schemas():
     from .batches import metadata as batches
     from .guided import metadata as guided
     from .quick_chat import metadata as quick_chat
-    return (metadata, assets, quota, multipart, writer, batches, guided, quick_chat)
+    from .project_activity import metadata as project_activity
+    return (metadata, assets, quota, multipart, writer, batches, guided, quick_chat, project_activity)
 
 
 def _tables():
