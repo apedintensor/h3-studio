@@ -10,12 +10,12 @@ from unittest.mock import patch
 
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select, update,insert
 
 from studio_platform.auth import Principal
 from studio_platform.control import WorkerControl, WorkerSpec
 from studio_platform.operator_capacity import (DeploymentBinding, OperatorCapacity, OperatorError, OperatorRegistry,
-    operator_commands, operator_nodes, selection)
+    operator_commands, operator_nodes, selection,operator_inventory,operator_heartbeats)
 from studio_platform.operator_controller import OperatorController, main, provider_lifetime_current
 from studio_platform.operator_routes import register_routes
 from studio_platform.repository import instance_intents, jobs, registered_workers
@@ -96,6 +96,26 @@ class OperatorTests(LedgerCase):
                 lambda:self.service.update_policy(actor,self.policy)):
                 with self.assertRaisesRegex(OperatorError,code): function()
         self.assertTrue(self.service.state(self.actor)["operator"]["permissions"]["start"])
+
+    def test_production_inventory_gates_preview_and_new_start_but_not_replay(self):
+        self.registry.inventory_required=True
+        blocked=self.service.preview(self.actor,self.chosen)
+        self.assertFalse(blocked["can_start"])
+        self.assertIn({"code":"operator_inventory_stale"},blocked["blockers"])
+        with self.repo.transaction() as connection:
+            connection.execute(insert(operator_heartbeats).values(id="global",controller_id="ctl",observed_at=self.now,state="running"))
+            connection.execute(insert(operator_inventory).values(binding_id=self.binding.binding_id,
+                binding_hash=self.binding.fingerprint,controller_id="ctl",observed_at=self.now,status="available"))
+        preview=self.service.preview(self.actor,self.chosen)
+        self.assertTrue(preview["can_start"])
+        self.now+=31
+        with self.assertRaisesRegex(OperatorError,"operator_inventory_stale"):
+            self.service.start(self.actor,{"preview_id":preview["preview_id"]},"inventory-once")
+        with self.repo.transaction() as connection:
+            connection.execute(update(operator_heartbeats).values(observed_at=self.now))
+        result=self.service.start(self.actor,{"preview_id":preview["preview_id"]},"inventory-once")
+        self.now+=400
+        self.assertEqual(self.service.start(self.actor,{"preview_id":preview["preview_id"]},"inventory-once"),result)
 
     def test_runtime_start_guard_rejects_stop_disabled_policy_and_expired_lease(self):
         self.create();self.controller.tick()

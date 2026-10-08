@@ -14,12 +14,18 @@ from pathlib import Path
 import re
 import stat
 import time
+import sys
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+from sqlalchemy import insert, select, update
 
 from .lium_provider import LiumError, LiumManifest, LiumProvider
 from .operator_capacity import (DeploymentBinding, OperatorCapacity, OperatorError,
-    OperatorRegistry, require)
+    OperatorRegistry, require, inventory_projection, operator_inventory, operator_heartbeats)
 from .operator_controller import OperatorController
-from .repository import Repository, Scope
+from .repository import Repository, Scope, request_hash
 from .runtime_catalog import engine_manifest, get_profile, model_for, public_catalog
 from .scaler import LaunchSpec
 
@@ -82,7 +88,7 @@ def _decode(raw):
         raise OperatorError("operator_runtime_json_invalid",422) from None
 
 
-def load_runtime_config(path):
+def load_runtime_config(path, *, validate_private_paths=True):
     source=_absolute(str(path))
     value=_decode(_read(source,128*1024,protected=True))
     required={"schema_version","registry_file","work_dir","ssh_key_file","known_hosts_file","port_start"}
@@ -90,13 +96,13 @@ def load_runtime_config(path):
     require(required<=set(value) and not set(value)-required-optional
         and type(value["schema_version"]) is int and value["schema_version"]==1,
         "operator_runtime_schema_invalid",422)
-    for name in ("registry_file","ssh_key_file"):
-        _absolute(value[name])
-    _absolute(value["work_dir"],directory=True)
+    _absolute(value["registry_file"])
+    _absolute(value["ssh_key_file"],exists=validate_private_paths)
+    _absolute(value["work_dir"],directory=True,exists=validate_private_paths)
     trust=value.get("trust_first_host_key",False)
     require(type(trust) is bool,"operator_runtime_trust_invalid",422)
-    hosts=_absolute(value["known_hosts_file"],exists=not trust)
-    _absolute(str(hosts.parent),directory=True)
+    hosts=_absolute(value["known_hosts_file"],exists=validate_private_paths and not trust)
+    _absolute(str(hosts.parent),directory=True,exists=validate_private_paths)
     require(type(value["port_start"]) is int and 1024<=value["port_start"]<=64511,
         "operator_runtime_port_invalid",422)
     python=value.get("runtime_python","/venv/main/bin/python")
@@ -226,11 +232,11 @@ class _BoundLiumProvider(LiumProvider):
         return super().validate_launch(launch,**kwargs)
 
 
-def _assemble(path, *, clock=time.time):
+def _assemble(path, *, clock=time.time, credential_loader=None):
     config=load_runtime_config(path)
     bindings=_bindings(config["registry_file"])
-    loader=None
-    if config["credential_source"]=="aws_runtime":
+    loader=credential_loader
+    if loader is None and config["credential_source"]=="aws_runtime":
         from .lium_runtime_aws import AwsLiumLoader
         loader=AwsLiumLoader(config["secret_arn"],config["secret_version_id"])
     providers={}
@@ -258,18 +264,121 @@ def _assemble(path, *, clock=time.time):
     return config,registry,providers
 
 
-def create_registry(path):
-    """API process: lazy credentials; no inventory query until GET offers."""
-    return _assemble(path)[1]
+def create_registry(path, *, repository=None):
+    """API/worker: local public metadata and database only, never a provider.
+
+    The API needs no SSH private key, writable controller directory, AWS role,
+    Lium credential, or outbound network. Source/config paths remain identical
+    across processes and their small immutable metadata must be mounted.
+    """
+    config=load_runtime_config(path,validate_private_paths=False)
+    bindings=_bindings(config["registry_file"])
+    for binding in bindings:
+        _validate_sources(binding)
+        _manifest(binding)
+    registry=OperatorRegistry(bindings,catalog=public_catalog,inventory_required=True)
+    def offers(chosen):
+        binding=registry.resolve(chosen)
+        if repository is None:
+            return {"status":"unavailable","observed_at":None,"stale":True,
+                "offers":[],"reason_code":"operator_inventory_not_configured"}
+        with repository.engine.connect() as connection:
+            return inventory_projection(connection,binding,repository.clock())
+    registry.offers_reader=offers
+    return registry
 
 
-def create_controller(path, *, repository=None, settings=None, boot_factory=None):
+class InventoryRefresh:
+    """One bounded read-only probe off the lifecycle loop; no raw response saved.
+
+    Slow inventory must not delay provider-lifetime refresh, collection or drain.
+    No thread has authority to create a rental. Publication occurs on the main
+    loop only while this process still owns the current heartbeat projection.
+    """
+    def __init__(self,repo,registry,providers):
+        self.repo,self.registry,self.providers=repo,registry,providers
+        self.executor=None
+        self.pending=None
+        self.last={}
+
+    def _probe(self,binding):
+        try:
+            result=self.providers[binding.binding_id].preflight_availability(binding.launch)
+            reason=None if result is None else result if result in {
+                "provider_inventory_unavailable","provider_inventory_unconfirmed"} else "operator_inventory_unavailable"
+            return "available" if result is None else "unavailable",reason
+        except Exception:
+            return "unavailable","operator_inventory_unavailable"
+
+    def __call__(self,controller_id,*,stopping=False):
+        if self.pending and self.pending[1].done():
+            binding,future,started_at=self.pending
+            status,reason=future.result()
+            self.pending=None
+            if not stopping:
+                with self.repo.transaction() as connection:
+                    self.repo._lock_capacity(connection)
+                    heartbeat=connection.execute(select(operator_heartbeats).where(
+                        operator_heartbeats.c.id=="global")).mappings().first()
+                    if heartbeat and heartbeat["controller_id"]==controller_id:
+                        value=dict(binding_hash=binding.fingerprint,controller_id=controller_id,
+                            observed_at=started_at,status=status,reason_code=reason)
+                        row=connection.execute(select(operator_inventory.c.binding_id).where(
+                            operator_inventory.c.binding_id==binding.binding_id)).first()
+                        if row:
+                            connection.execute(update(operator_inventory).where(
+                                operator_inventory.c.binding_id==binding.binding_id).values(**value))
+                        else:
+                            connection.execute(insert(operator_inventory).values(binding_id=binding.binding_id,**value))
+        if stopping:
+            if self.executor:
+                self.executor.shutdown(wait=False,cancel_futures=True)
+            return
+        if self.pending: return
+        now=self.repo.clock()
+        eligible=[b for b in self.registry.bindings.values() if b.enabled and now<b.expires_at
+            and now-self.last.get(b.binding_id,float("-inf"))>=30]
+        if not eligible: return
+        binding=min(eligible,key=lambda b:self.last.get(b.binding_id,float("-inf")))
+        if self.executor is None: self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix="operator-inventory")
+        self.last[binding.binding_id]=now
+        self.pending=(binding,self.executor.submit(self._probe,binding),now)
+
+
+def _status_writer(config,*,clock):
+    # Bind the raw approved JSON, not defaults added by the loader.
+    digest=request_hash(_decode(_read(config["config_path"],128*1024,protected=True)))
+    path=Path(config["work_dir"])/"controller-status.json"
+    def write(controller_id,value):
+        state=value["state"]
+        result={"schema_version":1,"runtime_config_sha256":digest,"controller_id":controller_id,
+            "observed_at":clock(),"state":state,
+            "local_connections_released":state=="shutdown_complete" and value.get("local_connections_released") is True,
+            "cloud_removal_confirmed":False,"billing_settled":False}
+        require(state in {"running","degraded","draining","shutdown_waiting","shutdown_complete"},
+            "operator_status_state_invalid")
+        _absolute(str(path),exists=False)
+        temporary=path.with_name(".controller-status-"+uuid.uuid4().hex+".tmp")
+        try:
+            fd=os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+            with os.fdopen(fd,"w",encoding="utf-8") as stream:
+                json.dump(result,stream,sort_keys=True,separators=(",",":"))
+                stream.flush();os.fsync(stream.fileno())
+            os.replace(temporary,path)
+        except Exception:
+            # Keep a failed temporary file for operator inspection; do not
+            # expose arbitrary filesystem/credential context through errors.
+            raise OperatorError("operator_status_write_failed") from None
+    return write
+
+
+def create_controller(path, *, repository=None, settings=None, boot_factory=None, credential_loader=None):
     """CLI factory. Existing schema, policies, budgets and pools remain unchanged."""
     if settings is None:
         from .settings import Settings
         settings=Settings.from_environment()
     repo=repository if repository is not None else Repository(settings.database_url)
-    config,registry,providers=_assemble(path,clock=repo.clock)
+    config,registry,providers=_assemble(path,clock=repo.clock,credential_loader=credential_loader)
     service=OperatorCapacity(repo,settings,registry)
     if boot_factory is None:
         def boot_factory(*args):
@@ -278,4 +387,19 @@ def create_controller(path, *, repository=None, settings=None, boot_factory=None
     def boot(binding,intent,chosen):
         return boot_factory(repo,providers[binding.binding_id],binding,intent,chosen,config)
     return OperatorController(service,provider_factory=lambda binding:providers[binding.binding_id],
-        boot_factory=boot,enabled=True)
+        boot_factory=boot,enabled=True,inventory_refresh=InventoryRefresh(repo,registry,providers),
+        status_writer=_status_writer(config,clock=repo.clock))
+
+
+def create_controller_from_stdin(path, *, stream=None, **kwargs):
+    """Reuse the reviewed host-to-container memory envelope, without AWS access."""
+    config=load_runtime_config(path)
+    require(config["credential_source"]=="aws_runtime","operator_stdin_requires_aws_identity",422)
+    require("credential_loader" not in kwargs,"operator_stdin_loader_conflict",422)
+    from .production_scaler import stdin_loader
+    try:
+        loader=stdin_loader(SimpleNamespace(secret_arn=config["secret_arn"],
+            secret_version_id=config["secret_version_id"]),stream if stream is not None else sys.stdin.buffer)
+    except Exception:
+        raise OperatorError("operator_credential_envelope_invalid",422) from None
+    return create_controller(path,credential_loader=loader,**kwargs)

@@ -44,6 +44,38 @@ operator_nodes = Table("platform_operator_capacity_nodes", metadata,
 operator_heartbeats = Table("platform_operator_capacity_heartbeats", metadata,
     Column("id", String(30), primary_key=True), Column("controller_id", String(200), nullable=False),
     Column("observed_at", Float, nullable=False), Column("state", String(30), nullable=False))
+operator_inventory = Table("platform_operator_capacity_inventory", metadata,
+    Column("binding_id", String(200), primary_key=True), Column("binding_hash", String(64), nullable=False),
+    Column("controller_id", String(200), nullable=False), Column("observed_at", Float, nullable=False),
+    Column("status", String(30), nullable=False), Column("reason_code", String(100)))
+
+INVENTORY_FRESH_SECONDS = 120
+CONTROLLER_FRESH_SECONDS = 30
+
+
+def inventory_projection(connection, binding, now):
+    """Read-only provider observation, bound to this exact protected selection.
+
+    Neither stored prices nor provider response bodies are trusted. The approved
+    ceiling comes from the same binding that authorizes a later reservation.
+    """
+    row=connection.execute(select(operator_inventory).where(
+        operator_inventory.c.binding_id==binding.binding_id)).mappings().first()
+    heartbeat=connection.execute(select(operator_heartbeats).where(
+        operator_heartbeats.c.id=="global")).mappings().first()
+    fresh=bool(row and heartbeat and row["binding_hash"]==binding.fingerprint
+        and row["controller_id"]==heartbeat["controller_id"]
+        and heartbeat["state"] in {"running","degraded"}
+        and 0<=now-heartbeat["observed_at"]<=CONTROLLER_FRESH_SECONDS
+        and 0<=now-row["observed_at"]<=INVENTORY_FRESH_SECONDS
+        and binding.enabled and now<binding.expires_at)
+    status=row["status"] if fresh and row["status"] in {"available","unavailable"} else "unavailable"
+    reason=(None if status=="available" else row["reason_code"] if fresh and row["reason_code"] in {
+        "provider_inventory_unavailable","provider_inventory_unconfirmed","operator_inventory_unavailable"}
+        else "operator_inventory_stale")
+    return {"status":status,"observed_at":row["observed_at"] if row else None,"stale":not fresh,
+        "offers":[],"reason_code":reason,"minimum_ttl_seconds":binding.min_ttl_seconds,
+        "hourly_cost_microusd":binding.hourly_cost_microusd,"hourly_cost_basis":"approved_ceiling"}
 
 POLICY_FIELDS = {"enabled", "max_instances", "max_physical_gpus", "max_hourly_cost_microusd",
                  "idle_shutdown_seconds", "max_ttl_seconds"}
@@ -170,13 +202,15 @@ class OperatorRegistry:
     browser-provided launch payload. ``get`` must resolve accepted bindings after
     restarts, including disabled/expired ones needed for cleanup.
     """
-    def __init__(self, bindings=(), *, catalog=None, offers=None, resolver=None, getter=None):
+    def __init__(self, bindings=(), *, catalog=None, offers=None, resolver=None, getter=None,
+                 inventory_required=False):
         values = tuple(bindings)
         require(all(isinstance(x,DeploymentBinding) for x in values) and
                 len({x.binding_id for x in values})==len(values), "operator_registry_invalid",422)
         self.bindings = {item.binding_id:item for item in values}
         self.catalog_reader, self.offers_reader = catalog, offers
         self.resolver, self.getter = resolver, getter
+        self.inventory_required=inventory_required
 
     def resolve(self, chosen):
         if self.resolver is not None:
@@ -235,13 +269,13 @@ class OperatorRegistry:
             raise OperatorError("operator_registry_file_invalid",422) from None
 
     @classmethod
-    def from_environment(cls, *, catalog=None, offers=None):
+    def from_environment(cls, *, catalog=None, offers=None, repository=None):
         runtime=os.environ.get("H3_OPERATOR_RUNTIME_CONFIG", "").strip()
         source=os.environ.get("H3_OPERATOR_CAPACITY_REGISTRY", "").strip()
         require(not (runtime and source),"operator_registry_configuration_conflict",422)
         if runtime:
             from .operator_runtime import create_registry
-            return create_registry(runtime)
+            return create_registry(runtime,repository=repository)
         return cls.from_file(source,catalog=catalog,offers=offers) if source else cls(catalog=catalog,offers=offers)
 
 
@@ -364,6 +398,9 @@ class OperatorCapacity:
                     blockers.append({"code":"operator_hourly_cost_limit"})
                 if binding.reservation_per_node_microusd<math.ceil(binding.hourly_cost_microusd*chosen["ttl_seconds"]/3600):
                     blockers.append({"code":"operator_reservation_insufficient"})
+                if self.registry.inventory_required:
+                    inventory=inventory_projection(connection,binding,now)
+                    if inventory["status"]!="available": blockers.append({"code":inventory["reason_code"]})
             public={"preview_id":str(uuid.uuid4()),"expires_at":now+120,"policy_version":policy["version"],
                     "selection":chosen,"can_start":not blockers,"blockers":blockers,
                     "estimated_hourly_cost_microusd":hourly,"reservation_microusd":reservation,
@@ -409,6 +446,9 @@ class OperatorCapacity:
             require(policy["enabled"] and policy["version"]==value["policy_version"],"operator_policy_changed")
             binding=self.registry.get(value["binding_id"])
             require(binding.enabled and binding.fingerprint==value["binding_hash"],"operator_binding_changed")
+            if self.registry.inventory_required:
+                inventory=inventory_projection(connection,binding,now)
+                require(inventory["status"]=="available",inventory["reason_code"])
             chosen=value["selection"]
             require(chosen["ttl_seconds"]>=binding.min_ttl_seconds,"operator_ttl_below_provider_minimum")
             require(now+chosen["ttl_seconds"]<=binding.expires_at,"operator_authority_expiring")
