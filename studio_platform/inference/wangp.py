@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 import uuid
 
-from .protocol import BackendError, NotReady, Outcome, SubmissionUncertain
+from .protocol import BackendError, NotReady, Outcome, SubmissionUncertain, safe_failure_code
 from .wangp_contract import (EngineManifest, HostReadiness, OperationReceipt,
     PreparedRequest, canonical_json, operation_id, _identifier)
 from ..runtime_hosts.wangp_receipts import checked_directory, checked_reader, sync_directory
@@ -134,7 +134,8 @@ class WanGPBackend:
             if (receipt.hold_reason or state not in {"running", "succeeded", "failed", "cancelled"}
                     or state in {"succeeded", "failed", "cancelled"} and receipt.stop_proven is not True):
                 state = "unknown"
-            return Outcome(state, receipt.operation_id, None)
+            return Outcome(state, receipt.operation_id, None,
+                safe_failure_code(receipt.reason) if state == "failed" else None)
         except Exception:
             return Outcome("unknown", task_id, None)
 

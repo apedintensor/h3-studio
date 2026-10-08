@@ -15,6 +15,21 @@ from typing import Any, Callable, Mapping, Protocol
 TAG = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 TASK = re.compile(r"^[A-Za-z0-9_-]{1,200}$")
 
+# Diagnostic labels only, never execution/retry/stop authority. The pinned
+# WanGP API discards exception classes, so categories describe known message
+# signatures rather than claiming a recovered exception type or root cause.
+INFERENCE_FAILURE_CODES = frozenset(
+    f"wangp_{stage}_{category}"
+    for stage in ("validation", "generation", "runtime", "unknown")
+    for category in ("unclassified", "cuda_out_of_memory", "tensor_shape_mismatch",
+                     "media_decode_failed", "dependency_missing")
+)
+
+
+def safe_failure_code(value):
+    """Accept only the closed vocabulary; never persist arbitrary adapter text."""
+    return value if type(value) is str and value in INFERENCE_FAILURE_CODES else None
+
 
 class BackendError(Exception):
     """Stable message only. Do not propagate URL, response body, prompt or tokens."""
@@ -41,6 +56,7 @@ class Outcome:
     state: str
     task_id: str | None = None
     actual_cost_microusd: int | None = None
+    error_code: str | None = None
 
 
 class InferenceBackend(Protocol):
