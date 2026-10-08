@@ -19,22 +19,22 @@ from starlette.concurrency import run_in_threadpool
 from .assets import AssetService, AssetNotFound
 from .upload_route import AssetUploadRoute
 from .auth import Auth, AuthenticationError, LoginLimited
-from .capabilities import VERSION, capabilities, compile_request
+from .capabilities import VERSION, capabilities
 from .media import MediaError, MediaBusy
 from .project_validation import validate_project
-from .repository import Repository, Scope, NotFound, Conflict, BudgetExceeded, plans, artifacts, jobs
+from .repository import Repository, NotFound, Conflict, BudgetExceeded, artifacts, jobs
 from .settings import Settings
 from .storage import LocalObjectStore, StorageError, S3ObjectStore
 from .storage_config import S3StorageConfig, R2_CREDENTIAL_FIELDS, load_storage_credentials
-from .source_snapshot import source_snapshot, validate_source_ref
 from .http_limits import (ADMISSION_SCOPE_KEY, BodyLimitMiddleware, UploadAdmission,
                          RequestAdmission, RequestAdmissionMiddleware, admission_rejected, is_asset_upload, body_limit)
 from .execution_policy import ExecutionPolicies
-from .render_plans import RECIPE as RENDER_RECIPE, compile_render, validate_render_source
+from .render_plans import RECIPE as RENDER_RECIPE, compile_render
 from .agent_discovery import PUBLIC_PATHS as AGENT_PUBLIC_PATHS, DISCOVERY_LINK
 from .agent_connect_routes import EXCHANGE_PATH, register_routes as register_agent_connect_routes
 from .frontend import FRONTEND_CONTRACT, STATIC_CACHE_SCOPE_KEY, is_public_frontend
 from .generation_admission import GenerationAdmission, reject_managed
+from .generation_services import GenerationAccess, GenerationPlanning, GenerationRead
 
 COOKIE = "sixnine_session"
 TERMINAL = {"succeeded", "failed", "cancelled"}
@@ -81,67 +81,18 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
     app.state.assets, app.state.settings = asset_service, settings
     app.state.upload_admission = upload_admission
     app.state.request_admission = request_admission
-
-    def scope(principal, project_id):
-        return Scope(settings.tenant_id, principal.owner, project_id, principal.actor_id)
-
-    def project_scope(principal):
-        return scope(principal, "__projects")
-
-    def authorized_project(principal, project_id, operation="projects:read"):
-        if not isinstance(project_id, str) or not principal.allows(project_id, operation):
-            raise NotFound("project_not_found")
-        return repo.get_document(project_scope(principal), "project", project_id)
-
-    def project_response(record):
-        return {"id": record["document_id"], "version": record["version"],
-                "updated_at": record["updated_at"], "project": record["payload"]}
-
-    def public_execution(execution):
-        # Expose user-relevant admission, not operator approval/budget identities.
-        return {"admission_state": execution.get("admission_state", "queued" if execution.get("enabled") else "blocked"),
-                "enabled": bool(execution.get("enabled")), "quote_known": bool(execution.get("quote_known")),
-                "backend": execution.get("backend"),
-                **({"delivery_spec": execution["delivery_spec"]} if "delivery_spec" in execution else {})}
-
-    def owned_plan(principal, plan_id):
-        with repo.engine.connect() as conn:
-            row = conn.execute(select(plans).where(plans.c.id == plan_id,
-                plans.c.tenant_id == settings.tenant_id, plans.c.owner_id == principal.owner)).mappings().first()
-        if not row:
-            raise NotFound("plan_not_found")
-        authorized_project(principal, row["project_id"], "jobs:write")
-        return dict(row)
-
-    def owned_job(principal, job_id, operation="jobs:read"):
-        job = repo.get_job_for_owner(settings.tenant_id, principal.owner, job_id)
-        authorized_project(principal, job["project_id"], operation)
-        return job
-
-    def public_artifact(record):
-        value = record["metadata"]
-        return {"id": record["id"], "job_id": record["job_id"], "kind": value["kind"],
-                "mime": value.get("mime", value.get("content_type", "application/octet-stream")),
-                "size_bytes": value["size_bytes"], "sha256": value["sha256"],
-                "metadata": {k: v for k, v in value.items() if k not in {"object_key", "provider", "storage_profile"}},
-                "content_url": f'/v1/artifacts/{record["id"]}/content',
-                "download_url": f'/v1/artifacts/{record["id"]}/content?download=1'}
-
-    def public_job(job, *, artifact_records=None):
-        stored_request = job["request"]
-        visible = {k: job.get(k) for k in ("id", "status", "created_at", "updated_at", "request_hash", "error_code", "result", "created")}
-        visible.update(client_ref=stored_request.get("client_ref", {}), phase=job["status"],
-            recipe_id=stored_request.get("recipe_id"), effective_request=stored_request.get("request", {}),
-            simulation=job["execution_plan"].get("backend") == "mock" or stored_request.get("simulation") is True, plan_id=job["plan_id"],
-            project_id=job["project_id"], artifacts=[])
-        if "delivery_spec" in job["execution_plan"]:
-            visible["delivery_spec"] = job["execution_plan"]["delivery_spec"]
-        if job["status"] == "succeeded":
-            if artifact_records is None:
-                artifact_records = repo.list_artifacts(Scope(settings.tenant_id, job["owner_id"], job["project_id"]), job["id"])
-            for art in artifact_records:
-                visible["artifacts"].append(public_artifact(art))
-        return visible
+    generation_access = GenerationAccess(repo, settings.tenant_id)
+    generation_read = GenerationRead(repo, generation_access)
+    generation_planning = GenerationPlanning(repo=repo, assets=asset_service, settings=settings,
+        policies=execution_policies, access=generation_access, read=generation_read)
+    app.state.generation_access = generation_access
+    app.state.generation_read = generation_read
+    app.state.generation_planning = generation_planning
+    # Compatibility names used by existing scenario and batch routes now point
+    # to HTTP-independent services, rather than closures over this app factory.
+    scope, project_scope = generation_access.scope, generation_access.project_scope
+    authorized_project, owned_plan, owned_job = generation_access.project, generation_access.plan, generation_access.job
+    project_response, public_execution, public_job = generation_read.project, generation_read.execution, generation_read.public_job
 
     @app.exception_handler(NotFound)
     @app.exception_handler(AssetNotFound)
@@ -461,32 +412,7 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
 
     @app.post("/v1/generation-plans", status_code=201)
     def make_plan(request: Request, body: dict):
-        principal = request.state.principal
-        project_id = body.get("client_ref", {}).get("project_id") if isinstance(body.get("client_ref"), dict) else None
-        project = authorized_project(principal, project_id, "jobs:write")["payload"]
-        reject_managed(project)
-        return plan_response(principal, body, project)
-
-    def plan_response(principal, body, project):
-        project_id = project["id"]
-        compiled, fingerprint = compile_request(body,
-            lambda asset_id: asset_service.model_snapshot(principal.owner, project_id, asset_id),
-            backend=settings.execution_backend)
-        ref = compiled["client_ref"]
-        if not validate_source_ref(project, ref):
-            raise Conflict("shot_version_conflict")
-        compiled["server_source_hash"] = source_snapshot(project, ref["shot_id"])
-        admission = execution_policies.evaluate(compiled, scope(principal, project_id), fingerprint)
-        execution = admission.execution
-        enabled, blockers = execution["enabled"], execution["blockers"]
-        simulation = settings.execution_backend == "mock"
-        plan = repo.create_plan(scope(principal, project_id), compiled, execution,
-            expires_at=admission.expires_at, estimated_cost_microusd=admission.cost)
-        return {"plan_id": plan["id"], "status": "ready" if enabled else "blocked", "request_hash": plan["request_hash"],
-                "effective_request": compiled["request"], "output_spec": compiled["output_spec"],
-                "client_ref": ref, "expires_at": plan["expires_at"], "blockers": blockers,
-                "warnings": ["本地模拟：不调用模型，不代表H3速度或质量"] if simulation else [],
-                "estimate": admission.estimate, "execution": public_execution(execution), "simulation": simulation}
+        return generation_admission.plan(request.state.principal, body)
 
     @app.get("/v1/projects/{project_id}/shots/{shot_id}/generation-draft")
     def generation_draft(project_id: str, shot_id: str, request: Request):
@@ -571,19 +497,8 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
             "warnings": warnings, "estimate": admission.estimate, "execution": public_execution(admission.execution),
             "simulation": compiled["simulation"]}
 
-    def check_plan_source(project, compiled):
-        if compiled["recipe_id"] == RENDER_RECIPE:
-            if not validate_render_source(project, compiled):
-                raise Conflict("chapter_timeline_changed")
-        else:
-            ref = compiled["client_ref"]
-            if (not validate_source_ref(project, ref)
-                    or compiled.get("server_source_hash") != source_snapshot(project, ref["shot_id"])):
-                raise Conflict("shot_version_conflict")
-
     generation_admission = GenerationAdmission(repo=repo, assets=asset_service, settings=settings,
-        policies=execution_policies, scope=scope, authorized_project=authorized_project,
-        owned_plan=owned_plan, plan_response=plan_response, check_source=check_plan_source,
+        policies=execution_policies, access=generation_access, planning=generation_planning,
         capabilities_provider=lambda: capabilities(settings))
     app.state.generation_admission = generation_admission
 
@@ -603,20 +518,12 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
     @app.get("/v1/jobs")
     def list_jobs(request: Request, client_project_id: str | None = None, limit: int = Query(100, ge=1, le=100),
                   offset: int = Query(0, ge=0, le=1000000)):
-        principal = request.state.principal
-        if client_project_id:
-            authorized_project(principal, client_project_id, "jobs:read")
-        allowed = ((None if principal.all_projects else principal.project_ids) if "jobs:read" in principal.scopes else ()) if principal.machine else None
-        values = repo.list_jobs_for_owner(settings.tenant_id, principal.owner, project_id=client_project_id, project_ids=allowed,
-                                         limit=limit, offset=offset, summary=True)
-        visible = [v for v in values if principal.allows(v["project_id"], "jobs:read")]
-        media = repo.list_artifacts_for_jobs(settings.tenant_id, principal.owner,
-            {v["id"]: v["project_id"] for v in visible if v["status"] == "succeeded"})
-        return {"jobs": [public_job(v, artifact_records=media.get(v["id"], [])) for v in visible]}
+        return generation_read.list_jobs(request.state.principal,
+            project_id=client_project_id, limit=limit, offset=offset)
 
     @app.get("/v1/jobs/{job_id}")
     def get_job(job_id: str, request: Request):
-        return public_job(owned_job(request.state.principal, job_id))
+        return generation_read.job(request.state.principal, job_id)
 
     @app.get("/v1/activity-summary")
     def activity_summary(request: Request, client_project_id: str):
@@ -640,13 +547,7 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
     @app.api_route("/v1/artifacts/{artifact_id}/content", methods=["GET", "HEAD"])
     def artifact_content(artifact_id: str, request: Request, download: bool = False):
         principal = request.state.principal
-        with repo.engine.connect() as conn:
-            row = conn.execute(select(artifacts).join(jobs, artifacts.c.job_id == jobs.c.id).where(
-                artifacts.c.id == artifact_id, jobs.c.tenant_id == settings.tenant_id,
-                jobs.c.owner_id == principal.owner)).mappings().first()
-        if not row:
-            raise NotFound("artifact_not_found")
-        owned_job(principal, row["job_id"])
+        row = generation_access.artifact(principal, artifact_id)
         value = row["metadata"]
         extension = {"video": "mp4", "audio": "flac", "image": "png"}.get(value.get("kind"), "bin")
         filename = value.get("filename", f'sixnine-{row["job_id"][:8]}-{value.get("kind", "result")}.{extension}')
@@ -662,8 +563,6 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
     app.state.public_job = public_job
     from .quick_chat import QuickChatHooks
     from .quick_chat_routes import register_routes as register_quick_chat_routes
-    def quick_public_job(principal, job_id):
-        return public_job(owned_job(principal, job_id))
 
     def quick_cancel(principal, job_id):
         job = owned_job(principal, job_id, "jobs:write")
@@ -671,7 +570,7 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
 
     hooks = quick_chat_hooks or QuickChatHooks(preflight=generation_admission.preflight,
         create_planned=generation_admission.create_planned, enqueue=lambda p, j: generation_admission.enqueue(p, j, business=True),
-        public_job=quick_public_job, cancel=quick_cancel, refresh_planned=generation_admission.refresh_planned)
+        public_job=generation_read.job, cancel=quick_cancel, refresh_planned=generation_admission.refresh_planned)
     register_quick_chat_routes(app, hooks=hooks, assistant=assistant,
         assistant_enabled=assistant_enabled)
     from .quick_chat_recovery import QuickChatRecovery

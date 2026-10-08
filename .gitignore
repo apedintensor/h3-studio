@@ -282,6 +282,7 @@ inventory.json
 
 # Reviewed WanGP integration source; no weights, credentials or execution state.
 !studio_platform/generation_admission.py
+!studio_platform/generation_services.py
 !studio_platform/inference/wangp.py
 !studio_platform/inference/wangp_contract.py
 !studio_platform/inference/wangp_compiler.py
