@@ -15,7 +15,7 @@ from sqlalchemy import func, select, update,insert
 from studio_platform.auth import Principal
 from studio_platform.control import WorkerControl, WorkerSpec
 from studio_platform.operator_capacity import (DeploymentBinding, OperatorCapacity, OperatorError, OperatorRegistry,
-    operator_commands, operator_nodes, selection,operator_inventory,operator_heartbeats)
+    operator_commands, operator_nodes, selection,operator_inventory,operator_heartbeats, public_bootstrap)
 from studio_platform.operator_controller import OperatorController, main, provider_lifetime_current
 from studio_platform.operator_routes import register_routes
 from studio_platform.repository import instance_intents, jobs, registered_workers
@@ -406,6 +406,62 @@ class OperatorTests(LedgerCase):
         self.assertEqual(state["nodes"][0]["runtime_state"],"awaiting_qualified_workers")
         self.assertEqual(state["operations"][0]["state"],"waiting")
         self.assertEqual(state["summary"]["slots_ready"],0)
+
+    def test_unknown_boot_cause_survives_api_read_without_new_rental_or_settlement(self):
+        self.create()
+        report={"state":"blocked","reason_code":"bootstrap_reconciliation_required","slots":[{
+            "state":"bootstrap_reconciliation_required","phase":"runtime_start_unknown",
+            "failure_phase":"runtime_manifest","error_code":"wangp_configuration_permissions",
+            "error_type":"ValueError","log":"SECRET"}]}
+        self.controller.boot_factory=lambda *args:SimpleNamespace(tick=lambda *args,**kwargs:report)
+        self.controller.tick()
+        original=self.repo.list_instance_intents()[0]
+        budget=self.repo.get_budget("owner-budget")
+        for _ in range(3):
+            self.now+=5
+            self.controller.tick()
+        state=OperatorCapacity(self.repo,self.settings,self.registry).state(self.actor)
+        node=state['nodes'][0]
+        self.assertEqual(node['runtime_state'],'blocked')
+        self.assertEqual(node['reason_code'],'bootstrap_reconciliation_required')
+        self.assertEqual(node['bootstrap']['observed_at'],self.now)
+        self.assertEqual(node['bootstrap']['slots'][0]['error_code'],'wangp_configuration_permissions')
+        self.assertEqual(node['bootstrap']['slots'][0]['failure_phase'],'runtime_manifest')
+        self.assertEqual(state['operations'][0]['state'],'blocked')
+        self.assertEqual(state['operations'][0]['reason_code'],'bootstrap_reconciliation_required')
+        self.assertEqual(len(self.provider.creates),1)
+        self.assertEqual(self.provider.destroys,[])
+        current=self.repo.list_instance_intents()[0]
+        self.assertEqual((current['id'],current['hard_deadline'],current['state']),
+            (original['id'],original['hard_deadline'],'starting'))
+        self.assertEqual(self.repo.get_budget('owner-budget'),budget)
+        self.assertNotIn('SECRET',json.dumps(state))
+
+    def test_public_bootstrap_masks_malformed_private_fields(self):
+        value=public_bootstrap({'state':{'secret':'SECRET'},'reason_code':['SECRET'],
+            'observed_at':float('nan'),'log':'SECRET','slots':[{'state':{'secret':'SECRET'},
+                'phase':['SECRET'],'failure_phase':'SECRET','error_code':'https://private.invalid/?token=SECRET',
+                'error_type':{'secret':'SECRET'},'message':'SECRET'}]})
+        self.assertEqual(value['state'],'blocked')
+        self.assertEqual(value['slots'][0]['error_code'],'UnclassifiedBootstrapFailure')
+        self.assertNotIn('observed_at',value)
+        self.assertNotIn('SECRET',json.dumps(value))
+
+    def test_live_registration_does_not_erase_boot_reconciliation_hold(self):
+        self.create()
+        factory=self.controller.boot_factory
+        def boot(*args):
+            value=factory(*args)
+            original_tick=value.tick
+            def tick(*a,**kw):
+                original_tick(*a,**kw)
+                return {'state':'blocked','reason_code':'bootstrap_reconciliation_required','slots':[]}
+            value.tick=tick
+            return value
+        self.controller.boot_factory=boot
+        self.controller.tick()
+        self.assertEqual(self.service.state(self.actor)['nodes'][0]['runtime_state'],'blocked')
+        self.assertEqual(self.repo.list_instance_intents()[0]['state'],'starting')
 
     def test_response_lost_is_reconciled_without_duplicate_create(self):
         self.provider.create_uncertain=True

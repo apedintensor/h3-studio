@@ -179,6 +179,31 @@ class SystemDiagnosisTests(unittest.TestCase):
         self.host.config = SimpleNamespace(work_dir=self.root/'cpu')
         self.host.coordinates = {'instance_id': POD}
 
+    def test_unknown_runtime_report_has_static_diagnosis_without_remote_details(self):
+        value={'state':'unknown','phase':'runtime_start_unknown','failure_phase':'runtime_manifest',
+            'code':'wangp_configuration_permissions','error_type':'ValueError','runtime_verified':False,
+            'system_package_diagnostics':{'secret':'SECRET'},'download_failure':{'url':'SECRET'},
+            'runtime':{'debug':'SECRET'},'log':'SECRET'}
+        (self.root/'setup-status.json').write_text(json.dumps(value))
+        (self.root/'sixnine-bootstrap-identity.json').write_text('{}')
+        def execute(script, **kwargs):
+            output=io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(compile(script.replace('/workspace/h3-studio',self.root.as_posix()),'<offline-report>','exec'),{})
+            return json.loads(output.getvalue())
+        self.host.run=execute
+        result=self.host.report()
+        self.assertEqual(result['state'],'unknown')
+        self.assertEqual(result['error_code'],'wangp_configuration_permissions')
+        self.assertEqual(result['failure_phase'],'runtime_manifest')
+        self.assertNotIn('SECRET',json.dumps(result))
+        value.update(code='https://invalid/?token=SECRET',error_type={'message':'SECRET'},failure_phase='SECRET')
+        (self.root/'setup-status.json').write_text(json.dumps(value))
+        result=self.host.report()
+        self.assertEqual(result['error_code'],'UnclassifiedBootstrapFailure')
+        self.assertEqual(result['failure_phase'],'unknown')
+        self.assertNotIn('SECRET',json.dumps(result))
+
     def test_report_preserves_old_failed_phase_and_sanitizes_package_details(self):
         value = {'state': 'failed', 'phase': 'setup_failed', 'failed_phase': 'system_package_verification',
             'code': 'system_package_mismatch', 'error_type': 'ValueError', 'log': 'SECRET',

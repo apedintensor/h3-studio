@@ -436,13 +436,18 @@ if out['state']=='ready':
  out['gpus']=[{'uuid':x.split(',')[0].strip(),'memory_mib':int(x.split(',')[1].strip()),'name':','.join(x.split(',')[2:]).strip()} for x in rows]
 print(json.dumps(out))
 ''')
-        if report.get('state') == 'failed':
+        if report.get('state') in {'failed', 'unknown', 'reconcile_required'} or report.get('phase') == 'runtime_start_unknown':
             diagnosis = safe_bootstrap_diagnosis(report)
-            report.pop('system_package_diagnostics', None)
-            report.pop('download_failure', None)
-            report.update(diagnosis)
+            report = {'identity':report.get('identity'), 'state':report.get('state'), **diagnosis}
         else:
             report.pop('download_failure', None)
+            report.pop('system_package_diagnostics', None)
+            # Nonterminal progress is untrusted remote input too. Only expose
+            # known static fields even if a malformed report includes an error.
+            diagnosis = safe_bootstrap_diagnosis(report)
+            for key in ('phase', 'failure_phase', 'error_code', 'error_type'):
+                if key in report:
+                    report[key] = diagnosis[key]
         if getattr(self.config, 'deployment_profile_id', '') and report.get('state') == 'ready':
             gpus = report.get('gpus')
             selected = report.pop('selected_gpus', None)

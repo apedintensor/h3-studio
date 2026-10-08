@@ -295,6 +295,32 @@ def node_version(intent, node):
                          "updated_at":intent["updated_at"],"desired_state":node["desired_state"]})
 
 
+def public_bootstrap(value):
+    """Small, static projection; never expose remote logs, paths or messages."""
+    if not isinstance(value,dict): return None
+    from .lium_bootstrap import _static, safe_bootstrap_diagnosis
+    states={"ready","preparing","starting","waiting","blocked","failed","draining","stopped","recovering"}
+    slot_states={"fleet_running","draining","bootstrap_failed","staging_failed","fleet_attention_required",
+        "fleet_recovery_required","staging_recovery_required","bootstrap_start_unknown",
+        "bootstrap_reconciliation_required","booting","staging","staged","bootstrap_locked",
+        "staging_cancelled","staging_authority_unavailable","bootstrap_start_not_authorized",
+        "bootstrap_deadline_insufficient","instance_not_admitting","instance_not_confirmed",
+        "ready_for_qualification","runtime_ready","qualified","unknown"}
+    result={"state":_static(value.get("state"),states,"blocked"),
+        "reason_code":_static(value.get("reason_code"),{
+            "bootstrap_reconciliation_required","operator_bootstrap_failed"},None),"slots":[]}
+    observed=value.get("observed_at")
+    if type(observed) in (int,float) and math.isfinite(observed): result["observed_at"]=observed
+    slots=value.get("slots",[])
+    for index,slot in enumerate(slots[:8] if isinstance(slots,list) else []):
+        if not isinstance(slot,dict): continue
+        safe=safe_bootstrap_diagnosis(slot)
+        item={"index":index,"state":_static(slot.get("state"),slot_states,"unknown")}
+        item.update({key:safe[key] for key in ("phase","failure_phase","error_code","error_type") if key in slot})
+        result["slots"].append(item)
+    return result
+
+
 class OperatorCapacity:
     def __init__(self, repo, settings, registry=None):
         self.repo,self.settings,self.registry=repo,settings,registry or OperatorRegistry()
@@ -527,9 +553,12 @@ class OperatorCapacity:
                     "engine_manifest_digest":spec.get("engine_manifest_digest")})
             allowed=intent["state"]!="destroyed"
             availability={"allowed":allowed,"blockers":[] if allowed else [{"code":"operator_node_already_destroyed"}]}
+            bootstrap=public_bootstrap(payload.get("bootstrap"))
             nodes.append({"id":intent["id"],"version":node_version(intent,row),"provider":intent["provider"],
                 "provider_instance_id":intent["provider_instance_id"],"state":intent["state"],
                 "runtime_state":row["runtime_state"],"desired_state":row["desired_state"],
+                "bootstrap":bootstrap,
+                "reason_code":bootstrap.get("reason_code") if bootstrap and row["runtime_state"] in {"blocked","failed"} else None,
                 "gpu_count":intent["physical_gpus"],"gpu_model":payload["selection"]["gpu_type"],
                 "runtime_profile_id":payload["selection"]["runtime_profile_id"],"observed_at":observed,"stale":stale,
                 "mode":payload["selection"]["mode"],

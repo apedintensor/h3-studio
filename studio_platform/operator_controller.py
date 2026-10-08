@@ -20,7 +20,7 @@ from sqlalchemy import insert, select, update
 
 from .autoscale import ScalePolicy
 from .operator_capacity import (ACTIVE_COMMANDS, OperatorError, operator_commands,
-    operator_heartbeats, operator_nodes, require, safe_id)
+    operator_heartbeats, operator_nodes, require, safe_id, public_bootstrap)
 from .repository import BudgetExceeded, Conflict, LeaseLost, instance_intents, registered_workers, scaler_actions
 from .scaler import ScaleCoordinator
 
@@ -344,6 +344,7 @@ class OperatorController:
         if result["state"]=="not_leader": return "not_leader"
         intent,latest,action,workers=self._node_snapshot(intent_id)
         runtime="destroyed" if intent["state"]=="destroyed" else "waiting_provider"
+        bootstrap=None
         if runtime=="destroyed" and intent_id in self.boots:
             close=getattr(self.boots[intent_id],"close",None)
             if callable(close): close()
@@ -386,10 +387,12 @@ class OperatorController:
                 reported=report.get("state") if isinstance(report,dict) else report
                 allowed={"ready","preparing","starting","waiting","blocked","failed","draining","stopped","recovering"}
                 runtime=reported if reported in allowed else "preparing"
+                bootstrap=public_bootstrap({**(report if isinstance(report,dict) else {}),
+                    "state":runtime,"observed_at":self.repo.clock()})
                 intent,latest,action,workers=self._node_snapshot(intent_id)
                 # A hook's 'ready' string is not readiness evidence. Qualified
                 # fresh registrations must match exact model/engine/device set.
-                if not stopping and self._qualified(binding,workers):
+                if not stopping and runtime not in {"blocked","failed"} and self._qualified(binding,workers):
                     runtime="ready"
                     with self.repo.transaction() as connection:
                         coordinator._leader(connection,lease)
@@ -402,8 +405,12 @@ class OperatorController:
         if intent["state"] in {"creating","creation_unknown"}: runtime="creation_unknown"
         if stopping and runtime=="ready": runtime="draining"
         with self.repo.transaction() as connection:
+            current=self.repo._locked(connection,select(operator_nodes).where(operator_nodes.c.intent_id==intent_id))
+            values={"runtime_state":runtime,"updated_at":self.repo.clock()}
+            if bootstrap is not None:
+                values["payload"]={**current["payload"],"bootstrap":bootstrap}
             connection.execute(update(operator_nodes).where(operator_nodes.c.intent_id==intent_id).values(
-                runtime_state=runtime,updated_at=self.repo.clock()))
+                **values))
         return runtime
 
     def _summarize_commands(self):
@@ -427,7 +434,11 @@ class OperatorController:
                         # to make the requested node count appear complete.
                         self._record_command(command["id"],"partial","operator_partial_capacity")
                     elif any(n["runtime_state"] in {"failed","blocked"} for n in owned):
-                        self._record_command(command["id"],"blocked","operator_bootstrap_failed")
+                        reconciliation=any(n["runtime_state"]=="blocked" and
+                            (public_bootstrap(n["payload"].get("bootstrap")) or {}).get("reason_code")==
+                            "bootstrap_reconciliation_required" for n in owned)
+                        self._record_command(command["id"],"blocked","bootstrap_reconciliation_required"
+                            if reconciliation else "operator_bootstrap_failed")
                     else: self._record_command(command["id"],"waiting","operator_preparing")
             else:
                 intent=intents.get(command["payload"]["node_id"])
