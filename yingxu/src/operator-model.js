@@ -34,3 +34,18 @@ export function allowed(snapshot,permission,now=Date.now()){
 export function profileSelection(profile,selection){
   return {...selection,runtime_profile_id:profile?.id||'',gpu_type:profile?.gpu_models?.[0]||'',gpu_count:profile?.gpu_count_options?.[0]||1,filters:{...selection.filters,min_ram_gib:Math.ceil((profile?.minimum_ram_bytes||0)/1024**3),min_disk_gib:Math.ceil((profile?.minimum_disk_bytes||0)/1024**3)}};
 }
+export function runtimeDuration(policy,reportedMinimum=null,value=null){
+  const maximumMinutes=Number.isFinite(policy?.max_ttl_seconds)?Math.floor(policy.max_ttl_seconds/60):null;
+  const minimumMinutes=Number.isFinite(reportedMinimum)&&reportedMinimum>0?Math.ceil(reportedMinimum/60):null;
+  const feasible=maximumMinutes!==null&&maximumMinutes>=Math.max(2,minimumMinutes??2);
+  const suggestedSeconds=feasible?Math.min(maximumMinutes,Math.max(180,minimumMinutes??2))*60:null;
+  const problem=!feasible?'当前策略上限无法容纳供应商期限，请先核对运行上限。':value!==null&&(!Number.isFinite(value)||value%60!==0||value<120||value>maximumMinutes*60||minimumMinutes!==null&&value<minimumMinutes*60)?'本次运行时间不在已核对的范围内，请调整后重新预览。':null;
+  return {minimumMinutes,maximumMinutes,suggestedSeconds,problem};
+}
+export function initialOperatorSelection(policy){
+  return {runtime_profile_id:'',mode:'fl',gpu_type:'',node_count:1,gpu_count:1,ttl_seconds:runtimeDuration(policy).suggestedSeconds??0,filters:{min_ram_gib:0,min_disk_gib:0,min_download_mbps:500,max_price_per_gpu_hour_microusd:2000000,allowed_countries:[]}};
+}
+export function operatorStartPayload(selection,customFilters=false){
+  if(customFilters)return selection;
+  const {filters,...body}=selection;return body;
+}
