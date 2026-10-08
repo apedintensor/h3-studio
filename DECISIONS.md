@@ -28,7 +28,7 @@ Keep IDs stable. A material reversal receives a new decision ID and a `supersede
 
 ## DEC-003 — Qualify one BF16 Base / 50-step slice before broader capability
 
-- **Status / scope:** Accepted; initial runtime and public-generation acceptance scope, not a permanent product limit.
+- **Status / scope:** Historical initial runtime/public-generation acceptance scope. Superseded by [DEC-011](#dec-011--use-rtx-5090-and-int8-for-future-low-cost-h3-tests) for future test hardware/precision priority only; existing BF16 jobs, evidence and outstanding recovery criteria remain intact.
 - **Decision:** Establish one declared FL2VA recipe and one isolated execution slot, with one active generation per slot. Preserve BF16 Base and 50-step semantics; reject unsupported controls instead of substituting quantized, distilled or accelerated variants. The first real service proof is text-to-video. Optional first/last-image source mapping is not proof of delivered last-frame fidelity; REF image/video/audio capability requires its own mapping and qualification.
 - **Delivery refinement (recorded 2026-10-08):** New separately qualified WanGP plans may opt into the frozen `native-frames-v1` contract, preserving the native ending and generated waveform instead of silently cutting to integer seconds. Existing snapshots and legacy workers retain their original requested-duration export. This is an explicit follow-up contract under D3, not activation or a change to the first text-only proof's configuration.
 - **Why:** The accepted first slice separates a reliable real API-to-download path from broader capability and redundancy claims. The integration records an unresolved native-versus-delivered ending contract.
@@ -98,6 +98,15 @@ Keep IDs stable. A material reversal receives a new decision ID and a `supersede
 - **Alternatives:** Competing task databases, mandatory routine human PR handling, blanket commits of dirty shared work, or declaring completion from test totals alone are rejected. No framework replacement is selected.
 - **Revisit when:** Coordination or evidence failures expose a specific missing rule; update the shared workflow without creating a second process or treating inactivity as abandonment.
 - **Evidence / current contract:** [Pinned workflow][P-workflow], [PR #30](https://github.com/apedintensor/h3-studio/pull/30); [current workflow](WORKFLOW.md). The stable required `test` check and exact release rules remain defined there.
+
+## DEC-011 — Use RTX 5090 and INT8 for future low-cost H3 tests
+
+- **Status / scope:** Accepted user direction, 2026-10-08; future tests prioritize inexpensive RTX 5090 INT8 for both FL2VA and Ref2VA. Supersedes DEC-003's future hardware/precision priority, not historical acceptance, immutable jobs or required recovery gates.
+- **Decision:** Present a bounded machine/filter/startup test proposal before execution, then use measured findings to design an operator panel. Retain the existing WanGP adapter, business API and single capacity/rental authority. Do not silently upgrade to expensive GPUs or change an accepted BF16 request into INT8.
+- **Why:** The user wants an inexpensive working service and direct visibility/control over machine configuration and preparation, after substantial time was spent on cold setup.
+- **Proposed, not selected:** Pruned 20B versus original 33B INT8, exact component settings, RAM thresholds, images, finite limits and manual-capacity UI/API. The linked proposal recommends an explicitly named pruned candidate; INT8 authorization alone is not approval of pruning or demonstrated full-control parity.
+- **Revisit when:** The user changes priority, or measured failures require revising the proposed memory/control envelope. Hardware/recipe changes remain explicit; existing jobs and cumulative costs survive.
+- **Evidence / proposal:** [User-direction planning claim](https://github.com/apedintensor/h3-studio/issues/22#issuecomment-6056468134); [5090 pilot and panel proposal](docs/research/h3-economics-20261008/5090-test-plan.md). No GPU, image build, model download or production change is authorized by this record.
 
 [P-platform]: https://github.com/apedintensor/h3-studio/blob/704202541a51be542bd39c7f931ae8b5c86ff528/PROJECT-PLAN.md#L39-L76
 [P-engine]: https://github.com/apedintensor/h3-studio/blob/704202541a51be542bd39c7f931ae8b5c86ff528/PROJECT-PLAN.md#L107-L134
