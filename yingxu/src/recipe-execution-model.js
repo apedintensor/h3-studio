@@ -41,7 +41,7 @@ export function recipeExecutionStatus(recipe,{project,shot,now=Date.now()}={}){
   if(Number.isFinite(limits.max_duration_seconds)){summary.push(`采样时长最多 ${limits.max_duration_seconds} 秒`);if(Number(values.duration)>limits.max_duration_seconds)issues.push(`当前生成时长 ${values.duration} 秒，超过云端 ${limits.max_duration_seconds} 秒上限。`);}
   if(Number.isFinite(limits.max_steps)){summary.push(`最多 ${limits.max_steps} 步`);if(Number(values.steps)>limits.max_steps)issues.push(`当前采样 ${values.steps} 步，云端最多接受 ${limits.max_steps} 步。`);}
   if(Number.isFinite(limits.max_pixels)){summary.push(`最多 ${limits.max_pixels.toLocaleString('zh-CN')} 像素`);if(values.resolution==='custom'&&Number(values.width)*Number(values.height)>limits.max_pixels)issues.push(`自定义画面 ${values.width}×${values.height} 超过云端像素上限。`);}
-  const references=project&&shot?referenceSpecs(project,shot.id).references:[],guides=shot?.data.h3?.guides||[];
+  const references=project&&shot?referenceSpecs(project,shot.id,{mode:recipe.mode}).references:[],guides=shot?.data.h3?.guides||[];
   const mediaKeys=new Set(references.map(ref=>mediaKey(ref.entity,ref.range)));
   for(const guide of guides)mediaKeys.add(`${guide.media_id}:${guide.source_range?.start??''}:${guide.source_range?.end??''}`);
   if(Number.isFinite(limits.max_reference_files)){summary.push(limits.max_reference_files===0?'暂不接受参考文件':`参考文件最多 ${limits.max_reference_files} 份`);if(mediaKeys.size>limits.max_reference_files)issues.push(`当前已关联参考素材，超出云端最多 ${limits.max_reference_files} 份的范围；可保留素材，明确调整关联后再预检。`);}

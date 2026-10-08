@@ -2,8 +2,7 @@
 from fastapi import File, Form, Header, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
-from .quick_chat import QuickChatService, QuickChatError, DEFAULT_SETTINGS
-import copy
+from .quick_chat import QuickChatService, QuickChatError, default_next_settings
 from .quick_chat_assistant import QuickChatAssistant, model_schema
 from .capabilities import capabilities
 from .upload_route import QuickChatAssetUploadRoute
@@ -61,7 +60,7 @@ def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False)
         return {"version": 1, "agent_contract": agent_contract(),
             "models": model_schema(enabled=assistant_enabled), "capabilities": capabilities(settings),
             "assistant_enabled": assistant_enabled, "copies": {"minimum": 1, "maximum": 4},
-            "default_next_settings": copy.deepcopy(DEFAULT_SETTINGS),
+            "default_next_settings": default_next_settings(settings),
             "turn_creation": {"create_card": {"type": "boolean", "default": False,
                 "allowed_assistant_modes": ["none"], "atomic_with_turn": True,
                 "starts_generation": False, "result_field": "card_id"}},

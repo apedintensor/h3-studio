@@ -29,6 +29,21 @@ MODELS = {"gemini-3.8-flash": "Gemini 3.8 Flash", "gemma-4-31b-it": "Gemma 4 31B
 DEFAULT_MODEL = "gemini-3.8-flash"
 EMPTY_INPUTS = {"first_frame": None, "last_frame": None, "images": [], "videos": [], "audios": [], "guides": []}
 DEFAULT_SETTINGS = {"recipe_id": "h3-base-fl2va-v1", "controls": {"duration": 5, "resolution": "480P"}, "copies": 1}
+
+
+def default_next_settings(settings):
+    """New sessions only; changing the default never migrates authored history."""
+    from .execution_profiles import default_profile_id
+    from .inference.wangp_profile_compiler import control_schema
+    result = copy.deepcopy(DEFAULT_SETTINGS)
+    profile_id = default_profile_id(settings)
+    if profile_id is not None:
+        result["deployment_profile_id"] = profile_id
+        result["controls"] = {key: copy.deepcopy(value["default"])
+            for key, value in control_schema(profile_id, "fl").items() if "default" in value}
+    return result
+
+
 metadata = MetaData()
 objects = Table("platform_quick_chat_objects", metadata,
     Column("id", String(80), primary_key=True), Column("tenant", String(200), nullable=False),
@@ -257,7 +272,7 @@ class QuickChatService:
             append_activity(conn, tenant_id=self.tenant, principal=principal, project_id=project["id"], version=1,
                 occurred_at=self.repo.clock(), before=None, after=project, event_type="project.created")
             session = self._new(conn, principal, ident, "session", {"title": title, "model_id": model,
-                "project_id": project["id"], "next_settings": DEFAULT_SETTINGS, "bindings": [], "latest_seq": 0,
+                "project_id": project["id"], "next_settings": default_next_settings(self.settings), "bindings": [], "latest_seq": 0,
                 "active_turn_id": None}, ident=ident)
             self._remember(conn, principal, "session-create", key, body, ident)
             return {"session": self._session_public(session)}

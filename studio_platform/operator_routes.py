@@ -9,7 +9,7 @@ PREFIX = "/v1/operator/capacity"
 
 def register_routes(app, *, registry=None, service=None):
     service = service or OperatorCapacity(app.state.repository, app.state.settings,
-        registry if registry is not None else OperatorRegistry.from_environment())
+        registry if registry is not None else OperatorRegistry.from_environment(repository=app.state.repository))
     app.state.operator_capacity = service
 
     def principal(request):

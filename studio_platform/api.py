@@ -589,7 +589,7 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
     from .runtime_catalog import public_catalog
     registry = operator_registry
     if registry is None:
-        registry = OperatorRegistry.from_environment(catalog=public_catalog)
+        registry = OperatorRegistry.from_environment(catalog=public_catalog, repository=app.state.repository)
     register_operator_routes(app, registry=registry)
     from .frontend import register_routes as register_frontend_routes
     register_frontend_routes(app)

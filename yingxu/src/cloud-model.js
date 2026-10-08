@@ -1,27 +1,34 @@
 import {boundVideoRange} from './video-cut-model.js';
 import {ancestors,validateProject} from './store.js';
 import {effectiveLook} from './character-model.js';
+import {shotLocationIds} from './location-model.js';
 
 const clone=value=>structuredClone(value);
 export const jobLabels={planned:'等待批次确认',waiting_capacity:'等待计算容量',queued:'等待执行',claimed:'已分配',submitting:'正在提交',running:'生成中',collecting:'保存与核验结果',checking:'检查成片',succeeded:'已完成',failed:'失败',cancel_requested:'正在确认取消',cancelled:'已取消',blocked:'等待条件满足',submission_unknown:'提交结果待核对',recovery_hold:'恢复后待核对'};
 export const activeJobStatuses=new Set(['waiting_capacity','queued','claimed','submitting','running','collecting','checking','cancel_requested']);
 export function recoveryMessage(job){return job?.error_code==='cancellation_requires_reconciliation'?'已记录取消意愿，但原提交结果仍需管理员核对。原任务和费用记录保留，请勿重复提交。':'原任务等待管理员核对执行与费用；作品仍可编辑，请勿重复提交。';}
 export function capacityWaitMessage(job){
-  if(job?.status!=='waiting_capacity')return '';
+  if(job?.status!=='waiting_capacity'&&!(job?.status==='queued'&&job?.error_code==='capacity_queued_task_repair_required'))return '';
   const reasons={
     capacity_no_matching_gpu:'暂时没有符合型号、显存和价格上限的可用 GPU。系统会继续查找其他合适机器；原任务保留，无需重新提交。',
     capacity_inventory_check_failed:'暂时无法确认 GPU 库存，系统会重试查询。目前尚未确认有可用机器，请保留原任务。',
     capacity_rental_reconciliation:'GPU 租赁结果需要核对，当前尚未开始生成。为避免重复收费，已暂停再次租机；原任务保留，等待处理。',
     capacity_configuration_unavailable:'当前 GPU 执行配置暂不可用，需修复后才能继续。原任务保留，可取消等待。',
     capacity_bootstrap_repair_required:'GPU 环境准备失败，正在修复；原任务已保留，无需重新提交。',
+    capacity_queued_task_repair_required:'GPU 工作机需要恢复，已暂停接新任务。你的任务仍保留，等待恢复；可取消等待，请勿重复提交。',
     capacity_budget_or_limit:'当前 GPU 预算或并发额度不足，暂时无法开机。原任务保留，不会自动提高预算。',
     capacity_gpu_starting:'正在准备 GPU、加载模型并检查运行条件，通过后自动执行原任务，无需再次提交。',
+    capacity_provider_preparing:'GPU 供应商正在准备机器，尚未开始加载模型或生成。原任务保留，无需重新提交。',
+    capacity_provider_configuring_ssh:'GPU 供应商正在配置远程连接，尚未开始加载模型或生成。原任务保留，无需重新提交。',
+    capacity_provider_preparation_failed:'GPU 供应商准备机器失败，尚未开始生成。机器回收与费用仍需核对，原任务保留；无需重新提交。',
+    capacity_provider_preparation_timeout:'GPU 供应商准备机器超时，尚未开始生成。机器回收与费用仍需核对，原任务保留；无需重新提交。',
+    capacity_provider_preparation_retry_limit:'GPU 供应商准备机器连续失败，已暂停自动租机，等待管理员处理。尚未开始生成，原任务仍保留；可取消等待，无需重新提交。',
     capacity_gpu_busy:'GPU 正在处理队列中的任务，当前任务等待空闲执行位置，无需重新提交。',
     capacity_searching_gpu:'正在查找符合条件的 GPU，尚未开始生成。找到后会自动准备机器，可取消等待。',
   };
   return reasons[job.error_code]||'等待计算容量启动与验收，尚未开始模型推理。保持原任务，可请求取消；无需重新提交。';
 }
-export function jobMessage(job){if(job?.status==='waiting_capacity')return capacityWaitMessage(job);if(job?.status==='recovery_hold')return recoveryMessage(job);if(job?.error_code==='render_cache_capacity_exhausted')return '粗剪服务的工作空间已满，本次已停止，尚未开始编码。素材保持不变；请等管理员处理容量后，再预检并确认新的粗剪任务。';return job?.message||job?.error?.message||job?.error_code||'';}
+export function jobMessage(job){if(job?.status==='waiting_capacity'||job?.status==='queued'&&job?.error_code==='capacity_queued_task_repair_required')return capacityWaitMessage(job);if(job?.status==='recovery_hold')return recoveryMessage(job);if(job?.error_code==='render_cache_capacity_exhausted')return '粗剪服务的工作空间已满，本次已停止，尚未开始编码。素材保持不变；请等管理员处理容量后，再预检并确认新的粗剪任务。';return job?.message||job?.error?.message||job?.error_code||'';}
 export function estimateLabel(estimate){if(!estimate||estimate.cost_microusd==null)return '费用尚未报价，不能据此认为免费。';if(estimate.source==='mock'||estimate.kind==='simulation')return '模拟测试不调用模型，费用为 $0；真实推理价格尚未验证。';if(estimate.kind==='included')return '此项粗剪当前不单独计费；服务器资源仍有运行成本。';if(estimate.kind==='budget_reservation')return `预算预留 $${(estimate.cost_microusd/1000000).toFixed(4)} ${estimate.currency||'USD'}；这是运营配置的额度占用，实际费用待核对，不是最终账单。`;if(typeof estimate.cost_microusd==='number')return `预计 $${(estimate.cost_microusd/1000000).toFixed(4)} ${estimate.currency||'USD'}；以实际执行结算为准。`;return '费用信息暂不可用。';}
 export function stableJSON(value){if(Array.isArray(value))return '['+value.map(stableJSON).join(',')+']';if(value&&typeof value==='object')return '{'+Object.keys(value).sort().map(key=>JSON.stringify(key)+':'+stableJSON(value[key])).join(',')+'}';return JSON.stringify(value);}
 export async function digest(value){const bytes=new TextEncoder().encode(stableJSON(value));return [...new Uint8Array(await crypto.subtle.digest('SHA-256',bytes))].map(n=>n.toString(16).padStart(2,'0')).join('');}
@@ -31,7 +38,7 @@ export function removeFreestyleInput(project,shotId,assetId,{guide=false,roles=[
 export function copyForCloud(project){const p=clone(project);p.id='project-'+crypto.randomUUID();p.jobs=[];p.updatedAt=new Date().toISOString();for(const e of p.entities){const asset=project.entities.find(a=>a.id===e.data.selectedAssetId);if(boundVideoRange(e.data.selectedVideoRange,asset)){e.data.selectedVideoRange.cloudAssetId=null;e.data.selectedVideoRange.cloudArtifactId=null;}}for(const e of p.entities){delete e.data.cloudAssetId;delete e.data.cloudArtifactId;delete e.data.cloudContentPath;}for(const tracks of Object.values(p.journey?.soundTracks||{}))if(Array.isArray(tracks))for(const track of tracks)if(track.generatedFrom)track.needsReview=true;return p;}
 export function checkedProjectRecord(record){const project=record?.project,checked=validateProject(project);if(!checked.ok||!Number.isInteger(record.version)||record.version<1||record.id!==project.id)throw Error(checked.error||'云项目响应无效，未替换当前作品。');return {...record,project:checked.project};}
 
-export function referenceSpecs(project,shotId){
+export function referenceSpecs(project,shotId,{mode}={}){
   const shot=project.entities.find(e=>e.id===shotId);if(!shot||!['shot','generation'].includes(shot.type))return {references:[],issues:['镜头不存在。']};
   const find=id=>project.entities.find(e=>e.id===id),references=[],issues=[];
   const add=(asset,purpose,range=null,linkId=null)=>{
@@ -45,6 +52,9 @@ export function referenceSpecs(project,shotId){
     if(['image','video','audio'].includes(asset?.type))add(asset,link.role,shot.data.referenceRanges?.[link.id],link.id);
     else if(link.role==='dependency')issues.push(`前置步骤「${asset?.title||'未知'}」尚未被明确选为实际参考素材。`);
   }
+  // Shared visual identity is an ordinary REF input. FL retains the story's
+  // cast/location assignments but only sends explicitly chosen frame inputs.
+  if((mode??shot.data.h3?.inputMode)!=='fl'){
   const scene=find(shot.parentId),characters=new Set([...(scene?.data.cast||[]),...(shot.data.cast||[])].map(c=>c.characterId));
   for(const link of project.links.filter(l=>l.target===shotId&&l.role==='identity'&&find(l.source)?.type==='character'))characters.add(link.source);
   for(const id of characters){const character=find(id),binding=effectiveLook(project,shot,id),look=character?.data.looks?.find(l=>l.id===binding?.lookId);
@@ -52,7 +62,18 @@ export function referenceSpecs(project,shotId){
     const gallery=Object.values(look.gallery||{}).filter(Boolean);if(!gallery.length)issues.push(`造型「${look.name}」尚未放入参考图。`);
     for(const assetId of gallery){const asset=find(assetId);if(!references.some(r=>r.entity.id===assetId))add(asset,'identity');}
   }
+  for(const id of shotLocationIds(project,shot)){
+    const location=find(id);if(location?.type!=='location'){issues.push('已绑定地点不存在，请重新选择。');continue;}
+    for(const assetId of location.data.referenceAssetIds||[])if(!references.some(ref=>ref.entity.id===assetId))add(find(assetId),'reference');
+  }
+  }
   return {references,issues:[...new Set(issues)]};
+}
+export function selectedRecipe(recipes,h3={}){return h3.recipeId?recipes.find(recipe=>recipe.id===h3.recipeId):h3.inputMode?recipes.find(recipe=>recipe.mode===h3.inputMode):recipes[0];}
+export function effectiveReferenceCount(project,shotId,kind){
+  const {references}=referenceSpecs(project,shotId);
+  // The service counts ordinary inputs separately from reusable time guides.
+  return new Set(references.filter(ref=>ref.entity.type===kind&&!['firstFrame','lastFrame'].includes(ref.purpose)).map(ref=>ref.entity.id)).size;
 }
 export function shotSnapshot(project,shotId){
   const shot=project.entities.find(e=>e.id===shotId);if(!shot)return null;
@@ -91,7 +112,7 @@ export function validateControlValues(recipe,controls){
 export function buildPlanPayload(project,shotId,{recipe,capabilitiesVersion,assetMap={},sourceHash}={}){
   const shot=project.entities.find(e=>e.id===shotId);if(!shot)throw Error('镜头已被删除。');
   if(!recipe)throw Error('先选择有明确能力说明的配方。');
-  const {references,issues}=referenceSpecs(project,shotId),controls=controlsForRecipe(recipe,shot.data.h3?.controls,shot.data.seconds);
+  const {references,issues}=referenceSpecs(project,shotId,{mode:recipe.mode}),controls=controlsForRecipe(recipe,shot.data.h3?.controls,shot.data.seconds);
   issues.push(...validateControlValues(recipe,controls));
   const prompt=String(shot.data.prompt??shot.description??'').trim();if(!prompt)issues.push('先写清这个镜头的画面与动作。');
   const inputs={images:[],videos:[],audios:[],guides:[]},seen=new Set();

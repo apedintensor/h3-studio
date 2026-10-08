@@ -57,7 +57,7 @@ def safe_error(error):
 
 class OperatorController:
     def __init__(self, service, *, provider_factory, boot_factory=None, enabled=False,
-                 leader_id=None, coordinator_factory=None):
+                 leader_id=None, coordinator_factory=None, inventory_refresh=None, status_writer=None):
         require(type(enabled) is bool and callable(provider_factory),"operator_controller_configuration_invalid",422)
         self.service,self.repo=service,service.repo
         self.provider_factory,self.boot_factory=provider_factory,boot_factory
@@ -65,6 +65,8 @@ class OperatorController:
         self.leader_id=leader_id or "operator-"+uuid.uuid4().hex
         require(safe_id(self.leader_id),"operator_controller_identity_invalid",422)
         self.coordinator_factory=coordinator_factory
+        self.inventory_refresh=inventory_refresh
+        self.status_writer=status_writer
         self.coordinators,self.boots={},{}
         self.shutting_down=False
         self.shutdown_started_at=None
@@ -130,9 +132,11 @@ class OperatorController:
                     self.shutdown_released.add(intent_id)
             except Exception:
                 pending.append({"node_id":intent_id,"code":"operator_local_release_unconfirmed"})
-        return {"state":"shutdown_waiting" if pending else "shutdown_complete",
+        result={"state":"shutdown_waiting" if pending else "shutdown_complete",
             "local_connections_released":not pending,"pending":pending,
             "cloud_removal_confirmed":False,"billing_settled":False}
+        if self.status_writer is not None: self.status_writer(self.leader_id,result)
+        return result
 
     def _coordinator(self,binding):
         key=(binding.binding_id,binding.fingerprint)
@@ -475,12 +479,21 @@ class OperatorController:
                     connection.execute(update(operator_nodes).where(operator_nodes.c.intent_id==node["intent_id"]).values(
                         runtime_state="observation_failed",updated_at=self.repo.clock()))
         self._summarize_commands()
+        if self.inventory_refresh is not None:
+            try:
+                self.inventory_refresh(self.leader_id,stopping=self.shutting_down)
+            except Exception:
+                # A missing/stale observation blocks future previews, never
+                # interrupts an existing rental's lifetime/collection loop.
+                pass
         status="draining" if self.shutting_down else "degraded" if errors else "running"
         with self.repo.transaction() as connection:
             # A competing controller's newer heartbeat is not ours to overwrite.
             connection.execute(update(operator_heartbeats).where(operator_heartbeats.c.id=="global",
                 operator_heartbeats.c.controller_id==self.leader_id).values(observed_at=self.repo.clock(),state=status))
-        return {"state":status,"commands":len(commands),"nodes":len(nodes),"errors":errors}
+        result={"state":status,"commands":len(commands),"nodes":len(nodes),"errors":errors}
+        if self.status_writer is not None: self.status_writer(self.leader_id,result)
+        return result
 
 
 def main(argv=None):

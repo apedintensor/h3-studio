@@ -2,6 +2,7 @@ import {reconcileGeneratedTracks} from './generated-sound-model.js';
 import {rangeShapeIssue} from './video-cut-model.js';
 import {detachDeletedReferences} from './entity-references.js';
 import {effectiveLook,lookShots} from './character-model.js';
+import {locationShots} from './location-model.js';
 import {resolveCanvasPositions} from './canvas-layout.js';
 import legacySeed from './legacy-seed.json' with { type: 'json' };
 
@@ -78,6 +79,8 @@ export function validateProject(input){
     for(const field of ['fileId','fileName','mime'])if(e.data[field]!==undefined&&(typeof e.data[field]!=='string'||e.data[field].length>1000))return fail(`素材「${e.title}」的 ${field} 无效。`);
   }
   for(const e of input.entities){
+    if(e.data.locationId!==undefined&&(typeof e.data.locationId!=='string'||e.data.locationId!==''&&(!['scene','shot'].includes(e.type)||input.entities.find(asset=>asset.id===e.data.locationId)?.type!=='location')))return fail(`「${e.title}」的绑定地点无效。`);
+    if(e.data.referenceAssetIds!==undefined&&(e.type!=='location'||!Array.isArray(e.data.referenceAssetIds)||new Set(e.data.referenceAssetIds).size!==e.data.referenceAssetIds.length||e.data.referenceAssetIds.some(id=>typeof id!=='string'||input.entities.find(asset=>asset.id===id)?.type!=='image')))return fail(`地点「${e.title}」的参考图片不存在或格式无效。`);
     if(e.data.selectedAssetId!==undefined&&e.data.selectedAssetId!==''){const asset=input.entities.find(a=>a.id===e.data.selectedAssetId);if(e.type!=='shot'||typeof e.data.selectedAssetId!=='string'||!asset||!['image','video'].includes(asset.type))return fail(`镜头「${e.title||'未命名'}」选定的候选素材不存在或不是图片 / 视频，请重新选择。`);}
     const parent=e.parentId===null?null:input.entities.find(x=>x.id===e.parentId);
     if(e.parentId!==null&&!parent)return fail(`节点「${e.title}」引用的父级不存在。`);
@@ -173,7 +176,7 @@ export function createStore({storage,now=()=>Date.now(),seed=legacySeed}={}){
     persist();emit();return true;
   };
   const changeView=patch=>{coalesce=null;state={...state,...patch};persist();emit();};
-  const markDownstream=(p,id)=>{const reached=new Set([id]),queue=[id];while(queue.length){const next=queue.shift(),subject=p.entities.find(e=>e.id===next),castShots=subject?.type==='character'?p.entities.filter(e=>e.type==='shot'&&effectiveLook(p,e,next)).map(e=>e.id):[],galleryShots=p.entities.filter(e=>e.type==='character').flatMap(c=>(c.data.looks||[]).filter(l=>Object.values(l.gallery||{}).includes(next)).flatMap(l=>lookShots(p,c.id,l.id).map(e=>e.id))),dependents=new Set([...castShots,...galleryShots,...p.links.filter(l=>l.source===next).map(l=>l.target),...p.entities.filter(e=>e.parentId===next||e.data.selectedAssetId===next).map(e=>e.id)]);for(const target of dependents)if(!reached.has(target)){reached.add(target);queue.push(target);const e=p.entities.find(x=>x.id===target);if(e&&['scene','shot','generation'].includes(e.type))e.status='review';}}};
+  const markDownstream=(p,id)=>{const reached=new Set([id]),queue=[id];while(queue.length){const next=queue.shift(),subject=p.entities.find(e=>e.id===next),castShots=subject?.type==='character'?p.entities.filter(e=>e.type==='shot'&&effectiveLook(p,e,next)).map(e=>e.id):[],galleryShots=p.entities.filter(e=>e.type==='character').flatMap(c=>(c.data.looks||[]).filter(l=>Object.values(l.gallery||{}).includes(next)).flatMap(l=>lookShots(p,c.id,l.id).map(e=>e.id))),locationDependents=[...locationShots(p,next).map(e=>e.id),...p.entities.filter(e=>e.type==='location'&&(e.data.referenceAssetIds||[]).includes(next)).flatMap(e=>[e.id,...locationShots(p,e.id).map(shot=>shot.id)])],dependents=new Set([...locationDependents,...castShots,...galleryShots,...p.links.filter(l=>l.source===next).map(l=>l.target),...p.entities.filter(e=>e.parentId===next||e.data.selectedAssetId===next).map(e=>e.id)]);for(const target of dependents)if(!reached.has(target)){reached.add(target);queue.push(target);const e=p.entities.find(x=>x.id===target);if(e&&['scene','shot','generation'].includes(e.type))e.status='review';}}};
   const replace=(p)=>{const valid=validateProject(p);if(!valid.ok){say(valid.error);return false;}if(protectedRaw&&recoveryRaw!==null&&!backup(recoveryRaw,'recovery'))return false;if(!backup())return false;protectedRaw=false;recoveryRaw=null;past.length=0;future.length=0;coalesce=null;state={...state,project:valid.project,workspaceEpoch:state.workspaceEpoch+1,selectedId:null,scopeId:null,notice:'旧项目已备份，当前项目已切换。'};persist();emit();return true;};
   return {
     getState:()=>state,
@@ -220,7 +223,7 @@ export function createStore({storage,now=()=>Date.now(),seed=legacySeed}={}){
       for(const key of ['title','description','parentId','status','version'])if(Object.hasOwn(patch,key))e[key]=patch[key];if(patch.data)e.data={...e.data,...patch.data};
       if(e.type==='generation'&&e.data.recipe!==state.project.entities.find(x=>x.id===id).data.recipe){for(const link of p.links.filter(l=>l.target===id)){const checked=validateLink({...p,links:p.links.filter(l=>l.id!==link.id)},link.source,link.target,link.role);if(!checked.ok){say(`无法切换生成能力：${checked.error} 请先解除不兼容的关联；原配方和素材均已保留。`);return false;}}}
       const before=state.project.entities.find(x=>x.id===id);if(JSON.stringify({...e,version:0})===JSON.stringify({...before,version:0}))return true;if(before.status==='ready'&&!Object.hasOwn(patch,'status'))e.status='draft';
-      const shotChanged=e.description!==before.description||e.parentId!==before.parentId||['seconds','goal','shotSize','cameraMove','cameraHeight','cast','referenceRanges','prompt','style','h3'].some(key=>JSON.stringify(e.data[key])!==JSON.stringify(before.data[key]));
+      const shotChanged=e.description!==before.description||e.parentId!==before.parentId||['seconds','goal','shotSize','cameraMove','cameraHeight','cast','locationId','referenceRanges','prompt','style','h3'].some(key=>JSON.stringify(e.data[key])!==JSON.stringify(before.data[key]));
       if(e.type==='shot'&&shotChanged&&state.workspace.mode==='cloud'&&!Object.hasOwn(patch,'version'))e.version=before.version+1;
       if(e.type==='shot'&&shotChanged&&before.data.acceptPlaceholder)e.data.acceptPlaceholder=false;
       if(e.type==='shot'&&(before.data.selectedAssetId||before.data.uxReview?.chosen)&&shotChanged&&!Object.hasOwn(patch,'status'))e.status='review';
@@ -230,7 +233,7 @@ export function createStore({storage,now=()=>Date.now(),seed=legacySeed}={}){
     duplicateEntity(id){
       const p=clone(state.project),original=p.entities.find(e=>e.id===id);if(!original)return false;
       const ids=descendants(p,id),remap=new Map([...ids].map(old=>[old,uid(p.entities.find(e=>e.id===old).type)])),copies=p.entities.filter(e=>ids.has(e.id)).map(e=>({...clone(e),id:remap.get(e.id),parentId:remap.get(e.parentId)||e.parentId,title:e.id===id?`${e.title.slice(0,154)} 副本`:e.title,version:1,status:'draft'}));
-      for(const copy of copies){delete copy.data.confirmed;if(remap.has(copy.data.selectedAssetId))copy.data.selectedAssetId=remap.get(copy.data.selectedAssetId);if(remap.has(copy.data.selectedVideoRange?.assetId))copy.data.selectedVideoRange.assetId=remap.get(copy.data.selectedVideoRange.assetId);}
+      for(const copy of copies){delete copy.data.confirmed;if(remap.has(copy.data.locationId))copy.data.locationId=remap.get(copy.data.locationId);if(Array.isArray(copy.data.referenceAssetIds))copy.data.referenceAssetIds=copy.data.referenceAssetIds.map(id=>remap.get(id)||id);if(remap.has(copy.data.selectedAssetId))copy.data.selectedAssetId=remap.get(copy.data.selectedAssetId);if(remap.has(copy.data.selectedVideoRange?.assetId))copy.data.selectedVideoRange.assetId=remap.get(copy.data.selectedVideoRange.assetId);}
       copies.find(e=>e.id===remap.get(id)).order=Math.max(-1,...children(p,original.parentId).map(e=>e.order))+1;
       const links=p.links.filter(l=>ids.has(l.target)).map(l=>({...l,id:uid('link'),source:remap.get(l.source)||l.source,target:remap.get(l.target)}));
       for(const [old,fresh]of remap){const xy=p.layout.positions[old]||{x:0,y:0};p.layout.positions[fresh]={x:xy.x+60,y:xy.y+60};}p.entities.push(...copies);p.links.push(...links);

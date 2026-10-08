@@ -172,8 +172,10 @@ def capabilities(settings):
                             "applies_to": "unset_controls_only", "source": "current_operator_execution_policy",
                             "description": "当前执行池要求这些控制值。新镜头的未设置项采用此预设；已有明确选择保留。API调用请显式传入，最终以预检为准。"}
     upload_geometry = {"min_side": 256, "max_side": 5760, "min_aspect_ratio": .4, "max_aspect_ratio": 2.5}
-    from .execution_profiles import public_profiles
-    return {"capabilities_version": VERSION, "recipes": recipes, "deployment_profiles": public_profiles(settings),
+    from .execution_profiles import public_profiles, default_profile_id
+    profiles = public_profiles(settings)
+    return {"capabilities_version": VERSION, "recipes": recipes, "deployment_profiles": profiles,
+            "default_deployment_profile_id": default_profile_id(settings, profiles),
             "upload_constraints": {"max_bytes": settings.max_upload_bytes,
                 "allowed_extensions": dict(EXTENSIONS),
                 "image": {**upload_geometry, "single_frame_only": True},
