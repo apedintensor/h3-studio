@@ -11,7 +11,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("pro_pilot", Path(__file__).with_name("h3_pro6000_pilot_runtime.py"))
+spec = importlib.util.spec_from_file_location("pro_pilot", Path(__file__).parent / "tools" / "h3_pro6000_pilot_runtime.py")
 pro = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pro)
 
