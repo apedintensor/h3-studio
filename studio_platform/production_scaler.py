@@ -876,21 +876,32 @@ class FiniteController:
                     and str(exc) == "lium_absolute_ttl_unconfirmed" else "boot_observation_unconfirmed"}
         reason = decision.get("reason")
         if not stopping:
-            if (any(row["state"] == "creation_unknown" for row in instances)
-                    or any(v.get("state") == "rental_contract_requires_reconciliation" for v in boot_status.values())):
-                reason = "creation_needs_reconciliation"
-            elif any(v.get("state") == "configuring_ssh" for v in boot_status.values()):
-                reason = "provider_configuring_ssh"
-            elif any(v.get("state") == "provider_ttl_unconfirmed" for v in boot_status.values()):
-                reason = "provider_ttl_unconfirmed"
-            elif any(v.get("state") == "provider_preparing" for v in boot_status.values()):
-                reason = "provider_preparing"
-            elif any(row["state"] == "starting" for row in instances):
-                reason = "gpu_starting"
-            elif any(row["state"] in ("ready", "busy") for row in instances):
-                reason = "gpu_busy"
-            self.cold.record_wait_reason(c.capacity_approval_id, reason or "searching")
+            reason = self._wait_reason(decision, instances, boot_status)
+            self._record_wait_reason(reason)
         return self.status(decision=decision.get("state"), reason=reason, boot=boot_status)
+
+    def _wait_reason(self, decision, instances, boot_status):
+        reason = decision.get("reason")
+        if (any(row["state"] == "creation_unknown" for row in instances)
+                or any(v.get("state") == "rental_contract_requires_reconciliation" for v in boot_status.values())):
+            reason = "creation_needs_reconciliation"
+        elif any(v.get("state") == "configuring_ssh" for v in boot_status.values()):
+            reason = "provider_configuring_ssh"
+        elif any(v.get("state") == "provider_ttl_unconfirmed" for v in boot_status.values()):
+            reason = "provider_ttl_unconfirmed"
+        elif any(v.get("state") == "provider_preparing" for v in boot_status.values()):
+            reason = "provider_preparing"
+        elif any(row["state"] == "starting" for row in instances):
+            reason = "gpu_starting"
+        elif any(row["state"] in ("ready", "busy") for row in instances):
+            reason = "gpu_busy"
+        return reason
+
+    def _record_wait_reason(self, reason):
+        self.cold.record_wait_reason(self.config.capacity_approval_id, reason or "searching")
+
+    def _project_status(self, value):
+        return value
 
     def status(self, *, fresh_ledger_only=False, **extra):
         rows, _ = self._managed()
@@ -915,6 +926,7 @@ class FiniteController:
             value.update(reason="creation_needs_reconciliation",
                 recovery={"code": "creation_outcome_unknown", "intent_ids": unknown,
                           "automatic_rerent_allowed": False})
+        value = self._project_status(value)
         if fresh_ledger_only:
             value.update(snapshot_only=False, controller_exit_required=True)
         else:

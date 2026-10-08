@@ -436,6 +436,76 @@ class PoolServiceCycle(FiniteController):
             return False
         return all(row["state"] == "destroyed" and row["billing_status"] == "settled" for row in rows)
 
+    def _member_readiness(self):
+        from .member_readiness import STATES, project_member
+        now = self.repo.clock()
+        stopping = self.stopping()
+        values = []
+        with self.repo.engine.connect() as connection:
+            grant = self._approval(connection)
+            if grant is None:
+                rows, mapping = [], {}
+                approval_available = False
+            else:
+                rows, _, mapping = self.members.managed(connection, grant)
+                p = grant["payload"]
+                approval_available = bool(grant["enabled"] and min(grant["expires_at"],
+                    p["qualification_expires_at"], p["quote_expires_at"],
+                    p["scale_policy"]["hard_deadline"]) > now and self.approval_current(p))
+            by_id = {row["id"]: row for row in rows}
+            # Only the current exact binding is projected. Historical workers
+            # stay in the ledger; no fallback to an older generation's slot.
+            for member in self.member_ids:
+                row = by_id.get(mapping.get(member))
+                worker = preparation = job = None
+                held, unsafe = False, ()
+                if row is not None:
+                    worker_id = "lium-"+row["id"].replace("-", "")
+                    worker = connection.execute(select(registered_workers).where(
+                        registered_workers.c.id == worker_id)).mappings().first()
+                    preparation = self.scaler.preparation(connection, row)
+                    held = self.member_hold(row, connection) is not None
+                    if row["provider_instance_id"]:
+                        unsafe = tuple(connection.execute(self._unsafe_attempts(
+                            instance_id=row["provider_instance_id"]).distinct().limit(2)).scalars())
+                    if worker and worker["current_job_id"]:
+                        job = connection.execute(select(jobs.c.id, jobs.c.pool, jobs.c.status).where(
+                            jobs.c.id == worker["current_job_id"])).mappings().first()
+                values.append(project_member(self.config, member, row, worker,
+                    now=now, model_id=MODEL, held=held, preparation=preparation, job=job,
+                    unsafe_jobs=unsafe, stopping=stopping))
+        return {"observed_at": now, "approval_available": approval_available,
+            "members": values, "counts": {state: sum(v["state"] == state for v in values) for state in STATES}}
+
+    def _readiness_reason(self, reason, projection):
+        from .member_readiness import PREPARING_REASONS, readiness_reason
+        if not projection["approval_available"] and (reason is None or reason in PREPARING_REASONS):
+            return "capacity_approval_or_cycle_conflict"
+        return readiness_reason(reason, projection["members"])
+
+    def _wait_reason(self, decision, instances, boot_status):
+        from .member_readiness import PREPARING_REASONS
+        reason = super()._wait_reason(decision, instances, boot_status)
+        # A legacy preparing label must not erase a specific budget/repair or
+        # authority failure from the current decision. Rental/TTL uncertainty
+        # also remains explicit even when a healthy sibling is ready.
+        explicit = decision.get("reason")
+        if explicit is not None and explicit not in PREPARING_REASONS:
+            reason = explicit
+        return self._readiness_reason(reason, self._member_readiness())
+
+    def _record_wait_reason(self, reason):
+        # This says nothing about an individual job's recipe or TTL fit. The
+        # existing admission path alone can activate it and clear its error.
+        super()._record_wait_reason("matching_slot_pending" if reason == "gpu_ready" else reason)
+
+    def _project_status(self, value):
+        projection = self._member_readiness()
+        value["member_readiness"] = projection
+        if not self.stopping():
+            value["reason"] = self._readiness_reason(value.get("reason"), projection)
+        return value
+
     def status(self, *, fresh_ledger_only=False, **extra):
         rows, _ = self._managed()
         extra["member_holds"] = [{"intent_id": intent_id, "state": "repair_required"}
