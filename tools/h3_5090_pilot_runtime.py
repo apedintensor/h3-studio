@@ -114,8 +114,14 @@ def assert_no_ui(root):
 
 
 def environment(root):
+    root = root.resolve(strict=True)
     assert_no_ui(root)
     source = source_identity(root)
+    # MMGP is vendored in this reviewed WanGP checkout, not installed in site-packages.
+    sys.path.insert(0, str(root))
+    mmgp = importlib.import_module("mmgp")
+    if not getattr(mmgp, "__file__", None) or not Path(mmgp.__file__).resolve().is_relative_to(root):
+        raise ValueError("vendored_mmgp_import_collision")
     versions = dict(sorted((d.metadata["Name"].lower(), d.version)
                            for d in importlib.metadata.distributions() if d.metadata["Name"]))
     # Import probes are explicit here, not at module import or in `assets`.

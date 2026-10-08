@@ -136,6 +136,25 @@ class PilotTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "asset_hash_mismatch:shared.bin"):
                 pilot.verify_assets(self.root, modes={"fl"})
 
+    def test_environment_prioritizes_reviewed_vendored_mmgp_and_rejects_collision(self):
+        def import_probe(name):
+            self.assertEqual(pilot.sys.path[0], str(self.root.resolve()))
+            if name == "mmgp":
+                return types.SimpleNamespace(__file__=str(self.root / "mmgp" / "__init__.py"))
+            raise RuntimeError("remaining_dependency_probes_reached")
+        with patch.object(pilot, "assert_no_ui"), patch.object(pilot, "source_identity"), \
+             patch.object(pilot.sys, "path", list(pilot.sys.path)), \
+             patch.object(pilot.importlib.metadata, "distributions", return_value=[]), \
+             patch.object(pilot.importlib, "import_module", side_effect=import_probe):
+            with self.assertRaisesRegex(RuntimeError, "remaining_dependency_probes_reached"):
+                pilot.environment(self.root)
+        with patch.object(pilot, "assert_no_ui"), patch.object(pilot, "source_identity"), \
+             patch.object(pilot.sys, "path", list(pilot.sys.path)), \
+             patch.object(pilot.importlib, "import_module", return_value=types.SimpleNamespace(
+                 __file__=str(self.root.parent / "unreviewed" / "mmgp.py"))):
+            with self.assertRaisesRegex(ValueError, "vendored_mmgp_import_collision"):
+                pilot.environment(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()
