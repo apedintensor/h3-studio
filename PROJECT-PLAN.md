@@ -107,6 +107,8 @@ Do not make unknown work disappear by migrating it into an empty database or res
 
 ## 7. Engine and deployment decisions
 
+Decision input: [H3 deployment, capability and GPU economics research (2026-10-08)](docs/research/h3-economics-20261008/README.md), tracked in [#66](https://github.com/apedintensor/h3-studio/issues/66), compares dated primary-source measurements and prices. It does not select a new runtime, change existing recipes or establish full-control/cost parity.
+
 Retain pinned ComfyUI as the behavioral baseline and compatibility route while extracting the adapter boundary.
 User decision, 2026-10-06: authorization for WanGP has been obtained. Adopt its existing headless runtime through a thin inference adapter, keeping upstream unchanged where practical. This replaces the earlier SGLang-first evaluation order; it does not establish completed integration or production readiness.
 
