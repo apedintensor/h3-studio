@@ -207,3 +207,21 @@ class ParentRecoveryTests(ledger.LedgerCase):
                 Settings(self.config.data_dir), owner_token=recovered.fleet.process_tokens[self.worker], recover_slot=True), 0)
         self.assertEqual(self.control.get(self.worker)["drain_requested"], 1)
         self.assert_no_upstream_repeat()
+
+    def test_long_outage_retirement_needs_owned_exit_and_fresh_idle_not_expired_heartbeat(self):
+        self.control.mark_ready(self.worker, upstream_idle_confirmed=True)
+        original_expiry = self.control.get(self.worker)["expires_at"]
+        with owned_process(self.fleet, self.worker, self.token):
+            recovered = self.new_boot()
+            self.now = original_expiry+1
+            with patch.object(recovered, "_popen_impl", side_effect=AssertionError):
+                recovered.tick(self.intent["id"], stopping=True)
+            self.assertNotEqual(self.control.get(self.worker)["state"], "retired")
+        self.backend.queue = {"queue_running": ["synthetic-still-busy"], "queue_pending": []}
+        recovered.tick(self.intent["id"], stopping=True)
+        self.assertNotEqual(self.control.get(self.worker)["state"], "retired")
+        self.backend.queue = {"queue_running": [], "queue_pending": []}
+        recovered.tick(self.intent["id"], stopping=True)
+        worker = self.control.get(self.worker)
+        self.assertEqual((worker["state"], worker["expires_at"]), ("retired", original_expiry))
+        self.assert_no_upstream_repeat()

@@ -505,7 +505,16 @@ class ProductionBoot(BootController):
             worker = control.get(worker_id)
             if worker["state"] == "retired":
                 continue
-            if worker["current_job_id"] is None and worker["expires_at"] > self.repo.clock() and worker["drain_requested"]:
+            from .control import worker_spec_payload
+            from .repository import request_hash
+            recovered_exit = (getattr(self.fleet, "process_ownership", False) is True
+                and getattr(self.fleet, "recovering", False) is True
+                and worker["spec_hash"] == request_hash(worker_spec_payload(self.fleet.config.slot(worker_id).spec)))
+            # A long parent outage may leave an expired registration. A
+            # reconstructed exact owner now has positive CPU exit AND a fresh
+            # original-runtime idle proof; never refresh its admission lease.
+            if (worker["current_job_id"] is None and worker["drain_requested"]
+                    and (worker["expires_at"] > self.repo.clock() or recovered_exit)):
                 control.retire(worker_id, upstream_idle_confirmed=True)
 
     def children_done(self):
