@@ -124,10 +124,10 @@
   },
   "minimum_ram_bytes": 103079215104,
   "minimum_free_vram_bytes": 30064771072,
-  "minimum_disk_bytes": 268435456000,
+  "minimum_disk_bytes": 137438953472,
   "hardware_filters": {
     "minimum_cpu_cores": 12,
-    "minimum_download_mbps": 500,
+    "minimum_download_mbps": 200,
     "maximum_price_per_gpu_hour_microusd": 850000
   },
   "tested_topology": {
@@ -345,7 +345,7 @@
   ],
   "warnings": [
     "Historical single-run samples; cache state was not controlled. No SLA or cross-profile speed ranking.",
-    "RAM/disk numbers are pilot admission bounds, not measured model minima.",
+    "RAM retains the pilot admission bound; disk/download filters are derived operating policy, not measured minima or throughput guarantees.",
     "No 768p/50-step qualification; no arbitrary Cartesian product of input roles.",
     "All model components resident together in VRAM was not verified.",
     "Production adapter and lifecycle integration require separate current verification.",
