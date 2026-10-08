@@ -120,6 +120,10 @@ class HostBoundaryTests(unittest.TestCase):
         self.stack.enter_context(patch.object(host,'receipt',return_value={'state':'running','controller_id':'test-controller'}))
         self.stack.enter_context(patch.object(host,'compose'))
         self.stack.enter_context(patch.object(release,'wait_ready'))
+        # Lifecycle fixtures are owned by the unprivileged CI runner. Ownership
+        # checks are covered separately; keep reading the actual durable record.
+        self.stack.enter_context(patch.object(release,'_protected_json',
+            side_effect=lambda path, **kwargs: json.loads(path.read_text())))
         return installed
 
     def test_start_persists_before_launch_then_signal_drains_without_forcing_exit(self):
