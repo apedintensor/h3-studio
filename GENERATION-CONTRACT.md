@@ -251,7 +251,7 @@ The existing all-pool obligation timer gates the configured idle interval
 (600 seconds under the accepted operating target); a fast intervening job
 resets it. Global authority expiry/revocation still drains the entire service.
 
-This bounded E2 slice has no in-place member replenishment. A failed original
+With no replacement policy, E2 has no in-place member replenishment. A failed original
 member is not rebound or replaced with a third node. A fresh pair may open only
 after the previous pair is physically removed, rental bills settled, children
 proven stopped and original jobs safely transferable without another attempt.
@@ -259,6 +259,64 @@ Runtime/preparation repair holds require explicit repair rather than automatic
 pair replacement. Rotation preserves original budgets, absolute authority,
 accepted requests and waiter deadlines. Offline tests do not enable this mode
 or establish provider operation, physical-host independence or production timing.
+
+### Optional immutable member replacement generations (E3)
+
+A **new** two-member service policy and its new approval can explicitly freeze
+`member_replacement: {version: 1, max_replacements: 3, backoff_s: 60,
+failure_limit: 2}`. These example values are not defaults or spending authority.
+The validated ranges are 1–16 replacements per member/approval, 60–86400 seconds
+initial backoff, and 1–5 consecutive failures. Omission preserves historical
+payloads, fingerprints and original-pair behavior. Existing live approvals are
+never adopted, rewritten or silently enabled.
+
+Generation zero stays in the original membership table. The existing ledger
+adds immutable `(approval_id, member_id, generation)` rows, each with a unique
+predecessor and new intent. Current membership is the highest admitted ordinal,
+including reserved/creation-unknown states; it never falls back to an older
+ready worker. New generate claims use only that binding. Existing attempts retain
+their original worker and protected reconciliation route. Ports are deterministic
+`port_start + 2 * generation + member_index`, with the complete bounded range
+validated before activation; a historical generation's port is never reused.
+
+Replacement requires positive exact provider removal and settled/released
+reservations for every approved rental account, with identical final amounts.
+The normal invoice poll may settle after the removal receipt; any recorded final
+provider cost must agree. A registered predecessor must be retired with released
+devices and no lease, live/unknown/collecting or unstopped submitted attempt.
+Local closure requires the original owned exited fleet children plus successful
+transport closure, bound to intent/pod/worker, source/config and port. Lost
+handles or absent files alone are not proof. A never-registered predecessor
+instead requires exact owned failed-preparation evidence, or the irreversible
+`retiring_unused` start barrier with no contradictory runtime evidence.
+An authoritative `not_created` result is a separate no-rent case: the exact
+current intent's create receipt and applied action must positively agree on
+absence, all its reservations must be released at zero, and no pod, worker,
+attempt or bootstrap evidence may contradict it. Later fresh demand may use a
+new ordinal; the old intent is never retried. This consumes the absolute ordinal
+cap but neither increments nor resets the paid preparation-failure streak.
+
+The same fenced capacity/account transaction reserves the next generation,
+records ancestry, and commits its sole create action before the provider call.
+Both that transaction and the immediate pre-POST guard require current authority
+and a fresh eligible waiting/queued original job with no attempt or lease.
+Unknown outcomes reconcile that same action; no replacement is financed solely
+by unknown/cancel/collecting or already-running work. The healthy sibling's
+grant, worker, attempt, port and accepted requests remain unchanged.
+
+Backoff begins at the predecessor's recorded destruction time, grows by powers
+of two with the failure streak (capped at 16 times the configured base), and
+does not reset on restart. Runtime quarantine or unused-provider retirement
+counts as failure. Only that exact member generation's durable successful,
+stopped actual attempt with validated published video resets its streak;
+sibling success or bootstrap readiness does not. The absolute per-approval,
+per-member generation cap never resets. Expired authority, exhausted budget,
+unknown invoices, missing stop evidence, caps and absent demand remain held.
+Protected status exposes the member, ordinal, limit, safe reason and retry time;
+it does not authorize execution. Whole-pool 600-second idle/obligation handling,
+accepted waiter deadlines and cumulative accounting remain unchanged. Backup
+preserves ancestry but restores approvals/jobs disabled. Offline evidence does
+not enable this policy or prove live replenishment, speed or fault-domain separation.
 
 ## 6. Output contract
 

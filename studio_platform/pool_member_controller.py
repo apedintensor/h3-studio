@@ -13,10 +13,11 @@ import uuid
 from sqlalchemy import insert, select, update
 
 from .capacity import pool_member_ids, reserve_capacity_member
-from .repository import (Conflict, capacity_approvals, capacity_pool_members,
+from .repository import (Conflict, Scope, capacity_approvals, capacity_pool_members, capacity_member_generations,
     budget_accounts, capacity_waiters, instance_intents, jobs, registered_workers, scaler_actions,
-    scaler_receipts, canonical, BudgetExceeded)
+    scaler_receipts, canonical, request_hash, BudgetExceeded)
 from .scaler import LaunchSpec
+from .pool_member_generations import bindings as member_bindings, replacement_policy, retirement_ledger, one_receipt, successful_generation, no_rent_proven
 
 
 def port_for_member(config, repo, intent_id):
@@ -29,12 +30,11 @@ def port_for_member(config, repo, intent_id):
     with repo.engine.connect() as connection:
         approval = connection.execute(select(capacity_approvals).where(
             capacity_approvals.c.id == config.capacity_approval_id)).mappings().one()
-        bindings = list(connection.execute(select(capacity_pool_members).where(
-            capacity_pool_members.c.approval_id == approval["id"])).mappings())
+        bindings, _ = member_bindings(connection, approval)
     if (pool_member_ids(approval["payload"]) != members
             or any(r["approval_hash"] != approval["approval_hash"] or r["member_id"] not in members for r in bindings)):
         raise ScalerError("capacity_pool_member_identity_mismatch")
-    expected = {r["intent_id"]: config.port_start+members.index(r["member_id"]) for r in bindings}
+    expected = {r["intent_id"]: config.port_start+2*r["generation"]+members.index(r["member_id"]) for r in bindings}
     if intent_id not in expected:
         raise ScalerError("capacity_pool_unknown_member")
     path = config.work_dir/"cycle-state.json"
@@ -51,27 +51,28 @@ def port_for_member(config, repo, intent_id):
 
 
 class MemberLaunchCoordinator:
-    """Atomically attach an approved original member to its only create intent.
+    """Atomically attach an approved member generation to its only create intent.
 
     A return after a persisted action is never permission to repeat its POST.
     The existing ScaleCoordinator reconciles that exact intent after uncertainty.
-    No replacement or rebound membership is provided by this primitive.
+    Replacement requires separately frozen policy and positive predecessor
+    retirement evidence; original membership is never rebound.
     """
 
-    def __init__(self, scaler, *, approval_guard, job_guard, budget_ceiling_microusd):
+    def __init__(self, scaler, *, approval_guard, job_guard, budget_ceiling_microusd, retirement_guard=None):
         if type(budget_ceiling_microusd) is not int or budget_ceiling_microusd <= 0:
             raise ValueError("capacity_pool_service_budget_required")
         self.scaler, self.repo = scaler, scaler.repo
         self.approval_guard, self.job_guard = approval_guard, job_guard
         self.budget_ceiling_microusd = budget_ceiling_microusd
+        self.retirement_guard = retirement_guard
 
     def managed(self, connection, approval):
         p = approval["payload"]
         members = pool_member_ids(p)
         if not members:
             raise Conflict("capacity_pool_members_required")
-        bindings = list(connection.execute(select(capacity_pool_members).where(
-            capacity_pool_members.c.approval_id == approval["id"])).mappings())
+        bindings, current = member_bindings(connection, approval)
         if any(r["approval_hash"] != approval["approval_hash"] or r["member_id"] not in members for r in bindings):
             raise Conflict("capacity_pool_member_identity_mismatch")
         ids = {r["intent_id"] for r in bindings}
@@ -90,9 +91,9 @@ class MemberLaunchCoordinator:
                 or actions[r["id"]]["pool"] != p["pool"]
                 or actions[r["id"]]["launch_spec"] != p["launch"] for r in selected):
             raise Conflict("capacity_pool_member_action_mismatch")
-        return selected, actions, {r["member_id"]: r["intent_id"] for r in bindings}
+        return selected, actions, {key: row["intent_id"] for key, row in current.items()}
 
-    def _demand(self, connection, approval):
+    def _demand(self, connection, approval, *, replacement=False):
         p, now = approval["payload"], self.repo.clock()
         if (not approval["enabled"] or min(approval["expires_at"], p["qualification_expires_at"],
                 p["quote_expires_at"], p["scale_policy"]["hard_deadline"]) <= now
@@ -120,6 +121,11 @@ class MemberLaunchCoordinator:
                 continue
             if job["status"] in ("waiting_capacity", "queued") and job["wait_deadline"] <= now:
                 continue
+            if replacement and (job["status"] not in ("waiting_capacity", "queued")
+                    or job["attempt_no"] != 0 or job["current_attempt_id"] is not None
+                    or job["lease_worker_id"] is not None or job["lease_expires_at"] is not None
+                    or job["not_before"] > now):
+                continue
             return True
         return False
 
@@ -131,17 +137,18 @@ class MemberLaunchCoordinator:
                 approval = connection.execute(select(capacity_approvals).where(
                     capacity_approvals.c.id == approval_id)).mappings().one()
                 _, _, mapping = self.managed(connection, approval)
+                _, current = member_bindings(connection, approval)
                 return (approval["pool"] == lease.pool and mapping.get(member_id) == intent_id
-                    and self._demand(connection, approval))
+                    and self._demand(connection, approval, replacement=current[member_id]["generation"] > 0))
         except Exception:
             return False
 
     def create_once(self, lease, approval_id, member_id):
         """Reserve/bind/action/barrier commit precedes exactly one provider call.
 
-        Only *original* approved members can be created; an unknown A still
-        consumes its reservation while an unbound, separately approved B can
-        proceed. Foreign/unbound live intents fail closed before any reservation.
+        An unknown A still consumes its reservation while separately approved B
+        can proceed. New generations require the complete replacement gate.
+        Foreign/unbound live intents fail closed before any reservation.
         """
         if self.scaler.enabled is not True or self.scaler.provider.enabled is not True:
             return {"state": "disabled"}
@@ -156,9 +163,13 @@ class MemberLaunchCoordinator:
             if member_id not in pool_member_ids(p):
                 raise Conflict("capacity_pool_member_not_approved")
             _, _, mapping = self.managed(connection, approval)
+            previous = None
             if member_id in mapping:
-                return {"state": "member_already_bound", "intent_id": mapping[member_id]}
-            if not self._demand(connection, approval):
+                gate = self.replacement_status(connection, approval, member_id)
+                if gate["state"] != "replacement_eligible":
+                    return gate
+                previous = gate
+            if not self._demand(connection, approval, replacement=previous is not None):
                 return {"state": "no_confirmed_pool_demand"}
             launch = LaunchSpec(**p["launch"])
             if launch.provider != getattr(self.scaler.provider, "provider_id", None):
@@ -168,7 +179,20 @@ class MemberLaunchCoordinator:
                 validate(launch, physical_gpus=1, slots=1,
                     reserved_cost_microusd=p["scale_policy"]["instance_reservation_microusd"],
                     hard_deadline=min(p["scale_policy"]["hard_deadline"], approval["expires_at"]))
-            intent = reserve_capacity_member(self.repo, approval_id, member_id, connection=connection)
+            if previous is None:
+                intent = reserve_capacity_member(self.repo, approval_id, member_id, connection=connection)
+            else:
+                generation = previous["generation"]+1
+                intent = self.repo.reserve_instance_intent(Scope(**p["budget_scope"]), p["pool"],
+                    "member-"+request_hash({"approval_id": approval_id, "member_id": member_id, "generation": generation}),
+                    physical_gpus=1, slots=1, reserved_cost_microusd=p["scale_policy"]["instance_reservation_microusd"],
+                    hard_deadline=min(p["scale_policy"]["hard_deadline"], approval["expires_at"]),
+                    budget_account_ids=p["budget_account_ids"], dry_run=False, provider=launch.provider, connection=connection)
+                if not intent["created"]:
+                    raise Conflict("capacity_member_generation_unbound")
+                connection.execute(insert(capacity_member_generations).values(approval_id=approval_id, member_id=member_id,
+                    generation=generation, approval_hash=approval["approval_hash"], previous_intent_id=previous["intent_id"],
+                    intent_id=intent["id"], created_at=self.repo.clock()))
             if not intent["created"]:
                 raise Conflict("capacity_pool_member_action_missing")
             # reserve_capacity_member already holds the ordered account locks.
@@ -191,6 +215,53 @@ class MemberLaunchCoordinator:
         self.scaler._apply(lease, intent["id"], fact, observed_at)
         return {"state": "creation_observed", "intent_id": intent["id"], "provider_state": fact.state}
 
+    def replacement_status(self, connection, approval, member_id):
+        """Read-only gate; create_once repeats it under leader/capacity locks."""
+        history, current = member_bindings(connection, approval)
+        binding = current.get(member_id)
+        if binding is None:
+            return {"state": "original_member_unbound", "member_id": member_id}
+        result = {"state": "member_already_bound", "intent_id": binding["intent_id"]}
+        policy = replacement_policy(approval["payload"])
+        if policy is None:
+            return result
+        row = connection.execute(select(instance_intents).where(instance_intents.c.id == binding["intent_id"])).mappings().one()
+        result.update(member_id=member_id, generation=binding["generation"], max_replacements=policy["max_replacements"],
+                      retry_at=None, automatic_rerent_allowed=False)
+        if row["state"] != "destroyed":
+            return result
+        result["state"] = "replacement_held"
+        try:
+            if binding["generation"] >= policy["max_replacements"]:
+                raise Conflict("member_replacement_limit")
+            retirement_ledger(connection, approval, row)
+            if self.retirement_guard is None or self.retirement_guard(connection, approval, row, binding) is not True:
+                raise Conflict("member_replacement_local_stop_unconfirmed")
+            failures = 0
+            chain = [r for r in history if r["member_id"] == member_id]
+            for prior in reversed(chain):
+                if successful_generation(connection, prior["intent_id"]):
+                    break
+                prior_row = connection.execute(select(instance_intents).where(
+                    instance_intents.c.id == prior["intent_id"])).mappings().one()
+                phase = self.scaler.preparation(connection, prior_row)
+                if one_receipt(connection, prior["intent_id"], "member_quarantine") is not None or (
+                        phase is not None and phase.get("phase") == "retiring_unused"):
+                    failures += 1
+            result.update(consecutive_failures=failures, failure_limit=policy["failure_limit"])
+            if failures >= policy["failure_limit"]:
+                raise Conflict("member_replacement_failure_limit")
+            retry_at = row["updated_at"]+policy["backoff_s"]*2**min(max(failures-1, 0), 4)
+            result["retry_at"] = retry_at
+            if self.repo.clock() < retry_at:
+                raise Conflict("member_replacement_backoff")
+            if not self._demand(connection, approval, replacement=True):
+                raise Conflict("member_replacement_no_waiting_demand")
+            result.update(state="replacement_eligible", automatic_rerent_allowed=True)
+        except Conflict as error:
+            result["reason"] = str(error)
+        return result
+
 
 # Imported after the pure transaction primitives to keep the controller entry
 # point's lazy import free of an on-demand/controller cycle.
@@ -198,11 +269,12 @@ from .production_scaler import FiniteController, ScalerError, MODEL, save
 
 
 class PoolServiceCycle(FiniteController):
-    """Two original members; no in-place replacement or generation rebinding.
+    """Two members with immutable opt-in replacement generations.
 
     Each node retains its own ProductionBoot and original worker/attempts. A
     failed peer is quarantined locally. Global policy expiry/revocation still
-    drains the pool. A subsequent pair requires complete prior retirement.
+    drains the pool. Omitted replacement policy retains original-pair semantics;
+    a subsequent pair requires complete prior retirement in either mode.
     """
 
     def __init__(self, *args, **kwargs):
@@ -213,7 +285,8 @@ class PoolServiceCycle(FiniteController):
             raise ScalerError("capacity_pool_members_required")
         self.members = MemberLaunchCoordinator(self.scaler,
             approval_guard=self.approval_current, job_guard=self.job_allowed,
-            budget_ceiling_microusd=self.config.service_policy["budget_ceiling_microusd"])
+            budget_ceiling_microusd=self.config.service_policy["budget_ceiling_microusd"],
+            retirement_guard=self._local_retirement_confirmed)
         self.scaler.unused_preparation_guard = self._unused_provider_preparation
         self.scaler.unsubmitted_retirement_guard = self._member_retirement_allowed
 
@@ -227,6 +300,7 @@ class PoolServiceCycle(FiniteController):
             and payload["budget_scope"] == asdict(c.scope)
             and sorted(payload["budget_account_ids"]) == sorted(c.budget_account_ids)
             and payload["scale_policy"] == c.scale_policy and payload["launch"] == c.launches[0]
+            and payload.get("member_replacement") == c.service_policy.get("member_replacement")
             and self.policies.capacity_approval_current(payload))
 
     def _approval(self, connection):
@@ -278,10 +352,58 @@ class PoolServiceCycle(FiniteController):
             launch=LaunchSpec(**c.launches[0]), scale_policy=ScalePolicy(**c.scale_policy),
             budget_scope=c.scope, budget_account_ids=c.budget_account_ids, enabled=True,
             pool_members={"version": 1, "member_ids": list(self.member_ids)},
-            pool_controller="continuing-two-members-v1", **engine)
+            pool_controller="continuing-two-members-v1",
+            **({"member_replacement": c.service_policy["member_replacement"]}
+               if "member_replacement" in c.service_policy else {}), **engine)
 
     def port_for(self, intent_id):
         return port_for_member(self.config, self.repo, intent_id)
+
+    def _local_retirement_confirmed(self, connection, approval, intent, binding):
+        """Read exact owned closure or positive irreversible never-started proof."""
+        c = self.config
+        expected = {"version": 1, "intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+            "worker_id": "lium-"+intent["id"].replace("-", ""), "config_hash": c.fingerprint(),
+            "sources": c.source_sha256,
+            "local_port": c.port_start+2*binding["generation"]+self.member_ids.index(binding["member_id"])}
+        proof = one_receipt(connection, intent["id"], "member_local_closed")
+        if proof is not None:
+            identity = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
+                        "configuration_id": c.configuration_id, "sources": c.source_sha256}
+            if c.execution_backend == "wangp-worker":
+                identity.update(backend="wangp-worker", engine_manifest_digest=c.engine_manifest_digest)
+            if c.output_delivery:
+                identity["output_delivery"] = c.output_delivery
+            if (not isinstance(proof, dict) or any(proof.get(k) != v for k, v in expected.items())
+                    or proof.get("local_transport_closed") is not True or proof.get("bootstrap_identity") != identity):
+                return False
+            if proof.get("kind") == "owned_fleet_exited":
+                children = proof.get("children")
+                return (isinstance(proof.get("fleet_hash"), str) and len(proof["fleet_hash"]) == 64
+                    and isinstance(children, list) and len(children) == 1
+                    and children[0].get("worker_id") == expected["worker_id"]
+                    and type(children[0].get("pid")) is int and children[0]["pid"] > 0
+                    and type(children[0].get("exit_code")) is int)
+            if proof.get("kind") == "owned_preparation_never_registered":
+                return (proof.get("phase") in ("bootstrap_failed", "staging_failed", "staging_cancelled", "qualification_failed")
+                    and connection.execute(select(registered_workers.c.id).where(
+                        registered_workers.c.id == expected["worker_id"])).first() is None)
+            return False
+        # An irreversible provider start barrier proves bootstrap was never
+        # allowed. This is not an inference from absent files or a PENDING label.
+        preparation = self.scaler.preparation(connection, intent)
+        never_created = no_rent_proven(connection, intent)
+        unused = preparation is not None and preparation["phase"] == "retiring_unused"
+        no_boot = never_created and (preparation is None or preparation["phase"] == "awaiting_provider")
+        if (not (unused or no_boot)
+                or intent["id"] in self.boots
+                or connection.execute(select(registered_workers.c.id).where(
+                    registered_workers.c.id == expected["worker_id"])).first() is not None):
+            return False
+        for path in (c.work_dir/"boot"/intent["id"], c.work_dir/("lifetime-"+intent["id"]+".json")):
+            if path.exists() or path.is_symlink():
+                return False
+        return True
 
     def member_hold(self, intent, connection=None):
         path = self.config.work_dir/"member-holds"/(intent["id"]+".json")
@@ -400,13 +522,16 @@ class PoolServiceCycle(FiniteController):
                 result = self.members.create_once(lease, c.capacity_approval_id, member)
                 if result["state"] == "creation_observed":
                     decision = result
+                elif result["state"] == "replacement_held":
+                    decision = {"state": "blocked", "reason": result["reason"]}
             except BudgetExceeded:
                 return {"state": "blocked", "reason": "ledger_capacity_or_budget_limit"}
             except LeaseLost:
                 return {"state": "leader_changed_reconcile_required"}
         rows, _ = self._managed()
         repair = self._repair_members(rows)
-        if repair and not any(row["state"] in ("starting", "ready", "busy") and row["id"] not in repair for row in rows):
+        if (repair and not any(row["state"] in ("starting", "ready", "busy") and row["id"] not in repair for row in rows)
+                and not (decision.get("reason") or "").startswith("member_replacement_")):
             decision = {"state": "blocked", "reason": "queued_task_repair_required"}
         return decision
 
@@ -432,7 +557,13 @@ class PoolServiceCycle(FiniteController):
 
     def rotation_allowed(self):
         rows, _ = self._managed()
-        if not rows or self._repair_members(rows):
+        repair_rows = rows
+        if self.config.service_policy.get("member_replacement") is not None:
+            with self.repo.engine.connect() as connection:
+                approval = self._approval(connection)
+                _, _, current = self.members.managed(connection, approval)
+            repair_rows = [r for r in rows if r["id"] in current.values()]
+        if not rows or self._repair_members(repair_rows):
             return False
         return all(row["state"] == "destroyed" and row["billing_status"] == "settled" for row in rows)
 
@@ -510,4 +641,9 @@ class PoolServiceCycle(FiniteController):
         rows, _ = self._managed()
         extra["member_holds"] = [{"intent_id": intent_id, "state": "repair_required"}
             for intent_id in sorted(self._repair_members(rows))]
+        if self.config.service_policy.get("member_replacement") is not None:
+            with self.repo.engine.connect() as connection:
+                approval = self._approval(connection)
+                extra["member_replacements"] = [self.members.replacement_status(connection, approval, member)
+                                                for member in self.member_ids] if approval else []
         return super().status(fresh_ledger_only=fresh_ledger_only, **extra)
