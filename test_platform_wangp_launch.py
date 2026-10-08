@@ -123,6 +123,54 @@ assert callable(read_verification_receipt)
         self.assertFalse(self.state.exists())
         self.assertIn("runtime_files_verified", output.getvalue())
 
+    def diagnostic_args(self):
+        return ["--startup-status-file", str(self.root / "startup.json"), "--startup-id", "f"*32,
+                "--expected-manifest-digest", self.manifest.digest]
+
+    def startup_failure(self):
+        from studio_platform.runtime_hosts.wangp_startup import read_startup_failure
+        return read_startup_failure(self.root / "startup.json", slot_key="slot-test",
+            manifest_digest=self.manifest.digest, launch_id="f"*32, pid=os.getpid())
+
+    def test_early_import_failure_has_private_receipt_and_no_journal(self):
+        secret = "synthetic-key https://private.example/?token=do-not-print"
+        with patch.object(wangp_launcher, "_EARLY_IMPORT_FAILURE", ModuleNotFoundError(secret)), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(wangp_launcher.main(self.argv + self.diagnostic_args()), 1)
+        self.assertFalse(self.state.exists())
+        failure = self.startup_failure()
+        self.assertEqual((failure["phase"], failure["error_code"]),
+                         ("runtime_imports", "wangp_runtime_dependency_missing"))
+        self.assertNotIn(secret, json.dumps(failure) + output.getvalue())
+
+    def test_token_failure_is_distinct_and_receipt_contains_no_exception_text(self):
+        secret = "synthetic secret URL https://private.invalid/key"
+        with patch.object(wangp_launcher, "private_token_file", side_effect=ValueError(secret)), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(wangp_launcher.main(self.argv + self.diagnostic_args()), 1)
+        self.assertFalse(self.state.exists())
+        failure = self.startup_failure()
+        self.assertEqual((failure["phase"], failure["error_code"]),
+                         ("runtime_token", "wangp_startup_stage_failed"))
+        self.assertNotIn(secret, json.dumps(failure) + output.getvalue())
+
+    def test_actual_subprocess_missing_dependency_reports_before_manifest_read(self):
+        script = '''import sys
+class DenyFastAPI:
+ def find_spec(self,name,path=None,target=None):
+  if name.split('.')[0]=='fastapi':raise ModuleNotFoundError('synthetic hidden import details')
+sys.meta_path.insert(0,DenyFastAPI())
+from studio_platform.runtime_hosts.wangp_launcher import main
+raise SystemExit(main(sys.argv[1:]))
+'''
+        result = subprocess.run([sys.executable, "-c", script, *self.argv, *self.diagnostic_args()],
+            cwd=Path(__file__).parent, capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(self.state.exists())
+        failure = json.loads((self.root / "startup.json").read_text())
+        self.assertEqual((failure["phase"], failure["error_type"]), ("runtime_imports", "ModuleNotFoundError"))
+        self.assertNotIn("hidden import details", result.stdout + result.stderr + json.dumps(failure))
+
     def test_changed_verified_manifest_fails_before_session_or_listener(self):
         from studio_platform.runtime_hosts import wangp_session
         with patch.object(wangp_session, "verify_runtime", return_value={"manifest_digest": "0" * 64}), \

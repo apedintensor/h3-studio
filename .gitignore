@@ -91,6 +91,7 @@ inventory.json
 !studio_platform/execution_profiles.py
 !studio_platform/operator_boot.py
 !studio_platform/runtime_hosts/wangp_profile_bootstrap.py
+!studio_platform/runtime_hosts/wangp_startup.py
 !tools/build_operator_sources.py
 !tools/run_operator_preview.py
 !OPERATOR-CAPACITY-CONTRACT.md

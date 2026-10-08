@@ -333,6 +333,12 @@ def install(config, slot_key, token_file, *, launch=True):
             raise ValueError("private_token_invalid")
         token = token_bytes.decode("ascii")
         status("runtime_start")
+        from uuid import uuid4
+        from studio_platform.runtime_hosts.wangp_startup import read_startup_failure
+        startup_id = uuid4().hex
+        startup_receipt = base / ("runtime-startup-" + startup_id + ".json")
+        command += ["--startup-status-file", str(startup_receipt), "--startup-id", startup_id,
+                    "--expected-manifest-digest", manifest_digest]
         # Popen failure is not proof that no child was ever created.
         started = True
         with open(os.devnull, "wb") as quiet:
@@ -342,6 +348,17 @@ def install(config, slot_key, token_file, *, launch=True):
         deadline = time.monotonic() + 900
         while time.monotonic() < deadline:
             if child.poll() is not None:
+                try:
+                    failure = read_startup_failure(startup_receipt, slot_key=slot_key,
+                        manifest_digest=manifest_digest, launch_id=startup_id, pid=child.pid)
+                except Exception:
+                    failure = None
+                if failure is not None:
+                    # A caught failure is not proof all runtime descendants stopped.
+                    # Keep unknown after dispatch; preserve only literal diagnostics.
+                    return status("runtime_start_unknown", state="unknown", failed_phase=failure["phase"],
+                        failure_phase=failure["phase"], error_type=failure["error_type"],
+                        code=failure["error_code"], runtime_verified=False)
                 raise ValueError("runtime_process_exited")
             verified = None
             if (state / VERIFICATION_RECEIPT).exists():
