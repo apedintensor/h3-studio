@@ -68,7 +68,19 @@ def read_sources(config):
     from .inference.wangp_compiler import H3FL2VACompiler
     from .inference.wangp_ref_compiler import H3Ref2VACompiler, RECIPE_ID
     try:
-        if tuple(config.recipe_ids) == (RECIPE_ID,):
+        if getattr(config,'deployment_profile_id',''):
+            from .runtime_catalog import validate_manifest
+            validate_manifest(manifest)
+            runtime = json.loads(files['wangp-runtime.json'])
+            if (manifest.document["deployment_profile_id"] != config.deployment_profile_id
+                    or manifest.document["model_id"] != config.model_id
+                    or tuple(config.recipe_ids) != (manifest.document["generation_recipe_id"],)
+                    or runtime.get('deployment_profile_id') != config.deployment_profile_id
+                    or runtime.get('profile_slot_index') != config.profile_slot_index
+                    or runtime.get('expected_host_gpus') != config.expected_host_gpus
+                    or runtime.get('port') != 8199 + config.profile_slot_index):
+                raise ValueError()
+        elif tuple(config.recipe_ids) == (RECIPE_ID,):
             H3Ref2VACompiler(manifest, None)
         elif tuple(config.recipe_ids) == ('h3-base-fl2va-v1',):
             H3FL2VACompiler(manifest, None)
@@ -94,7 +106,8 @@ def validate_report(config, report, manifest):
 
 def make_slot(config, intent, report, directory):
     endpoint = f'http://127.0.0.1:{config.local_port}'
-    spec = WorkerSpec('lium-'+intent['id'].replace('-', ''), intent['pool'], 'lium',
+    suffix = '-gpu'+str(config.profile_slot_index) if config.deployment_profile_id else ''
+    spec = WorkerSpec('lium-'+intent['id'].replace('-', '')+suffix, intent['pool'], 'lium',
         intent['provider_instance_id'], (report['gpus'][0]['uuid'],), config.recipe_ids,
         config.model_id, config.configuration_id, 'wangp-worker', config.engine_manifest_digest,
         output_delivery=config.output_delivery)
@@ -140,10 +153,23 @@ def connect_backend(boot, intent, directory, state):
 
 class WanGPSSHHost(SSHHost):
     remote_port = 8199
+    remote_root = REMOTE_ROOT
 
     def __init__(self, config, coordinates):
         self.config = config
+        self.remote_root = REMOTE_ROOT
+        if config.deployment_profile_id:
+            self.remote_root += '/profile-slot-'+str(config.profile_slot_index)
+            self.remote_port = 8199 + config.profile_slot_index
         super().__init__(config, coordinates)
+
+    def run(self, code, **kwargs):
+        # Only trusted, internally authored remote snippets cross this seam.
+        # Slot isolation never uses a client-provided path or shell fragment.
+        if getattr(self.config, 'deployment_profile_id', ''):
+            code = code.replace(REMOTE_ROOT, self.remote_root)
+            code = code.replace('==8199 and', '=='+str(self.remote_port)+' and')
+        return super().run(code, **kwargs)
 
     def upload(self, files, *, progress=None, should_stop=None):
         def check():
@@ -158,7 +184,7 @@ class WanGPSSHHost(SSHHost):
         with self.client.open_sftp() as sftp:
             for name, data in files.items():
                 check()
-                target = REMOTE_ROOT+'/'+name
+                target = self.remote_root+'/'+name
                 try:
                     with sftp.open(target, 'rb') as f:
                         if f.read(len(data)+1) != data:
@@ -357,7 +383,7 @@ print(json.dumps({'verified':True}))
                 f.write(secrets.token_urlsafe(48)); f.flush(); os.fsync(f.fileno())
         token = private_token_file(token_path)
         with self.client.open_sftp() as sftp:
-            target = REMOTE_ROOT+'/wangp-token'
+            target = self.remote_root+'/wangp-token'
             try:
                 with sftp.open(target, 'rb') as f:
                     if f.read(256).decode() != token:
@@ -383,7 +409,7 @@ with (root/'sixnine-bootstrap.lock').open('a') as lock:
   with (root/'bootstrap-controller.log').open('ab') as log:
    proc=subprocess.Popen(['/opt/conda/bin/python','-u',str(root/'wangp-bootstrap.py'),'--config',str(root/'wangp-runtime.json'),'--slot-key',expected['intent_id'],'--token-file',str(root/'wangp-token')],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
   print(json.dumps({'state':'started','pid':proc.pid}))
-'''.replace('IDENTITY', repr(identity)))
+'''.replace('IDENTITY', repr(identity)).replace("'/opt/conda/bin/python'", repr(self.config.runtime_python)))
 
     def report(self):
         report = self.run('''import json,subprocess
@@ -396,6 +422,7 @@ def read(name):
  return json.loads(p.read_text())
 s=read('setup-status.json')
 out={k:s.get(k) for k in ('state','phase','error_code','error_type','runtime_verified','engine_manifest_digest','source_revision','runtime','system_package_diagnostics','download_failure')}
+out['selected_gpus']=s.get('gpus')
 out['error_code']=s.get('error_code',s.get('code'))
 out['failure_phase']=s.get('failure_phase',s.get('failed_phase',s.get('phase')))
 out['identity']=read('sixnine-bootstrap-identity.json')
@@ -411,6 +438,15 @@ print(json.dumps(out))
             report.update(diagnosis)
         else:
             report.pop('download_failure', None)
+        if getattr(self.config, 'deployment_profile_id', '') and report.get('state') == 'ready':
+            gpus = report.get('gpus')
+            selected = report.pop('selected_gpus', None)
+            if (not isinstance(gpus, list) or len(gpus) != self.config.expected_host_gpus
+                    or not isinstance(selected, list) or len(selected) != 1
+                    or not any(g.get('uuid') == selected[0].get('uuid') for g in gpus)):
+                raise BootError('bootstrap_gpu_identity_or_memory_mismatch')
+            report['gpus'] = [g for g in gpus if g['uuid'] == selected[0]['uuid']]
+        report.pop('selected_gpus', None)
         return report
 
     def preparation_idle_report(self, *, expected_prestart_identity=None):

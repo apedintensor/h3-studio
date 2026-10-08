@@ -72,8 +72,16 @@ def extract(archive, target, *, maximum):
 
 
 def validate_config(value):
-    if not isinstance(value, dict) or set(value) != EXPECTED_FIELDS or value["version"] != 1:
+    fields = EXPECTED_FIELDS | ({"deployment_profile_id", "profile_slot_index", "expected_host_gpus"}
+        if isinstance(value, dict) and value.get("deployment_profile_id") else set())
+    if not isinstance(value, dict) or set(value) != fields or value["version"] != 1:
         raise ValueError("bootstrap_configuration_invalid")
+    if value.get("deployment_profile_id"):
+        if (not isinstance(value["deployment_profile_id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", value["deployment_profile_id"])
+                or type(value["expected_host_gpus"]) is not int or not 1 <= value["expected_host_gpus"] <= 8
+                or type(value["profile_slot_index"]) is not int or not 0 <= value["profile_slot_index"] < value["expected_host_gpus"]
+                or not value["prepared_root"] or value["dependency_artifact_url"] or value["dependency_artifact_path"]):
+            raise ValueError("bootstrap_profile_configuration_invalid")
     for key in ("install_root", "source_bundle_path", "manifest_path", "model_root", "config_path", "status_path"):
         checked_path(value[key])
     if Path(value["config_path"]).name != "wgp_config.json":
@@ -163,7 +171,10 @@ def install(config, slot_key, token_file, *, launch=True):
 
     try:
         status("checking_package")
-        if platform.system() != "Linux" or not re.fullmatch(r"3\.11\.[0-9]+", platform.python_version()):
+        if config.get("deployment_profile_id"):
+            if platform.system() != "Linux" or platform.python_version() != "3.12.14":
+                raise ValueError("native_profile_python31214_linux_required")
+        elif platform.system() != "Linux" or not re.fullmatch(r"3\.11\.[0-9]+", platform.python_version()):
             raise ValueError("python311_linux_required")
         bundle = checked_path(config["source_bundle_path"])
         if bundle.stat().st_size > MAX_SOURCE or sha_file(bundle) != config["source_bundle_sha256"]:
@@ -177,96 +188,108 @@ def install(config, slot_key, token_file, *, launch=True):
         from studio_platform.runtime_hosts.wangp_session import config_for_model_root
         manifest = EngineManifest.from_dict(json.loads(Path(config["manifest_path"]).read_text(encoding="utf-8")))
         manifest_digest = manifest.digest
-        if manifest.document.get("runtime_digest_kind") != "sixnine-environment-lock-sha256":
-            raise ValueError("resolved_environment_manifest_required")
-        if config["prepared_root"]:
-            dependency = checked_path(config["prepared_root"]) / "dependencies"
+        if config.get("deployment_profile_id"):
+            from studio_platform.runtime_hosts.wangp_profile_bootstrap import prepare
+            runtime, python, environment = prepare(config, manifest, source, status)
         else:
-            status("dependency_download")
-            if config["dependency_artifact_path"]:
-                artifact = checked_path(config["dependency_artifact_path"])
+            if manifest.document.get("runtime_digest_kind") != "sixnine-environment-lock-sha256":
+                raise ValueError("resolved_environment_manifest_required")
+            if config["prepared_root"]:
+                dependency = checked_path(config["prepared_root"]) / "dependencies"
             else:
-                artifact = base / "dependencies.tar.gz"
-                download(config["dependency_artifact_url"], artifact, maximum=MAX_DEPENDENCIES)
-            if artifact.stat().st_size > MAX_DEPENDENCIES or sha_file(artifact) != config["dependency_artifact_sha256"]:
-                raise ValueError("dependency_artifact_mismatch")
-            dependency = base / "dependencies"
-            status("dependency_unpack")
-            extract(artifact, dependency, maximum=MAX_UNPACKED)
-        runtime = dependency / "upstream"
-        lock = validate_lock(json.loads((runtime / ".sixnine-environment.json").read_text(encoding="utf-8")))
-        if digest(lock) != manifest.document["runtime_digest"]:
-            raise ValueError("environment_binding_mismatch")
-        deb_files = []
-        for item in lock.get("debs", []):
-            deb = regular_file(dependency / "debs", item["file"])
-            if deb.stat().st_size != item["size_bytes"] or sha_file(deb) != item["sha256"]:
-                raise ValueError("system_deb_mismatch")
-            deb_files.append(str(deb))
-        if deb_files:
-            status("system_package_install")
-            subprocess.run(["dpkg", "--install", *deb_files], check=True, capture_output=True,
-                           env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
-        restore_kit = source / "system-restore"
-        if restore_kit.exists():
-            from studio_platform.runtime_hosts.wangp_system_restore import restore_system
-            status("system_package_restore")
-            try:
-                restore_system(restore_kit, lock)
-            except ValueError as error:
-                if str(error) in {"system_restore_unrecognized_drift", "system_restore_verification_failed"}:
-                    failure_diagnostics["system_package_diagnostics"] = system_package_diagnostics(
-                        lock["system_packages"], system_packages())
-                raise
-        status("system_package_verification")
-        observed_system = system_packages()
-        if any(observed_system.get(name) != version for name, version in lock["system_packages"].items()):
-            failure_diagnostics["system_package_diagnostics"] = system_package_diagnostics(
-                lock["system_packages"], observed_system)
-            raise ValueError("system_package_mismatch")
-        verify_source(runtime, lock)
-        requirements = dependency / "requirements.lock"
-        if sha_file(requirements) != lock["requirements_lock_sha256"]:
-            raise ValueError("requirements_lock_mismatch")
-        for item in lock["wheels"]:
-            wheel = regular_file(dependency / "wheels", item["file"])
-            if wheel.stat().st_size != item["size_bytes"] or sha_file(wheel) != item["sha256"]:
-                raise ValueError("wheel_mismatch")
-        venv = (checked_path(config["prepared_root"]) if config["prepared_root"] else base) / "venv"
-        python = str(venv / "bin/python")
-        environment = dict(os.environ, PYTHONPATH=str(source), HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
-                           PIP_CONFIG_FILE=os.devnull, PYTHONDONTWRITEBYTECODE="1")
-        if not config["prepared_root"]:
-            status("dependency_install")
-            subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, capture_output=True)
-            subprocess.run([python, "-m", "pip", "install", "--no-index", "--require-hashes", "--find-links",
-                            str(dependency / "wheels"), "-r", str(requirements)], check=True, capture_output=True, env=environment)
-        subprocess.run([python, "-m", "pip", "check"], check=True, capture_output=True, env=environment)
-        status("runtime_imports")
-        imported = subprocess.run([python, str(source / "deploy/wangp/probe_gpu.py"),
-                                  "--runtime-root", str(runtime), "--output", str(base / "gpu-import.json")],
-                                 capture_output=True, text=True, env=environment, timeout=180)
-        if imported.returncode != 0:
-            raise ValueError("runtime_import_probe_failed")
-        import_evidence = json.loads(imported.stdout)
-        if (import_evidence.get("state") != "imports_verified"
-                or import_evidence.get("environment_lock_sha256") != digest(lock)
-                or import_evidence.get("inference_verified") is not False):
-            raise ValueError("runtime_import_receipt_mismatch")
+                status("dependency_download")
+                if config["dependency_artifact_path"]:
+                    artifact = checked_path(config["dependency_artifact_path"])
+                else:
+                    artifact = base / "dependencies.tar.gz"
+                    download(config["dependency_artifact_url"], artifact, maximum=MAX_DEPENDENCIES)
+                if artifact.stat().st_size > MAX_DEPENDENCIES or sha_file(artifact) != config["dependency_artifact_sha256"]:
+                    raise ValueError("dependency_artifact_mismatch")
+                dependency = base / "dependencies"
+                status("dependency_unpack")
+                extract(artifact, dependency, maximum=MAX_UNPACKED)
+            runtime = dependency / "upstream"
+            lock = validate_lock(json.loads((runtime / ".sixnine-environment.json").read_text(encoding="utf-8")))
+            if digest(lock) != manifest.document["runtime_digest"]:
+                raise ValueError("environment_binding_mismatch")
+            deb_files = []
+            for item in lock.get("debs", []):
+                deb = regular_file(dependency / "debs", item["file"])
+                if deb.stat().st_size != item["size_bytes"] or sha_file(deb) != item["sha256"]:
+                    raise ValueError("system_deb_mismatch")
+                deb_files.append(str(deb))
+            if deb_files:
+                status("system_package_install")
+                subprocess.run(["dpkg", "--install", *deb_files], check=True, capture_output=True,
+                               env=dict(os.environ, DEBIAN_FRONTEND="noninteractive"))
+            restore_kit = source / "system-restore"
+            if restore_kit.exists():
+                from studio_platform.runtime_hosts.wangp_system_restore import restore_system
+                status("system_package_restore")
+                try:
+                    restore_system(restore_kit, lock)
+                except ValueError as error:
+                    if str(error) in {"system_restore_unrecognized_drift", "system_restore_verification_failed"}:
+                        failure_diagnostics["system_package_diagnostics"] = system_package_diagnostics(
+                            lock["system_packages"], system_packages())
+                    raise
+            status("system_package_verification")
+            observed_system = system_packages()
+            if any(observed_system.get(name) != version for name, version in lock["system_packages"].items()):
+                failure_diagnostics["system_package_diagnostics"] = system_package_diagnostics(
+                    lock["system_packages"], observed_system)
+                raise ValueError("system_package_mismatch")
+            verify_source(runtime, lock)
+            requirements = dependency / "requirements.lock"
+            if sha_file(requirements) != lock["requirements_lock_sha256"]:
+                raise ValueError("requirements_lock_mismatch")
+            for item in lock["wheels"]:
+                wheel = regular_file(dependency / "wheels", item["file"])
+                if wheel.stat().st_size != item["size_bytes"] or sha_file(wheel) != item["sha256"]:
+                    raise ValueError("wheel_mismatch")
+            venv = (checked_path(config["prepared_root"]) if config["prepared_root"] else base) / "venv"
+            python = str(venv / "bin/python")
+            environment = dict(os.environ, PYTHONPATH=str(source), HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+                               PIP_CONFIG_FILE=os.devnull, PYTHONDONTWRITEBYTECODE="1")
+            if not config["prepared_root"]:
+                status("dependency_install")
+                subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, capture_output=True)
+                subprocess.run([python, "-m", "pip", "install", "--no-index", "--require-hashes", "--find-links",
+                                str(dependency / "wheels"), "-r", str(requirements)], check=True, capture_output=True, env=environment)
+            subprocess.run([python, "-m", "pip", "check"], check=True, capture_output=True, env=environment)
+            status("runtime_imports")
+            imported = subprocess.run([python, str(source / "deploy/wangp/probe_gpu.py"),
+                                      "--runtime-root", str(runtime), "--output", str(base / "gpu-import.json")],
+                                     capture_output=True, text=True, env=environment, timeout=180)
+            if imported.returncode != 0:
+                raise ValueError("runtime_import_probe_failed")
+            import_evidence = json.loads(imported.stdout)
+            if (import_evidence.get("state") != "imports_verified"
+                    or import_evidence.get("environment_lock_sha256") != digest(lock)
+                    or import_evidence.get("inference_verified") is not False):
+                raise ValueError("runtime_import_receipt_mismatch")
         model_root = checked_path(config["model_root"])
         model_root.mkdir(parents=True, exist_ok=True)
         from studio_platform.runtime_hosts.wangp_download import DownloadFailure, run_download, safe_download_failure
         status("model_download")
         try:
-            run_download(python, source, config["manifest_path"], manifest_digest,
-                         model_root, base / "model-download", environment, status)
+            if config.get("deployment_profile_id"):
+                from studio_platform.runtime_hosts.wangp_profile_bootstrap import download_profile
+                download_profile(config, python, source, manifest_digest, model_root, base / "model-download", environment, status)
+            else:
+                run_download(python, source, config["manifest_path"], manifest_digest,
+                             model_root, base / "model-download", environment, status)
         except DownloadFailure as error:
             failure_diagnostics["download_failure"] = safe_download_failure(error.diagnosis)
             raise ValueError(str(error)) from None
         runtime_config = checked_path(config["config_path"])
         runtime_config.parent.mkdir(parents=True, exist_ok=True)
         with runtime_config.open("x", encoding="utf-8") as target:
-            json.dump(config_for_model_root(model_root), target)
+            if config.get("deployment_profile_id"):
+                from studio_platform.runtime_catalog import runtime_config as profile_config
+                json.dump(profile_config(config["deployment_profile_id"], model_root), target)
+            else:
+                json.dump(config_for_model_root(model_root), target)
         runtime_config.chmod(0o600)
         state = base / "slot-state"
         command = [python, "-m", "studio_platform.runtime_hosts.wangp_launcher", "--runtime-root", str(runtime),
@@ -296,6 +319,9 @@ def install(config, slot_key, token_file, *, launch=True):
             if not re.fullmatch(r"GPU-[A-Za-z0-9-]+", uuid) or not memory.isdecimal():
                 raise ValueError("gpu_observation_invalid")
             devices.append({"uuid": uuid, "total_bytes": int(memory) * 1024**2})
+        if config.get("deployment_profile_id"):
+            from studio_platform.runtime_hosts.wangp_profile_bootstrap import selected_devices
+            devices = selected_devices(config, devices, expected_uuid=environment['CUDA_VISIBLE_DEVICES'])
         if len(devices) != 1:
             raise ValueError("single_gpu_recipe_required")
         with token_file.open("rb") as stream:

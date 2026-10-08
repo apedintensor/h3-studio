@@ -79,7 +79,10 @@ def key_check(key):
 
 
 def settings_check(value):
-    fields(value, {"recipe_id", "controls", "copies"}, {"recipe_id", "controls", "copies"})
+    fields(value, {"recipe_id", "controls", "copies", "deployment_profile_id"}, {"recipe_id", "controls", "copies"})
+    if value.get("deployment_profile_id") is not None:
+        from .runtime_catalog import get_profile
+        get_profile(value["deployment_profile_id"])
     if value["recipe_id"] not in RECIPES or type(value["copies"]) is not int or not 1 <= value["copies"] <= 4:
         raise QuickChatError("invalid_settings", "生成方式或份数无效。", 422)
     validate_controls_patch(value["controls"])
@@ -391,7 +394,7 @@ class QuickChatService:
             "mime": asset["mime"], "metadata": asset["metadata"], "missingFile": False, "source": "upload"}}
 
     def _card_snapshot(self, principal, session, body):
-        settings_check({k: body[k] for k in ("recipe_id", "controls", "copies")})
+        settings_check({k: body[k] for k in ("recipe_id", "controls", "copies", "deployment_profile_id") if k in body})
         if not isinstance(body["prompt"], str) or not body["prompt"].strip() or len(body["prompt"])>12000:
             raise QuickChatError("invalid_prompt", "任务卡需要1–12000字符的完整提示词。", 422)
         sources, provenance = {}, []
@@ -411,6 +414,8 @@ class QuickChatService:
         if RECIPES[body["recipe_id"]] == "ref" and (inputs["first_frame"] or inputs["last_frame"]):
             raise QuickChatError("reference_conflict", "全能参考方式不能同时指定首尾帧。", 422)
         snapshot = {k: canonical(body[k]) for k in ("prompt", "recipe_id", "controls", "copies")}
+        if body.get("deployment_profile_id") is not None:
+            snapshot["deployment_profile_id"] = body["deployment_profile_id"]
         snapshot.update(inputs=inputs, title=body.get("title", "我的视频"), provenance=provenance)
         if not isinstance(snapshot["title"], str) or not snapshot["title"].strip() or len(snapshot["title"])>160:
             raise QuickChatError("invalid_title", "卡片标题须为1–160字符。", 422)
@@ -439,6 +444,7 @@ class QuickChatService:
                     "prompt": snapshot["prompt"], "quickChatProjection": {"session_id": session["id"],
                         "revision_id": revision_id, "item_id": item_id, "requested_input_hash": digest}}})
             configure(project, {"shot_id": shot_id, "recipe_id": snapshot["recipe_id"], "prompt": snapshot["prompt"],
+                **({"deployment_profile_id": snapshot["deployment_profile_id"]} if snapshot.get("deployment_profile_id") else {}),
                 "controls": {**snapshot["controls"], "seed": seed}, "inputs": snapshot["inputs"]}, sources)
             from .source_snapshot import source_snapshot
             items.append({"id": item_id, "index": index, "seed": seed, "shot_id": shot_id,
@@ -459,7 +465,7 @@ class QuickChatService:
         return revision
 
     def save_card(self, principal, session_id, body, key, *, card_id=None):
-        allowed = {"title", "prompt", "recipe_id", "controls", "inputs", "copies", "turn_id", "source_revision_id", "expected_card_version"}
+        allowed = {"title", "prompt", "recipe_id", "controls", "inputs", "copies", "turn_id", "source_revision_id", "expected_card_version", "deployment_profile_id"}
         fields(body, allowed, {"prompt", "recipe_id", "controls", "inputs", "copies"})
         session = self._access(principal, session_id, "projects:read", "projects:write")
         namespace = "card:"+(card_id or session_id)
@@ -1023,7 +1029,7 @@ class QuickChatService:
             prepared = None
             if proposal and p["assistant_mode"] != "discuss":
                 fields(proposal, {"title", "prompt", "controls", "recipe_id", "inputs", "copies"}, {"prompt"})
-                inherited = ({k: related[k] for k in ("recipe_id", "controls", "copies")} if related else copy.deepcopy(p["next_settings"]))
+                inherited = ({k: related[k] for k in ("recipe_id", "controls", "copies", "deployment_profile_id") if k in related} if related else copy.deepcopy(p["next_settings"]))
                 try:
                     controls_patch = proposal.get("controls", {})
                     validate_controls_patch(controls_patch)

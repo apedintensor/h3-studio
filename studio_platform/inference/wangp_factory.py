@@ -48,12 +48,20 @@ the transport; they are never serialized into fleet/config/manifest identities.
             or value["enabled"] is not True or value["configuration_id"] != slot.spec.configuration_id):
         raise ValueError("wangp_runtime_configuration_mismatch")
     manifest = EngineManifest.from_dict(read_document(value["manifest_file"]))
-    if (manifest.digest != slot.spec.engine_manifest_digest or slot.spec.model_id != MODEL_ID
+    profile_id = manifest.document.get("deployment_profile_id")
+    if profile_id is not None:
+        from ..runtime_catalog import validate_manifest
+        expected_model_id = validate_manifest(manifest)["model_id"]
+        from .wangp_profile_compiler import H3ProfileCompiler
+        compiler = H3ProfileCompiler
+    else:
+        expected_model_id = MODEL_ID
+        compiler = H3Ref2VACompiler if manifest.document["compiler_id"] == REF_COMPILER_ID else H3FL2VACompiler
+    if (manifest.digest != slot.spec.engine_manifest_digest or slot.spec.model_id != expected_model_id
             or manifest.document.get("synthetic") is True):
         raise ValueError("wangp_manifest_binding_mismatch")
     transport = HTTPWanGPTransport(slot.endpoint, private_token_file(value["token_file"]),
         expected_incarnation=value['runtime_incarnation'])
-    compiler = H3Ref2VACompiler if manifest.document["compiler_id"] == REF_COMPILER_ID else H3FL2VACompiler
     return WanGPBackend(enabled=True, slot_key=value["slot_key"], manifest=manifest,
                         transport=transport, compiler=compiler(manifest, transport.stage_input),
                         expected_incarnation=value.get('runtime_incarnation'))

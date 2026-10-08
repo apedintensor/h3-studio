@@ -172,7 +172,8 @@ def capabilities(settings):
                             "applies_to": "unset_controls_only", "source": "current_operator_execution_policy",
                             "description": "当前执行池要求这些控制值。新镜头的未设置项采用此预设；已有明确选择保留。API调用请显式传入，最终以预检为准。"}
     upload_geometry = {"min_side": 256, "max_side": 5760, "min_aspect_ratio": .4, "max_aspect_ratio": 2.5}
-    return {"capabilities_version": VERSION, "recipes": recipes,
+    from .execution_profiles import public_profiles
+    return {"capabilities_version": VERSION, "recipes": recipes, "deployment_profiles": public_profiles(settings),
             "upload_constraints": {"max_bytes": settings.max_upload_bytes,
                 "allowed_extensions": dict(EXTENSIONS),
                 "image": {**upload_geometry, "single_frame_only": True},
@@ -191,7 +192,7 @@ def capabilities(settings):
 def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
     """Validate immutable inputs without loading weights or accessing providers."""
     permitted = {"client_ref", "recipe_id", "capabilities_version", "prompt", "inputs", "controls",
-                 "execution_policy_id", "client_edit"}
+                 "execution_policy_id", "client_edit", "deployment_profile_id"}
     if not isinstance(body, dict) or set(body) - permitted:
         raise ValueError("计划包含不支持的字段")
     if body.get("execution_policy_id", "self-hosted-default") != "self-hosted-default":
@@ -203,6 +204,13 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
     recipe = body.get("recipe_id")
     if not isinstance(recipe, str) or recipe not in RECIPES:
         raise ValueError("未接入此配方；内部recipe ID不能替代上游model ID")
+    profile_id = body.get("deployment_profile_id")
+    profile = None
+    if profile_id is not None:
+        from .runtime_catalog import get_profile
+        profile = get_profile(profile_id)
+        if backend != "wangp-worker":
+            raise ValueError("所选部署配方需要 WanGP 执行服务；不会改用其他模型")
     ref = body.get("client_ref")
     if not isinstance(ref, dict) or set(ref) - {"project_id", "chapter_id", "scene_id", "shot_id", "shot_version", "source_hash"}:
         raise ValueError("client_ref来源关联无效")
@@ -220,7 +228,10 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 12000:
         raise ValueError("请输入1至12000字符的单镜提示词")
     controls = copy.deepcopy(body.get("controls", {}))
-    if backend == "wangp-worker":
+    if profile is not None:
+        from .inference.wangp_profile_compiler import control_schema as profile_schema
+        selected_schema = lambda: profile_schema(profile_id, RECIPES[recipe])
+    elif backend == "wangp-worker":
         if RECIPES[recipe] == "ref":
             from .inference.wangp_ref_compiler import control_schema as selected_schema
         else:
@@ -292,14 +303,17 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
         ids.append(guide["media_id"])
     assets = {key: resolve_asset(key) for key in dict.fromkeys(ids)}
     metadata = {key: val["metadata"] for key, val in assets.items()}
-    request = {"backend": "comfy-local", "model": MODEL, "mode": RECIPES[recipe],
+    request = {"backend": "comfy-local", "model": profile["model_id"] if profile else MODEL, "mode": RECIPES[recipe],
                "prompt": prompt.strip(), "duration": 5,
-               "resolution": "480P" if backend == "wangp-worker" and RECIPES[recipe] == "ref" else "768P", "aspect_ratio": "16:9",
+               "resolution": "480P" if profile is not None or backend == "wangp-worker" and RECIPES[recipe] == "ref" else "768P", "aspect_ratio": "16:9",
                "generate_audio": True, **controls, "inputs": inputs, "video_audio": video_audio}
     if type(request["duration"]) is not int or type(request["generate_audio"]) is not bool:
         raise ValueError("生成时长须为整数秒，声音开关须为布尔值")
     spec = native_output_spec(request)
-    if backend == "wangp-worker":
+    if profile is not None:
+        from .inference.wangp_profile_compiler import normalize_request as normalize_profile
+        request = normalize_profile(request, metadata, spec, profile_id)
+    elif backend == "wangp-worker":
         if RECIPES[recipe] == "ref":
             from .inference.wangp_ref_compiler import normalize_request
         else:
@@ -315,5 +329,7 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
                   "request": request, "output_spec": spec, "assets": assets,
                   "client_edit": body.get("client_edit", {}),
                   "execution_policy_id": body.get("execution_policy_id", "self-hosted-default")}
+    if profile_id is not None:
+        normalized["deployment_profile_id"] = profile_id
     fingerprint = hashlib.sha256(json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     return normalized, fingerprint

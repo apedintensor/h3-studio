@@ -10,7 +10,7 @@ ACTION_FIELDS = {
     "asset.attach": {"asset_id", "entity_id", "title", "parent_id", "shot_id", "role", "select"},
     "artifact.adopt": {"artifact_id", "entity_id", "title", "parent_id", "shot_id", "select"},
     "shot.select": {"shot_id", "entity_id"}, "shot.trim": {"shot_id", "start", "end"},
-    "shot.configure_generation": {"shot_id", "recipe_id", "prompt", "controls", "inputs"},
+    "shot.configure_generation": {"shot_id", "recipe_id", "prompt", "controls", "inputs", "deployment_profile_id"},
     "captions.set": {"chapter_id", "cues"}, "captions.confirm": {"chapter_id", "reviewed"},
     "sound.set": {"chapter_id", "tracks", "mode"}, "sound.generated": {"shot_id", "gain"},
 }
@@ -108,6 +108,7 @@ def operation_schemas():
             "description": "Existing image/video entity ID. Omit, null or empty string to clear the selection."}},
         "shot.trim": {"shot_id": ID_SCHEMA, "start": TIME, "end": TIME},
         "shot.configure_generation": {"shot_id": ID_SCHEMA, "recipe_id": {"enum": list(RECIPES)},
+            "deployment_profile_id": {"type": ["string", "null"], "description": "Exact ID from capabilities.deployment_profiles; null retains legacy service routing."},
             "prompt": {"type": "string", "maxLength": 12000},
             "controls": {"type": "object", "additionalProperties": False, "properties": editable_controls}, "inputs": draft_inputs},
         "captions.set": {"chapter_id": ID_SCHEMA, "cues": {"type": "array", "maxItems": 500, "items": {

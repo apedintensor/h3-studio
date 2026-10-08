@@ -389,7 +389,9 @@ class PackageTests(unittest.TestCase):
         with tarfile.open(output) as source:
             self.assertEqual(set(source.getnames()), set(package.PRIVATE_FILES))
             self.assertTrue(all(item.isfile() for item in source))
-        self.assertTrue(all(name.endswith(".py") for name in package.PRIVATE_FILES))
+        from studio_platform.runtime_catalog import PROFILE_IDS
+        profile_files = {f"deploy/wangp/profiles/{identity}.json" for identity in PROFILE_IDS}
+        self.assertEqual({name for name in package.PRIVATE_FILES if not name.endswith('.py')}, profile_files)
 
     def test_bound_manifest_is_new_identity_and_never_claims_inference(self):
         lock_file = self.root / "environment.json"

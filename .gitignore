@@ -88,6 +88,13 @@ inventory.json
 !GENERATION-FOUNDATION-RESULT.md
 !studio_platform/control.py
 !studio_platform/execution_policy.py
+!studio_platform/execution_profiles.py
+!studio_platform/operator_boot.py
+!studio_platform/runtime_hosts/wangp_profile_bootstrap.py
+!tools/build_operator_sources.py
+!tools/run_operator_preview.py
+!OPERATOR-CAPACITY-CONTRACT.md
+!OPERATOR-CAPACITY-OPERATIONS.md
 !studio_platform/fleet.py
 !studio_platform/scaler.py
 !studio_platform/render_plans.py

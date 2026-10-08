@@ -67,6 +67,8 @@ class GenerationRead:
         return {"admission_state": execution.get("admission_state", "queued" if execution.get("enabled") else "blocked"),
                 "enabled": bool(execution.get("enabled")), "quote_known": bool(execution.get("quote_known")),
                 "backend": execution.get("backend"),
+                **({"deployment_profile_id": execution["deployment_profile_id"]} if execution.get("deployment_profile_id") else {}),
+                **({"timing_hint": execution["timing_hint"]} if execution.get("timing_hint") else {}),
                 **({"delivery_spec": execution["delivery_spec"]} if "delivery_spec" in execution else {})}
 
     @staticmethod
@@ -86,6 +88,8 @@ class GenerationRead:
             recipe_id=stored_request.get("recipe_id"), effective_request=stored_request.get("request", {}),
             simulation=job["execution_plan"].get("backend") == "mock" or stored_request.get("simulation") is True, plan_id=job["plan_id"],
             project_id=job["project_id"], artifacts=[])
+        if stored_request.get("deployment_profile_id"):
+            visible["deployment_profile_id"] = stored_request["deployment_profile_id"]
         if "delivery_spec" in job["execution_plan"]:
             visible["delivery_spec"] = job["execution_plan"]["delivery_spec"]
         if job["status"] == "succeeded":
@@ -128,6 +132,16 @@ class GenerationPlanning:
         compiled["server_source_hash"] = source_snapshot(project, ref["shot_id"])
         admission = self.policies.evaluate(compiled, self.access.scope(principal, project_id), fingerprint)
         execution = admission.execution
+        if compiled.get("deployment_profile_id"):
+            from .runtime_catalog import timing_hint
+            execution["deployment_profile_id"] = compiled["deployment_profile_id"]
+            inputs, output = compiled["request"]["inputs"], compiled["output_spec"]
+            roles = [role for key, role in (("images", "image"), ("videos", "video"), ("audios", "audio"),
+                     ("first_frame", "first_frame"), ("last_frame", "last_frame")) if inputs.get(key)]
+            hint = timing_hint(compiled["deployment_profile_id"], compiled["request"]["mode"],
+                output["width"], output["height"], output["frames"], 24, compiled["request"]["steps"], roles)
+            if hint:
+                execution["timing_hint"] = hint
         enabled, blockers = execution["enabled"], execution["blockers"]
         simulation = self.settings.execution_backend == "mock"
         plan = self.repo.create_plan(self.access.scope(principal, project_id), compiled, execution,
