@@ -22,7 +22,7 @@ class AbsoluteTTLTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)/"rents"
-        self.detail = {"id": POD, "name": "sixnine-"+TAG, "status": "PENDING", "created_at": stamp(900),
+        self.detail = {"id": POD, "name": "sixnine-"+TAG, "status": "RUNNING", "created_at": stamp(900),
             "termination_hours": 2, "removal_scheduled_at": None,
             "executor": {"executor_ip_address": "8.8.8.8"}, "ports_mapping": {"22": 2022}}
         self.schedule = None
@@ -61,6 +61,64 @@ class AbsoluteTTLTests(unittest.TestCase):
     def running(self, removed):
         self.detail.update(status="RUNNING", termination_hours=None, removal_scheduled_at=stamp(removed))
 
+    def historical_pending_attempt(self, *, acknowledged, confirmed):
+        # Pre-upgrade on-disk evidence, never a new request from current code.
+        journal = RentJournal(self.directory)
+        ttl = self.marker()["absolute_ttl"]
+        ttl["attempts"] = [{"target": 8100, "started_at": self.now,
+            "status": "PENDING", "acknowledged": acknowledged, "confirmed": confirmed}]
+        with journal.ttl_lock(TAG):
+            journal.update_ttl(TAG, ttl)
+
+    def test_pending_is_unverified_until_first_running_schedule_after_restart(self):
+        self.detail["status"] = "PENDING"
+        provider = self.start()
+        for _ in range(3):
+            self.assertEqual(provider.reconcile(TAG, POD).state, "starting")
+            with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+                provider.lifetime(TAG, POD, local_created_at=900)
+            with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+                provider.ssh_connection(TAG, POD)
+            self.now += 30
+        ttl = self.marker()["absolute_ttl"]
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(ttl["attempts"], [])
+        self.assertEqual((ttl["instance_id"], ttl["provider_created_at"], ttl["deadline"]), (POD, 900, 8100))
+        self.now += 1200
+        self.running(9400)
+        provider = self.provider(journal_dir=self.directory)
+        self.assertEqual(provider.reconcile(TAG, POD).state, "running")
+        self.assertEqual(provider.lifetime(TAG, POD, local_created_at=900)["safe_deadline"], 7500)
+        self.assertEqual(provider.ssh_connection(TAG, POD)["instance_id"], POD)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(self.posts()[0][2], {"removal_scheduled_at": stamp(8100)})
+        attempt = self.marker()["absolute_ttl"]["attempts"][0]
+        self.assertEqual(attempt["status"], "RUNNING")
+        self.assertTrue(attempt["acknowledged"] and attempt["confirmed"])
+        self.assertEqual(sum(v[0] == "POST" and v[1].endswith("/rent") for v in self.api.calls), 1)
+
+    def test_historical_unknown_pending_schedule_is_never_replayed(self):
+        self.detail["status"] = "PENDING"
+        self.start()
+        self.historical_pending_attempt(acknowledged=False, confirmed=False)
+        before = self.marker()["absolute_ttl"]
+        provider = self.provider(journal_dir=self.directory)
+        self.assertEqual(provider.reconcile(TAG, POD).state, "starting")
+        self.running(9400)
+        for _ in range(2):
+            provider.reconcile(TAG, POD)
+            with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+                provider.lifetime(TAG, POD, local_created_at=900)
+        self.assertEqual(self.marker()["absolute_ttl"], before)
+        self.assertEqual(self.posts(), [])
+        # An exact GET can resolve the original unknown request; no new POST.
+        self.running(8100)
+        self.assertEqual(provider.lifetime(TAG, POD, local_created_at=900)["safe_deadline"], 7500)
+        attempt = self.marker()["absolute_ttl"]["attempts"][0]
+        self.assertTrue(attempt["confirmed"])
+        self.assertFalse(attempt["acknowledged"])
+        self.assertEqual(self.posts(), [])
+
     def test_original_bound_is_durable_before_rent_and_schedule_post(self):
         def rented(request):
             ttl = self.marker()["absolute_ttl"]
@@ -80,24 +138,55 @@ class AbsoluteTTLTests(unittest.TestCase):
         self.assertTrue(ttl["attempts"][0]["acknowledged"])
         self.assertEqual(self.posts()[0][2], {"removal_scheduled_at": stamp(8100)})
 
-    def test_one_confirmed_pending_to_running_correction_then_hold(self):
+    def test_historical_acknowledged_but_unconfirmed_pending_schedule_stays_held(self):
+        self.detail["status"] = "PENDING"
+        self.start()
+        self.historical_pending_attempt(acknowledged=True, confirmed=False)
+        before = self.marker()["absolute_ttl"]
+        self.running(9400)
+        provider = self.provider(journal_dir=self.directory)
+        for _ in range(2):
+            provider.reconcile(TAG, POD)
+            with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+                provider.ssh_connection(TAG, POD)
+        self.assertEqual(self.marker()["absolute_ttl"], before)
+        self.assertEqual(self.posts(), [])
+
+    def test_pending_past_original_deadline_never_schedules_or_extends(self):
+        self.detail["status"] = "PENDING"
         provider = self.start()
+        before = self.marker()["absolute_ttl"]
+        self.now = 8101
+        provider.reconcile(TAG, POD)
+        self.running(16000)
+        with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+            provider.lifetime(TAG, POD, local_created_at=900)
+        self.assertEqual(self.marker()["absolute_ttl"], before)
+        self.assertEqual(self.posts(), [])
+
+    def test_one_historical_confirmed_pending_to_running_correction_then_hold(self):
+        self.detail.update(status="PENDING", removal_scheduled_at=stamp(8100))
+        provider = self.start()
+        self.historical_pending_attempt(acknowledged=True, confirmed=True)
         self.now += 1200
         self.running(9400)
         provider = self.provider(journal_dir=self.directory)
         self.assertEqual(provider.lifetime(TAG, POD, local_created_at=900)["safe_deadline"], 7500)
-        self.assertEqual(len(self.posts()), 2)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(len(self.marker()["absolute_ttl"]["attempts"]), 2)
         self.assertEqual(self.marker()["absolute_ttl"]["deadline"], 8100)
         self.running(9500)
         with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
             provider.ssh_connection(TAG, POD)
-        self.assertEqual(len(self.posts()), 2)
+        self.assertEqual(len(self.posts()), 1)
 
     def test_earlier_observed_deadline_is_preserved_across_ready_overwrite(self):
-        self.detail["removal_scheduled_at"] = stamp(7000)
+        self.detail.update(status="PENDING", removal_scheduled_at=stamp(7000))
         provider = self.start()
         self.assertEqual(self.posts(), [])
         self.assertEqual(self.marker()["absolute_ttl"]["effective_deadline"], 7000)
+        with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+            provider.lifetime(TAG, POD, local_created_at=900)
         self.running(9500)
         provider.ssh_connection(TAG, POD)
         self.assertEqual(self.posts()[0][2]["removal_scheduled_at"], stamp(7000))
