@@ -137,13 +137,20 @@ def validate_policy(value):
     if any(not isinstance(options, list) or not options or any(not isinstance(x, str) or len(x)>80 for x in options) for options in controls.values()):
         raise ValueError("Invalid execution control values")
     if "deployment_profile_id" in value:
-        from .runtime_catalog import engine_manifest, get_profile
+        from .runtime_catalog import engine_manifest, get_profile, supported_cases
         mode = "fl" if recipes == ["h3-base-fl2va-v1"] else "ref"
         profile = get_profile(value["deployment_profile_id"])
-        cases = [c for c in profile["verified_cases"] if c["mode"] == mode]
+        candidates = profile.get("qualification_cases", [])
+        if candidates and (profile.get("validation", {}).get("scope") != "pending_hardware_qualification"
+                or profile.get("validation", {}).get("production_adapter_verified") is not False
+                or qualification["status"] != "runtime_required"
+                or any("measurements" in case for case in candidates)):
+            raise ValueError("Deployment profile candidate qualification is not pending")
+        cases = [c for c in supported_cases(profile["id"]) if c["mode"] == mode]
         if (value.get("output_delivery") != "native-frames-v1"
                 or qualification.get("profile") != QUEUED_TASK_PROFILE
                 or value["engine_manifest_digest"] != engine_manifest(profile["id"], mode).digest
+                or not cases
                 or envelope["max_pixels"] > max(c["width"]*c["height"] for c in cases)
                 or envelope["max_steps"] > max(c["steps"] for c in cases)
                 or envelope["max_duration_seconds"] > 124/24 + 1e-6
@@ -152,7 +159,9 @@ def validate_policy(value):
                 or mode == "ref" and envelope["allow_first_last"]):
             raise ValueError("Deployment profile envelope exceeds tested scope")
         # Marginal limits only restrict admission; the compiler additionally
-        # checks the exact measured combination of mode, controls and inputs.
+        # checks the exact recorded combination of mode, controls and inputs.
+        # Pending candidates still require runtime qualification; these limits
+        # grant neither measured performance nor worker readiness.
     elif value["backend"] == "wangp-worker" and recipes == ["h3-base-ref2va-v1"]:
         from .inference.wangp_ref_compiler import validate_envelope
         if (recipes != ["h3-base-ref2va-v1"] or value.get("output_delivery") != "native-frames-v1"

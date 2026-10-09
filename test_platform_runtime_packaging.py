@@ -41,10 +41,13 @@ class RuntimeImagePackagingTests(unittest.TestCase):
 sys.path.insert(0,sys.argv[1])
 from studio_platform.runtime_catalog import PROFILE_IDS,public_catalog,engine_manifest
 catalog=public_catalog()
-assert len(catalog['profiles'])==3
+assert len(catalog['profiles'])==4
 for profile in catalog['profiles']:
-    assert profile['verified_cases']
     assert profile['validation']['production_adapter_verified'] is False
+    if not profile['verified_cases']:
+        assert profile['validation']['scope']=='pending_hardware_qualification'
+        assert profile.get('qualification_cases')
+        assert all('measurements' not in case for case in profile['qualification_cases'])
     for case in profile['verified_cases']:
         assert all(m['evidence'].startswith('https://github.com/apedintensor/h3-studio/blob/') for m in case['measurements'])
     for mode in ('fl','ref'):
@@ -53,7 +56,7 @@ print(json.dumps({'profiles':len(catalog['profiles']),'manifests':len(PROFILE_ID
 """
             result = subprocess.run([sys.executable,'-I','-S','-c',script,str(image)],
                                     capture_output=True,text=True,check=True,timeout=20,cwd=image)
-            self.assertEqual(json.loads(result.stdout), {'profiles':3, 'manifests':6})
+            self.assertEqual(json.loads(result.stdout), {'profiles':4, 'manifests':8})
 
 
 if __name__ == '__main__':

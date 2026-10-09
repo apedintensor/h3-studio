@@ -38,7 +38,7 @@ class FakeConnection:
 
 class FakeRepo:
     def __init__(self,binding):
-        self.intent={'id':INTENT,'provider_instance_id':INSTANCE,'state':'starting','hard_deadline':5000}
+        self.intent={'id':INTENT,'provider':'lium','provider_instance_id':INSTANCE,'state':'starting','hard_deadline':5000}
         self.node={'desired_state':'running','binding_hash':binding.fingerprint,'binding_id':'binding',
             'payload':{'lifetime':{'state':'verified','instance_id':INSTANCE,'observed_at':1000,'safe_deadline':5000}}}
         self.worker=None
@@ -77,7 +77,7 @@ class OperatorBootTests(unittest.TestCase):
             for name in subject.SOURCE_NAMES:
                 (directory/name).write_bytes((name+str(index)).encode())
             sources.append(str(directory))
-        self.binding=NS(runtime_profile_id=profile['id'],execution_slots=2,gpu_count=2,
+        self.binding=NS(runtime_profile_id=profile['id'],execution_slots=2,gpu_count=2,launch=NS(provider='lium'),
             model_id=profile['model_id'],configuration_id='native-test',recipe_ids=('h3-base-fl2va-v1',),
             engine_manifest_digest=engine_manifest(profile['id'],'fl').digest,fingerprint='f'*64,
             pool='native-test',expires_at=6000,
@@ -110,6 +110,34 @@ class OperatorBootTests(unittest.TestCase):
         with self.assertRaisesRegex(BootError,'source_changed'):
             subject.OperatorBoot(self.repo,None,self.binding,self.repo.intent,{},self.config,boot_class=FakeBoot)
         self.assertEqual(self.spawn,[])
+
+    def test_provider_mismatch_is_rejected_before_slot_construction(self):
+        with self.assertRaisesRegex(BootError,'provider_mismatch'):
+            subject.OperatorBoot(self.repo,None,self.binding,{**self.repo.intent,'provider':'targon'},
+                {},self.config,boot_class=FakeBoot)
+
+    def test_targon_profile_keeps_provider_uid_slot_hardware_and_idle_proof(self):
+        from studio_platform.targon_provider import TargonIdleProof
+        profile = get_profile(PROFILE_IDS[-1])
+        binding = copy.deepcopy(self.binding)
+        binding.runtime_profile_id = profile['id']
+        binding.model_id = profile['model_id']
+        binding.engine_manifest_digest = engine_manifest(profile['id'],'fl').digest
+        binding.launch.provider = 'targon'
+        binding.execution_slots = binding.gpu_count = 1
+        binding.boot = {key:values[:1] for key,values in binding.boot.items()}
+        intent = {**self.repo.intent,'provider':'targon','provider_instance_id':'workload_test-123'}
+        config = {**self.config,'work_dir':str(self.root/'targon-work')}
+        candidate = subject.OperatorBoot(self.repo,None,binding,intent,{},config,boot_class=FakeBoot)
+        self.assertEqual(len(candidate.slots),1)
+        self.assertEqual(candidate.slots[0].config.provider,'targon')
+        self.assertEqual(candidate.slots[0].config.min_gpu_bytes,90*1024**3)
+        candidate.slots[0].proof = TargonIdleProof('workload_test-123',1005,1001,True)
+        proof = candidate.idle_probe(INTENT,'workload_test-123')
+        self.assertIsInstance(proof,TargonIdleProof)
+        self.assertTrue(proof.idle)
+        candidate.slots[0].proof = InferenceIdleProof(INSTANCE,1005,1001,True)
+        self.assertIsNone(candidate.idle_probe(INTENT,'workload_test-123'))
 
     def test_guard_is_fail_closed_and_rechecks_node_binding_and_stop(self):
         self.assertFalse(self.boot._start_allowed())
@@ -261,7 +289,7 @@ class OperatorBootTests(unittest.TestCase):
         state={'identity':identity,'runtime_validation':{'profile':QUEUED_TASK_PROFILE,
             'state':'runtime_ready','generation_verified':False},'phase':'fleet_starting'}
         (expected_path.parent/'bootstrap-state.json').write_text(json.dumps(state))
-        spec=NS(configuration_id=self.binding.configuration_id,model_id=self.binding.model_id,pool=self.binding.pool,
+        spec=NS(configuration_id=self.binding.configuration_id,model_id=self.binding.model_id,pool=self.binding.pool,provider='lium',
             instance_id=INSTANCE,engine_manifest_digest=self.binding.engine_manifest_digest,
             output_delivery='native-frames-v1',recipe_ids=self.binding.recipe_ids)
         fleet=NS(fingerprint=lambda:'c'*64,slots=[NS(spec=spec)],slot=lambda identity:NS(spec=spec))

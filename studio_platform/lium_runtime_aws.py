@@ -53,8 +53,11 @@ class AwsLiumLoader:
     explicit VersionId avoids switching a running controller to another account
     after a mutable AWSCURRENT change. This class performs no writes to AWS.
     """
+    service, profile, base_url, key_variable = SERVICE, PROFILE, BASE_URL, KEY_VARIABLE
+    secret_name, secret_arn_pattern, config_type = SECRET_NAME, SECRET_ARN, LiumRuntimeConfig
+
     def __init__(self, secret_arn, version_id, *, client_factory=None):
-        if (not isinstance(secret_arn, str) or not SECRET_ARN.fullmatch(secret_arn)
+        if (not isinstance(secret_arn, str) or not self.secret_arn_pattern.fullmatch(secret_arn)
                 or not isinstance(version_id, str) or not VERSION_ID.fullmatch(version_id)):
             raise RuntimeCredentialError("lium_runtime_secret_identity_invalid")
         self._arn, self._version = secret_arn, version_id
@@ -63,7 +66,7 @@ class AwsLiumLoader:
         self._lock = threading.Lock()
 
     def __call__(self, service, *, profile):
-        if service != SERVICE or profile != PROFILE:
+        if service != self.service or profile != self.profile:
             raise RuntimeCredentialError("lium_runtime_service_profile_mismatch")
         with self._lock:
             if self._config is not None:
@@ -73,7 +76,7 @@ class AwsLiumLoader:
                     self._client = self._factory()
                 response = self._client.get_secret_value(SecretId=self._arn, VersionId=self._version)
                 if (not isinstance(response, dict) or response.get("ARN") != self._arn
-                        or response.get("Name") != SECRET_NAME or response.get("VersionId") != self._version
+                        or response.get("Name") != self.secret_name or response.get("VersionId") != self._version
                         or "SecretBinary" in response):
                     raise RuntimeCredentialError("lium_runtime_secret_response_identity_mismatch")
                 raw = response.get("SecretString")
@@ -91,14 +94,14 @@ class AwsLiumLoader:
                 expected = {"schema_version", "service", "profile", "base_url", "primary_key_variable", "api_key"}
                 if (not isinstance(value, dict) or set(value) != expected
                         or type(value["schema_version"]) is not int or value["schema_version"] != 1
-                        or value["service"] != SERVICE or value["profile"] != PROFILE
-                        or value["base_url"] != BASE_URL or value["primary_key_variable"] != KEY_VARIABLE):
+                        or value["service"] != self.service or value["profile"] != self.profile
+                        or value["base_url"] != self.base_url or value["primary_key_variable"] != self.key_variable):
                     raise RuntimeCredentialError("lium_runtime_profile_metadata_mismatch")
                 token = value["api_key"]
                 if (not isinstance(token, str) or not 1 <= len(token) <= 8192
                         or token != token.strip() or any(c in token for c in "\r\n\x00")):
                     raise RuntimeCredentialError("lium_runtime_key_invalid")
-                self._config = LiumRuntimeConfig(api_key=token)
+                self._config = self.config_type(api_key=token)
                 return self._config
             except RuntimeCredentialError:
                 raise

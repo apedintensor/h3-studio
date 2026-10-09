@@ -1,9 +1,9 @@
 """Pure selection checks: no provider, database, budgets, or credentials."""
-from dataclasses import replace
+from dataclasses import asdict,replace
 import unittest
 
 from studio_platform.operator_capacity import DeploymentBinding, OperatorError, OperatorRegistry, selection
-from studio_platform.repository import Scope
+from studio_platform.repository import Scope,request_hash
 from studio_platform.scaler import LaunchSpec
 
 
@@ -41,6 +41,19 @@ class RegistryRolloverTests(unittest.TestCase):
     def test_enabled_other_mode_does_not_replace_requested_disabled_recipe(self):
         other = replace(self.new, recipe_ids=("h3-base-ref2va-v1",))
         self.assertIs(OperatorRegistry([other, self.old]).resolve(self.chosen), self.old)
+
+    def test_targon_requires_explicit_registry_qualification_and_exact_provider(self):
+        targon=replace(self.new,binding_id="targon",launch=replace(self.new.launch,provider="targon"))
+        chosen={**self.chosen,"provider":"targon"}
+        with self.assertRaisesRegex(OperatorError,"provider_start_unqualified"):
+            OperatorRegistry([targon]).resolve(chosen)
+        registry=OperatorRegistry([self.new,targon],qualified_providers=("lium","targon"))
+        self.assertIs(registry.resolve(chosen),targon)
+        self.assertIs(registry.resolve(self.chosen),self.new)
+        legacy=asdict(self.old);legacy.pop("enabled")
+        self.assertEqual(self.old.fingerprint,request_hash(legacy))
+        self.assertNotIn("provider",asdict(self.old))
+        self.assertNotIn("provider",self.chosen)
 
 
 if __name__ == "__main__":

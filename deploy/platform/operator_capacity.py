@@ -30,6 +30,8 @@ PROFILES = ROOT/'execution-profiles.json'
 SETTINGS = ROOT/'operator-settings.json'
 KEY = Path('/srv/sixnine/gpu-scaler/identity/key')
 METADATA = Path('/srv/sixnine/lium-runtime-import.json')
+TARGON_METADATA = Path('/srv/sixnine/targon-runtime-import.json')
+TARGON_GUARD = Path('/srv/sixnine/targon-guard')
 SERVICE = 'operator-controller'
 FACTORY = 'studio_platform.operator_runtime:create_controller_from_stdin'
 MODULE = 'studio_platform.operator_controller'
@@ -64,6 +66,63 @@ def protected_file(path, maximum=1024*1024):
     return path
 
 
+def credential_references(runtime):
+    references={}
+    legacy={'secret_arn','secret_version_id'}&set(runtime)
+    release.require(not legacy or legacy=={'secret_arn','secret_version_id'},'operator_runtime_identity_mismatch')
+    if legacy: references['lium']={key:runtime[key] for key in legacy}
+    providers=runtime.get('provider_credentials',{})
+    release.require(isinstance(providers,dict) and not set(providers)-{'targon'},'operator_runtime_identity_mismatch')
+    for provider,reference in providers.items():
+        release.require(isinstance(reference,dict) and set(reference)=={'secret_arn','secret_version_id'},
+            'operator_runtime_identity_mismatch')
+        references[provider]=reference
+    release.require(bool(references) and all(isinstance(value,str) and value
+        for reference in references.values() for value in reference.values()),'operator_runtime_identity_mismatch')
+    return references
+
+
+def credential_files(runtime):
+    files={}
+    for provider,reference in credential_references(runtime).items():
+        path=METADATA if provider=='lium' else TARGON_METADATA
+        protected_file(path)
+        metadata=release._protected_json(path)
+        release.require(reference['secret_arn']==metadata.get('secret_arn')
+            and reference['secret_version_id']==metadata.get('version_id')
+            and metadata.get('service')==provider and metadata.get('profile')==provider+'--rig-root',
+            'operator_runtime_identity_mismatch')
+        files[str(path)]=release.checksum(path)
+    return files
+
+
+def guard_configuration(runtime):
+    release.require(runtime.get('cleanup_guard_dir')==TARGON_GUARD.as_posix(),'operator_guard_path_invalid')
+    for path in (TARGON_GUARD,*TARGON_GUARD.parents,TARGON_GUARD/'receipts'):
+        release.protected_directory(path)
+    requests=TARGON_GUARD/'requests'
+    info=requests.lstat()
+    release.require(stat.S_ISDIR(info.st_mode) and not requests.is_symlink()
+        and (os.name=='nt' or info.st_uid==10001 and not info.st_mode&0o077),'operator_guard_requests_not_private')
+    path=protected_file(TARGON_GUARD/'config.json')
+    value=release._protected_json(path)
+    reference=credential_references(runtime)['targon']
+    fields={'schema_version','directory','org_slug','resource_names','image_names','approval_start','approval_end',
+        'maximum_seconds','secret_arn','secret_version_id'}
+    release.require(set(value)==fields and type(value.get('schema_version')) is int and value['schema_version']==1
+        and value.get('directory')==TARGON_GUARD.as_posix()
+        and value.get('secret_arn')==reference['secret_arn']
+        and value.get('secret_version_id')==reference['secret_version_id']
+        and isinstance(value.get('org_slug'),str) and re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}',value['org_slug'])
+        and all(isinstance(value.get(key),list) and 1<=len(value[key])<=128
+            and all(isinstance(item,str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}',item) for item in value[key])
+            for key in ('resource_names','image_names'))
+        and all(type(value.get(key)) in (int,float) and math.isfinite(value[key]) for key in ('approval_start','approval_end'))
+        and value['approval_start']<value['approval_end'] and type(value.get('maximum_seconds')) is int
+        and 120<=value['maximum_seconds']<=14400, 'operator_guard_identity_mismatch')
+    return value,{str(path):release.checksum(path)}
+
+
 def configuration():
     """Read only non-secret, root-controlled configuration and exact sources."""
     for folder in (ROOT,ROOT/'sources',ROOT/'provider-manifests'):
@@ -78,18 +137,16 @@ def configuration():
         'operator_ssh_identity_permissions_invalid')
     for parent in KEY.parents:
         release.protected_directory(parent)
-    for path in (RUNTIME,REGISTRY,PROFILES,SETTINGS,METADATA):
+    for path in (RUNTIME,REGISTRY,PROFILES,SETTINGS):
         protected_file(path)
     runtime = release._protected_json(RUNTIME)
-    metadata = release._protected_json(METADATA)
     paths = {'registry_file':REGISTRY.as_posix(),'work_dir':str(ROOT/'control'),
         'ssh_key_file':KEY.as_posix(),'known_hosts_file':str(ROOT/'control'/'known_hosts')}
     release.require(all(runtime.get(k)==v for k,v in paths.items())
-        and runtime.get('credential_source')=='aws_runtime'
-        and runtime.get('secret_arn')==metadata.get('secret_arn')
-        and runtime.get('secret_version_id')==metadata.get('version_id')
-        and metadata.get('service')=='lium' and metadata.get('profile')=='lium--rig-root',
+        and runtime.get('credential_source')=='aws_runtime',
         'operator_runtime_identity_mismatch')
+    references=credential_references(runtime)
+    credential_hashes=credential_files(runtime)
     registry = release._protected_json(REGISTRY,maximum=1024*1024)
     release.require(set(registry)=={'schema_version','bindings'} and registry['schema_version']==1
         and isinstance(registry['bindings'],list) and 1<=len(registry['bindings'])<=128,
@@ -97,13 +154,33 @@ def configuration():
     default = default_profile()
     release.require(any(b.get('runtime_profile_id')==default and b.get('enabled') is True
         for b in registry['bindings']), 'operator_default_profile_not_enabled')
-    files = {str(p):release.checksum(p) for p in (RUNTIME,REGISTRY,PROFILES,SETTINGS)}
+    files = {**credential_hashes,**{str(p):release.checksum(p) for p in (RUNTIME,REGISTRY,PROFILES,SETTINGS)}}
+    guard=None
+    if 'targon' in references:
+        guard,guard_hashes=guard_configuration(runtime)
+        files.update(guard_hashes)
+    else:
+        release.require('cleanup_guard_dir' not in runtime,'operator_guard_configuration_conflict')
     for binding in registry['bindings']:
+        provider=binding.get('launch',{}).get('provider')
+        release.require(provider in references,'operator_runtime_provider_unconfigured')
         boot = binding['boot']
         path = Path(boot['provider_manifest_file'])
         release.require(path.parent==ROOT/'provider-manifests','operator_provider_manifest_path_invalid')
         protected_file(path)
         files[str(path)] = release.checksum(path)
+        if provider=='targon':
+            manifest=release._protected_json(path)
+            release.require(manifest.get('org_slug')==guard.get('org_slug')
+                and manifest.get('resource_name') in guard.get('resource_names',[])
+                and manifest.get('image_name') in guard.get('image_names',[])
+                and type(guard.get('maximum_seconds')) is int
+                and type(manifest.get('max_lifetime_seconds',7200)) is int
+                and guard['maximum_seconds']>=manifest.get('max_lifetime_seconds',7200)
+                and type(guard.get('approval_start')) in (int,float)
+                and type(guard.get('approval_end')) in (int,float)
+                and guard['approval_start']<manifest.get('approved_until',0)<=guard['approval_end'],
+                'operator_guard_manifest_mismatch')
         release.require(isinstance(boot['source_dirs'],list) and isinstance(boot['source_sha256'],list)
             and len(boot['source_dirs'])==len(boot['source_sha256']), 'operator_sources_invalid')
         for folder, hashes in zip(boot['source_dirs'],boot['source_sha256']):
@@ -133,7 +210,11 @@ def default_profile():
     return value['default_deployment_profile_id']
 
 
-def controller(image):
+def controller(image, runtime=None):
+    guard_mounts=[]
+    if runtime is not None and 'targon' in credential_references(runtime):
+        release.require(runtime.get('cleanup_guard_dir')==TARGON_GUARD.as_posix(),'operator_guard_path_invalid')
+        guard_mounts=[bind(TARGON_GUARD,True),bind(TARGON_GUARD/'requests')]
     return {'image':image,'pull_policy':'never','user':'10001:10001','init':True,'restart':'no',
         'read_only':True,'cap_drop':['ALL'],'security_opt':['no-new-privileges:true'],
         'pids_limit':192,'mem_limit':1024**3,'cpus':.75,
@@ -146,7 +227,7 @@ def controller(image):
         # Accidental compose up is inert. Only host launch appends --enabled.
         'command':['python','-m',MODULE,'--factory',FACTORY,'--config',RUNTIME.as_posix()],
         'secrets':[{'source':'app_database_url','target':'/run/secrets/app_database_url'}],
-        'volumes':shared_mounts()+[bind(KEY,True),bind(ROOT/'control'),
+        'volumes':shared_mounts()+guard_mounts+[bind(KEY,True),bind(ROOT/'control'),
             {'type':'bind','source':(ROOT/'tmp').as_posix(),'target':'/tmp','bind':{'create_host_path':False}},
             {'type':'bind','source':'/srv/sixnine/platform-data','target':'/data','bind':{'create_host_path':False}}],
         'networks':{'database':{},'edge':{}},
@@ -154,17 +235,17 @@ def controller(image):
         'logging':{'driver':'json-file','options':{'max-size':'10m','max-file':'3'}}}
 
 
-def overlay(image, profile_id):
+def overlay(image, profile_id, runtime=None):
     return {'services':{'app':{'environment':{'H3_OPERATOR_RUNTIME_CONFIG':RUNTIME.as_posix(),
         'SIXNINE_EXECUTION_PROFILES_FILE':PROFILES.as_posix(),'SIXNINE_GENERATION_ENABLED':'1',
         'SIXNINE_EXECUTION_BACKEND':'wangp-worker','AWS_EC2_METADATA_DISABLED':'true',
         'SIXNINE_DEFAULT_DEPLOYMENT_PROFILE_ID':profile_id,
         'SIXNINE_OPERATOR_CAPACITY_OWNERS':'superdan'},
         'volumes':shared_mounts(),'healthcheck':{'test':['CMD','python','-c',GPU_HEALTH]}},
-        SERVICE:controller(image)}}
+        SERVICE:controller(image,runtime)}}
 
 
-def validate_rendered(value, directory, version, image, profile_id):
+def validate_rendered(value, directory, version, image, profile_id, runtime=None):
     config = copy.deepcopy(value)
     if version in ('2.38.2','v2.38.2'):
         for service in config['services'].values():
@@ -177,12 +258,12 @@ def validate_rendered(value, directory, version, image, profile_id):
         if actual.get('entrypoint',False) is None: del actual['entrypoint']
         for mount in actual.get('volumes',[]):
             if mount.get('read_only') is False: del mount['read_only']
-    expected = controller(image)
+    expected = controller(image,runtime)
     for mount in expected['volumes']:
         if mount.get('read_only') is False: del mount['read_only']
     release.require(actual==expected,'operator_controller_configuration_invalid')
     app = config['services']['app']
-    wanted = overlay(image,profile_id)['services']['app']
+    wanted = overlay(image,profile_id,runtime)['services']['app']
     for key,value in wanted['environment'].items():
         release.require(app['environment'].get(key)==value,'operator_app_environment_invalid')
         del app['environment'][key]
@@ -305,9 +386,9 @@ def prepare():
     marker = ROOT/'active.json'
     if marker.exists() or marker.is_symlink():
         release.require(release._protected_json(marker).get('active') is False,'operator_barrier_retained')
-    atomic(ROOT/'overlay.json',overlay(environment['SIXNINE_IMAGE'],default_profile()))
+    atomic(ROOT/'overlay.json',overlay(environment['SIXNINE_IMAGE'],default_profile(),runtime))
     version = release.command(['compose','version','--short'],environment=environment).decode().strip()
-    validate_rendered(json.loads(compose(directory,environment,'config','--format','json')),directory,version,environment['SIXNINE_IMAGE'],default_profile())
+    validate_rendered(json.loads(compose(directory,environment,'config','--format','json')),directory,version,environment['SIXNINE_IMAGE'],default_profile(),runtime)
     checked = probe(directory,environment)
     require_quiet(checked)
     record = {'schema_version':1,'commit':commit,'image_id':image_id,
@@ -332,7 +413,7 @@ def prepared():
     commit,directory,environment,image_id = approved_current()
     release.require(value=={'schema_version':1,'commit':commit,'image_id':image_id,
         'runtime_config_sha256':release.canonical_hash(runtime),'files':files},'operator_prepared_identity_changed')
-    release.require(release._protected_json(ROOT/'overlay.json')==overlay(environment['SIXNINE_IMAGE'],default_profile()),
+    release.require(release._protected_json(ROOT/'overlay.json')==overlay(environment['SIXNINE_IMAGE'],default_profile(),runtime),
         'operator_overlay_changed')
     return runtime,value,directory,environment
 
@@ -381,17 +462,28 @@ def receipt(pin, *, fresh=False):
     return value
 
 
-def launch(directory,environment,runtime,pin, *, loader_factory=None,popen=subprocess.Popen):
+def launch(directory,environment,runtime,pin, *, loader_factory=None,targon_loader_factory=None,popen=subprocess.Popen):
     from studio_platform.lium_runtime_aws import AwsLiumLoader
-    loader = (loader_factory or AwsLiumLoader)(runtime['secret_arn'],runtime['secret_version_id'])
+    references=credential_references(runtime)
+    loaders=[]
     envelope = None
     try:
-        loaded = loader('lium',profile='lium--rig-root')
-        envelope = {'secret_arn':runtime['secret_arn'],'version_id':runtime['secret_version_id'],
-            'payload':{'schema_version':1,'service':loaded.service,'profile':loaded.profile,
-                'base_url':loaded.base_url,'primary_key_variable':loaded.primary_key_variable,'api_key':loaded.api_key}}
+        credentials={}
+        for provider,reference in references.items():
+            if provider=='lium':
+                factory=loader_factory or AwsLiumLoader
+            else:
+                from studio_platform.targon_runtime_aws import AwsTargonLoader
+                factory=targon_loader_factory or AwsTargonLoader
+            loader=factory(reference['secret_arn'],reference['secret_version_id'])
+            loaders.append(loader)
+            loaded=loader(provider,profile=provider+'--rig-root')
+            credentials[provider]={'secret_arn':reference['secret_arn'],'version_id':reference['secret_version_id'],
+                'payload':{'schema_version':1,'service':loaded.service,'profile':loaded.profile,
+                    'base_url':loaded.base_url,'primary_key_variable':loaded.primary_key_variable,'api_key':loaded.api_key}}
+        envelope=credentials['lium'] if set(credentials)=={'lium'} else {'schema_version':2,'credentials':credentials}
         payload = json.dumps(envelope,separators=(',',':')).encode()
-        release.require(len(payload)<=24576,'operator_credential_envelope_limit')
+        release.require(len(payload)<=(24576 if set(credentials)=={'lium'} else 49152),'operator_credential_envelope_limit')
         args = [release.DOCKER,'--host','unix:///var/run/docker.sock',*compose_args(directory,'run','-T',
             '--no-deps','--name',pin['container_name'],'--label',LABEL+'='+pin['prepared_hash'],
             # Import main canonically: -m defines a second __main__ class that
@@ -404,7 +496,9 @@ def launch(directory,environment,runtime,pin, *, loader_factory=None,popen=subpr
         return process
     finally:
         if envelope is not None: envelope.clear()
-        loader.close()
+        for loader in loaders:
+            try: loader.close()
+            except Exception: pass
 
 
 def close_admission(directory,environment,pin):

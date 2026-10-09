@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "policies": [
+    {
+      "backend": "wangp-worker",
+      "budget_accounts": [
+        "demand-job-total-20261004",
+        "demand-job-owner-{owner_id}-20261004"
+      ],
+      "configuration_id": "op-targon-pruned-fl",
+      "deployment_profile_id": "h3-pruned-rank8-int8-pro6000-quanto-int8-vae-int8-sdpa-p4-lowram-v1",
+      "enabled": true,
+      "engine_manifest_digest": "b73552b1015a6dbf7f5c4f0fe3d1c91caefc7c0706847e1bf476c4c3315af965",
+      "envelope": {
+        "max_pixels": 1032192,
+        "max_duration_seconds": 5.166666666666667,
+        "max_steps": 50,
+        "max_reference_files": 2,
+        "max_guides": 0,
+        "allow_first_last": true,
+        "allow_audio": true,
+        "controls": {
+          "sampler_name": [
+            "euler"
+          ],
+          "scheduler": [
+            "auto"
+          ],
+          "video_decode": [
+            "tiled"
+          ],
+          "audio_decode": [
+            "normal"
+          ],
+          "encoder_device": [
+            "default"
+          ]
+        },
+        "input_limits": {
+          "max_images": 0,
+          "max_videos": 0,
+          "max_audios": 0,
+          "max_image_pixels": 4194304,
+          "max_video_pixels": 399360,
+          "max_video_duration_seconds": 2.3333333333333335,
+          "max_audio_duration_seconds": 5.2,
+          "guide_kinds": [],
+          "guide_recipe_ids": [],
+          "max_guide_time_seconds": 5,
+          "allow_video_audio": false
+        }
+      },
+      "id": "self-hosted-default",
+      "model_id": "MiniMax-H3-Pruned-Rank8-INT8",
+      "output_delivery": "native-frames-v1",
+      "pool": "op-targon-pruned-fl",
+      "qualification": {
+        "evidence_id": "user-20261009-targon-int8-qualification",
+        "expires_at": 1791996530,
+        "profile": "queued-task-first-v1",
+        "status": "runtime_required",
+        "verified_at": 1791391730
+      },
+      "recipe_ids": [
+        "h3-base-fl2va-v1"
+      ],
+      "reservation": {
+        "cost_microusd": 800000,
+        "expected_runtime_s": 1800,
+        "expires_at": 1791996530,
+        "source_id": "user-20261009-targon-int8-qualification"
+      },
+      "revision": "targon-int8-r1"
+    },
+    {
+      "backend": "wangp-worker",
+      "budget_accounts": [
+        "demand-job-total-20261004",
+        "demand-job-owner-{owner_id}-20261004"
+      ],
+      "configuration_id": "op-targon-pruned-ref",
+      "deployment_profile_id": "h3-pruned-rank8-int8-pro6000-quanto-int8-vae-int8-sdpa-p4-lowram-v1",
+      "enabled": true,
+      "engine_manifest_digest": "4eb14f285908ac15339e06a285bc7627609296eb8ba02ce70d7bfee9f9f4ac5f",
+      "envelope": {
+        "max_pixels": 399360,
+        "max_duration_seconds": 5.166666666666667,
+        "max_steps": 50,
+        "max_reference_files": 3,
+        "max_guides": 0,
+        "allow_first_last": false,
+        "allow_audio": true,
+        "controls": {
+          "sampler_name": [
+            "euler"
+          ],
+          "scheduler": [
+            "auto"
+          ],
+          "video_decode": [
+            "tiled"
+          ],
+          "audio_decode": [
+            "normal"
+          ],
+          "encoder_device": [
+            "default"
+          ]
+        },
+        "input_limits": {
+          "max_images": 1,
+          "max_videos": 1,
+          "max_audios": 1,
+          "max_image_pixels": 399360,
+          "max_video_pixels": 399360,
+          "max_video_duration_seconds": 2.3333333333333335,
+          "max_audio_duration_seconds": 5.2,
+          "guide_kinds": [],
+          "guide_recipe_ids": [],
+          "max_guide_time_seconds": 5,
+          "allow_video_audio": false
+        }
+      },
+      "id": "self-hosted-default",
+      "model_id": "MiniMax-H3-Pruned-Rank8-INT8",
+      "output_delivery": "native-frames-v1",
+      "pool": "op-targon-pruned-ref",
+      "qualification": {
+        "evidence_id": "user-20261009-targon-int8-qualification",
+        "expires_at": 1791996530,
+        "profile": "queued-task-first-v1",
+        "status": "runtime_required",
+        "verified_at": 1791391730
+      },
+      "recipe_ids": [
+        "h3-base-ref2va-v1"
+      ],
+      "reservation": {
+        "cost_microusd": 800000,
+        "expected_runtime_s": 1800,
+        "expires_at": 1791996530,
+        "source_id": "user-20261009-targon-int8-qualification"
+      },
+      "revision": "targon-int8-r1"
+    }
+  ]
+}

@@ -361,3 +361,12 @@ inventory.json
 # Dedicated business backup infrastructure; no deployed targets or credentials.
 !deploy/platform/business-backup.json
 !deploy/platform/BUSINESS-BACKUP.md
+
+# Explicit Targon VM adapter, independent cleanup and prepared INT8 runtime.
+!studio_platform/targon_provider.py
+!studio_platform/targon_cleanup.py
+!studio_platform/targon_runtime_aws.py
+!tools/targon_cleanup_guard.py
+!deploy/wangp/targon_prepare.py
+!deploy/wangp/profiles/
+!deploy/wangp/profiles/h3-pruned-rank8-int8-pro6000-quanto-int8-vae-int8-sdpa-p4-lowram-v1.json

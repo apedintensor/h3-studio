@@ -28,13 +28,31 @@ from .qualification_profiles import QUEUED_TASK_PROFILE
 from .runtime_hosts.wangp_startup import CODES as STARTUP_CODES, PHASES as STARTUP_PHASES, TYPES as STARTUP_TYPES
 from .worker import ComfyBackend, SubmissionRejected, _slot_lock
 
+
+def provider_instance_id(provider, value):
+    """Local intent UUIDs and remote provider identities are separate domains."""
+    if provider == 'lium':
+        return _uuid(value)
+    if provider != 'targon' or not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):
+        raise BootError('bootstrap_provider_instance_invalid')
+    return value
+
+
+def idle_proof_type(provider):
+    if provider == 'lium':
+        return InferenceIdleProof
+    if provider == 'targon':
+        from .targon_provider import TargonIdleProof
+        return TargonIdleProof
+    raise BootError('bootstrap_provider_unsupported')
+
 REMOTE_ROOT = "/workspace/h3-studio"
 MODEL_REVISION = "e5eb578a89295337b8ff433a035929ce0279e0b6"
 COMFY_REVISION = "e9027f2b30f37bb3052714eb08fcf479542f4fc0"
 
 # These are literals emitted by the pinned bootstrap, not arbitrary exception
 # messages/classes from a remote machine. Unknown values are explicitly masked.
-BOOT_FAILURE_CODES = frozenset({"native_profile_python31214_linux_required", "wangp_runtime_source_mismatch",
+BOOT_FAILURE_CODES = frozenset({"targon_prepare_failed", "native_profile_python31214_linux_required", "wangp_runtime_source_mismatch",
     "wangp_runtime_source_modified", "wangp_runtime_requirements_mismatch", "wangp_runtime_untracked_code",
     "wangp_runtime_dependency_mismatch", "wangp_profile_cache_lock_timeout", "wangp_profile_manifest_mismatch",
     "InternalSetupFailure", "SubprocessTimeout", "SubprocessFailed",
@@ -140,6 +158,7 @@ class BootConfig:
     runtime_python: str = "/opt/conda/bin/python"
     profile_slot_index: int = -1
     expected_host_gpus: int = 1
+    provider: str = 'lium'
 
     def __post_init__(self):
         from .inference.outputs import validate_delivery_policy
@@ -161,6 +180,9 @@ class BootConfig:
                 raise ValueError("bootstrap_profile_requires_native_wangp")
         if self.runtime_python not in {"/opt/conda/bin/python", "/venv/main/bin/python"}:
             raise ValueError("bootstrap_runtime_python_unsupported")
+        if (self.provider not in {'lium', 'targon'} or self.provider == 'targon'
+                and (not self.deployment_profile_id or self.execution_backend != 'wangp-worker')):
+            raise ValueError('bootstrap_provider_unsupported')
         if not self.deployment_profile_id and self.runtime_python != "/opt/conda/bin/python":
             raise ValueError("legacy_bootstrap_python_changed")
         if (type(self.expected_host_gpus) is not int or not 1 <= self.expected_host_gpus <= 8
@@ -215,6 +237,10 @@ class SSHHost:
     def _connect(self):
         import paramiko
         config, coordinates = self.config, self.coordinates
+        expected_user = 'ubuntu' if getattr(config, 'provider', 'lium') == 'targon' else 'root'
+        username = coordinates.get('username', 'root')
+        if username != expected_user:
+            raise BootError('bootstrap_ssh_user_mismatch')
         if self.client is not None:
             self.client.close()
         self.client = paramiko.SSHClient()
@@ -229,7 +255,7 @@ class SSHHost:
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy()
             if config.trust_first_host_key and not self._ever_connected else paramiko.RejectPolicy())
         try:
-            self.client.connect(coordinates["host"], port=coordinates["port"], username="root",
+            self.client.connect(coordinates["host"], port=coordinates["port"], username=username,
                 key_filename=str(config.ssh_key_file), look_for_keys=False, allow_agent=False,
                 timeout=15, banner_timeout=15, auth_timeout=15)
             self._ever_connected = True
@@ -269,7 +295,8 @@ class SSHHost:
             timer = threading.Timer(min(timeout, remaining()), expire)
             timer.daemon = True
             timer.start()
-            channel.exec_command("python3 -c "+shlex.quote(script))
+            prefix = 'sudo -n python3 -c ' if getattr(getattr(self, 'config', None), 'provider', 'lium') == 'targon' else 'python3 -c '
+            channel.exec_command(prefix+shlex.quote(script))
             remaining()
             output = bytearray()
             while not channel.exit_status_ready() or channel.recv_ready() or channel.recv_stderr_ready():
@@ -591,6 +618,9 @@ class BootController:
         value = {"intent_id": intent["id"], "instance_id": intent["provider_instance_id"],
             "configuration_id": self.config.configuration_id,
             "sources": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+        if self.config.provider != 'lium':
+            value['provider'] = self.config.provider
+            value['hard_deadline'] = intent['hard_deadline']
         if self.config.execution_backend == "wangp-worker":
             value.update(backend="wangp-worker", engine_manifest_digest=self.config.engine_manifest_digest)
         if self.config.output_delivery:
@@ -634,10 +664,12 @@ class BootController:
                 return {"state": "bootstrap_locked"}
             with self.repo.engine.connect() as conn:
                 intent = conn.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().first()
-            if (intent is None or intent["provider"] != "lium" or not intent["provider_instance_id"]
+            if (intent is None or intent["provider"] != self.config.provider or not intent["provider_instance_id"]
                     or intent["physical_gpus"] != self.config.expected_host_gpus
                     or self.config.profile_slot_index >= intent["slots"]):
-                raise BootError("bootstrap_requires_reserved_single_gpu_lium_intent")
+                raise BootError("bootstrap_requires_reserved_single_gpu_lium_intent" if self.config.provider == 'lium'
+                    else 'bootstrap_requires_reserved_provider_intent')
+            provider_instance_id(self.config.provider, intent['provider_instance_id'])
             self.bound_instance = intent["provider_instance_id"]
             if intent["state"] in {"draining", "destroying", "destroyed"}:
                 if self.fleet:
@@ -954,7 +986,7 @@ class BootController:
             queue = self.backend._json("GET", "/queue")
             idle = queue.get("queue_running") == [] and queue.get("queue_pending") == []
         self.idle_since = (self.idle_since if self.idle_since is not None else now) if idle else None
-        return InferenceIdleProof(instance_id, now, self.idle_since or now, idle)
+        return idle_proof_type(self.config.provider)(instance_id, now, self.idle_since or now, idle)
 
     def close(self):
         # Graceful CPU-side shutdown never terminates a GPU pod or unknown job.

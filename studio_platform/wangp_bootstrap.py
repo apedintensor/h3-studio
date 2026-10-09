@@ -107,7 +107,10 @@ def validate_report(config, report, manifest):
 def make_slot(config, intent, report, directory):
     endpoint = f'http://127.0.0.1:{config.local_port}'
     suffix = '-gpu'+str(config.profile_slot_index) if config.deployment_profile_id else ''
-    spec = WorkerSpec('lium-'+intent['id'].replace('-', '')+suffix, intent['pool'], 'lium',
+    provider = getattr(config, 'provider', 'lium')
+    if intent.get('provider', 'lium') != provider:
+        raise BootError('bootstrap_slot_provider_mismatch')
+    spec = WorkerSpec(provider+'-'+intent['id'].replace('-', '')+suffix, intent['pool'], provider,
         intent['provider_instance_id'], (report['gpus'][0]['uuid'],), config.recipe_ids,
         config.model_id, config.configuration_id, 'wangp-worker', config.engine_manifest_digest,
         output_delivery=config.output_delivery)
@@ -181,7 +184,7 @@ class WanGPSSHHost(SSHHost):
             raise BootError('wangp_boot_source_set_invalid')
         self._capture_system_observation()
         self.run("from pathlib import Path; import json; Path('/workspace/h3-studio').mkdir(parents=True,exist_ok=True); print(json.dumps({'ok':True}))")
-        with self.client.open_sftp() as sftp:
+        with self._source_sftp() as sftp:
             for name, data in files.items():
                 check()
                 target = self.remote_root+'/'+name
@@ -200,6 +203,18 @@ class WanGPSSHHost(SSHHost):
         dependency = dependency_source(self.config, json.loads(files['wangp-runtime.json']))
         if dependency is not None:
             self._upload_dependency(*dependency, progress=progress, should_stop=should_stop)
+
+    @contextmanager
+    def _source_sftp(self):
+        if getattr(self.config, 'provider', 'lium') == 'targon':
+            # Ubuntu's login identity stays unprivileged. This fixed, bounded
+            # subsystem keeps trusted bootstrap files/token root-owned without
+            # opening a root login or weakening strict runtime permissions.
+            with self._transfer_sftp(time.monotonic()+SFTP_OPEN_SECONDS+SFTP_IO_SECONDS) as sftp:
+                yield sftp
+        else:
+            with self.client.open_sftp() as sftp:
+                yield sftp
 
     def inspect_system_packages(self):
         """Read-only pre-upload inventory; no package installation or admission."""
@@ -223,9 +238,9 @@ print(json.dumps({'packages':dict(line.split('\\t',1) for line in rows[:10000]),
 
     def _capture_system_observation(self):
         """Keep the first safe inventory on CPU before transferring dependencies."""
-        from .lium_provider import _uuid
+        from .lium_bootstrap import provider_instance_id
         instance_id = self.coordinates.get('instance_id')
-        _uuid(instance_id)
+        provider_instance_id(getattr(self.config, 'provider', 'lium'), instance_id)
         directory = self.config.work_dir/'os-observations'
         if directory.is_symlink():
             raise BootError('system_package_observation_path_invalid')
@@ -278,7 +293,10 @@ print(json.dumps({'packages':dict(line.split('\\t',1) for line in rows[:10000]),
         try:
             channel.settimeout(_transfer_remaining(deadline, SFTP_IO_SECONDS))
             timer = guard(_transfer_remaining(deadline, SFTP_OPEN_SECONDS))
-            channel.invoke_subsystem('sftp')
+            if getattr(getattr(self, 'config', None), 'provider', 'lium') == 'targon':
+                channel.exec_command('sudo -n /usr/lib/openssh/sftp-server')
+            else:
+                channel.invoke_subsystem('sftp')
             sftp = paramiko.SFTPClient(channel)
             timer.cancel()
             if expired.is_set():
@@ -387,7 +405,7 @@ print(json.dumps({'verified':True}))
             with os.fdopen(os.open(token_path, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600), 'w') as f:
                 f.write(secrets.token_urlsafe(48)); f.flush(); os.fsync(f.fileno())
         token = private_token_file(token_path)
-        with self.client.open_sftp() as sftp:
+        with self._source_sftp() as sftp:
             target = self.remote_root+'/wangp-token'
             try:
                 with sftp.open(target, 'rb') as f:
@@ -398,7 +416,7 @@ print(json.dumps({'verified':True}))
                     sftp.chmod(target, 0o600)
                     f.write(token.encode())
         del token
-        return self.run('''import fcntl,json,os,subprocess,sys
+        return self.run('''import fcntl,hashlib,json,os,subprocess,sys,tarfile
 from pathlib import Path
 root=Path('/workspace/h3-studio')
 with (root/'sixnine-bootstrap.lock').open('a') as lock:
@@ -411,8 +429,26 @@ with (root/'sixnine-bootstrap.lock').open('a') as lock:
  else:
   with marker.open('x') as f:
    json.dump(expected,f);f.flush();os.fsync(f.fileno())
+  command=['/opt/conda/bin/python','-u',str(root/'wangp-bootstrap.py'),'--config',str(root/'wangp-runtime.json'),'--slot-key',expected['intent_id'],'--token-file',str(root/'wangp-token')]
+  if expected.get('provider')=='targon':
+   archive=root/'wangp-package.tar.gz'
+   if archive.is_symlink() or not archive.is_file() or archive.stat().st_size>16777216: raise ValueError('source_bundle_mismatch')
+   if hashlib.sha256(archive.read_bytes()).hexdigest()!=expected['sources']['wangp-package.tar.gz']: raise ValueError('source_bundle_mismatch')
+   with tarfile.open(archive,'r:gz') as source:
+    matches=[member for member in source.getmembers() if member.name=='deploy/wangp/targon_prepare.py']
+    if len(matches)!=1 or not matches[0].isfile() or not 0<matches[0].size<=262144: raise ValueError('targon_preparer_invalid')
+    data=source.extractfile(matches[0]).read(262145)
+    if len(data)!=matches[0].size: raise ValueError('targon_preparer_invalid')
+   prepare=root/'targon-prepare.py'
+   if prepare.is_symlink(): raise ValueError('targon_preparer_invalid')
+   if prepare.exists():
+    if not prepare.is_file() or prepare.stat().st_nlink!=1 or prepare.read_bytes()!=data: raise ValueError('targon_preparer_invalid')
+   else:
+    with prepare.open('xb') as f:
+     os.fchmod(f.fileno(),0o600);f.write(data);f.flush();os.fsync(f.fileno())
+   command=['python3','-u',str(prepare),*command[3:]]
   with (root/'bootstrap-controller.log').open('ab') as log:
-   proc=subprocess.Popen(['/opt/conda/bin/python','-u',str(root/'wangp-bootstrap.py'),'--config',str(root/'wangp-runtime.json'),'--slot-key',expected['intent_id'],'--token-file',str(root/'wangp-token')],stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+   proc=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
   print(json.dumps({'state':'started','pid':proc.pid}))
 '''.replace('IDENTITY', repr(identity)).replace("'/opt/conda/bin/python'", repr(self.config.runtime_python)))
 
@@ -498,6 +534,7 @@ try:
   if len(raw)>1048576: raise ValueError('unconfirmed')
   args=raw.split(b'\\0')
   bootstrap+=int(any(a==b'wangp-bootstrap.py' or a.endswith(b'/wangp-bootstrap.py') for a in args)
+                 or any(a==b'targon-prepare.py' or a.endswith(b'/targon-prepare.py') for a in args)
                  or b'studio_platform.runtime_hosts.wangp_download' in args)
   runtime+=int(b'studio_platform.runtime_hosts.wangp_launcher' in args)
  listening=False
