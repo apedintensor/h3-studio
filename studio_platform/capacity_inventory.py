@@ -182,10 +182,10 @@ def _lium(rows):
                 raise _InventoryError("inventory_invalid_response")
         minimum = raw.get("min_gpu_count_for_rental")
         missing = []
-        if minimum is None:
-            missing.append("allocation")
-        elif _count(minimum, minimum=1) > count:
+        if minimum is not None and _count(minimum, minimum=1) > count:
             raise _InventoryError("inventory_invalid_response")
+        # A whole-host quote needs no splitting permission. Keep an unknown
+        # minimum for the projection to assess smaller requested allocations.
         full_host_available = (free == count and raw.get("is_whole_host_free") is not False
                                and raw.get("has_no_pending_rental") is not False)
         if not full_host_available:

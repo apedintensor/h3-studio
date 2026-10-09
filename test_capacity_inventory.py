@@ -85,7 +85,18 @@ class InventoryTests(unittest.TestCase):
         self.assertIsNone(offer["download_mbps"])
         self.assertIsNone(offer["ram_gib"])
         self.assertIsNone(offer["min_gpu_count_for_rental"])
-        self.assertEqual(offer["unverified_fields"], ["allocation", "country", "download_mbps", "ram_gib"])
+        self.assertEqual(offer["unverified_fields"], ["country", "download_mbps", "ram_gib"])
+
+    def test_complete_single_gpu_host_needs_no_minimum_split_metadata(self):
+        row = lium()
+        row.update(gpu_count=1, available_gpu_count=1, min_gpu_count_for_rental=None)
+        row["specs"]["gpu"]["details"] = [{"name": "NVIDIA GeForce RTX 5090"}]
+        result, _ = self.scan([row], provider="lium")
+        self.assertEqual(result["status"], "ok")
+        offer = result["offers"][0]
+        self.assertEqual((offer["gpu_count"], offer["available_gpu_count"], offer["available_count"]), (1, 1, 1))
+        self.assertIsNone(offer["min_gpu_count_for_rental"])
+        self.assertNotIn("allocation", offer["unverified_fields"])
 
     def test_verified_server_edition_is_preserved(self):
         row = lium()
@@ -142,7 +153,8 @@ class InventoryTests(unittest.TestCase):
             result, _ = self.scan([dict(targon(), available=value)])
             self.assertEqual((result["status"], result["offers"]), ("error", []))
         for field, value in (("available_gpu_count", None), ("available_gpu_count", 3),
-                             ("price_per_gpu", "NaN"), ("price_per_gpu", "-1")):
+                             ("price_per_gpu", "NaN"), ("price_per_gpu", "-1"),
+                             ("min_gpu_count_for_rental", 3)):
             result, _ = self.scan([dict(lium(), **{field: value})], provider="lium")
             self.assertEqual((result["status"], result["offers"]), ("error", []))
         row = targon()
