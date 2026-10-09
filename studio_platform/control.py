@@ -161,7 +161,9 @@ class WorkerControl:
                 .where((instance_intents.c.state.in_(("draining", "destroying", "destroyed")))
                     | (instance_intents.c.hard_deadline <= now),
                     instance_intents.c.provider_instance_id.is_not(None))).tuples())
-            if inspect(connection).has_table(operator_nodes.name):
+            # Catalog enumeration stays SELECT-only on SQLite/PostgreSQL;
+            # has_table() uses SQLite PRAGMA, outside the dry-run read contract.
+            if operator_nodes.name in inspect(connection).get_table_names():
                 stopping.update(connection.execute(select(instance_intents.c.provider, instance_intents.c.provider_instance_id)
                     .join(operator_nodes, operator_nodes.c.intent_id == instance_intents.c.id)
                     .where(operator_nodes.c.desired_state != "running",
