@@ -265,6 +265,14 @@
         "A4"
       ]
     },
+    "E8": {
+      "number": 89,
+      "node_id": "I_kwDOU6TGZc8AAAABWGMGFw",
+      "url": "https://github.com/apedintensor/h3-studio/issues/89",
+      "title": "Select H3 model and mode, then choose a ranked exact GPU allocation",
+      "project_item_id": "PVTI_lAHOAVQqAs4Bl2y8zg_pPUw",
+      "depends_on": []
+    },
     "C4": {
       "number": 47,
       "node_id": "I_kwDOU6TGZc8AAAABVu6jSg",
