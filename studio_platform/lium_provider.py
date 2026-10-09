@@ -326,9 +326,10 @@ class LiumProvider:
     def _ensure_absolute_ttl(self, tag, instance_id):
         """Bound new rents only; legacy markers never acquire inferred authority.
 
-        Unknown schedule POSTs are GET-only thereafter. One acknowledged and
-        verified pending schedule may be shortened again at the RUNNING
-        transition. A second overwrite remains a visible operator hold.
+        First scheduling waits for RUNNING: the provider may overwrite a
+        PENDING schedule during startup. Unknown POSTs remain GET-only. One
+        historical acknowledged and verified pending schedule may still be
+        shortened at RUNNING; a second overwrite remains an operator hold.
         """
         marker = self._journal_read(tag)
         if not marker or "absolute_ttl" not in marker:
@@ -346,6 +347,12 @@ class LiumProvider:
                 if removed is not None:
                     ttl["effective_deadline"] = min(ttl["effective_deadline"], removed)
                 if ttl["effective_deadline"] <= self.clock():
+                    raise ValueError
+                if detail["status"] == "PENDING":
+                    # Retain the original identity and any earlier observed
+                    # deadline, but do not spend a schedule attempt before the
+                    # provider has finished initializing its relative timer.
+                    self._journal.update_ttl(tag, ttl)
                     raise ValueError
                 safe = removed is not None and removed <= ttl["effective_deadline"]
                 if safe:
