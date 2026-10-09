@@ -119,6 +119,49 @@ class LiumProviderTests(unittest.TestCase):
         self.assertEqual([path for method,path,_ in self.api.calls if method=="POST"],
                          [f"/api/executors/{EXECUTOR}/rent"])
 
+    def test_exact_selection_matches_only_inventory_gpu_aliases(self):
+        from studio_platform.capacity_inventory import _lium
+        for raw_names, approved in (
+                (("NVIDIA GeForce RTX 5090",)*2,"RTX 5090"),
+                (("RTX 5090",)*2,"NVIDIA GeForce RTX 5090"),
+                (("NVIDIA GeForce RTX 5090","RTX 5090"),"RTX 5090"),
+                (("NVIDIA RTX PRO 6000 Blackwell Server Edition",)*2,
+                 "RTX PRO 6000 Blackwell Server Edition")):
+            with self.subTest(raw_names=raw_names,approved=approved):
+                raw,_,config,selected_launch=self.exact_fixture()
+                raw["specs"]["gpu"]["details"]=[{"name":name,"capacity":32768} for name in raw_names]
+                target=_lium([raw])[0]
+                config=replace(config,compatible_gpu_names=(approved,))
+                self.api.calls.clear()
+                provider=self.provider(manifests=(config,))
+                result=provider.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+                    hard_deadline=8300,intent_created_at=None)
+                self.assertEqual(result.instance_id,POD)
+                self.assertEqual([path for method,path,_ in self.api.calls if method=="POST"],
+                    [f"/api/executors/{EXECUTOR}/rent"])
+
+    def test_exact_gpu_aliases_do_not_relax_class_or_per_device_vram(self):
+        from studio_platform.scaler import CreationNotSubmitted
+        for kind in ("mixed_gpu","unknown_alias","low_vram","string_vram","bool_vram","wrong_approved_class"):
+            with self.subTest(kind=kind):
+                raw,target,config,selected_launch=self.exact_fixture()
+                config=replace(config,compatible_gpu_names=("RTX 5090",))
+                details=[{"name":"NVIDIA GeForce RTX 5090","capacity":32768} for _ in range(2)]
+                if kind=="mixed_gpu": details[1]["name"]="NVIDIA RTX PRO 6000 Blackwell Server Edition"
+                elif kind=="unknown_alias": details[1]["name"]="GeForce RTX 5090"
+                elif kind=="low_vram": details[1]["capacity"]=32767
+                elif kind=="string_vram": details[1]["capacity"]="32768"
+                elif kind=="bool_vram": details[1]["capacity"]=True
+                elif kind=="wrong_approved_class":
+                    config=replace(config,compatible_gpu_names=("RTX PRO 6000 Blackwell Server Edition",))
+                raw["specs"]["gpu"]["details"]=details
+                self.api.calls.clear()
+                provider=self.provider(manifests=(config,))
+                with self.assertRaises(CreationNotSubmitted):
+                    provider.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+                        hard_deadline=8300,intent_created_at=None)
+                self.assertEqual(self.api.count("POST"),0)
+
     def test_exact_selection_rechecks_stock_price_and_resources_before_any_post(self):
         from studio_platform.scaler import CreationNotSubmitted
         for kind in ("missing","price","ram","disk","partial","gpu","slots"):

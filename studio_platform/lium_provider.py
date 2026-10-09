@@ -394,7 +394,7 @@ class LiumProvider:
 
     def _select_exact_offer(self, manifest, expected):
         """Recheck the selected complete host; never fall through to another ID."""
-        from .capacity_inventory import _lium, allocation_resources
+        from .capacity_inventory import _GPU_NAMES, _lium, allocation_resources
         from .capacity_market import _constraints
         try:
             identity=_uuid(expected.get("offer_id"))
@@ -424,7 +424,11 @@ class LiumProvider:
                     or row["gpu_type"]!=expected.get("gpu_type")):
                 raise ValueError
             details=raw["specs"]["gpu"]["details"]
-            if manifest.compatible_gpu_names and any(item.get("name") not in manifest.compatible_gpu_names
+            # Inventory publishes canonical names; the provider may retain an
+            # NVIDIA prefix. Use that same closed alias map on both sides, while
+            # keeping every physical GPU's type and VRAM requirements intact.
+            allowed_names={_GPU_NAMES.get(name,name) for name in manifest.compatible_gpu_names}
+            if manifest.compatible_gpu_names and any(_GPU_NAMES.get(item.get("name")) not in allowed_names
                     or type(item.get("capacity")) is not int or item["capacity"]<manifest.minimum_vram_mib
                     for item in details):
                 raise ValueError
