@@ -529,6 +529,42 @@ class OperatorTests(LedgerCase):
         self.assertEqual(self.provider.creates,[])
         self.assertEqual(self.repo.get_budget("owner-budget")["reserved_microusd"],1_000_000)
 
+    def test_pending_provider_removal_survives_restart_without_preparation_or_duplicate_delete(self):
+        self.create();self.controller.tick()
+        node=self.service.state(self.actor)["nodes"][0]
+        intent=self.repo.list_instance_intents()[0]
+        budget=self.repo.get_budget("owner-budget")
+        self.service.node_command(self.actor,node["id"],{"expected_version":node["version"]},"stop-pending","stop")
+        self.provider.facts[intent["id"]]=ProviderFact("running",intent["provider_instance_id"],
+            idle_confirmed=True,idle_since=self.now)
+        def pending(tag,instance_id):
+            self.provider.destroys.append((tag,instance_id))
+            self.provider.facts[tag]=ProviderFact("unknown",instance_id)
+            return self.provider.facts[tag]
+        self.provider.destroy=pending
+        self.controller.tick()
+        self.assertEqual(self.repo.list_instance_intents()[0]["state"],"destroying")
+        self.assertEqual(self.service.state(self.actor)["nodes"][0]["runtime_state"],"removal_pending")
+        self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+        self.assertEqual(len(self.provider.destroys),1)
+
+        self.now+=121
+        replacement=OperatorController(self.service,provider_factory=lambda _:self.provider,
+            boot_factory=lambda *args:self.fail("Removal must never bootstrap a worker"),
+            enabled=True,leader_id="replacement")
+        replacement.tick()
+        current=self.service.state(self.actor)["nodes"][0]
+        self.assertEqual((current["state"],current["runtime_state"]),("destroying","removal_pending"))
+        self.assertEqual(self.repo.list_instance_intents()[0]["hard_deadline"],intent["hard_deadline"])
+        self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+        self.assertEqual(len(self.provider.creates),1)
+        self.assertEqual(len(self.provider.destroys),1)
+        self.provider.facts[intent["id"]]=ProviderFact("destroyed",intent["provider_instance_id"])
+        replacement.tick()
+        current=self.service.state(self.actor)["nodes"][0]
+        self.assertEqual((current["state"],current["runtime_state"]),("destroyed","destroyed"))
+        self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+
     def test_drain_stops_admission_but_does_not_force_destroy(self):
         self.create()
         self.controller.tick()

@@ -356,7 +356,8 @@ class OperatorController:
             drain=stopping,stop=desired=="stopped")
         if result["state"]=="not_leader": return "not_leader"
         intent,latest,action,workers=self._node_snapshot(intent_id)
-        runtime="destroyed" if intent["state"]=="destroyed" else "waiting_provider"
+        runtime=({"destroyed":"destroyed","destroying":"removal_pending"}
+            .get(intent["state"],"waiting_provider"))
         bootstrap=None
         if runtime=="destroyed" and intent_id in self.boots:
             close=getattr(self.boots[intent_id],"close",None)

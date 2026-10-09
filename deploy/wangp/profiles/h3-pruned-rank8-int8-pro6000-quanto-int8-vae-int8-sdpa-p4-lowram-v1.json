@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "id": "h3-pruned-rank8-int8-pro6000-quanto-int8-vae-int8-sdpa-p4-lowram-v1",
-  "label": "RTX PRO 6000 · Pruned Rank8 INT8 (qualification pending)",
+  "label": "RTX PRO 6000 · Pruned Rank8 INT8 (two native cases measured)",
   "model_id": "MiniMax-H3-Pruned-Rank8-INT8",
   "gpu_models": [
     "RTX PRO 6000 Blackwell",
@@ -132,16 +132,81 @@
     "minimum_download_mbps": 0,
     "maximum_price_per_gpu_hour_microusd": 1690000
   },
-  "tested_topology": null,
+  "tested_topology": {
+    "hosts": 1,
+    "gpus_per_host": 1,
+    "gpus_per_model": 1,
+    "active_jobs_per_gpu": 1,
+    "shared_host_ram_bytes": 130870181888,
+    "observed_gpu_memory_bytes": 102641958912,
+    "observed_gpu_model": "RTX PRO 6000 Blackwell Server Edition",
+    "startup": "single_slot"
+  },
   "validation": {
     "scope": "pending_hardware_qualification",
     "production_adapter_verified": false,
-    "source_profile_id": "h3-pruned-rank8-int8-quanto-int8-vae-int8-sdpa-p4-lowram-v1"
+    "source_profile_id": "h3-pruned-rank8-int8-quanto-int8-vae-int8-sdpa-p4-lowram-v1",
+    "native_runtime_evidence": "https://github.com/apedintensor/h3-studio/issues/86#issuecomment-6083341543"
   },
-  "verified_cases": [],
+  "verified_cases": [
+    {
+      "id": "pro6000-candidate-2",
+      "mode": "fl",
+      "width": 832,
+      "height": 480,
+      "frames": 124,
+      "fps": 24,
+      "steps": 20,
+      "input_roles": [
+        "first_frame",
+        "last_frame"
+      ],
+      "measurements": [
+        {
+          "total_seconds": 188.9950643719999,
+          "loading_callback_seconds": 9.109824348000075,
+          "sample_count": 1,
+          "cache_state": "not_controlled",
+          "measured_at": "2026-10-09T13:48:03.959451Z",
+          "evidence": "https://github.com/apedintensor/h3-studio/issues/86#issuecomment-6083341543",
+          "receipt_sha256": "59ef8f72d94aa424b5b6e84c5491805e67f6e752e9c1d3bfd388a7b380a918a4",
+          "output_sha256": "9710334ac5f6b8dbe94911728a0740e40dd9bb671a26d7f6d9d32adf18693a35",
+          "audio_output_sha256": "b136c09ccab7185cf5742528ba025c327bccb15408693349ffdd17402215896c"
+        }
+      ]
+    },
+    {
+      "id": "pro6000-candidate-8",
+      "mode": "ref",
+      "width": 832,
+      "height": 480,
+      "frames": 124,
+      "fps": 24,
+      "steps": 20,
+      "input_roles": [
+        "audio",
+        "image",
+        "video"
+      ],
+      "measurements": [
+        {
+          "total_seconds": 162.733107087,
+          "loading_callback_seconds": 6.201033290999931,
+          "sample_count": 1,
+          "cache_state": "not_controlled",
+          "measured_at": "2026-10-09T13:52:13.980196Z",
+          "evidence": "https://github.com/apedintensor/h3-studio/issues/86#issuecomment-6083341543",
+          "receipt_sha256": "f4d4f2207b6eb476eebb3df4e6b234d3544106b2a09e33239d6f89fd999fa86c",
+          "output_sha256": "cb66b097afc7d5e927a8e8b3d14876e7a77e23a39b5e455218330c57058be3d0",
+          "audio_output_sha256": "ec9c26258117be47d6fbec69015ba6f673f4bf4f5613c65de93603cfd7a0a558"
+        }
+      ]
+    }
+  ],
   "warnings": [
-    "PRO 6000 hardware and provider lifecycle qualification are pending; no measured timing or successful inference is claimed.",
-    "The explicit candidate envelopes retain the source pruned INT8 weights, precision, controls and 96 GiB runtime RAM floor.",
+    "Two isolated single-PRO 6000 native cases completed: 480p/20-step FL first+last and Ref2VA image+video+audio. Public API, provider lifecycle and the remaining six candidate combinations are not certified by these outputs.",
+    "Measured task totals run from submission through output validation, including task-local loading but excluding VM startup, model download, environment verification and runtime initialization. One sample per case; cache state was not controlled.",
+    "Pending candidates contain no measurements and still require runtime qualification. All cases retain the source pruned INT8 weights, precision, controls and 96 GiB runtime RAM floor.",
     "The source RTX 5090 profile and its historical measurements remain separate.",
     "Advertised disk and network values are filters, not measured performance guarantees.",
     "All model components resident together in VRAM was not verified.",
@@ -229,19 +294,6 @@
       "input_roles": []
     },
     {
-      "id": "pro6000-candidate-2",
-      "mode": "fl",
-      "width": 832,
-      "height": 480,
-      "frames": 124,
-      "fps": 24,
-      "steps": 20,
-      "input_roles": [
-        "first_frame",
-        "last_frame"
-      ]
-    },
-    {
       "id": "pro6000-candidate-3",
       "mode": "ref",
       "width": 832,
@@ -303,20 +355,6 @@
       "input_roles": [
         "audio",
         "image"
-      ]
-    },
-    {
-      "id": "pro6000-candidate-8",
-      "mode": "ref",
-      "width": 832,
-      "height": 480,
-      "frames": 124,
-      "fps": 24,
-      "steps": 20,
-      "input_roles": [
-        "audio",
-        "image",
-        "video"
       ]
     }
   ]

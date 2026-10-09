@@ -17,13 +17,14 @@ class TargonExecutionPolicyTests(unittest.TestCase):
     def setUp(self):
         self.policies = json.loads(FIXTURE.read_text(encoding='utf-8'))['policies']
 
-    def test_rollout_fl_and_ref_policies_validate_without_measured_hardware_claim(self):
+    def test_rollout_policies_remain_runtime_required_after_partial_native_evidence(self):
         loaded = read_profiles(FIXTURE.resolve())
         self.assertEqual(len(loaded), 2)
         for mode, value in zip(('fl', 'ref'), self.policies):
             with self.subTest(mode=mode):
                 profile = get_profile(value['deployment_profile_id'])
-                self.assertEqual(profile['verified_cases'], [])
+                self.assertEqual(len(profile['verified_cases']), 2)
+                self.assertEqual(len(profile['qualification_cases']), 6)
                 self.assertIs(validate_policy(value), value)
                 self.assertEqual(value['pool'], 'op-targon-pruned-'+mode)
                 self.assertEqual(value['configuration_id'], 'op-targon-pruned-'+mode)
@@ -63,6 +64,7 @@ class TargonExecutionPolicyTests(unittest.TestCase):
         value = self.policies[0]
         profile = get_profile(value['deployment_profile_id'])
         profile['qualification_cases'] = [c for c in profile['qualification_cases'] if c['mode']=='ref']
+        profile['verified_cases'] = [c for c in profile['verified_cases'] if c['mode']=='ref']
         with patch('studio_platform.runtime_catalog.get_profile', return_value=profile):
             with self.assertRaisesRegex(ValueError, '^Deployment profile envelope exceeds tested scope$'):
                 validate_policy(value)

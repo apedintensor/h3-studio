@@ -111,7 +111,8 @@ def public_profiles(settings):
                 'constraints':constraints,'limits':limits,
                 'custom_canvas_constraints':{'maximum_pixel_area':constraints['max_pixels'],
                     'minimum_aspect_ratio':16/9,'maximum_aspect_ratio':16/9},
-                'input_notes':('硬件验收待完成；仅开放固定候选组合。' if profile.get('qualification_cases') else '仅开放已测组合；')
+                'input_notes':(('部分组合已有单次实测；其余候选仍待验收。' if profile['verified_cases']
+                    else '硬件验收待完成；仅开放固定候选组合。') if profile.get('qualification_cases') else '仅开放已测组合；')
                     +'视频参考需规范化为56帧/24fps且关闭原声，独立参考音频2–5.2秒。',
                 'joint_cases':[{'input_roles':c['input_roles'],'width':c['width'],'height':c['height'],
                     'frames':c['frames'],'steps':c['steps']} for c in

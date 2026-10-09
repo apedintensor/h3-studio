@@ -9,6 +9,7 @@ export function createOperatorClient(options={}){
   return {...api,
     state:()=>api.request(ROOT+'/state'),
     catalog:()=>api.request(ROOT+'/catalog'),
+    candidates:({model_id,mode,ttl_seconds})=>api.request(ROOT+'/candidates?'+new URLSearchParams({model_id,mode,ttl_seconds})),
     offers:({runtime_profile_id,mode,gpu_type,gpu_count,provider,node_count,ttl_seconds,filters})=>{
       const query=new URLSearchParams({runtime_profile_id,mode,gpu_type,gpu_count});
       for(const [key,value] of Object.entries({provider,node_count,ttl_seconds}))if(value!==undefined)query.set(key,value);
