@@ -323,6 +323,28 @@ class TargonProvider:
             raise TargonError("targon_instance_identity_conflict")
         return identity
 
+    def _post_instance(self, value, tag, manifest, instance_id=None):
+        """POST acknowledgements may omit identity fields; GET proves identity.
+
+        Retain the returned UID before observing registration so a lost GET can
+        recover the same workload even when listings lag. Supplied conflicting
+        fields still fail closed; missing fields never count as identity proof.
+        """
+        if not isinstance(value, dict):
+            raise TargonError("targon_workload_identity_unconfirmed")
+        identity = _id(value.get("uid", instance_id))
+        if instance_id is not None and identity != instance_id:
+            raise TargonError("targon_instance_identity_conflict")
+        expected = {"name": _name(tag), "type": "VM", "image": manifest.image_name}
+        if any(key in value and value[key] != expected_value for key, expected_value in expected.items()):
+            raise TargonError("targon_workload_identity_unconfirmed")
+        if "resource" in value:
+            resource = value["resource"]
+            if (not isinstance(resource, dict) or any(key in resource and resource[key] != expected_value
+                    for key, expected_value in {"name": manifest.resource_name, "gpu_count": manifest.gpu_count}.items())):
+                raise TargonError("targon_workload_identity_unconfirmed")
+        return identity
+
     def _exact(self, tag, manifest, instance_id=None):
         if instance_id is not None:
             value = self._request("GET", self._route(manifest, instance_id), missing_ok=True)
@@ -361,6 +383,11 @@ class TargonProvider:
         status = state["status"].lower()
         if status == "deleted":
             return ProviderFact("destroyed", instance)
+        marker, _ = self._marker(tag, instance)
+        if marker["phase"] == "delete_started":
+            # An ACK is not removal proof. A stale running/provisioning GET
+            # must not advertise boot readiness or report preparation again.
+            return ProviderFact("unknown", instance)
         if status != "running":
             return ProviderFact("starting", instance, provider_status="FAILED" if status == "error" else "PENDING",
                                 preparation_stage="provider_preparing")
@@ -403,7 +430,11 @@ class TargonProvider:
         value = self._request("POST", self._route(manifest), payload={"type": "VM", "name": _name(tag),
             "image": manifest.image_name, "resource_name": manifest.resource_name,
             "ssh_keys": list(manifest.ssh_key_ids), "vm_config": {"hostname": _name(tag)}})
-        instance = self._identity(value, tag, manifest)
+        instance = self._post_instance(value, tag, manifest)
+        self._journal.transition(tag, {"register_started"}, "register_started", instance_id=instance)
+        value = self._exact(tag, manifest, instance)
+        if value is None:
+            raise TargonError("targon_workload_identity_unconfirmed")
         self._journal.transition(tag, {"register_started"}, "registered", instance_id=instance)
         return self._deploy(tag, manifest, value)
 
@@ -419,7 +450,10 @@ class TargonProvider:
             raise TargonError("targon_independent_cleanup_unconfirmed")
         self._journal.transition(tag, {"registered"}, "deploy_started")
         value = self._request("POST", self._route(manifest, marker["instance_id"]) + "/deploy")
-        self._identity(value, tag, manifest, marker["instance_id"])
+        self._post_instance(value, tag, manifest, marker["instance_id"])
+        value = self._exact(tag, manifest, marker["instance_id"])
+        if value is None:
+            raise TargonError("targon_workload_identity_unconfirmed")
         self._journal.transition(tag, {"deploy_started"}, "deployed")
         return self._fact(tag, value)
 
