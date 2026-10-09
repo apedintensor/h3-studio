@@ -108,6 +108,14 @@ It does not run the rental controller, alter budgets/policies, or initialize
 capacity. The API/worker remains a cache reader without provider egress or keys.
 The normal application schema migration creates the additive table first.
 
+The configured operator controller refreshes Lium's provider-wide market cache
+asynchronously, using its existing approved in-memory Lium loader and one bounded
+GET at a time, no more often than every 30 seconds. This full-stock observation is
+separate from its per-binding admission probes; failed reads replace availability
+with an unknown/error observation, and drain stops new reads and late publication.
+Targon public stock uses the separate keyless host sampler below. Neither path
+gives provider credentials or egress to the API or changes rental/budget authority.
+
 For an already configured service environment, the explicit sampler command is:
 
 ```text
@@ -145,6 +153,44 @@ Provider sources: [Targon inventory](https://docs.targon.com/api/inventory),
 Public listing/units, authenticated allocation, runtime readiness, validated
 generation and final billing are separate evidence. Keep dated live receipts
 on the delivery issue rather than using this guide as a deployment status log.
+
+### Protected AWS Targon stock sampler
+
+The reviewed host helper is `deploy/platform/targon_market.py`. Its separately
+approved, root-owned installation path is `/opt/sixnine-release/targon_market.py`,
+beside the existing release helper; an application source merge does not install
+or enable it. It uses the approved current application image and existing database
+secret, without provider credentials, GPU authority, runtime mounts or schema
+initialization. The normal release must have installed the inventory table first.
+
+After exact-version host approval, run each step separately and check its receipt:
+
+```text
+python3 /opt/sixnine-release/targon_market.py prepare
+python3 /opt/sixnine-release/targon_market.py once
+python3 /opt/sixnine-release/targon_market.py start
+python3 /opt/sixnine-release/targon_market.py status
+```
+
+`prepare` only renders configuration and pins the approved release, helper,
+manifest, compose/site files and archive-proven image identities in the protected
+`/srv/sixnine/targon-market` directory. OCI index and container config IDs may differ
+only when the approved single-image archive binds them. `once` performs a real
+public Targon inventory GET and writes a bounded normalized database observation;
+success requires a fresh successful observation, not merely process exit zero.
+`start` requires that acceptance receipt and enables the scoped systemd timer,
+which repeats every 30 seconds. Each sample rechecks the protected pin and live
+application identity without decompressing the image archive again.
+
+Use `python3 /opt/sixnine-release/targon_market.py stop` to disable this timer and
+stop only its exactly named, image-bound and pin-labelled sampler container. It
+does not stop the rental controller or cleanup guardian. `cleanup` is the same
+scoped container cleanup used by the systemd unit after each sample; it retains
+its own identity checks even after an application release changes. A changed
+release/helper invalidates sampling. An existing preparation is never overwritten:
+stop and reconcile the sampler, preserve its old protected receipts, then review
+and prepare the new exact version. This guide grants no production activation or
+rental authority.
 
 ## Acceptance before calling it operational
 

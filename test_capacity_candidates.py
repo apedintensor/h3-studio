@@ -144,6 +144,56 @@ class CandidateTests(LedgerCase):
         self.assertEqual(rows[1]["offer_kind"], "resource_sku")
         self.assertEqual(rows[0]["offer_kind"], "executor")
 
+    def test_explicit_pool_pause_blocks_only_matching_candidate_and_preserves_qualification(self):
+        self.qualify(pool="lium-active")
+        self.qualify(PROFILE_IDS[3], "RTX PRO 6000 Blackwell", "targon", pool="targon-paused",
+            launch=LaunchSpec("targon", "candidate", PRUNED, offer_id="rtx6000b-small"))
+        self.publish("lium", [offer()])
+        self.publish("targon", [offer("rtx6000b-small", "targon", "RTX PRO 6000 Blackwell")])
+        actor = Principal("superdan", "browser", auth_mode="password")
+        service = OperatorCapacity(self.repo, SimpleNamespace(operator_capacity_owners=("superdan",)), self.registry)
+        service.update_policy(actor, {"expected_version":0, "enabled":True, "max_instances":4,
+            "max_physical_gpus":4, "max_hourly_cost_microusd":4000000,
+            "idle_shutdown_seconds":600, "max_ttl_seconds":7200})
+        budget = copy.deepcopy(self.repo.get_budget("owner-budget"))
+        for instances, gpus in ((0, 1), (1, 0), (0, 0)):
+            with self.subTest(instances=instances, gpus=gpus):
+                self.repo.configure_pool("targon-paused", max_instances=instances, max_physical_gpus=gpus)
+                rows = self.project()["candidates"]
+                self.assertEqual([row["provider"] for row in rows], ["lium", "targon"])
+                self.assertEqual(rows[0]["blockers"], [])
+                paused = rows[1]
+                self.assertTrue(paused["deployment_qualified"])
+                self.assertTrue(paused["specs_confirmed"])
+                self.assertEqual(paused["execution_slots"], 1)
+                self.assertEqual(paused["qualification"], "unqualified")
+                self.assertEqual(paused["rank_reasons"][0], "deployment_qualified")
+                self.assertEqual(paused["blockers"], ["operator_pool_paused"])
+                with self.assertRaisesRegex(OperatorError, "operator_pool_paused"):
+                    self.resolve(paused["selection"])
+                preview = service.preview(actor, paused["selection"])
+                self.assertFalse(preview["can_start"])
+                self.assertEqual(preview["blockers"], [{"code":"operator_pool_paused"}])
+        self.assertEqual(self.repo.get_budget("owner-budget"), budget)
+        self.assertEqual(self.repo.list_instance_intents(), [])
+        self.repo.configure_pool("targon-paused", max_instances=1, max_physical_gpus=1)
+        resumed = next(row for row in self.project()["candidates"] if row["provider"] == "targon")
+        self.assertEqual(resumed["blockers"], [])
+        self.assertEqual(self.resolve(resumed["selection"])["offer_id"], "rtx6000b-small")
+
+    def test_missing_or_occupied_pool_is_not_projected_as_an_explicit_pause(self):
+        self.qualify(pool="test")
+        self.publish("lium", [offer()])
+        self.assertEqual(self.project()["candidates"][0]["blockers"], [])
+        self.repo.configure_pool("test", max_instances=1, max_physical_gpus=1)
+        self.repo.reserve_instance_intent(self.scope, "test", "occupied", physical_gpus=1, slots=1,
+            reserved_cost_microusd=100000, hard_deadline=self.now+3600,
+            budget_account_ids=("owner-budget",), dry_run=False, provider="lium")
+        row = self.project()["candidates"][0]
+        self.assertEqual(row["blockers"], [])
+        self.assertTrue(row["deployment_qualified"])
+        self.assertEqual(self.resolve(row["selection"])["offer_id"], "executor-1")
+
     def test_binding_filters_and_full_worker_count_are_required_for_qualification(self):
         self.qualify(filters={"min_ram_gib":96, "min_disk_gib":128, "min_download_mbps":500,
                               "max_price_per_gpu_hour_microusd":800000, "allowed_countries":["US"]})

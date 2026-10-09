@@ -141,6 +141,34 @@ class OperatorTests(LedgerCase):
         self.assertIn({"code":"operator_ttl_below_provider_minimum"},preview["blockers"])
         self.assertFalse(preview["can_start"])
 
+    def test_pool_pause_blocks_legacy_preview_and_stale_preview_without_reservation(self):
+        budget=self.repo.get_budget("owner-budget")
+        for instances,gpus in ((0,1),(1,0),(0,0)):
+            with self.subTest(instances=instances,gpus=gpus):
+                self.repo.configure_pool(self.binding.pool,max_instances=1,max_physical_gpus=1)
+                before=self.service.preview(self.actor,self.chosen)
+                self.assertTrue(before["can_start"])
+                self.repo.configure_pool(self.binding.pool,max_instances=instances,max_physical_gpus=gpus)
+                paused=self.service.preview(self.actor,self.chosen)
+                self.assertFalse(paused["can_start"])
+                self.assertEqual(paused["blockers"],[{"code":"operator_pool_paused"}])
+                with self.assertRaisesRegex(OperatorError,"operator_pool_paused"):
+                    self.service.start(self.actor,{"preview_id":before["preview_id"]},"paused-start")
+        self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+        self.assertEqual(self.repo.list_instance_intents(),[])
+        self.assertEqual(self.provider.creates,[])
+        with self.repo.engine.connect() as connection:
+            self.assertEqual(connection.scalar(select(func.count()).select_from(operator_commands)),0)
+
+    def test_pool_pause_preserves_existing_start_idempotency(self):
+        before=self.service.preview(self.actor,self.chosen)
+        body={"preview_id":before["preview_id"]}
+        original=self.service.start(self.actor,body,"before-pause")
+        self.repo.configure_pool(self.binding.pool,max_instances=0,max_physical_gpus=0)
+        self.assertEqual(self.service.start(self.actor,body,"before-pause"),original)
+        self.assertFalse(self.service.preview(self.actor,self.chosen)["can_start"])
+        self.assertEqual(self.repo.list_instance_intents(),[])
+
     def test_provider_hour_rounding_shortens_before_boot_without_resetting_money(self):
         self.registry.bindings[self.binding.binding_id]=replace(self.binding,max_ttl_seconds=7200)
         self.service.update_policy(self.actor,{**self.policy,"expected_version":1,"max_ttl_seconds":7200})

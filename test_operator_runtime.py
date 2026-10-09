@@ -7,15 +7,134 @@ import io
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock,patch
+
+import httpx
 
 from studio_platform.operator_capacity import OperatorError
 from studio_platform.operator_runtime import (create_controller,create_registry,load_runtime_config,
-    _assemble,_manifest,_validate_sources,create_controller_from_stdin,InventoryRefresh)
+    _assemble,_manifest,_validate_sources,create_controller_from_stdin,InventoryRefresh,LiumMarketRefresh)
 from studio_platform.operator_capacity import operator_inventory,operator_heartbeats
+from studio_platform.capacity_market import market_inventory
 from sqlalchemy import insert,select,update
 from studio_platform.runtime_catalog import PROFILE_IDS,engine_manifest,get_profile,model_for
 from test_platform_repository import LedgerCase
+
+
+class DeferredStockExecutor:
+    def __init__(self,**kwargs):
+        self.work=[]
+        self.shutdown_calls=[]
+
+    def submit(self,function):
+        future=Future()
+        self.work.append((function,future))
+        return future
+
+    def complete(self,index=0):
+        function,future=self.work[index]
+        try: future.set_result(function())
+        except Exception as error: future.set_exception(error)
+
+    def shutdown(self,**kwargs): self.shutdown_calls.append(kwargs)
+
+
+class LiumStockTests(LedgerCase):
+    def row(self):
+        with self.repo.engine.connect() as connection:
+            return connection.execute(select(market_inventory).where(market_inventory.c.provider=="lium")).mappings().first()
+
+    def test_one_inflight_read_interval_and_shutdown_never_wait_or_publish_late_result(self):
+        refresh=LiumMarketRefresh(self.repo,Mock())
+        executor=DeferredStockExecutor()
+        with patch("studio_platform.operator_runtime.ThreadPoolExecutor",return_value=executor), \
+             patch.object(refresh,"_probe",return_value={"provider":"lium","status":"ok","observed_at":self.now,"offers":[]}):
+            refresh()
+            self.now+=300
+            refresh()
+            self.assertEqual(len(executor.work),1)  # Even a slow request cannot overlap.
+            executor.complete()
+            refresh()
+            self.assertEqual(len(executor.work),2)
+            self.assertEqual(self.row()["observed_at"],1000)  # Do not refresh its age on publish.
+            executor.complete(1)
+            refresh()
+            self.now+=29
+            refresh()
+            self.assertEqual(len(executor.work),2)
+            self.now+=1
+            refresh()
+            self.assertEqual(len(executor.work),3)
+            before=dict(self.row())
+            refresh(stopping=True)
+            self.assertEqual(executor.shutdown_calls,[{"wait":False,"cancel_futures":True}])
+            executor.complete(2)
+            self.now+=100
+            refresh()
+            refresh(stopping=True)
+            self.assertEqual(len(executor.work),3)
+            self.assertEqual(dict(self.row()),before)
+
+    def test_full_stock_scan_is_get_only_uses_existing_identity_closes_client_and_redacts(self):
+        from test_capacity_inventory import lium,loader
+        from studio_platform import capacity_inventory
+        approved_loader=Mock(side_effect=loader)
+        refresh=LiumMarketRefresh(self.repo,approved_loader)
+        executor=DeferredStockExecutor()
+        requests,clients=[],[]
+        original_client=httpx.Client
+        def response(request):
+            requests.append(request)
+            return httpx.Response(200,json=[lium()])
+        def client(**kwargs):
+            self.assertEqual(kwargs["timeout"],capacity_inventory.TIMEOUT_SECONDS)
+            self.assertFalse(kwargs["follow_redirects"])
+            kwargs["transport"]=httpx.MockTransport(response)
+            value=original_client(**kwargs);clients.append(value);return value
+        before=self.repo.get_budget("owner-budget")
+        with patch("studio_platform.operator_runtime.ThreadPoolExecutor",return_value=executor), \
+             patch.object(capacity_inventory.httpx,"Client",side_effect=client), \
+             patch("studio_platform.lium_provider._central_loader",side_effect=AssertionError("wrong_identity_source")), \
+             patch("studio_platform.lium_provider.LiumProvider._request",side_effect=AssertionError("no_rental_or_dry_run")):
+            refresh();executor.complete();refresh();refresh(stopping=True)
+        approved_loader.assert_called_once_with("lium",profile="lium--rig-root")
+        self.assertEqual([(r.method,str(r.url)) for r in requests],[("GET",capacity_inventory.LIUM_URL)])
+        self.assertTrue(clients[0].is_closed)
+        row=self.row()
+        self.assertEqual(row["payload"]["status"],"ok")
+        self.assertEqual(len(row["payload"]["offers"]),1)
+        self.assertNotIn("must-not-escape",json.dumps(dict(row)))
+        self.assertEqual(before,self.repo.get_budget("owner-budget"))
+
+    def test_transport_timeout_replaces_success_with_unknown_and_closes_owned_client(self):
+        from test_capacity_inventory import loader
+        from studio_platform import capacity_inventory
+        from studio_platform.capacity_market import publish_observation
+        publish_observation(self.repo,{"provider":"lium","status":"ok","observed_at":self.now,"offers":[]})
+        refresh=LiumMarketRefresh(self.repo,loader)
+        executor=DeferredStockExecutor()
+        clients=[]
+        original_client=httpx.Client
+        def timeout(request): raise httpx.ReadTimeout("private-error-must-not-escape")
+        def client(**kwargs):
+            kwargs["transport"]=httpx.MockTransport(timeout)
+            value=original_client(**kwargs);clients.append(value);return value
+        with patch("studio_platform.operator_runtime.ThreadPoolExecutor",return_value=executor), \
+             patch.object(capacity_inventory.httpx,"Client",side_effect=client):
+            refresh();executor.complete();refresh();refresh(stopping=True)
+        self.assertTrue(clients[0].is_closed)
+        self.assertEqual(self.row()["payload"]["status"],"error")
+        self.assertEqual(self.row()["payload"]["reason_code"],"inventory_scan_failed")
+        self.assertNotIn("must-not-escape",json.dumps(dict(self.row())))
+
+    def test_unexpected_reader_error_is_recorded_unknown_without_raw_message(self):
+        refresh=LiumMarketRefresh(self.repo,Mock())
+        executor=DeferredStockExecutor()
+        with patch("studio_platform.operator_runtime.ThreadPoolExecutor",return_value=executor), \
+             patch.object(refresh,"_probe",side_effect=RuntimeError("private-error-must-not-escape")):
+            refresh();executor.complete();refresh();refresh(stopping=True)
+        self.assertEqual(self.row()["payload"]["status"],"error")
+        self.assertNotIn("must-not-escape",json.dumps(dict(self.row())))
 
 
 class RuntimeTests(LedgerCase):
@@ -195,6 +314,17 @@ class RuntimeTests(LedgerCase):
             self.assertEqual(result.service.policy()["version"],0)
         self.assertEqual(before,self.repo.get_budget("owner-budget"))
         self.assertEqual(list((self.root/"work").iterdir()),[])
+
+    def test_market_refresh_reuses_exact_controller_loader_and_is_absent_for_targon_only(self):
+        loader=Mock(side_effect=AssertionError("no_credentials_during_construction"))
+        controller=create_controller(self.path,repository=self.repo,settings=SimpleNamespace(),credential_loader=loader)
+        self.assertIs(controller.inventory_refresh.market_refresh.loader,loader)
+        self.assertIsNone(controller.inventory_refresh.market_refresh.executor)
+        loader.assert_not_called()
+        self.use_targon()
+        controller=create_controller(self.path,repository=self.repo,settings=SimpleNamespace(),credential_loader=loader)
+        self.assertIsNone(controller.inventory_refresh.market_refresh)
+        loader.assert_not_called()
 
     def test_config_paths_and_credential_fields_are_explicit(self):
         config=load_runtime_config(self.path)
