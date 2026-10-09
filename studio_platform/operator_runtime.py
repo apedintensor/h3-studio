@@ -1,8 +1,8 @@
 """Trusted local-file composition for the existing operator rental authority.
 
 Construction reads bounded deployment metadata only. Credentials remain lazy;
-inventory is queried only by an explicit offers request and rents only by the
-fenced controller. This file neither initializes budgets nor enables a pool.
+the running controller refreshes inventory asynchronously and alone has fenced
+rental authority. This file neither initializes budgets nor enables a pool.
 """
 from __future__ import annotations
 
@@ -404,6 +404,53 @@ def create_registry(path, *, repository=None):
     return registry
 
 
+class LiumMarketRefresh:
+    """Provider-wide stock cache using the controller's existing identity.
+
+    Keep this full GET separate from per-binding admission probes, which may be
+    filtered or dry-run selectors. The transport bounds live in scan_lium; no
+    Future timeout substitutes for them. A slow read never holds the tick loop.
+    """
+    def __init__(self,repo,loader):
+        self.repo,self.loader=repo,loader
+        self.executor=None
+        self.pending=None
+        self.last=float("-inf")
+        self.closed=False
+
+    def _probe(self):
+        from .capacity_inventory import scan_lium
+        return scan_lium(self.loader,clock=self.repo.clock)
+
+    def __call__(self,*,stopping=False):
+        if stopping:
+            self.closed=True
+            if self.executor:
+                # Cancel a queued read, but do not wait on an in-flight bounded
+                # HTTP request while leases or output collection need ticks.
+                self.executor.shutdown(wait=False,cancel_futures=True)
+                self.executor=None
+            return
+        if self.closed: return
+        if self.pending:
+            if not self.pending.done(): return
+            from .capacity_market import publish_observation
+            try:
+                observation=self.pending.result()
+                publish_observation(self.repo,observation)
+            except Exception:
+                publish_observation(self.repo,{"provider":"lium","status":"error",
+                    "observed_at":self.repo.clock(),"offers":[]})
+            finally:
+                self.pending=None
+        now=self.repo.clock()
+        if now-self.last<30: return
+        if self.executor is None:
+            self.executor=ThreadPoolExecutor(max_workers=1,thread_name_prefix="lium-market")
+        self.last=now
+        self.pending=self.executor.submit(self._probe)
+
+
 class InventoryRefresh:
     """One bounded read-only probe off the lifecycle loop; no raw response saved.
 
@@ -411,8 +458,9 @@ class InventoryRefresh:
     No thread has authority to create a rental. Publication occurs on the main
     loop only while this process still owns the current heartbeat projection.
     """
-    def __init__(self,repo,registry,providers):
+    def __init__(self,repo,registry,providers,*,market_refresh=None):
         self.repo,self.registry,self.providers=repo,registry,providers
+        self.market_refresh=market_refresh
         self.executor=None
         self.pending=None
         self.last={}
@@ -427,6 +475,9 @@ class InventoryRefresh:
             return "unavailable","operator_inventory_unavailable",self.repo.clock()
 
     def __call__(self,controller_id,*,stopping=False):
+        if self.market_refresh is not None:
+            try: self.market_refresh(stopping=stopping)
+            except Exception: pass  # A failed stock write must not block rental reconciliation.
         if self.pending and self.pending[1].done():
             binding,future=self.pending
             status,reason,observed_at=future.result()
@@ -502,8 +553,12 @@ def create_controller(path, *, repository=None, settings=None, boot_factory=None
             return create_boot(*args)
     def boot(binding,intent,chosen):
         return boot_factory(repo,providers[binding.binding_id],binding,intent,chosen,config)
+    # All Lium bindings use the same explicit service/profile and validated
+    # loader. Do not copy credentials or give provider egress to the API.
+    lium=next((provider for provider in providers.values() if isinstance(provider,_BoundLiumProvider)),None)
+    market=LiumMarketRefresh(repo,lium._loader) if lium is not None else None
     return OperatorController(service,provider_factory=lambda binding:providers[binding.binding_id],
-        boot_factory=boot,enabled=True,inventory_refresh=InventoryRefresh(repo,registry,providers),
+        boot_factory=boot,enabled=True,inventory_refresh=InventoryRefresh(repo,registry,providers,market_refresh=market),
         status_writer=_status_writer(config,clock=repo.clock))
 
 

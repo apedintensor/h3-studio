@@ -1158,6 +1158,16 @@ class _NullLock:
         return False
 
 
+def paused_capacity_pools(connection):
+    """Project explicit zero ceilings only; not free capacity or runtime approval.
+
+    Missing limits still fail at reservation, but are not an operator pause.
+    The reserve barrier remains authoritative for races and occupied pools.
+    """
+    return frozenset(connection.execute(select(pool_limits.c.pool).where(or_(
+        pool_limits.c.max_instances == 0, pool_limits.c.max_physical_gpus == 0))).scalars())
+
+
 def _allowed_ids(values):
     """Bounded explicit authorization set; empty never broadens into unfiltered."""
     if values is None:

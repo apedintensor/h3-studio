@@ -12,6 +12,7 @@ from sqlalchemy import select
 
 from .capacity_inventory import allocation_resources
 from .capacity_market import FRESH_SECONDS, PROVIDERS, ROW_FIELDS, _constraints, market_inventory
+from .repository import paused_capacity_pools
 
 
 def _require(condition, code, status=409):
@@ -126,13 +127,17 @@ def _deployment(registry, profile, row, choice, now):
     return list(dict.fromkeys(blockers)), slots
 
 
-def _candidate(registry, profile, row, observed, mode, ttl_seconds, now):
+def _candidate(registry, profile, row, observed, mode, ttl_seconds, now, paused_pools):
     choice = {"runtime_profile_id": profile["id"], "mode": mode, "provider": row["provider"],
               "gpu_type": row["gpu_type"], "gpu_count": row["gpu_count"], "node_count": 1,
               "ttl_seconds": ttl_seconds, "filters": {}, "offer_id": row["offer_id"]}
     blockers = _spec_blockers(profile, row)
     deployment_blockers, slots = _deployment(registry, profile, row, choice, now)
     blockers = list(dict.fromkeys(blockers + deployment_blockers))
+    # A paused execution pool retains its measured runtime qualification. Its
+    # explicit operator ceiling, not temporary occupancy, blocks new starts.
+    if not deployment_blockers and registry.resolve(choice).pool in paused_pools:
+        blockers.append("operator_pool_paused")
     hardware, hints = profile["hardware_filters"], []
     if (row.get("price_per_gpu_hour_microusd") is not None
             and row["price_per_gpu_hour_microusd"] > hardware["maximum_price_per_gpu_hour_microusd"]):
@@ -148,7 +153,7 @@ def _candidate(registry, profile, row, observed, mode, ttl_seconds, now):
             "deployment_qualified": not deployment_blockers,
             "specs_confirmed": not any(code.startswith("inventory_unknown_") for code in blockers),
             "qualification": "qualified" if qualified else "unqualified", "preference_hints": hints,
-            "rank_reasons": ["deployment_qualified" if qualified else "deployment_pending",
+            "rank_reasons": ["deployment_qualified" if not deployment_blockers else "deployment_pending",
                 "whole_allocation_price", "bandwidth_known" if row.get("download_mbps") is not None
                 else "bandwidth_unknown"]}
 
@@ -157,6 +162,7 @@ def candidates_projection(connection, registry, model_id, mode, ttl_seconds, now
     """Keep model/precision exact; discover only explicit catalog GPU names."""
     profiles = _profiles(registry, model_id, mode, ttl_seconds)
     providers, rows = _observations(connection, now)
+    paused_pools = paused_capacity_pools(connection)
     candidates, uncertain_allocation = [], False
     for row, observed in rows:
         compatible = [profile for profile in profiles if row["gpu_type"] in profile["gpu_models"]]
@@ -171,7 +177,7 @@ def candidates_projection(connection, registry, model_id, mode, ttl_seconds, now
                 # unknown slicing contract cannot supply a fabricated quote.
                 uncertain_allocation |= "allocation" in row.get("unverified_fields", [])
                 continue
-            candidates.append(_candidate(registry, profile, row, observed, mode, ttl_seconds, now))
+            candidates.append(_candidate(registry, profile, row, observed, mode, ttl_seconds, now, paused_pools))
     candidates.sort(key=lambda row: (row["qualification"] != "qualified",
         row["hourly_cost_microusd"] if row.get("hourly_cost_microusd") is not None else math.inf,
         row.get("download_mbps") is None, -(row.get("download_mbps") or 0),
@@ -213,4 +219,5 @@ def resolve_selected_offer(connection, registry, chosen, now):
     _require(row["available_count"] > 0, "operator_offer_unavailable")
     blockers = _spec_blockers(profile, row) + _deployment(registry, profile, row, chosen, now)[0]
     _require(not blockers, blockers[0] if blockers else "operator_offer_unqualified")
+    _require(registry.resolve(chosen).pool not in paused_capacity_pools(connection), "operator_pool_paused")
     return copy.deepcopy(row)

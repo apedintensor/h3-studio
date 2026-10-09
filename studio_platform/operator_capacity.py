@@ -16,7 +16,7 @@ import uuid
 from sqlalchemy import Column, Float, ForeignKey, Integer, JSON, String, Table, UniqueConstraint, func, insert, select, update
 
 from .repository import (Scope, metadata, canonical, request_hash, capacity_gate, instance_intents,
-                         jobs, registered_workers, scaler_actions)
+                         jobs, registered_workers, scaler_actions, paused_capacity_pools)
 from .scaler import LaunchSpec
 
 operator_policy = Table("platform_operator_capacity_policy", metadata,
@@ -469,6 +469,7 @@ class OperatorCapacity:
             hourly=reservation=None
             selected_offer=None
             if binding:
+                if binding.pool in paused_capacity_pools(connection): blockers.append({"code":"operator_pool_paused"})
                 chosen={**chosen,"filters":binding.filters}
                 hourly=binding.hourly_cost_microusd*chosen["node_count"]
                 reservation=binding.reservation_per_node_microusd*chosen["node_count"]
@@ -486,7 +487,7 @@ class OperatorCapacity:
                         from .capacity_candidates import resolve_selected_offer
                         selected_offer=resolve_selected_offer(connection,self.registry,chosen,now)
                     except OperatorError as error:
-                        blockers.append({"code":error.code})
+                        if {"code":error.code} not in blockers: blockers.append({"code":error.code})
                 elif self.registry.inventory_required:
                     inventory=inventory_projection(connection,binding,now)
                     if inventory["status"]!="available": blockers.append({"code":inventory["reason_code"]})
@@ -543,6 +544,7 @@ class OperatorCapacity:
             chosen=value["selection"]
             require(binding.enabled and command_binding_fingerprint(binding,chosen)==value["binding_hash"],
                     "operator_binding_changed")
+            require(binding.pool not in paused_capacity_pools(connection), "operator_pool_paused")
             if chosen.get("offer_id"):
                 require(not self.registry.inventory_required or exact_offer_controller_ready(connection,now),
                         "operator_exact_offer_controller_unavailable")

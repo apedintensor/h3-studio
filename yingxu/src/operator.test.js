@@ -110,6 +110,14 @@ test('stock readiness distinguishes missing specifications, deployment qualifica
   assert.equal(operatorOfferReadiness({qualification:'qualified',blockers:[]}),'待启动预览');
   assert.equal(operatorOfferReadiness({qualification:'unqualified',blockers:[]}),'部署待验收');
 });
+test('paused pool explains disabled starts without claiming its measured deployment is unqualified',()=>{
+  for(const blocker of ['operator_pool_paused',{code:'operator_pool_paused'}]){
+    const row={qualification:'unqualified',deployment_qualified:true,specs_confirmed:true,blockers:[blocker]};
+    assert.equal(operatorOfferReadiness(row),'启动已暂停');
+    assert.equal(reasonText(blocker),'该执行池已暂停启动，请联系管理员核对运行配置。');
+    assert.equal(operatorOfferReadiness({...row,blockers:[]}),'待启动预览');
+  }
+});
 test('late inventory response from a previous account cannot be used for recommendations',async()=>{
   const held=deferred(),controller=createOperatorController({client:fakeClient({offers:()=>held.promise}),storage:memory()});
   await controller.setAccount('a');const scan=controller.offers({provider:'targon'});await controller.setAccount('b');held.resolve({market:{recommendations:[{provider:'targon',offer_id:'old-account-offer'}]}});
