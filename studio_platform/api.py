@@ -267,6 +267,14 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
             "source_trim": True, "generated_audio": True, "render_contract_version": 3}
         return result
 
+    @app.get("/v1/generation-availability")
+    def get_generation_availability(request: Request):
+        principal = request.state.principal
+        if principal.machine and not {"jobs:read", "jobs:write"}.intersection(principal.scopes):
+            raise HTTPException(403, "generation_availability_forbidden")
+        from .generation_availability import generation_availability
+        return generation_availability(settings, repo, registry=app.state.operator_capacity.registry)
+
     @app.get("/v1/projects")
     def list_projects(request: Request, limit: int = Query(100, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000)):
         principal = request.state.principal

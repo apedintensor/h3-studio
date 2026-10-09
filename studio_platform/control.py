@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass
 import math
 import re
 
-from sqlalchemy import and_, case, func, insert, select, update
+from sqlalchemy import and_, case, func, insert, inspect, select, update
 
 from .queue import TaskQueue
 from .inference.outputs import validate_delivery_policy
@@ -156,9 +156,18 @@ class WorkerControl:
         counts = {state: 0 for state in ("ready", "busy", "unknown", "registered", "draining", "retired")}
         matched = 0
         with self.repo.engine.connect() as connection:
+            from .operator_capacity import operator_nodes
             stopping = set(connection.execute(select(instance_intents.c.provider, instance_intents.c.provider_instance_id)
-                .where(instance_intents.c.state.in_(("draining", "destroying", "destroyed")),
+                .where((instance_intents.c.state.in_(("draining", "destroying", "destroyed")))
+                    | (instance_intents.c.hard_deadline <= now),
                     instance_intents.c.provider_instance_id.is_not(None))).tuples())
+            # Catalog enumeration stays SELECT-only on SQLite/PostgreSQL;
+            # has_table() uses SQLite PRAGMA, outside the dry-run read contract.
+            if operator_nodes.name in inspect(connection).get_table_names():
+                stopping.update(connection.execute(select(instance_intents.c.provider, instance_intents.c.provider_instance_id)
+                    .join(operator_nodes, operator_nodes.c.intent_id == instance_intents.c.id)
+                    .where(operator_nodes.c.desired_state != "running",
+                        instance_intents.c.provider_instance_id.is_not(None))).tuples())
             rows = connection.execute(select(registered_workers).where(registered_workers.c.pool == pool)).mappings()
             for row in rows:
                 spec = row["spec"]
@@ -172,10 +181,10 @@ class WorkerControl:
                 state = row["state"]
                 if state == "retired":
                     observed = "retired"
-                elif row["expires_at"] <= now:
-                    observed = "unknown"
                 elif row["drain_requested"] or (row["provider"], row["instance_id"]) in stopping:
                     observed = "draining"
+                elif row["expires_at"] <= now or row["updated_at"] > now or row["spec_hash"] != request_hash(spec):
+                    observed = "unknown"
                 elif state == "ready" and row["current_job_id"] is None:
                     observed = "ready"
                 elif state in ("registered", "draining", "unknown"):

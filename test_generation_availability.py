@@ -1,0 +1,216 @@
+"""Current public mode observations: isolated SQL/fake identities, no cloud calls."""
+import copy
+from dataclasses import replace
+import json
+import secrets
+import unittest
+
+from fastapi.testclient import TestClient
+from sqlalchemy import insert, update
+
+from studio_platform.api import create_app
+from studio_platform.control import WorkerControl, WorkerSpec
+from studio_platform.execution_policy import ExecutionPolicies
+from studio_platform.execution_profiles import tested_envelope
+from studio_platform.generation_availability import generation_availability
+from studio_platform.operator_capacity import (DeploymentBinding, OperatorRegistry, operator_nodes,
+    operator_commands, operator_heartbeats)
+from studio_platform.repository import Conflict, instance_intents, registered_workers, request_hash
+from studio_platform.runtime_catalog import engine_manifest
+from studio_platform.scaler import LaunchSpec
+import test_platform_execution_profiles as profile_tests
+from test_platform_execution_profiles import PRUNED, INT8
+from test_platform_execution_policy import policy as legacy_policy
+
+
+class AvailabilityTests(unittest.TestCase):
+    write = profile_tests.ExecutionProfileTests.write
+    compiled = profile_tests.ExecutionProfileTests.compiled
+
+    def setUp(self):
+        profile_tests.ExecutionProfileTests.setUp(self)
+        self.now = self.repo.clock()
+        self.repo.clock = lambda: self.now
+        ref = copy.deepcopy(self.values[0])
+        ref.update(pool="ref-pool", configuration_id="ref-config", recipe_ids=["h3-base-ref2va-v1"],
+            engine_manifest_digest=engine_manifest(PRUNED, "ref").digest,
+            envelope=tested_envelope(PRUNED, "ref"))
+        self.values.append(ref)
+        self.write()
+        self.registry = OperatorRegistry()
+
+    def result(self):
+        return generation_availability(self.settings, self.repo, registry=self.registry)
+
+    def modes(self, profile=PRUNED):
+        return next(p["modes"] for p in self.result()["profiles"] if p["deployment_profile_id"] == profile)
+
+    def worker(self, index, *, ready=True, provider="test-only", instance=None):
+        p = self.values[index]
+        spec = WorkerSpec(f"private-worker-{index}", p["pool"], provider, instance or f"private-instance-{index}",
+            (f"private-gpu-{index}",), tuple(p["recipe_ids"]), p["model_id"], p["configuration_id"],
+            "wangp-worker", p["engine_manifest_digest"], output_delivery="native-frames-v1")
+        control = WorkerControl(self.repo)
+        control.register(spec)
+        if ready:
+            control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        return spec
+
+    def mutate_worker(self, spec, **values):
+        with self.repo.transaction() as connection:
+            connection.execute(update(registered_workers).where(registered_workers.c.id == spec.worker_id).values(**values))
+
+    def node(self):
+        p = self.values[0]
+        self.repo.configure_pool(p["pool"], max_instances=2, max_physical_gpus=2)
+        intent = self.repo.reserve_instance_intent(self.scope, p["pool"], "private-intent", provider="lium",
+            physical_gpus=1, slots=1, reserved_cost_microusd=1, hard_deadline=self.now+1800,
+            budget_account_ids=["test-tenant:sixnine"], dry_run=False)
+        self.repo.update_instance(intent["id"], "creating")
+        self.repo.update_instance(intent["id"], "starting", provider_instance_id="private-provider-instance")
+        binding = DeploymentBinding("private-binding", PRUNED, "RTX 5090", 1, p["pool"], p["configuration_id"],
+            p["model_id"], tuple(p["recipe_ids"]), p["engine_manifest_digest"],
+            LaunchSpec("lium", p["configuration_id"], p["model_id"]), self.scope,
+            ("test-tenant:sixnine",), 1, 1, self.now+3600, enabled=True)
+        self.registry = OperatorRegistry([binding])
+        with self.repo.transaction() as connection:
+            connection.execute(insert(operator_commands).values(id="private-command", actor="private-actor",
+                idempotency_key="private-key", request_hash="a"*64, kind="start", state="waiting",
+                payload={}, created_at=self.now, updated_at=self.now))
+            connection.execute(insert(operator_nodes).values(intent_id=intent["id"], command_id="private-command",
+                ordinal=0, binding_id=binding.binding_id, binding_hash=binding.fingerprint,
+                payload={"selection":{"runtime_profile_id":PRUNED,"mode":"fl"}},
+                desired_state="running", runtime_state="preparing", updated_at=self.now))
+            connection.execute(insert(operator_heartbeats).values(id="global", controller_id="private-controller",
+                observed_at=self.now, state="running"))
+        return intent
+
+    def test_none_fl_ref_both_and_exact_profile_are_not_substituted(self):
+        self.assertEqual({m["state"] for m in self.modes().values()}, {"unavailable"})
+        other = self.worker(1)
+        self.assertTrue(self.modes(INT8)["fl"]["available"])
+        self.assertFalse(self.modes()["fl"]["available"])
+        ref = self.worker(2)
+        self.assertEqual([self.modes()[m]["state"] for m in ("fl","ref")], ["unavailable","ready"])
+        fl = self.worker(0)
+        self.assertTrue(all(m["available"] for m in self.modes().values()))
+        WorkerControl(self.repo).retire(ref.worker_id, upstream_idle_confirmed=True)
+        self.assertEqual([self.modes()[m]["state"] for m in ("fl","ref")], ["ready","unavailable"])
+
+    def test_busy_registered_stale_future_hash_and_drain_are_distinct(self):
+        spec = self.worker(0, ready=False)
+        self.assertEqual(self.modes()["fl"]["state"], "starting")
+        self.mutate_worker(spec, state="busy", current_job_id="private-job")
+        self.assertEqual(self.modes()["fl"]["state"], "busy")
+        self.assertTrue(self.modes()["fl"]["available"])
+        self.mutate_worker(spec, expires_at=self.now-1)
+        self.assertEqual(self.modes()["fl"]["state"], "unknown")
+        self.mutate_worker(spec, expires_at=self.now+90, updated_at=self.now+1)
+        self.assertEqual(self.modes()["fl"]["state"], "unknown")
+        self.mutate_worker(spec, updated_at=self.now, spec_hash="f"*64)
+        self.assertEqual(self.modes()["fl"]["state"], "unknown")
+        self.mutate_worker(spec, drain_requested=1)
+        self.assertEqual(self.modes()["fl"]["state"], "unavailable")
+
+    def test_starting_requires_fresh_exact_binding_and_excludes_stopping(self):
+        intent = self.node()
+        self.assertEqual(self.modes()["fl"]["state"], "starting")
+        self.assertFalse(self.modes()["fl"]["available"])
+        self.now += 31
+        self.assertEqual(self.modes()["fl"]["state"], "unknown")
+        self.now -= 31
+        with self.repo.transaction() as connection:
+            connection.execute(update(operator_nodes).values(binding_hash="f"*64))
+        self.assertEqual(self.modes()["fl"]["state"], "unknown")
+        with self.repo.transaction() as connection:
+            connection.execute(update(operator_nodes).values(desired_state="stopped"))
+        self.assertEqual(self.modes()["fl"]["state"], "unavailable")
+
+    def test_stop_request_excludes_fresh_worker_and_invalidates_prior_preflight(self):
+        self.node()
+        self.worker(0, provider="lium", instance="private-provider-instance")
+        compiled, fingerprint = self.compiled()
+        policies = ExecutionPolicies(self.settings, self.repo)
+        admitted = policies.evaluate(compiled, self.scope, fingerprint)
+        self.assertTrue(admitted.execution["enabled"], admitted.execution)
+        plan = {"request":compiled, "execution_plan":admitted.execution}
+        with self.repo.transaction() as connection:
+            connection.execute(update(operator_nodes).values(desired_state="stopped"))
+        self.assertEqual(self.modes()["fl"]["state"], "unavailable")
+        with self.assertRaisesRegex(Conflict, "execution_policy_changed_or_unavailable"):
+            policies.ensure_current(plan, self.scope)
+
+    def test_disabled_expired_and_invalid_config_do_not_claim_readiness(self):
+        self.worker(0)
+        self.settings = replace(self.settings, generation_enabled=False)
+        self.assertEqual(self.modes()["fl"]["state"], "disabled")
+        self.settings = replace(self.settings, generation_enabled=True)
+        self.values[0]["enabled"] = False
+        self.write()
+        self.assertEqual(self.modes()["fl"]["state"], "disabled")
+        self.values[0]["enabled"] = True
+        self.values[0]["qualification"]["expires_at"] = self.now+10
+        self.write()
+        self.assertEqual(self.modes()["fl"]["state"], "disabled")
+        self.path.write_text("invalid")
+        self.assertEqual(self.modes()["fl"]["state"], "unknown")
+
+    def test_expired_known_instance_excludes_fresh_worker_and_invalidates_prior_preflight(self):
+        intent = self.node()
+        self.worker(0, provider="lium", instance="private-provider-instance")
+        compiled, fingerprint = self.compiled()
+        policies = ExecutionPolicies(self.settings, self.repo)
+        admitted = policies.evaluate(compiled, self.scope, fingerprint)
+        self.assertTrue(admitted.execution["enabled"], admitted.execution)
+        plan = {"request": compiled, "execution_plan": admitted.execution}
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id == intent["id"]).values(
+                hard_deadline=self.now))
+        self.assertEqual(self.modes()["fl"]["state"], "unavailable")
+        self.assertFalse(self.modes()["fl"]["available"])
+        with self.assertRaisesRegex(Conflict, "execution_policy_changed_or_unavailable"):
+            policies.ensure_current(plan, self.scope)
+
+    def test_legacy_null_route_uses_only_its_actual_policy_not_named_default(self):
+        self.worker(0)
+        self.settings = replace(self.settings, default_deployment_profile_id=PRUNED)
+        self.assertEqual(self.modes(None)["fl"]["state"], "disabled")
+        legacy = legacy_policy(self.now)
+        legacy["recipe_ids"] = ["h3-base-fl2va-v1"]
+        path = self.root / "legacy.json"
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        self.settings = replace(self.settings, execution_policy_file=path, execution_backend="comfy-worker")
+        spec = WorkerSpec("private-legacy", legacy["pool"], "private-provider", "private-legacy-instance",
+            ("private-legacy-gpu",), tuple(legacy["recipe_ids"]), legacy["model_id"], legacy["configuration_id"])
+        control = WorkerControl(self.repo)
+        control.register(spec)
+        control.mark_ready(spec.worker_id, upstream_idle_confirmed=True)
+        self.assertEqual(self.modes(None)["fl"]["state"], "ready")
+        self.assertEqual(self.modes(None)["ref"]["state"], "disabled")
+        self.assertFalse(any(m["available"] for m in self.modes().values()))
+        self.path.write_text("invalid")
+        self.assertEqual(self.modes(None)["fl"]["state"], "ready")
+        path.write_text("invalid")
+        self.assertEqual(self.modes(None)["fl"]["state"], "unknown")
+
+    def test_authenticated_scopes_safe_projection_and_no_side_effect(self):
+        self.worker(0)
+        app = create_app(self.settings, repository=self.repo)
+        with TestClient(app) as client:
+            self.assertEqual(client.get("/v1/generation-availability").status_code, 401)
+            for i, scopes in enumerate((("jobs:read",), ("jobs:write",), ("assets:read",))):
+                token = secrets.token_urlsafe(40)
+                app.state.auth.register_client(f"availability-{i}", token, "superdan", ["story-one"], scopes)
+                response = client.get("/v1/generation-availability", headers={"Authorization":"Bearer "+token})
+                self.assertEqual(response.status_code, 200 if i<2 else 403)
+                if i<2:
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    self.assertNotIn("private-", response.text)
+                    self.assertEqual(response.json()["expires_at"], self.now+10)
+            client.post("/api/auth/login", json={"username":"supervan"}).raise_for_status()
+            self.assertEqual(client.get("/v1/generation-availability").status_code, 200)
+            self.assertEqual(client.get("/v1/operator/capacity/state").status_code, 403)
+
+
+if __name__ == "__main__":
+    unittest.main()

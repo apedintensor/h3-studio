@@ -1,6 +1,8 @@
 import React,{useEffect,useRef,useState} from 'react';
 import {X,Settings2} from 'lucide-react';
 import {DeploymentProfileSelect} from './DeploymentProfile.jsx';
+import GenerationAvailability from './GenerationAvailability.jsx';
+import {modeAvailability,requireModeAvailable} from './generation-availability.js';
 import {CONTROL_LABELS,CONTROL_GROUPS,clone,defaultsFor,effectiveControlSchema,recipeFor,settingsProblems,bindingParticipates} from './quick-chat-model.js';
 export function ChatDialog({title,onClose,children,wide=false,className='',eyebrow=''}){
   const ref=useRef(),opener=useRef(globalThis.document?.activeElement);
@@ -17,7 +19,7 @@ function ProfileInputBoundary({support}){
   if(!support?.input_notes&&!support?.joint_cases?.length)return null;
   return <section className="qc-profile-boundary"><strong>此配方已验收的输入组合</strong>{support.input_notes&&<p className="qc-muted">{support.input_notes}</p>}{support.joint_cases?.length>0&&<ul className="qc-muted">{support.joint_cases.map((item,index)=><li key={index}>{item.width} × {item.height} · {item.steps} 步 · {item.frames} 帧：{item.input_roles?.length?item.input_roles.map(role=>roles[role]||role).join(' ＋ '):'纯文字'}</li>)}</ul>}<p className="qc-muted">这些是已验证的组合，不代表可以任意混搭。最终以后台预检为准。</p></section>;
 }
-export default function QuickChatControls({capabilities,settings,bindings=[],cardPrompt,scope='next',modeIntent,busy=false,onSave,onClose,onEditMaterials}){
+export default function QuickChatControls({capabilities,settings,bindings=[],cardPrompt,scope='next',modeIntent,busy=false,onSave,onClose,onEditMaterials,availability,operator=false,onRefreshAvailability,availabilityChecking=false}){
   const [draft,setDraft]=useState(()=>clone(settings)),[prompt,setPrompt]=useState(cardPrompt||''),[error,setError]=useState(''),[pendingMode,setPendingMode]=useState(null);
   const recipe=recipeFor(capabilities,draft),schema=effectiveControlSchema(recipe);
   const [mode,setMode]=useState(modeIntent||recipe?.mode||'auto');
@@ -27,17 +29,20 @@ export default function QuickChatControls({capabilities,settings,bindings=[],car
   function target(intent){const base=capabilities?.recipes?.find(item=>item.mode===effectiveMode(intent));return base?recipeFor(capabilities,{...draft,recipe_id:base.id}):null;}
   function applyMode(intent){
     const next=target(intent);if(!next){setError('服务尚未开放这种生成方式。');return;}
+    if(next.mode!==recipe?.mode){try{requireModeAvailable(availability,capabilities,draft,next.mode);}catch(error){setError(error.message);setPendingMode(null);return;}}
     const defaults=defaultsFor(capabilities,next.id,draft.deployment_profile_id),nextSchema=effectiveControlSchema(next),controls={...defaults.controls};
     for(const [field,value]of Object.entries(draft.controls||{}))if(nextSchema[field]&&(!nextSchema[field].enum||nextSchema[field].enum.includes(value)))controls[field]=value;
     setDraft({...draft,recipe_id:next.id,controls});setMode(intent);setPendingMode(null);setError('');
   }
   function changeMode(intent){
     const next=target(intent);if(!next){setError('服务尚未开放这种生成方式。');return;}
+    if(next.mode!==recipe?.mode){try{requireModeAvailable(availability,capabilities,draft,next.mode);}catch(error){setError(error.message);return;}}
     const excluded=bindings.filter(b=>bindingParticipates(b,recipe)&&!bindingParticipates(b,next));
     if(excluded.length){setPendingMode({intent,count:excluded.length});return;}applyMode(intent);
   }
   async function save(event){
     event.preventDefault();if(pendingMode){setError('请先确认或取消生成方式切换。');return;}
+    if(recipe?.mode!==recipeFor(capabilities,settings)?.mode){try{requireModeAvailable(availability,capabilities,draft);}catch(error){setError(error.message);return;}}
     const problems=settingsProblems(draft,recipe);if(scope==='card'&&!prompt.trim())problems.unshift('请填写完整生成提示词。');
     if(problems.length){setError(problems.join(' '));return;}setError('');
     try{await onSave(draft,prompt,{modeIntent:mode});onClose();}catch(err){setError(err.message||'尚未保存，请核对原操作。');}
@@ -51,8 +56,9 @@ export default function QuickChatControls({capabilities,settings,bindings=[],car
       <p className="qc-muted">按常用程度排列 · 可用范围以当前服务与预检为准</p>
       {!recipe?<p role="alert">尚未读取到服务能力，不能猜测支持的参数。</p>:<>
         <DeploymentProfileSelect capabilities={capabilities} value={draft.deployment_profile_id} mode={recipe?.mode} disabled={busy} onChange={value=>setDraft({...draft,deployment_profile_id:value})}/><label className="qc-field"><span>生成方式</span><select aria-label="生成方式" value={pendingMode?.intent||mode} onChange={e=>changeMode(e.target.value)}>
-          <option value="auto">自动匹配素材</option>{['fl','ref'].filter(value=>capabilities.recipes.some(item=>item.mode===value)).map(value=><option key={value} value={value}>{value==='fl'?'首尾帧':'全能参考'}</option>)}
+          <option value="auto" disabled={effectiveMode('auto')!==recipe.mode&&!modeAvailability(availability,capabilities,draft,effectiveMode('auto')).available}>自动匹配素材</option>{['fl','ref'].filter(value=>capabilities.recipes.some(item=>item.mode===value)).map(value=>{const status=modeAvailability(availability,capabilities,draft,value);return <option key={value} value={value} disabled={!status.available}>{value==='fl'?'首尾帧':'全能参考'} · {status.label}</option>;})}
         </select></label>
+        <GenerationAvailability snapshot={availability} capabilities={capabilities} settings={draft} operator={operator} onRefresh={onRefreshAvailability} checking={availabilityChecking}/>
         <p className="qc-muted">首尾帧与全能参考互斥。切换后不兼容的素材会保留，但不会加入任务。{mode==='auto'?`当前匹配：${recipe.mode==='fl'?'文生 / 首尾帧':'全能参考'}。`:''}</p>
         {pendingMode&&<section className="qc-warning" role="alert"><p>切换后 {pendingMode.count} 份当前素材不再参与，原素材和历史卡片保留。</p><button type="button" onClick={()=>applyMode(pendingMode.intent)}>切换并保留素材</button><button type="button" onClick={()=>setPendingMode(null)}>保持原方式</button></section>}
         {scope==='card'&&<label className="qc-field"><span>完整视频提示词</span><textarea aria-label="完整视频提示词" rows={4} maxLength={12000} value={prompt} onChange={e=>setPrompt(e.target.value)} required/></label>}

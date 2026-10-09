@@ -91,6 +91,7 @@ export function createCloudClient({fetcher=(...args)=>fetch(...args),onUnauthori
     projects:({limit=100,offset=0}={})=>request(`/v1/projects?limit=${limit}&offset=${offset}`),createProject:(project,key)=>request('/v1/projects',{method:'POST',body:{project},key}),
     project:projectId=>request(`/v1/projects/${id(projectId)}`),saveProject:(projectId,project,version)=>request(`/v1/projects/${id(projectId)}`,{method:'PUT',body:{expected_version:version,project}}),
     capabilities:()=>request('/v1/capabilities'),
+    generationAvailability:()=>request('/v1/generation-availability'),
     changePassword:(old_password,new_password)=>request('/v1/auth/password',{method:'POST',body:{old_password,new_password}}),
     apiKeys:()=>request('/v1/api-keys'),createApiKey:body=>request('/v1/api-keys',{method:'POST',body}),revokeApiKey:keyId=>request(`/v1/api-keys/${id(keyId)}`,{method:'DELETE'}),
     projectMeta:projectId=>request(`/v1/projects/${id(projectId)}/meta`),

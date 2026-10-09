@@ -375,7 +375,7 @@ class ComposeBoundaryTests(unittest.TestCase):
         self.assertEqual(set(controller['networks']),{'database','edge'})
         self.assertNotIn('--enabled',controller['command'])
         self.assertEqual(app['environment']['SIXNINE_DEFAULT_DEPLOYMENT_PROFILE_ID'],PROFILE)
-        self.assertEqual(app['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS'],'superdan')
+        self.assertEqual(app['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS'],'superdan,supervan')
         for mount in app['volumes']:
             self.assertNotIn(str(host.KEY),mount['source'])
             self.assertNotIn('/control',mount['source'])

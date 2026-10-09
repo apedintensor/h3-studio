@@ -1,0 +1,120 @@
+"""Authenticated advisory capacity projection; no admission or provider actions."""
+from sqlalchemy import select
+
+from .control import WorkerControl, REAL_GPU_BACKENDS
+from .execution_policy import read_policy
+from .execution_profiles import read_profiles
+from .operator_capacity import operator_nodes, operator_heartbeats, OperatorError, CONTROLLER_FRESH_SECONDS
+from .repository import instance_intents
+from .runtime_catalog import public_catalog
+
+MODES = {"fl": "h3-base-fl2va-v1", "ref": "h3-base-ref2va-v1"}
+
+
+def _result(recipe, state, reason):
+    return {"recipe_id": recipe, "state": state, "reason_code": reason,
+            "available": state in {"ready", "busy"}}
+
+
+def _preparing(repo, registry, policy, mode, now):
+    """Only a fresh exact managed binding can claim an in-progress startup."""
+    if not policy.get("deployment_profile_id"):
+        return "unavailable"
+    with repo.engine.connect() as connection:
+        rows = list(connection.execute(select(operator_nodes, instance_intents.c.provider,
+            instance_intents.c.state.label("instance_state"), instance_intents.c.hard_deadline)
+            .join(instance_intents, instance_intents.c.id == operator_nodes.c.intent_id)
+            .where(instance_intents.c.pool == policy["pool"])).mappings())
+        heartbeat = connection.execute(select(operator_heartbeats).where(
+            operator_heartbeats.c.id == "global")).mappings().first()
+    states = set()
+    for row in rows:
+        chosen = row["payload"].get("selection", {})
+        if chosen.get("runtime_profile_id") != policy["deployment_profile_id"] or chosen.get("mode") != mode:
+            continue
+        if (row["desired_state"] != "running" or row["instance_state"] in {"draining", "destroying", "destroyed"}
+                or row["hard_deadline"] <= now):
+            continue
+        try:
+            binding = registry.get(row["binding_id"]) if registry is not None else None
+            exact = bool(binding and binding.fingerprint == row["binding_hash"]
+                and binding.runtime_profile_id == policy["deployment_profile_id"] and binding.mode == mode
+                and binding.pool == policy["pool"] and binding.configuration_id == policy["configuration_id"]
+                and binding.model_id == policy["model_id"] and binding.engine_manifest_digest == policy["engine_manifest_digest"]
+                and policy.get("output_delivery") == "native-frames-v1"
+                and binding.launch.provider == row["provider"])
+        except (OperatorError, ValueError):
+            exact = False
+        fresh = (heartbeat and heartbeat["state"] == "running"
+            and 0 <= now-heartbeat["observed_at"] <= CONTROLLER_FRESH_SECONDS
+            and 0 <= now-row["updated_at"] <= 60)
+        if not exact or not fresh or row["instance_state"] == "creation_unknown":
+            states.add("unknown")
+        elif row["runtime_state"] in {"blocked", "failed", "bootstrap_unconfigured", "draining", "stopped", "removal_pending"}:
+            states.add("unavailable")
+        elif row["runtime_state"] in {"waiting_provider", "preparing", "starting", "waiting", "recovering",
+                "awaiting_qualified_workers", "provider_lifetime_unverified", "provider_execution_unverified"}:
+            states.add("starting")
+        else:
+            states.add("unknown")
+    return "starting" if "starting" in states else "unknown" if "unknown" in states else "unavailable"
+
+
+def _mode_result(settings, repo, registry, policy, valid, mode, recipe, now):
+    if not settings.generation_enabled or settings.execution_backend not in REAL_GPU_BACKENDS:
+        state, reason = "disabled", "generation_disabled"
+    elif not valid:
+        state, reason = "unknown", "availability_configuration_unconfirmed"
+    elif policy is None or recipe not in policy["recipe_ids"]:
+        state, reason = "disabled", "profile_not_configured"
+    elif not policy["enabled"] or policy["backend"] != settings.execution_backend:
+        state, reason = "disabled", "profile_disabled"
+    elif (policy["qualification"]["status"] not in {"accepted", "runtime_required"}
+            or policy["qualification"]["verified_at"] > now
+            or now + policy["reservation"]["expected_runtime_s"] >= min(
+                policy["qualification"]["expires_at"], policy["reservation"]["expires_at"])):
+        state, reason = "disabled", "profile_authority_expired"
+    else:
+        counts = WorkerControl(repo).pool_status(policy["pool"], model_id=policy["model_id"],
+            configuration_id=policy["configuration_id"], recipe_id=recipe, backend=policy["backend"],
+            engine_manifest_digest=policy.get("engine_manifest_digest", ""), output_delivery=policy.get("output_delivery", ""))
+        if counts["ready"]:
+            state, reason = "ready", "matching_worker_ready"
+        elif counts["busy"]:
+            state, reason = "busy", "matching_worker_busy"
+        elif counts["unknown"]:
+            state, reason = "unknown", "worker_readiness_unconfirmed"
+        elif counts["registered"]:
+            state, reason = "starting", "matching_worker_starting"
+        else:
+            state = _preparing(repo, registry, policy, mode, now)
+            reason = {"starting": "matching_capacity_starting", "unknown": "capacity_readiness_unconfirmed",
+                      "unavailable": "matching_capacity_unavailable"}[state]
+    return _result(recipe, state, reason)
+
+
+def generation_availability(settings, repo, *, registry=None):
+    now = repo.clock()
+    try:
+        policies = read_profiles(settings.execution_profiles_file)
+        policies_valid = True
+    except ValueError:
+        policies, policies_valid = {}, False
+    profiles = []
+    for profile in public_catalog()["profiles"]:
+        modes = {}
+        for mode, recipe in MODES.items():
+            policy = policies.get((profile["id"], recipe))
+            modes[mode] = _mode_result(settings, repo, registry, policy, policies_valid, mode, recipe, now)
+        profiles.append({"deployment_profile_id": profile["id"], "modes": modes})
+    # Missing profile selection is the existing legacy route, never the default
+    # named profile. Read precisely the same policy source as selected_policy().
+    try:
+        legacy, legacy_valid = read_policy(settings.execution_policy_file), True
+    except ValueError:
+        legacy, legacy_valid = None, False
+    profiles.append({"deployment_profile_id": None, "modes": {
+        mode: _mode_result(settings, repo, registry, legacy, legacy_valid, mode, recipe, now)
+        for mode, recipe in MODES.items()}})
+    return {"version": 1, "observed_at": now, "expires_at": now+10,
+            "poll_after_seconds": 10, "advisory_only": True, "profiles": profiles}

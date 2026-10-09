@@ -240,7 +240,7 @@ def overlay(image, profile_id, runtime=None):
         'SIXNINE_EXECUTION_PROFILES_FILE':PROFILES.as_posix(),'SIXNINE_GENERATION_ENABLED':'1',
         'SIXNINE_EXECUTION_BACKEND':'wangp-worker','AWS_EC2_METADATA_DISABLED':'true',
         'SIXNINE_DEFAULT_DEPLOYMENT_PROFILE_ID':profile_id,
-        'SIXNINE_OPERATOR_CAPACITY_OWNERS':'superdan'},
+        'SIXNINE_OPERATOR_CAPACITY_OWNERS':'superdan,supervan'},
         'volumes':shared_mounts(),'healthcheck':{'test':['CMD','python','-c',GPU_HEALTH]}},
         SERVICE:controller(image,runtime)}}
 

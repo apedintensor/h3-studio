@@ -6,6 +6,8 @@ This is a dated observation, not live health or renewed authority. [DECISIONS.md
 
 ## Current release and operating state
 
+Pending source batch [#99](https://github.com/apedintensor/h3-studio/issues/99) adds authenticated live FL/REF availability, exact-profile creator/Agent checks and the explicitly authorized `supervan` browser-operator allowlist entry. Local API/permission tests and isolated browser checks are recorded in that issue; these are not deployed permission or capacity evidence. Read-only production receipt `ab1e1870-7026-47d1-9828-f55f1809b159` at epoch `1791574363.9044385` still reports only `superdan`, zero active jobs, one unresolved live Targon intent and one pending stop command. The same quiet-rollout gate remains; do not hot-edit the production allowlist or clear the obligation to bypass it.
+
 | Surface | Verified evidence | Boundary |
 |---|---|---|
 | Application and frontend | Exact application `bdb036651a435bae4eda25f2b28660c7aeb55354`, including [PR #95](https://github.com/apedintensor/h3-studio/pull/95) and [PR #96](https://github.com/apedintensor/h3-studio/pull/96). [Preparation/publication](https://github.com/apedintensor/h3-studio/actions/runs/37968759357) and [successful protected deployment retry](https://github.com/apedintensor/h3-studio/actions/runs/37972601514); healthy receipt `89e77910-191b-4f68-bdc5-e78b6192b733`. Approved manifest SHA-256 `21a94ec91aa7bba35b59fc057006a7d5e1daaf175fc966e2c2f43e7b2ed75b7a`; image identity `sha256:91683b852b400651f485da6a4832092ad48bcdcdca127823d7dfb9895e7186ac`. | Source/release checks are separate from the real jobs below. Published frontend assets do not establish browser workflow acceptance. |

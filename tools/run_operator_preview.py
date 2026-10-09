@@ -24,7 +24,7 @@ def main():
     import uvicorn
     settings = Settings(data_dir=args.data.resolve(),frontend_dir=args.frontend.resolve(),
         auth_mode='local-test',generation_enabled=False,execution_backend='disabled',render_enabled=False,
-        operator_capacity_owners=('superdan',))
+        operator_capacity_owners=('superdan','supervan'))
     app = create_app(settings,operator_registry=OperatorRegistry(catalog=public_catalog))
     scanner = None
     if args.scan_inventory:

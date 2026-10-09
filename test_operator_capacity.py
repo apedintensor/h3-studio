@@ -97,6 +97,20 @@ class OperatorTests(LedgerCase):
                 with self.assertRaisesRegex(OperatorError,code): function()
         self.assertTrue(self.service.state(self.actor)["operator"]["permissions"]["start"])
 
+    def test_explicit_second_operator_can_manage_capacity_but_keys_cannot(self):
+        self.settings.operator_capacity_owners=("superdan","supervan")
+        other=Principal("supervan","browser",auth_mode="password")
+        preview=self.service.preview(other,self.chosen)
+        self.assertTrue(preview["can_start"])
+        operation=self.service.start(other,{"preview_id":preview["preview_id"]},"supervan-start")["operation"]
+        self.assertEqual(operation["kind"],"start")
+        self.assertTrue(self.service.state(other)["operator"]["permissions"]["stop"])
+        for actor in (Principal("outsider","browser"),
+                      Principal("supervan","pat",machine=True,all_projects=True),
+                      Principal("superdan","pat",machine=True,all_projects=True)):
+            with self.assertRaisesRegex(OperatorError,"operator_forbidden"):
+                self.service.preview(actor,self.chosen)
+
     def test_production_inventory_gates_preview_and_new_start_but_not_replay(self):
         self.registry.inventory_required=True
         blocked=self.service.preview(self.actor,self.chosen)
