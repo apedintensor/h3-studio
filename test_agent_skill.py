@@ -48,6 +48,41 @@ class AgentClientTests(unittest.TestCase):
             self.run_client(handler)
         self.assertEqual(seen, ["studio.example.test"])
 
+    def test_availability_is_one_authenticated_get_and_preserves_per_profile_modes(self):
+        observed = {"version": 1, "observed_at": 100, "expires_at": 110,
+            "poll_after_seconds": 10, "advisory_only": True, "profiles": []}
+        for profile_id, states in (("selected-profile", ("unavailable", "starting")),
+                                   ("other-profile", ("ready", "busy")),
+                                   ("disabled-profile", ("disabled", "unknown"))):
+            observed["profiles"].append({"deployment_profile_id": profile_id,
+                "modes": {mode: {"recipe_id": "recipe-"+mode, "state": state,
+                    "reason_code": "observed_"+state, "available": state in {"ready", "busy"}}
+                    for mode, state in zip(("fl", "ref"), states)}})
+        seen = []
+        def handler(request):
+            seen.append((request.method, request.url.path))
+            self.assertEqual(request.headers["Authorization"], "Bearer synthetic-test-key")
+            self.assertFalse(request.content)
+            return httpx.Response(200, json=observed)
+        result = json.loads(self.run_client(handler, command="availability",
+            method="POST", path="/v1/jobs"))
+        # Even an old observation is returned unchanged, never converted into a global yes/no.
+        self.assertEqual(result, observed)
+        self.assertEqual(seen, [("GET", "/v1/generation-availability")])
+
+    def test_availability_error_or_redirect_never_retries_or_becomes_offline(self):
+        for status in (302, 401, 404, 503):
+            seen = []
+            def handler(request):
+                seen.append((request.method, str(request.url)))
+                return httpx.Response(status, headers={"Location": "https://untrusted.example/"},
+                    text="synthetic-test-key PRIVATE RESPONSE")
+            with self.subTest(status=status), self.assertRaisesRegex(ValueError, "HTTP "+str(status)) as error:
+                self.run_client(handler, command="availability")
+            self.assertEqual(seen, [("GET", "https://studio.example.test/v1/generation-availability")])
+            self.assertNotIn("PRIVATE", str(error.exception))
+            self.assertNotIn("synthetic-test-key", str(error.exception))
+
     def test_write_keeps_idempotency_and_does_not_retry(self):
         seen = []
         def handler(request):

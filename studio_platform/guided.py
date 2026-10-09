@@ -525,7 +525,9 @@ def register_routes(app):
         from .agent_discovery import public_guide
         return {"version": 2, "schema_url": "/v1/guided-schema", "openapi_url": "/openapi.json", "skill_download_url": "/v1/agent-skill.zip",
             "quick_creation": public_guide()["quick_creation"], "examples_url": "/for-agents/guide.json",
+            "generation_availability": public_guide()["generation_availability"],
             "steps": ["Browser account creates scoped API key; pass Bearer on API calls only",
+                "Before choosing FL/REF, preflight and a new GPU submission, GET /v1/generation-availability; follow generation_availability for exact profile/mode, freshness and administrator/wait guidance. An omitted/null legacy profile matches only the explicit null row. Existing uncertain jobs retain their original receipt/key.",
                 "For one clip, create workspace=freestyle; use project.journey.reviewShotId, shot.configure_generation and the saved-draft generation-plans route. Exact examples: /for-agents/guide.json",
                 "POST /v1/projects with title/logline and stable Idempotency-Key; select returned project id",
                 "POST /v1/projects/{id}/actions with expected_version and atomic actions",

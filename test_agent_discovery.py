@@ -35,12 +35,26 @@ class AgentDiscoveryTests(unittest.TestCase):
     def test_only_exact_safe_methods_are_public_and_api_stays_private(self):
         for path in sorted(agent_discovery.PUBLIC_PATHS):
             self.assertEqual(self.client.post(path, json={}).status_code, 401)
-        for path in ("/for-agents/private", "/for-agents/key", "/v1/projects", "/v1/capabilities",
+        for path in ("/for-agents/private", "/for-agents/key", "/v1/projects", "/v1/capabilities", "/v1/generation-availability",
                      "/v1/agent-guide", "/v1/guided-schema", "/v1/agent-skill.zip", "/openapi.json",
                      "/v1/projects/nonexistent/activity"):
             self.assertEqual(self.client.get(path).status_code, 401, path)
         self.assertEqual(self.client.get("/for-agents", headers={"Host": "attacker.example"}).status_code, 400)
         self.assertEqual(self.client.get("/for-agents", headers={"Authorization": "Bearer invalid"}).status_code, 401)
+
+    def test_discovery_only_links_authenticated_availability_without_live_observations(self):
+        guide = self.client.get("/for-agents/guide.json").json()
+        contract = guide["generation_availability"]
+        self.assertEqual(contract["path"], guide["authenticated_resources"]["generation_availability"])
+        self.assertEqual(contract["method"], "GET")
+        self.assertTrue(contract["authenticated"])
+        self.assertEqual(contract["required_scope_any"], ["jobs:read", "jobs:write"])
+        for private_observation in ("profiles", "observed_at", "expires_at"):
+            self.assertNotIn(private_observation, contract)
+        self.login()
+        authenticated = self.client.get("/v1/agent-guide")
+        self.assertEqual(authenticated.status_code, 200)
+        self.assertEqual(authenticated.json()["generation_availability"], contract)
 
     def test_public_content_does_not_change_after_private_edit(self):
         paths = ("/for-agents", "/llms.txt", "/for-agents/guide.json", "/for-agents/SKILL.md")

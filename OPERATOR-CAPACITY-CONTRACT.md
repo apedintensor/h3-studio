@@ -22,6 +22,25 @@ An operator-owned execution-profile file can bind several profile/mode policies.
 
 ## Commands and observations
 
+### Creator and Agent mode availability
+
+Authenticated `GET /v1/generation-availability` is the shared, read-only observation for browser creators and Agent clients. Browser authentication or a generation key with `jobs:read` or `jobs:write` is sufficient; operator privileges are not required. It performs no provider query, rental, job creation or inference and exposes no private worker, provider, account or job identifiers. Responses are not cacheable.
+
+The version-1 response contains `observed_at`, `expires_at`, `poll_after_seconds` (10), `advisory_only: true`, and `profiles`. Each entry identifies one exact `deployment_profile_id` and `modes.fl` / `modes.ref`, with `recipe_id`, `state`, `reason_code` and `available`. An explicit `deployment_profile_id: null` entry observes the actual legacy execution policy for drafts/plans without a profile; it never borrows readiness from the named default profile. Freshness expires after ten seconds; consumers refresh on focus, before a new generation confirmation and while showing current availability. Static capabilities and catalog qualification do not replace this observation.
+
+| State | New creator/Agent behavior |
+|---|---|
+| `ready` | Select this exact mode/profile and perform normal request-specific preflight. |
+| `busy` | Select this mode and attempt normal queue admission; show that matching capacity is busy. |
+| `starting` | Show that the matching machine is preparing; wait and refresh, without requesting another rental. |
+| `unavailable` | Block new generation confirmation for this mode and ask an administrator to start matching capacity. |
+| `disabled` | Block confirmation and ask an administrator to enable/configure the mode; renting alone may not resolve policy restrictions. |
+| `unknown` | Fail closed for new confirmation and refresh; stale or missing evidence is not proof of an offline or ready machine. |
+
+`available` is true only for `ready` or `busy`. A ready observation is not a slot reservation and does not validate the prompt, input combination, budget or remaining execution window. Existing preflight and submission admission remain authoritative. Do not combine FL readiness from one profile with REF readiness from another, silently change models/precision, or convert inputs to another mode. Existing saved choices, material roles and accepted jobs remain unchanged when availability changes. Original submissions and unknown outcomes must still be reconciled under their original idempotency identities, not blocked from observation or submitted again.
+
+Only explicitly authorized browser operators may follow the operator-console action to start capacity. The configured production browser allowlist includes `superdan` and `supervan` once its protected deployment is applied; ordinary creator/Agent availability access does not grant rental authority. Source configuration is not evidence of current deployed permissions.
+
 The operator API uses `/v1/operator/capacity`. Start follows selection -> bounded preview -> explicit confirmation with an idempotency key -> durable operation -> controller reconciliation. Identical replay returns the original operation. Conflicting reuse is rejected. Stock and quotes are observations with timestamps, not reservations. Selection accepts only allowlisted provider/profile/hardware/filter values from trusted deployment bindings, never a browser-supplied shell command, URL or manifest.
 
 Limits are versioned; concurrent edits require `expected_version`. Tightening limits prevents new starts without erasing existing nodes or reservations. Raising UI limits cannot raise a ledger budget, extend a deadline, or bypass the provider manifest. A start that no longer fits returns a concrete blocker. No automatic recharge.

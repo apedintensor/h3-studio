@@ -73,7 +73,17 @@ def public_guide():
         "description": "Create one quick H3 clip or edit a multi-chapter story; save the same prompt, separate references and controls visible on the website, plan generation and adopt results without replacing prior takes.",
         "discovery_is_authorization": False,
         "quick_chat": agent_contract(),
-        "runtime_state": "Not advertised by this static guide. Authenticate, read capabilities, and inspect an actual plan's execution, blockers and estimate. Disabled generation is not a successful generation.",
+        "runtime_state": "Not advertised by this static guide. Authenticate and GET /v1/generation-availability for the exact deployment profile and FL/REF mode before choosing a mode, preflight and a new submission. Refresh expired observations; capabilities and actual preflight remain authoritative for admission.",
+        "generation_availability": {
+            "method": "GET", "path": "/v1/generation-availability", "authenticated": True,
+            "required_scope_any": ["jobs:read", "jobs:write"],
+            "selection": "Match profiles[].deployment_profile_id and modes.fl or modes.ref with its recipe_id. An omitted/null profile uses only the explicit deployment_profile_id:null row for the actual legacy policy; a missing null row is unknown, never the named default. Never use another profile's availability or silently change the user's model, precision or references.",
+            "freshness": "Use observed_at and expires_at; refresh after expiry and wait at least poll_after_seconds between reads. Missing entries or failed/expired observations are unknown, not proof of offline status. If an older server returns 404 or an unsupported contract, preserve the draft and ask an administrator to update/check the service; never fall back to catalog enabled or submit blindly.",
+            "state_actions": {"ready": "Continue to preflight.", "busy": "Explain the wait; preflight decides whether this job can queue.",
+                "starting": "Wait and refresh; do not start another machine.", "unavailable": "Preserve the draft and ask an administrator to start this exact profile/mode.",
+                "disabled": "Report reason_code and ask an administrator to enable/configure the service.", "unknown": "Refresh; do not assume offline or submit blindly."},
+            "boundary": "Advisory only; available is true only for ready/busy. This read never reserves, rents or submits. It does not replace capabilities/preflight or authorize operator calls. Reconcile an existing uncertain job using its original receipt/key regardless of current availability.",
+        },
         "public_resources": {"html": "/for-agents", "text": "/llms.txt", "manifest": "/for-agents/guide.json",
             "skill": "/for-agents/SKILL.md", "skill_download": "/for-agents/skill.zip",
             "connection_helper": HELPER_PATH, "connection_manifest": MANIFEST_PATH},
@@ -105,7 +115,7 @@ def public_guide():
         },
         "authenticated_resources": {
             "guide": "/v1/agent-guide", "schema": "/v1/guided-schema", "openapi": "/openapi.json",
-            "capabilities": "/v1/capabilities", "projects": "/v1/projects",
+            "capabilities": "/v1/capabilities", "generation_availability": "/v1/generation-availability", "projects": "/v1/projects",
             "project": "/v1/projects/{project_id}", "actions": "/v1/projects/{project_id}/actions",
             "activity": "/v1/projects/{project_id}/activity", "assets": "/v1/assets",
             "generation_draft": "/v1/projects/{project_id}/shots/{shot_id}/generation-draft",
@@ -116,6 +126,7 @@ def public_guide():
         "workflow": [
             {"step": "Discover", "action": "Read the public skill; no key is needed to learn the contract. A shared URL alone does not authorize editing or spending."},
             {"step": "Connect", "action": "Use the owner's one-time connection grant and OS-protected helper, or an explicit existing scoped PAT. Then GET the authenticated guide, guided schema and capabilities. Use OpenAPI for exact endpoint bodies."},
+            {"step": "Check mode availability", "action": "GET authenticated /v1/generation-availability for the exact deployment profile and FL/REF mode before choosing, preflight and a new submission. Ready/busy can proceed to preflight; starting waits. For unavailable/disabled, preserve the draft and ask an administrator; unknown/expired needs a fresh observation. Never rent automatically or change modes to bypass capacity."},
             {"step": "Choose a workflow", "action": "For conversation sessions and editable job cards, follow this guide's quick_chat contract and authenticated /v1/quick-chat/schema. The website assistant is disabled by default; external Agents can create cards directly. The following project steps remain the supported legacy freestyle/story workflow. Neither path submits generation while authoring."},
             {"step": "Edit", "action": "Read the current project/version, then POST atomic guided actions with expected_version. On 409 read again and reconcile; preserve unrelated edits."},
             {"step": "Prepare media", "action": "Upload into the same project, wait for ready, then shot.configure_generation saves prompt, controls and separate receipt-ID input slots. It maintains web associations; asset.attach remains available for general library editing. Preserve originals and explicit selections."},
@@ -232,6 +243,8 @@ For one clip, POST /v1/projects with title and workspace=freestyle. Use project.
 A URL is a discovery link, not permission to edit or spend. The owner explicitly authorizes a one-time connection. Read /for-agents/connect-manifest.json, inspect /for-agents/connect.py and verify its digest before executing. The five-minute code may be handed to the Agent; the permanent PAT is generated locally and stored before exchange in Windows user DPAPI or Linux Secret Service. No internal AI Registry is required. Missing supported storage stops before exchange. Resume uncertain exchanges with the same saved connection. Manual PATs remain an advanced fallback using a process-only credential. Never put permanent keys in chat, URLs, argv or ordinary files. The only anonymous POST is /v1/agent-connect/exchange; account/business APIs and OpenAPI require authentication. The connection UI has a separate publication gate. Use only the origin supplied by the user and do not forward its credential to other origins.
 
 After authorization, read GET /v1/agent-guide, /v1/guided-schema, /v1/capabilities and /openapi.json. Static documentation is not proof that generation is enabled. An actual plan may be blocked; do not invent successful media.
+
+Before choosing FL/REF, preflight and a new submission, GET authenticated /v1/generation-availability (PAT jobs:read or jobs:write; the helper's availability command performs only this read). Match the exact profiles[].deployment_profile_id and modes.fl/ref recipe, not any other ready profile. An omitted/null legacy profile matches only the explicit deployment_profile_id:null row, never the named default; a missing null row is unknown. Observe expires_at and poll_after_seconds; expired/missing observations are unknown. ready/busy have available=true but remain subject to capabilities and preflight; busy may queue. starting waits without starting another machine. unavailable/disabled means preserve the draft and ask an administrator to start or configure that exact profile/mode. unknown means refresh, not assume offline. Do not rent, silently change model/precision/mode, or submit blindly to wake a GPU. Existing uncertain jobs still use their original receipt/key. Public discovery contains no live availability.
 
 ## Edit, generate, return control
 Read the current project/version; use atomic guided actions with expected_version and stable Idempotency-Key. On 409 fetch and reconcile. Upload references to the same story. Inspect a generation plan's blockers/estimate before submitting within the user's authorization. Poll the original job; an unknown outcome is never a reason to issue a new paid request.

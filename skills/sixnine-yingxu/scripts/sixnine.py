@@ -224,10 +224,14 @@ def run(args, transport=None, *, resolver=None, clock=time.monotonic, sleep=time
         headers["Idempotency-Key"] = args.idempotency_key
     with httpx.Client(base_url=args.base_url, headers=headers, follow_redirects=False,
                       timeout=httpx.Timeout(300, connect=15), trust_env=False, transport=transport) as client:
-        if args.command == "request":
-            path = api_path(args.path)
-            body = json.loads(Path(args.json_file).read_text(encoding="utf-8")) if args.json_file else None
-            response = client.request(args.method, path, json=body)
+        if args.command in {"request", "availability"}:
+            if args.command == "availability":
+                # Read the observation unchanged; this is not an admission or rental action.
+                response = client.get("/v1/generation-availability")
+            else:
+                path = api_path(args.path)
+                body = json.loads(Path(args.json_file).read_text(encoding="utf-8")) if args.json_file else None
+                response = client.request(args.method, path, json=body)
             check_response(response)
             if len(response.content) > 8 * 1024 * 1024:
                 raise ValueError("JSON response exceeded the expected limit")
@@ -265,6 +269,8 @@ def main():
     parser.add_argument("--profile")
     parser.add_argument("--connection", help="Activated one-time connection ID in OS-protected storage")
     commands = parser.add_subparsers(dest="command", required=True)
+    availability = commands.add_parser("availability", help="Read authenticated profile/mode availability once; never submit or rent")
+    availability.add_argument("--output")
     req = commands.add_parser("request")
     req.add_argument("method", choices=["GET", "POST", "PUT", "PATCH", "DELETE"])
     req.add_argument("path")
