@@ -36,6 +36,7 @@ from .frontend import FRONTEND_CONTRACT, STATIC_CACHE_SCOPE_KEY, is_public_front
 from .generation_admission import GenerationAdmission, reject_managed
 from .generation_services import GenerationAccess, GenerationPlanning, GenerationRead
 from .operator_capacity import OperatorRegistry  # Register additive tables before create_schema.
+from . import capacity_market  # Read-only market cache; never authorizes capacity.
 
 COOKIE = "sixnine_session"
 TERMINAL = {"succeeded", "failed", "cancelled"}

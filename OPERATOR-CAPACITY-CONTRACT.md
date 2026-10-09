@@ -28,6 +28,50 @@ Drain stops new claims and retains reconciliation/collection. Stop is drain-then
 
 An ambiguous bootstrap is `runtime_state: blocked` with `reason_code: bootstrap_reconciliation_required`, not indefinite preparation or proof of failure/removal. The node's optional `bootstrap` observation has a controller `observed_at`, aggregate state/reason and bounded per-slot `index`, `state`, `phase`, `failure_phase`, `error_code` and `error_type`. Only allowlisted static diagnostics are public; raw logs, exception messages, credentials and file paths are excluded. The last observation may remain visible after state changes and must be labelled historical. This projection preserves the original boot/rental journals, deadlines and reservations; it neither authorizes a restart nor converts unknown execution into safe destruction.
 
+## Provider stock and next-tier recommendations
+
+[Issue #85](https://github.com/apedintensor/h3-studio/issues/85) adds advisory
+Lium/Targon stock, independently of the existing binding-based start admission.
+`provider` is optional in a selection; omission still means Lium and remains
+absent in historical canonical selections/hashes. Explicit Targon cannot resolve
+to a Lium binding, including through a custom resolver. Existing accepted jobs,
+previews, binding fingerprints and cumulative ledgers are unchanged.
+
+`GET /v1/operator/capacity/offers` accepts the full selection: profile, mode,
+GPU type/count, `node_count`, `ttl_seconds`, `provider`, and JSON-encoded `filters`
+(at most 4096 characters). Existing defaults remain compatible. Its additive
+`market` projection contains the echoed selection/hash, effective filter basis,
+per-provider observation timestamps/status, stock rows and recommendations.
+The HTTP API reads a normalized DB cache; it performs no supplier calls and
+needs no new credentials. The legacy top-level availability remains exact-binding
+admission evidence; `market.advisory_only` is always true.
+
+A successful observation expires after 120 seconds. Failed, malformed, partial,
+future-dated, stale or unconfigured observations do not prove absence. Unknown
+specs or possible GPU splitting must remain unconfirmed. When the selected
+provider has no matching single 5090 allocation, recommend only a single PRO
+6000 from fresh Lium/Targon stock (Lium first, then whole-node price). Never
+increase GPU/node count, switch weight/precision/mode, or raise the price cap.
+Each recommendation retains the original selection except provider/GPU type.
+Selecting it requests a new preview; it neither reserves money nor rents.
+
+Rows distinguish actual whole-resource quotes from approved deployment ceilings.
+Targon MiB and CPU millicores are converted explicitly; unknown edition,
+bandwidth and location stay unknown. Lium larger/partially available hosts are
+not quoted as cheap one-GPU slices. An available resource count does not prove
+independent physical hosts. Price/metadata and runtime qualification blockers
+are visible even when a larger-GPU suggestion is useful.
+
+Targon stock is integrated; its paid lifecycle is not qualified by this change.
+Targon VM images/SSH identities differ from the Lium bootstrap, and the official
+VM/BM contract does not supply the sandbox-only TTL guarantee required by our
+current controller. Therefore Targon previews return
+`operator_provider_start_unqualified`; starts remain blocked. Public inventory
+does not certify account-specific allocation, runtime readiness, lifetime,
+deletion or billing. These require a separately qualified deployment binding
+and lifecycle under [#86](https://github.com/apedintensor/h3-studio/issues/86),
+not a bypass of Lium's proof checks.
+
 ## Historical generation hints
 
 Use `total_seconds` consistently: task submission through local output save/validation, including component loading encountered in the task, excluding machine startup, queueing, dependency setup and prior downloads. Store process/loading context separately; no controlled warm/cold comparison was performed. Match profile, mode, resolution, native frames/fps, steps and reference roles exactly. A single measured sample is not an SLA or an estimate for another configuration.

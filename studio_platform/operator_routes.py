@@ -1,8 +1,10 @@
 """Cookie-only operator endpoints. Shared application middleware owns CSRF."""
+import json
 from fastapi import Header, Query, Request
 from fastapi.responses import JSONResponse
 
 from .operator_capacity import OperatorCapacity, OperatorError, OperatorRegistry, selection
+from . import capacity_market  # Register additive observation table before startup DDL.
 
 PREFIX = "/v1/operator/capacity"
 
@@ -34,17 +36,18 @@ def register_routes(app, *, registry=None, service=None):
 
     @app.get(PREFIX+"/offers")
     def offers(request: Request, runtime_profile_id: str, gpu_type: str, mode: str,
-               gpu_count: int = Query(1, ge=1, le=8)):
+               gpu_count: int = Query(1, ge=1, le=8), provider: str = "lium",
+               node_count: int = Query(1, ge=1, le=32), ttl_seconds: int = Query(120, ge=120, le=14400),
+               filters: str = Query("{}", max_length=4096)):
         service.authorize(principal(request))
-        chosen=selection({"runtime_profile_id":runtime_profile_id,"gpu_type":gpu_type,
-            "node_count":1,"gpu_count":gpu_count,"mode":mode,"ttl_seconds":120,"filters":{}})
         try:
-            value=service.registry.offers(chosen,service.repo.clock())
-        except Exception:
-            # Never echo raw provider errors (which can include request URLs).
-            value={"status":"unavailable","observed_at":service.repo.clock(),
-                "offers":[],"reason_code":"operator_inventory_unavailable"}
-        return response(value)
+            parsed_filters = json.loads(filters)
+        except ValueError:
+            raise OperatorError("operator_filters_invalid", 422) from None
+        chosen=selection({"runtime_profile_id":runtime_profile_id,"gpu_type":gpu_type,
+            "node_count":node_count,"gpu_count":gpu_count,"mode":mode,"ttl_seconds":ttl_seconds,
+            "filters":parsed_filters,"provider":provider})
+        return response(service.offers(principal(request), chosen))
 
     @app.post(PREFIX+"/previews")
     def previews(request: Request, body: dict):

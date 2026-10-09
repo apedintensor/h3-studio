@@ -9,7 +9,12 @@ export function createOperatorClient(options={}){
   return {...api,
     state:()=>api.request(ROOT+'/state'),
     catalog:()=>api.request(ROOT+'/catalog'),
-    offers:({runtime_profile_id,mode,gpu_type,gpu_count})=>api.request(ROOT+'/offers?'+new URLSearchParams({runtime_profile_id,mode,gpu_type,gpu_count})),
+    offers:({runtime_profile_id,mode,gpu_type,gpu_count,provider,node_count,ttl_seconds,filters})=>{
+      const query=new URLSearchParams({runtime_profile_id,mode,gpu_type,gpu_count});
+      for(const [key,value] of Object.entries({provider,node_count,ttl_seconds}))if(value!==undefined)query.set(key,value);
+      if(filters!==undefined)query.set('filters',JSON.stringify(filters));
+      return api.request(ROOT+'/offers?'+query);
+    },
     preview:selection=>api.request(ROOT+'/previews',{method:'POST',body:selection}),
     start:(body,key)=>api.request(ROOT+'/starts',{method:'POST',body,key}),
     drain:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/drain`,{method:'POST',body,key}),
