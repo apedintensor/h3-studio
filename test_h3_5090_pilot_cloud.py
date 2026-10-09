@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 
 import httpx
+from studio_platform.lium_provider import LiumError
 from tools.h3_5090_pilot_cloud import (
     ExactPilotProvider, Pilot, PilotError, POLICY_5090, POLICY_PRO6000, number, qualify, public_rows,
 )
@@ -121,12 +122,19 @@ class PilotTests(unittest.TestCase):
     def count(self, method, suffix):
         return sum(m == method and route.endswith(suffix) for m, route, _ in self.calls)
 
-    def test_rent_records_intent_exact_node_price_and_verified_two_hour_ttl(self):
+    def test_rent_records_original_two_hour_ttl_and_waits_for_running_to_verify(self):
         result = self.rent()
-        self.assertTrue(result["ttl_verified"])
+        self.assertFalse(result["ttl_verified"])
         self.assertEqual(result["deadline"], 8200)
         self.assertEqual(result["collection_deadline"], 7600)
         self.assertEqual(self.count("POST", "/rent"), 1)
+        self.assertEqual(self.count("POST", "/schedule-removal"), 0)
+        self.now += 120
+        self.pods[0].update(status="RUNNING", removal_scheduled_at=stamp(self.now+7200))
+        verified = self.pilot.ensure_ttl(result["tag"])
+        self.assertTrue(verified["ttl_verified"])
+        self.assertEqual(verified["deadline"], 8200)
+        self.assertEqual(verified["collection_deadline"], 7600)
         self.assertEqual(self.count("POST", "/schedule-removal"), 1)
         self.assertTrue(self.rent()["replay_refused"])
         self.assertEqual(self.count("POST", "/rent"), 1)
@@ -155,7 +163,10 @@ class PilotTests(unittest.TestCase):
             self.assertEqual(number(value), Decimal("0.75"))
         finally:
             provider.close()
-        self.assertTrue(self.rent()["ttl_verified"])
+        result = self.rent()
+        self.assertFalse(result["ttl_verified"])
+        self.pods[0]["status"] = "RUNNING"
+        self.assertTrue(self.pilot.ensure_ttl(result["tag"])["ttl_verified"])
         self.assertEqual(self.count("POST", "/rent"), 1)
         for invalid in (Decimal("NaN"), Decimal("Infinity"), Decimal("-0.01"), True):
             with self.assertRaises(PilotError):
@@ -186,6 +197,10 @@ class PilotTests(unittest.TestCase):
         self.assertTrue(all(method == "GET" for method, _, _ in self.calls[before:]))
         self.assertTrue(self.rent()["replay_refused"])
         self.assertEqual(self.count("POST", "/rent"), 1)
+        with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+            self.pilot.ensure_ttl(result["tag"])
+        self.assertEqual(self.count("POST", "/schedule-removal"), 0)
+        self.pods[0]["status"] = "RUNNING"
         self.pilot.ensure_ttl(result["tag"])
         self.assertTrue(self.pilot.read()["records"][0]["ttl_verified"])
 
@@ -204,6 +219,12 @@ class PilotTests(unittest.TestCase):
         result = self.rent()
         self.pods[0]["status"] = "RUNNING"
         before = len(self.calls)
+        with self.assertRaisesRegex(PilotError, "not_ready"):
+            self.pilot.reconcile(result["tag"], connection=True)
+        self.assertTrue(all(method == "GET" for method, _, _ in self.calls[before:]))
+        self.assertEqual(self.count("POST", "/schedule-removal"), 0)
+        self.pilot.ensure_ttl(result["tag"])
+        before = len(self.calls)
         value = self.pilot.reconcile(result["tag"], connection=True)
         self.assertEqual(value["port"], 12345)
         self.assertFalse(value["allocation_verified"])
@@ -211,8 +232,10 @@ class PilotTests(unittest.TestCase):
         self.pods[0]["removal_scheduled_at"] = stamp(8400)
         with self.assertRaisesRegex(PilotError, "not_ready"):
             self.pilot.reconcile(result["tag"], connection=True)
-        self.pilot.ensure_ttl(result["tag"])
-        self.assertLessEqual(self.pilot.read()["records"][0]["verified_removal_at"], 8200)
+        with self.assertRaisesRegex(LiumError, "absolute_ttl_unconfirmed"):
+            self.pilot.ensure_ttl(result["tag"])
+        self.assertFalse(self.pilot.read()["records"][0]["ttl_verified"])
+        self.assertEqual(self.count("POST", "/schedule-removal"), 1)
 
     def test_destroy_once_and_only_statement_settles(self):
         result = self.rent()
@@ -265,8 +288,11 @@ class PilotTests(unittest.TestCase):
 
     def test_prior_verified_ttl_drift_is_refreshed_before_second_rental(self):
         original = self.rent()
+        self.assertFalse(original["ttl_verified"])
+        self.pods[0]["status"] = "RUNNING"
+        original = self.pilot.ensure_ttl(original["tag"])
         self.assertTrue(original["ttl_verified"])
-        self.assertEqual(original["phase"], "starting")
+        self.assertEqual(original["phase"], "running")
         self.now += 60
         self.pods[0].update(status="RUNNING", removal_scheduled_at=stamp(self.now + 7200))
         self.nodes.append(node(SECOND))
@@ -324,7 +350,12 @@ class Pro6000PolicyTests(unittest.TestCase):
         self.assertEqual(result["gpu_count"], 2)
         self.assertEqual(result["reservation_microusd"], 8_000_000)
         self.assertEqual(result["deadline"], 8200)
-        self.assertTrue(result["ttl_verified"])
+        self.assertFalse(result["ttl_verified"])
+        self.assertEqual(self.count("POST", "/schedule-removal"), 0)
+        self.pods[0]["status"] = "RUNNING"
+        verified = self.pilot.ensure_ttl(result["tag"])
+        self.assertTrue(verified["ttl_verified"])
+        self.assertEqual((verified["deadline"], verified["reservation_microusd"]), (8200, 8_000_000))
         state = self.pilot.read()
         self.assertEqual(state["policy"], POLICY_PRO6000.snapshot())
         provider = self.pilot.provider(state["records"][0], PUBLIC_KEY)
