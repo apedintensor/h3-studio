@@ -43,8 +43,11 @@ from studio_platform.runtime_catalog import PROFILE_IDS,public_catalog,engine_ma
 catalog=public_catalog()
 assert len(catalog['profiles'])==4
 for profile in catalog['profiles']:
-    assert profile['verified_cases'] or profile.get('qualification_cases')
     assert profile['validation']['production_adapter_verified'] is False
+    if not profile['verified_cases']:
+        assert profile['validation']['scope']=='pending_hardware_qualification'
+        assert profile.get('qualification_cases')
+        assert all('measurements' not in case for case in profile['qualification_cases'])
     for case in profile['verified_cases']:
         assert all(m['evidence'].startswith('https://github.com/apedintensor/h3-studio/blob/') for m in case['measurements'])
     for mode in ('fl','ref'):
