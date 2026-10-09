@@ -1,4 +1,4 @@
-"""Trusted local-file composition for the existing Lium rental authority.
+"""Trusted local-file composition for the existing operator rental authority.
 
 Construction reads bounded deployment metadata only. Credentials remain lazy;
 inventory is queried only by an explicit offers request and rents only by the
@@ -7,6 +7,7 @@ fenced controller. This file neither initializes budgets nor enables a pool.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from types import SimpleNamespace
 from sqlalchemy import insert, select, update
 
 from .lium_provider import LiumError, LiumManifest, LiumProvider
+from .targon_provider import TargonError, TargonManifest, TargonProvider
 from .operator_capacity import (DeploymentBinding, OperatorCapacity, OperatorError,
     OperatorRegistry, require, inventory_projection, operator_inventory, operator_heartbeats)
 from .operator_controller import OperatorController
@@ -92,13 +94,16 @@ def load_runtime_config(path, *, validate_private_paths=True):
     source=_absolute(str(path))
     value=_decode(_read(source,128*1024,protected=True))
     required={"schema_version","registry_file","work_dir","ssh_key_file","known_hosts_file","port_start"}
-    optional={"credential_source","secret_arn","secret_version_id","trust_first_host_key","runtime_python"}
+    optional={"credential_source","secret_arn","secret_version_id","provider_credentials",
+        "cleanup_guard_dir","trust_first_host_key","runtime_python"}
     require(required<=set(value) and not set(value)-required-optional
         and type(value["schema_version"]) is int and value["schema_version"]==1,
         "operator_runtime_schema_invalid",422)
     _absolute(value["registry_file"])
     _absolute(value["ssh_key_file"],exists=validate_private_paths)
     _absolute(value["work_dir"],directory=True,exists=validate_private_paths)
+    if "cleanup_guard_dir" in value:
+        _absolute(value["cleanup_guard_dir"],directory=True,exists=validate_private_paths)
     trust=value.get("trust_first_host_key",False)
     require(type(trust) is bool,"operator_runtime_trust_invalid",422)
     hosts=_absolute(value["known_hosts_file"],exists=validate_private_paths and not trust)
@@ -110,14 +115,43 @@ def load_runtime_config(path, *, validate_private_paths=True):
     credential=value.get("credential_source","central_registry")
     require(credential in {"central_registry","aws_runtime"},"operator_runtime_credential_source_invalid",422)
     if credential=="central_registry":
-        require(not {"secret_arn","secret_version_id"}&set(value),"operator_runtime_credential_conflict",422)
+        require(not {"secret_arn","secret_version_id","provider_credentials"}&set(value),
+            "operator_runtime_credential_conflict",422)
     else:
-        require({"secret_arn","secret_version_id"}<=set(value),"operator_runtime_credential_reference_missing",422)
-        from .lium_runtime_aws import AwsLiumLoader
-        try: AwsLiumLoader(value["secret_arn"],value["secret_version_id"])
-        except ValueError: raise OperatorError("operator_runtime_credential_reference_invalid",422) from None
+        references=_credential_references(value)
+        require(bool(references),"operator_runtime_credential_reference_missing",422)
+        for provider,reference in references.items():
+            try: _aws_loader(provider,reference)
+            except ValueError: raise OperatorError("operator_runtime_credential_reference_invalid",422) from None
     return {**value,"config_path":str(source),"credential_source":credential,
             "trust_first_host_key":trust,"runtime_python":python}
+
+
+def _credential_references(config):
+    references={}
+    legacy={"secret_arn","secret_version_id"}&set(config)
+    require(not legacy or legacy=={"secret_arn","secret_version_id"},
+        "operator_runtime_credential_reference_missing",422)
+    if legacy:
+        references["lium"]={key:config[key] for key in legacy}
+    providers=config.get("provider_credentials",{})
+    require(isinstance(providers,dict) and not set(providers)-{"targon"},
+        "operator_runtime_credential_reference_invalid",422)
+    for provider,reference in providers.items():
+        require(isinstance(reference,dict) and set(reference)=={"secret_arn","secret_version_id"},
+            "operator_runtime_credential_reference_invalid",422)
+        references[provider]=reference
+    return references
+
+
+def _aws_loader(provider,reference):
+    if provider=="lium":
+        from .lium_runtime_aws import AwsLiumLoader
+        loader=AwsLiumLoader
+    else:
+        from .targon_runtime_aws import AwsTargonLoader
+        loader=AwsTargonLoader
+    return loader(reference["secret_arn"],reference["secret_version_id"])
 
 
 def _bindings(path):
@@ -181,15 +215,17 @@ def _validate_sources(binding):
 def _manifest(binding):
     try:
         value=_decode(_read(binding.boot["provider_manifest_file"],128*1024,protected=True))
-        manifest=LiumManifest(**value)
+        manifest=(TargonManifest if binding.launch.provider=="targon" else LiumManifest)(**value)
         profile=get_profile(binding.runtime_profile_id)
         model=model_for(binding.runtime_profile_id,binding.mode)
     except OperatorError: raise
-    except (KeyError,TypeError,ValueError,LiumError):
+    except (KeyError,TypeError,ValueError,LiumError,TargonError):
         raise OperatorError("operator_runtime_provider_manifest_invalid",422) from None
     require(binding.model_id==profile["model_id"] and binding.recipe_ids==(model["generation_recipe_id"],)
         and binding.gpu_type in profile["gpu_models"] and binding.gpu_count in profile["gpu_count_options"]
         and binding.execution_slots==binding.gpu_count,"operator_runtime_profile_topology_mismatch",422)
+    if binding.launch.provider=="targon":
+        return _targon_manifest(binding,manifest,profile)
     require(manifest.server_side_selection and not manifest.executor_id and not binding.launch.offer_id,
         "operator_runtime_server_selection_required",422)
     require(manifest.configuration_id==binding.configuration_id and manifest.model_id==binding.model_id
@@ -220,6 +256,35 @@ def _manifest(binding):
     return manifest
 
 
+def _targon_manifest(binding,manifest,profile):
+    require(manifest.configuration_id==binding.configuration_id and manifest.model_id==binding.model_id
+        and manifest.resource_name==binding.launch.offer_id and manifest.image_name==binding.launch.image_id
+        and not binding.launch.region and manifest.gpu_count==binding.gpu_count
+        and manifest.execution_slots==binding.execution_slots and manifest.gpu_model=="RTX-PRO-6000B"
+        and binding.gpu_type in {"RTX PRO 6000 Blackwell","RTX PRO 6000 Blackwell Server Edition",
+            "RTX PRO 6000 Blackwell Workstation Edition"},"operator_runtime_launch_mismatch",422)
+    require(manifest.allow_preflight_only_price_cap and manifest.allow_controller_lifetime
+        and binding.expires_at<=manifest.approved_until,"operator_runtime_provider_approval_mismatch",422)
+    require(binding.max_ttl_seconds<=manifest.max_lifetime_seconds,
+        "operator_runtime_provider_ttl_mismatch",422)
+    require(binding.hourly_cost_microusd==manifest.hourly_cost_cap_microusd
+        and manifest.hourly_cost_cap_microusd%binding.gpu_count==0
+        and binding.reservation_per_node_microusd>=math.ceil(
+            manifest.hourly_cost_cap_microusd*manifest.max_lifetime_seconds/3600),
+        "operator_runtime_cost_binding_mismatch",422)
+    # Targon exposes neither a qualified network floor nor a country selector.
+    # An explicit fixed resource cannot claim to enforce unsupported filters.
+    require("min_cpu_cores" not in binding.filters,"operator_runtime_cpu_filter_unsupported",422)
+    require(binding.filters=={"min_ram_gib":manifest.minimum_ram_gib,
+        "min_disk_gib":manifest.minimum_disk_gib,"allowed_countries":[],
+        "max_price_per_gpu_hour_microusd":manifest.hourly_cost_cap_microusd//binding.gpu_count},
+        "operator_runtime_hardware_filters_mismatch",422)
+    require(manifest.minimum_ram_gib*1024**3>=profile["minimum_ram_bytes"]
+        and manifest.minimum_disk_gib*1024**3>=profile["minimum_disk_bytes"],
+        "operator_runtime_hardware_below_profile",422)
+    return manifest
+
+
 class _BoundLiumProvider(LiumProvider):
     """Recheck immutable local artifacts before each durable create reservation."""
     def __init__(self,binding,manifest,**kwargs):
@@ -240,29 +305,74 @@ class _BoundLiumProvider(LiumProvider):
         return result,cached[0]
 
 
-def _assemble(path, *, clock=time.time, credential_loader=None):
-    config=load_runtime_config(path)
+class _BoundTargonProvider(TargonProvider):
+    def __init__(self,binding,manifest,**kwargs):
+        self.binding,self.bound_manifest=binding,manifest
+        super().__init__(enabled=True,manifests=(manifest,),**kwargs)
+
+    def validate_launch(self,launch,**kwargs):
+        _validate_sources(self.binding)
+        require(_manifest(self.binding)==self.bound_manifest,"operator_runtime_manifest_changed")
+        return super().validate_launch(launch,**kwargs)
+
+    def inventory_observation(self):
+        # Base preflight makes one uncached read. Preserve request-start time,
+        # so a slow or backwards-clock response never becomes fresh inventory.
+        observed_at=self.clock()
+        self.preflight_availability(self.binding.launch)
+        require(type(observed_at) in (int,float) and math.isfinite(observed_at)
+            and 0<=self.clock()-observed_at<=60,"operator_inventory_unconfirmed")
+        return None,observed_at
+
+
+def _validated_bindings(config):
     bindings=_bindings(config["registry_file"])
-    loader=credential_loader
-    if loader is None and config["credential_source"]=="aws_runtime":
-        from .lium_runtime_aws import AwsLiumLoader
-        loader=AwsLiumLoader(config["secret_arn"],config["secret_version_id"])
-    providers={}
+    manifests={}
     for binding in bindings:
         _validate_sources(binding)
-        manifest=_manifest(binding)
-        providers[binding.binding_id]=_BoundLiumProvider(binding,manifest,loader=loader,clock=clock,
-            journal_dir=Path(config["work_dir"])/"rent-journal")
-    registry=OperatorRegistry(bindings,catalog=public_catalog)
+        manifests[binding.binding_id]=_manifest(binding)
+        if binding.launch.provider=="targon":
+            require("cleanup_guard_dir" in config,"operator_runtime_cleanup_guard_required",422)
+        if config["credential_source"]=="aws_runtime":
+            require(binding.launch.provider in _credential_references(config),
+                "operator_runtime_credential_reference_missing",422)
+    return bindings,manifests
+
+
+def _assemble(path, *, clock=time.time, credential_loader=None):
+    config=load_runtime_config(path)
+    bindings,manifests=_validated_bindings(config)
+    loaders={}
+    if credential_loader is None and config["credential_source"]=="aws_runtime":
+        loaders={provider:_aws_loader(provider,reference)
+            for provider,reference in _credential_references(config).items()}
+    providers={}
+    for binding in bindings:
+        manifest=manifests[binding.binding_id]
+        kwargs={"loader":credential_loader or loaders.get(binding.launch.provider),"clock":clock,
+            "journal_dir":Path(config["work_dir"])/"rent-journal"}
+        if binding.launch.provider=="targon":
+            from .targon_cleanup import TargonCleanupGuard
+            kwargs["cleanup_guard"]=TargonCleanupGuard(config["cleanup_guard_dir"],clock=clock)
+            provider_class=_BoundTargonProvider
+        else:
+            provider_class=_BoundLiumProvider
+        providers[binding.binding_id]=provider_class(binding,manifest,**kwargs)
+    registry=OperatorRegistry(bindings,catalog=public_catalog,
+        qualified_providers={"lium"}|{binding.launch.provider for binding in bindings})
 
     def offers(chosen):
         try:
             binding=registry.resolve(chosen)
             require(binding.enabled and binding.expires_at>clock(),"operator_deployment_not_qualified")
-            result=providers[binding.binding_id].preflight_availability(binding.launch)
+            provider=providers[binding.binding_id]
+            if binding.launch.provider=="targon":
+                result,observed_at=provider.inventory_observation()
+            else:
+                result,observed_at=provider.preflight_availability(binding.launch),clock()
             reason=None if result is None else (result if result in {
                 "provider_inventory_unavailable","provider_inventory_unconfirmed"} else "operator_inventory_unavailable")
-            return {"status":"available" if result is None else "unavailable","observed_at":clock(),
+            return {"status":"available" if result is None else "unavailable","observed_at":observed_at,
                 "offers":[],"reason_code":reason,"minimum_ttl_seconds":binding.min_ttl_seconds,
                 "hourly_cost_microusd":binding.hourly_cost_microusd,"hourly_cost_basis":"approved_ceiling"}
         except Exception:
@@ -276,15 +386,13 @@ def create_registry(path, *, repository=None):
     """API/worker: local public metadata and database only, never a provider.
 
     The API needs no SSH private key, writable controller directory, AWS role,
-    Lium credential, or outbound network. Source/config paths remain identical
+    provider credential, or outbound network. Source/config paths remain identical
     across processes and their small immutable metadata must be mounted.
     """
     config=load_runtime_config(path,validate_private_paths=False)
-    bindings=_bindings(config["registry_file"])
-    for binding in bindings:
-        _validate_sources(binding)
-        _manifest(binding)
-    registry=OperatorRegistry(bindings,catalog=public_catalog,inventory_required=True)
+    bindings,_=_validated_bindings(config)
+    registry=OperatorRegistry(bindings,catalog=public_catalog,inventory_required=True,
+        qualified_providers={"lium"}|{binding.launch.provider for binding in bindings})
     def offers(chosen):
         binding=registry.resolve(chosen)
         if repository is None:
@@ -406,8 +514,31 @@ def create_controller_from_stdin(path, *, stream=None, **kwargs):
     require("credential_loader" not in kwargs,"operator_stdin_loader_conflict",422)
     from .production_scaler import stdin_loader
     try:
-        loader=stdin_loader(SimpleNamespace(secret_arn=config["secret_arn"],
-            secret_version_id=config["secret_version_id"]),stream if stream is not None else sys.stdin.buffer)
+        source=stream if stream is not None else sys.stdin.buffer
+        raw=source.read(49153)
+        require(len(raw)<=49152,"operator_credential_envelope_invalid",422)
+        envelope=_decode(raw)
+        references=_credential_references(config)
+        if "schema_version" in envelope:
+            require(set(envelope)=={"schema_version","credentials"}
+                and type(envelope["schema_version"]) is int and envelope["schema_version"]==2
+                and isinstance(envelope["credentials"],dict)
+                and set(envelope["credentials"])==set(references),"operator_credential_envelope_invalid",422)
+            credentials=envelope["credentials"]
+        else:
+            require(set(references)=={"lium"},"operator_credential_envelope_invalid",422)
+            credentials={"lium":envelope}
+        loaders={}
+        for provider,reference in references.items():
+            memory=io.BytesIO(json.dumps(credentials[provider]).encode("utf-8"))
+            if provider=="lium":
+                loaders[provider]=stdin_loader(SimpleNamespace(**reference),memory)
+            else:
+                from .targon_runtime_aws import stdin_targon_loader
+                loaders[provider]=stdin_targon_loader(reference["secret_arn"],reference["secret_version_id"],memory)
+        def loader(service,*,profile):
+            require(service in loaders,"operator_runtime_credential_provider_mismatch",422)
+            return loaders[service](service,profile=profile)
     except Exception:
         raise OperatorError("operator_credential_envelope_invalid",422) from None
     return create_controller(path,credential_loader=loader,**kwargs)

@@ -180,11 +180,19 @@ def _lock_profile_device(torch, profile):
     properties = torch.cuda.get_device_properties(0)
     name = torch.cuda.get_device_name(0)
     pruned = profile['model_id'] == 'MiniMax-H3-Pruned-Rank8-INT8'
-    accepted = (re.fullmatch(r'(?:NVIDIA\s+)?(?:GeForce\s+)?RTX\s+5090', name)
-                if pruned else re.fullmatch(r'(?:NVIDIA\s+)?RTX\s+PRO\s+6000\s+Blackwell\s+(?:Server|Workstation)\s+Edition', name))
-    low, high = (30, 34) if pruned else (90, 100)
-    if (not accepted or torch.cuda.get_device_capability(0) != (12, 0)
-            or not low*1024**3 <= properties.total_memory <= high*1024**3):
+    hardware = profile.get('hardware_admission')
+    if hardware is not None:
+        accepted = name.removeprefix('NVIDIA ') in hardware['gpu_models']
+        capability = tuple(hardware['compute_capability'])
+        minimum, maximum = hardware['minimum_total_vram_bytes'], hardware['maximum_total_vram_bytes']
+    else:
+        accepted = (re.fullmatch(r'(?:NVIDIA\s+)?(?:GeForce\s+)?RTX\s+5090', name)
+                    if pruned else re.fullmatch(r'(?:NVIDIA\s+)?RTX\s+PRO\s+6000\s+Blackwell\s+(?:Server|Workstation)\s+Edition', name))
+        capability = (12, 0)
+        low, high = (30, 34) if pruned else (90, 100)
+        minimum, maximum = low*1024**3, high*1024**3
+    if (not accepted or torch.cuda.get_device_capability(0) != capability
+            or not minimum <= properties.total_memory <= maximum):
         raise ValueError('wangp_profile_gpu_mismatch')
     uuid = str(getattr(properties,'uuid',''))
     if not re.fullmatch(r'(?:GPU-)?[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}',uuid):
@@ -203,23 +211,48 @@ def _lock_profile_device(torch, profile):
     return stream
 
 
+def _available_profile_ram(proc_root=Path('/proc'), group_root=Path('/sys/fs/cgroup')):
+    """Respect cgroup-v2 limits in both a container namespace and a whole VM."""
+    info = {line.split(':',1)[0]: int(line.split()[1])*1024
+            for line in (proc_root/'meminfo').read_text().splitlines()}
+    available = info['MemAvailable']
+    if (group_root/'memory.max').is_file():
+        # Existing container deployments expose their constrained group here.
+        group = group_root
+    else:
+        # A VM's root cgroup has no memory.max. Resolve this process's v2
+        # membership instead, including constrained ancestors (e.g. a slice).
+        from pathlib import PurePosixPath
+        groups = [line[3:] for line in (proc_root/'self/cgroup').read_text().splitlines() if line.startswith('0::')]
+        if len(groups) != 1 or not groups[0].startswith('/') or '..' in PurePosixPath(groups[0]).parts:
+            raise ValueError('wangp_profile_cgroup_invalid')
+        if not (group_root/'cgroup.controllers').is_file():
+            raise ValueError('wangp_profile_cgroup_invalid')
+        group = group_root / groups[0].lstrip('/')
+        if not group.is_dir():
+            raise ValueError('wangp_profile_cgroup_invalid')
+    while True:
+        if (group/'memory.max').is_file():
+            limit_text = (group/'memory.max').read_text().strip()
+            used = int((group/'memory.current').read_text())
+            fields = dict((key,int(value)) for key,value in
+                          (line.split() for line in (group/'memory.stat').read_text().splitlines()))
+            file_bytes = max(0,fields.get('file',0)-fields.get('shmem',0))
+            lru = max(0,fields.get('active_file',0)+fields.get('inactive_file',0))
+            exclusions = sum(max(0,fields.get(k,0)) for k in ('file_dirty','file_writeback','unevictable'))
+            reclaimable = max(0,min(file_bytes,lru)-exclusions)
+            if limit_text != 'max':
+                limit = int(limit_text)
+                available = min(available,limit,max(0,limit-used+reclaimable))
+        if group == group_root:
+            break
+        group = group.parent
+    return available
+
+
 def _profile_memory_admission(torch, profile):
     """Cold-start gate from the measured pilot; clean file cache is reclaimable."""
-    info = {line.split(':',1)[0]: int(line.split()[1])*1024
-            for line in Path('/proc/meminfo').read_text().splitlines()}
-    group = Path('/sys/fs/cgroup')
-    limit_text = (group/'memory.max').read_text().strip()
-    used = int((group/'memory.current').read_text())
-    fields = dict((key,int(value)) for key,value in
-                  (line.split() for line in (group/'memory.stat').read_text().splitlines()))
-    file_bytes = max(0,fields.get('file',0)-fields.get('shmem',0))
-    lru = max(0,fields.get('active_file',0)+fields.get('inactive_file',0))
-    exclusions = sum(max(0,fields.get(k,0)) for k in ('file_dirty','file_writeback','unevictable'))
-    reclaimable = max(0,min(file_bytes,lru)-exclusions)
-    available = info['MemAvailable']
-    if limit_text != 'max':
-        limit = int(limit_text)
-        available = min(available,limit,max(0,limit-used+reclaimable))
+    available = _available_profile_ram()
     free,_ = torch.cuda.mem_get_info(0)
     if (available < profile['runtime']['minimum_available_ram_bytes']
             or free < profile['minimum_free_vram_bytes']):

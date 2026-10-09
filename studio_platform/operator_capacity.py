@@ -162,7 +162,7 @@ class DeploymentBinding:
                       *self.recipe_ids, *self.budget_account_ids):
             require(safe_id(value), "operator_binding_identity_invalid", 422)
         require(self.launch.configuration_id == self.configuration_id and self.launch.model_id == self.model_id
-                and self.launch.provider == "lium" and bool(self.recipe_ids) and bool(self.budget_account_ids)
+                and self.launch.provider in {"lium", "targon"} and bool(self.recipe_ids) and bool(self.budget_account_ids)
                 and self.recipe_ids in (("h3-base-fl2va-v1",),("h3-base-ref2va-v1",)),
                 "operator_binding_contract_invalid", 422)
         require(isinstance(self.engine_manifest_digest, str) and re.fullmatch(r"[0-9a-f]{64}", self.engine_manifest_digest),
@@ -200,12 +200,12 @@ class DeploymentBinding:
 class OperatorRegistry:
     """Server-owned registry seam. Optional resolver MUST retain immutable IDs.
 
-    Dynamic resolver is for trusted pre-approved filtered Lium manifests, not a
+    Dynamic resolver is for trusted pre-approved provider manifests, not a
     browser-provided launch payload. ``get`` must resolve accepted bindings after
     restarts, including disabled/expired ones needed for cleanup.
     """
     def __init__(self, bindings=(), *, catalog=None, offers=None, resolver=None, getter=None,
-                 inventory_required=False):
+                 inventory_required=False, qualified_providers=("lium",)):
         values = tuple(bindings)
         require(all(isinstance(x,DeploymentBinding) for x in values) and
                 len({x.binding_id for x in values})==len(values), "operator_registry_invalid",422)
@@ -213,10 +213,14 @@ class OperatorRegistry:
         self.catalog_reader, self.offers_reader = catalog, offers
         self.resolver, self.getter = resolver, getter
         self.inventory_required=inventory_required
+        require(isinstance(qualified_providers,(tuple,list,set,frozenset))
+            and all(isinstance(value,str) and value in {"lium","targon"} for value in qualified_providers),
+            "operator_registry_providers_invalid",422)
+        self.qualified_providers=frozenset(qualified_providers)
 
     def resolve(self, chosen):
         # Inventory support does not qualify a VM's paid lifecycle/bootstrap.
-        require(chosen.get("provider", "lium") == "lium", "operator_provider_start_unqualified")
+        require(chosen.get("provider", "lium") in self.qualified_providers, "operator_provider_start_unqualified")
         if self.resolver is not None:
             result = self.resolver(chosen)
             require(isinstance(result, DeploymentBinding) and result.matches(chosen), "operator_binding_selection_mismatch")

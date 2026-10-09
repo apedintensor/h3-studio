@@ -10,13 +10,13 @@ import re
 from .protocol import BackendError
 from .wangp_contract import InputDescriptor, PreparedRequest, canonical_json
 from .wangp_compiler import FIXED_CONTROLS, control_schema as legacy_schema
-from ..runtime_catalog import get_profile, model_for, timing_hint, validate_manifest
+from ..runtime_catalog import get_profile, model_for, supported_cases, validate_manifest
 from ..storage import key_belongs_to, validate_key
 
 
 def control_schema(profile_id, mode):
     model_for(profile_id, mode)
-    cases = [c for c in get_profile(profile_id)['verified_cases'] if c['mode'] == mode]
+    cases = [c for c in supported_cases(profile_id) if c['mode'] == mode]
     schema = legacy_schema()
     schema['steps'].update(default=20, enum=sorted({c['steps'] for c in cases}))
     schema['duration'].update(default=5, minimum=5, maximum=5, enum=[5])
@@ -126,7 +126,9 @@ def normalize_request(request, metadata, output_spec, profile_id):
     if (value.get('video_audio', {}) != expected_audio
             or any(type(v) is not bool for v in value.get('video_audio', {}).values())):
         raise ValueError('wangp_ref_soundtrack_unsupported')
-    if timing_hint(profile_id, mode, output_spec['width'], output_spec['height'], 124, 24, steps, roles) is None:
+    wanted = (mode, output_spec['width'], output_spec['height'], 124, 24, steps, sorted(roles))
+    if not any((case['mode'], case['width'], case['height'], case['frames'], case['fps'],
+                case['steps'], sorted(case['input_roles'])) == wanted for case in supported_cases(profile_id)):
         raise ValueError('wangp_profile_joint_envelope_unverified')
     value.update(inputs=inputs, video_audio=expected_audio)
     return value

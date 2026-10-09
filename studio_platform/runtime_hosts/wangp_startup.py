@@ -25,7 +25,7 @@ CODES = frozenset({"wangp_runtime_dependency_missing", "wangp_startup_stage_fail
     "wangp_runtime_requirements_mismatch", "wangp_runtime_untracked_code", "wangp_runtime_dependency_mismatch",
     "wangp_component_size_mismatch", "wangp_component_hash_mismatch", "wangp_profile_manifest_mismatch",
     "wangp_runtime_import_collision", "wangp_profile_one_visible_gpu_required", "wangp_profile_gpu_mismatch",
-    "wangp_profile_memory_headroom_insufficient", "wangp_profile_effective_config_changed",
+    "wangp_profile_memory_headroom_insufficient", "wangp_profile_cgroup_invalid", "wangp_profile_effective_config_changed",
     "wangp_profile_effective_backend_changed", "wangp_profile_model_definition_changed"})
 
 

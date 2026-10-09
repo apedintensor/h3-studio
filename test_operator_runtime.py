@@ -76,6 +76,113 @@ class RuntimeTests(LedgerCase):
 
     def save_binding(self): self.write(self.registry_path,{"schema_version":1,"bindings":[self.binding]})
 
+    def use_targon(self):
+        self.profile="h3-pruned-rank8-int8-pro6000-quanto-int8-vae-int8-sdpa-p4-lowram-v1"
+        profile=get_profile(self.profile)
+        self.expected=engine_manifest(self.profile,self.mode)
+        self.provider={"configuration_id":"targon-pruned-fl","model_id":profile["model_id"],
+            "org_slug":"offline-org","resource_name":"offline-pro6000","image_name":"offline-ubuntu",
+            "ssh_key_ids":["offline-key"],"gpu_count":1,"execution_slots":1,"gpu_model":"RTX-PRO-6000B",
+            "hourly_cost_cap_microusd":1_690_000,"approved_until":10_000_000_000,
+            "max_lifetime_seconds":7200,"minimum_ram_gib":96,"minimum_disk_gib":128,
+            "allow_preflight_only_price_cap":True,"allow_controller_lifetime":True}
+        self.write(self.manifest_path,self.provider)
+        self.binding.update(binding_id="targon-pruned-fl",configuration_id="targon-pruned-fl",
+            runtime_profile_id=self.profile,model_id=profile["model_id"],gpu_count=1,execution_slots=1,
+            gpu_type=profile["gpu_models"][0],engine_manifest_digest=self.expected.digest,
+            launch={"provider":"targon","configuration_id":"targon-pruned-fl","model_id":profile["model_id"],
+                "offer_id":"offline-pro6000","image_id":"offline-ubuntu"},
+            hourly_cost_microusd=1_690_000,reservation_per_node_microusd=3_380_000,min_ttl_seconds=120,
+            filters={"min_ram_gib":96,"min_disk_gib":128,"allowed_countries":[],
+                "max_price_per_gpu_hour_microusd":1_690_000})
+        boot=self.binding["boot"]
+        boot["source_dirs"]=boot["source_dirs"][:1];boot["source_sha256"]=boot["source_sha256"][:1]
+        root=Path(boot["source_dirs"][0])
+        self.write(root/"wangp-manifest.json",self.expected.document)
+        runtime=json.loads((root/"wangp-runtime.json").read_text())
+        runtime.update(deployment_profile_id=self.profile,expected_host_gpus=1)
+        self.write(root/"wangp-runtime.json",runtime)
+        for name in ("wangp-manifest.json","wangp-runtime.json"):
+            boot["source_sha256"][0][name]=hashlib.sha256((root/name).read_bytes()).hexdigest()
+        self.save_binding()
+        (self.root/"guard").mkdir()
+        self.config["cleanup_guard_dir"]=str(self.root/"guard")
+        self.write(self.path,self.config)
+        return {"runtime_profile_id":self.profile,"mode":"fl","gpu_type":self.binding["gpu_type"],
+            "gpu_count":1,"node_count":1,"ttl_seconds":120,"filters":{},"provider":"targon"}
+
+    def test_targon_registry_qualifies_only_explicit_manifest_without_provider_or_private_mount(self):
+        chosen=self.use_targon()
+        self.config.update(ssh_key_file=str(self.root/"unmounted"/"private-key"),
+            cleanup_guard_dir=str(self.root/"unmounted"/"guard"))
+        self.write(self.path,self.config)
+        with patch("studio_platform.operator_runtime._BoundTargonProvider",side_effect=AssertionError("provider")), \
+             patch("studio_platform.targon_cleanup.TargonCleanupGuard",side_effect=AssertionError("guard")), \
+             patch("studio_platform.targon_provider._central_loader",side_effect=AssertionError("credential")):
+            registry=create_registry(self.path)
+            self.assertEqual(registry.resolve(chosen).launch.provider,"targon")
+            self.assertEqual(registry.offers(chosen,self.now)["reason_code"],"operator_inventory_not_configured")
+            with self.assertRaisesRegex(OperatorError,"deployment_not_configured"):
+                registry.resolve({**chosen,"provider":"lium"})
+        self.assertEqual(list((self.root/"work").iterdir()),[])
+
+    def test_targon_composition_rechecks_manifest_and_source_before_reservation(self):
+        self.use_targon()
+        with patch("studio_platform.targon_provider._central_loader",side_effect=AssertionError("credential")), \
+             patch("studio_platform.targon_provider.TargonProvider._request",side_effect=AssertionError("network")):
+            _,registry,providers=_assemble(self.path,clock=lambda:self.now)
+            binding=registry.get(self.binding["binding_id"])
+            provider=providers[binding.binding_id]
+            self.assertEqual(provider.provider_id,"targon")
+            self.assertEqual(provider._cleanup_guard.root,self.root/"guard")
+            kwargs={"physical_gpus":1,"slots":1,"reserved_cost_microusd":3_380_000,"hard_deadline":self.now+7200}
+            provider.validate_launch(binding.launch,**kwargs)
+            self.write(self.manifest_path,{**self.provider,"ssh_key_ids":["changed-key"]})
+            with self.assertRaisesRegex(OperatorError,"manifest_changed"):
+                provider.validate_launch(binding.launch,**kwargs)
+            self.write(self.manifest_path,self.provider)
+            (Path(binding.boot["source_dirs"][0])/"wangp-bootstrap.py").write_text("changed")
+            with self.assertRaisesRegex(OperatorError,"source_changed"):
+                provider.validate_launch(binding.launch,**kwargs)
+
+    def test_targon_manifest_cannot_relax_identity_budget_lifetime_or_claim_unknown_filters(self):
+        self.use_targon()
+        for key,value in (("resource_name","different-resource"),("image_name","different-image"),
+            ("gpu_model","RTX-5090"),("hourly_cost_cap_microusd",1_700_000),
+            ("max_lifetime_seconds",3600),("max_lifetime_seconds",10800),("minimum_ram_gib",64),
+            ("minimum_disk_gib",64),("allow_preflight_only_price_cap",False),("allow_controller_lifetime",False)):
+            with self.subTest(key=key,value=value):
+                self.write(self.manifest_path,{**self.provider,key:value})
+                with self.assertRaises(OperatorError): create_registry(self.path)
+        self.write(self.manifest_path,self.provider)
+        for key,value in (("min_download_mbps",200),("allowed_countries",["US"])):
+            with self.subTest(key=key):
+                original=dict(self.binding["filters"])
+                self.binding["filters"][key]=value;self.save_binding()
+                with self.assertRaisesRegex(OperatorError,"hardware_filters_mismatch"): create_registry(self.path)
+                self.binding["filters"]=original
+        self.save_binding()
+        del self.config["cleanup_guard_dir"];self.write(self.path,self.config)
+        with self.assertRaisesRegex(OperatorError,"cleanup_guard_required"): create_registry(self.path)
+
+    def test_targon_inventory_uses_request_start_and_does_not_leak_resource_details(self):
+        chosen=self.use_targon()
+        _,registry,providers=_assemble(self.path,clock=lambda:self.now)
+        provider=providers[self.binding["binding_id"]]
+        start=self.now
+        def observe(launch):
+            self.now+=3
+            return {"available_count":1,"hourly_cost_microusd":1_600_000}
+        with patch.object(provider,"preflight_availability",side_effect=observe):
+            value=registry.offers(chosen,self.now)
+        self.assertEqual((value["status"],value["observed_at"]),("available",start))
+        self.assertEqual(value["hourly_cost_microusd"],1_690_000)
+        self.assertEqual(value["hourly_cost_basis"],"approved_ceiling")
+        self.assertNotIn("offline-pro6000",json.dumps(value))
+        with patch.object(provider,"clock",side_effect=[start,start-1]), \
+             patch.object(provider,"preflight_availability",return_value={}):
+            with self.assertRaisesRegex(OperatorError,"inventory_unconfirmed"): provider.inventory_observation()
+
     def test_factory_is_inert_and_does_not_change_budget_or_policy(self):
         before=self.repo.get_budget("owner-budget")
         with patch("studio_platform.lium_provider._central_loader",side_effect=AssertionError("credential read")), \
@@ -135,6 +242,45 @@ class RuntimeTests(LedgerCase):
         for changes in ({"version_id":"b"*32},{"secret_arn":arn+"bad"},{"extra":"denied"}):
             with self.assertRaisesRegex(OperatorError,"credential_envelope_invalid"):
                 create_controller_from_stdin(self.path,stream=io.BytesIO(json.dumps({**envelope,**changes}).encode()))
+
+    def test_private_stdin_routes_exact_pinned_provider_envelopes_without_fallback(self):
+        self.use_targon()
+        references={provider:{"secret_arn":
+            "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:/sixnine/platform/"+provider+"-Ab12Cd",
+            "secret_version_id":("a" if provider=="lium" else "b")*32} for provider in ("lium","targon")}
+        self.config.update(credential_source="aws_runtime",**references["lium"],
+            provider_credentials={"targon":references["targon"]})
+        self.write(self.path,self.config)
+        credentials={provider:{"secret_arn":reference["secret_arn"],"version_id":reference["secret_version_id"],
+            "payload":{"schema_version":1,"service":provider,"profile":provider+"--rig-root",
+                "base_url":"https://lium.io/api" if provider=="lium" else "https://api.targon.com",
+                "primary_key_variable":provider.upper()+"_API_KEY","api_key":"offline-"+provider}}
+            for provider,reference in references.items()}
+        envelope={"schema_version":2,"credentials":credentials}
+        with patch("studio_platform.lium_runtime_aws._client",side_effect=AssertionError("AWS network")), \
+             patch("studio_platform.operator_runtime.create_controller",return_value="created") as create:
+            create_registry(self.path)
+            self.assertEqual(create_controller_from_stdin(self.path,
+                stream=io.BytesIO(json.dumps(envelope).encode())),"created")
+            loader=create.call_args.kwargs["credential_loader"]
+            for provider in ("lium","targon"):
+                self.assertEqual(loader(provider,profile=provider+"--rig-root").api_key,"offline-"+provider)
+            with self.assertRaises(ValueError): loader("targon",profile="lium--rig-root")
+            with self.assertRaisesRegex(OperatorError,"credential_provider_mismatch"):
+                loader("vastai",profile="vastai--rig-root")
+        invalid=({"schema_version":2,"credentials":{"lium":credentials["lium"]}},
+            {"schema_version":2,"credentials":{**credentials,"targon":credentials["lium"]}},credentials["lium"])
+        for value in invalid:
+            with self.subTest(value=set(value)):
+                with self.assertRaisesRegex(OperatorError,"credential_envelope_invalid"):
+                    create_controller_from_stdin(self.path,stream=io.BytesIO(json.dumps(value).encode()))
+        # A Targon-only host needs no Lium secret reference or loaded credential.
+        del self.config["secret_arn"];del self.config["secret_version_id"]
+        self.write(self.path,self.config)
+        with patch("studio_platform.operator_runtime.create_controller",return_value="created"):
+            create_registry(self.path)
+            self.assertEqual(create_controller_from_stdin(self.path,stream=io.BytesIO(json.dumps(
+                {"schema_version":2,"credentials":{"targon":credentials["targon"]}}).encode())),"created")
 
     def test_inventory_is_controller_written_hash_bound_fresh_and_redacted(self):
         _,registry,providers=_assemble(self.path,clock=lambda:self.now)

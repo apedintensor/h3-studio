@@ -99,6 +99,102 @@ class HostBoundaryTests(unittest.TestCase):
         position=args[0].index(host.SERVICE)
         self.assertEqual(args[0][position+1:position+3],['-c',host.CANONICAL_ENTRYPOINT])
 
+    def targon_runtime(self):
+        return {'secret_arn':'synthetic-lium-arn','secret_version_id':'lium-version',
+            'provider_credentials':{'targon':{'secret_arn':'synthetic-targon-arn','secret_version_id':'targon-version'}},
+            'cleanup_guard_dir':host.TARGON_GUARD.as_posix()}
+
+    def test_multi_provider_envelopes_are_private_exact_and_closed_on_delivery_uncertainty(self):
+        runtime=self.targon_runtime()
+        loaders={provider:Mock(return_value=NS(service=provider,profile=provider+'--rig-root',
+            base_url='https://lium.io/api' if provider=='lium' else 'https://api.targon.com',
+            primary_key_variable=provider.upper()+'_API_KEY',api_key='synthetic-private-'+provider))
+            for provider in ('lium','targon')}
+        factories={provider:Mock(return_value=loader) for provider,loader in loaders.items()}
+        process=Mock();popen=Mock(return_value=process)
+        host.launch(self.root,{'PATH':'/usr/bin'},runtime,host.pin_for(prepared()),
+            loader_factory=factories['lium'],targon_loader_factory=factories['targon'],popen=popen)
+        envelope=json.loads(process.stdin.write.call_args.args[0])
+        self.assertEqual(envelope['schema_version'],2)
+        self.assertEqual(set(envelope['credentials']),{'lium','targon'})
+        for provider,loader in loaders.items():
+            loader.assert_called_once_with(provider,profile=provider+'--rig-root')
+            loader.close.assert_called_once()
+            value=envelope['credentials'][provider]
+            self.assertEqual(value['payload']['api_key'],'synthetic-private-'+provider)
+            self.assertEqual(value['secret_arn'],'synthetic-'+provider+'-arn')
+            self.assertNotIn('synthetic-private-'+provider,repr(popen.call_args))
+        process.stdin.close.assert_called_once()
+        process.stdin.write.side_effect=BrokenPipeError
+        for loader in loaders.values():loader.close.reset_mock()
+        with self.assertRaisesRegex(release.ReleaseError,'delivery_unknown'):
+            host.launch(self.root,{},runtime,host.pin_for(prepared()),loader_factory=factories['lium'],
+                targon_loader_factory=factories['targon'],popen=popen)
+        for loader in loaders.values():loader.close.assert_called_once()
+        process.kill.assert_not_called();process.terminate.assert_not_called()
+
+    def test_second_provider_load_failure_closes_prior_loader_before_any_process(self):
+        lium=Mock(return_value=NS(service='lium',profile='lium--rig-root',base_url='https://lium.io/api',
+            primary_key_variable='LIUM_API_KEY',api_key='synthetic'))
+        targon=Mock(side_effect=ValueError('offline-load-failure'))
+        popen=Mock()
+        with self.assertRaisesRegex(ValueError,'offline-load-failure'):
+            host.launch(self.root,{},self.targon_runtime(),host.pin_for(prepared()),
+                loader_factory=lambda *args:lium,targon_loader_factory=lambda *args:targon,popen=popen)
+        lium.close.assert_called_once();targon.close.assert_called_once();popen.assert_not_called()
+
+    def test_each_configured_provider_pins_its_own_metadata_in_prepared_files(self):
+        paths={provider:self.root/(provider+'-metadata.json') for provider in ('lium','targon')}
+        for provider,path in paths.items():
+            path.write_text(json.dumps({'service':provider,'profile':provider+'--rig-root',
+                'secret_arn':'synthetic-'+provider+'-arn','version_id':provider+'-version'}))
+        runtime=self.targon_runtime()
+        with patch.object(host,'METADATA',paths['lium']),patch.object(host,'TARGON_METADATA',paths['targon']), \
+             patch.object(host,'protected_file'),patch.object(release,'_protected_json',
+                 side_effect=lambda path:json.loads(path.read_text())):
+            files=host.credential_files(runtime)
+            self.assertEqual(set(files),{str(path) for path in paths.values()})
+            for field in ('secret_arn','secret_version_id'):
+                changed=copy.deepcopy(runtime);changed['provider_credentials']['targon'][field]='mismatched'
+                with self.assertRaisesRegex(release.ReleaseError,'identity_mismatch'):host.credential_files(changed)
+            self.assertEqual(set(host.credential_files({k:v for k,v in runtime.items()
+                if k not in ('secret_arn','secret_version_id')})),{str(paths['targon'])})
+        with self.assertRaisesRegex(release.ReleaseError,'identity_mismatch'):
+            host.credential_references({**runtime,'provider_credentials':{'vastai':{}}})
+
+    def test_guard_mounts_keep_receipts_read_only_and_api_unmounted(self):
+        runtime=self.targon_runtime()
+        value=host.overlay(IMAGE,PROFILE,runtime)
+        mounts=value['services'][host.SERVICE]['volumes']
+        guard=[mount for mount in mounts if mount['source'].startswith(host.TARGON_GUARD.as_posix())]
+        self.assertEqual(guard,[host.bind(host.TARGON_GUARD,True),host.bind(host.TARGON_GUARD/'requests')])
+        self.assertFalse(any('targon-guard' in mount['source'] or 'runtime-import' in mount['source']
+            for mount in value['services']['app']['volumes']))
+        with self.assertRaisesRegex(release.ReleaseError,'guard_path_invalid'):
+            host.controller(IMAGE,{**runtime,'cleanup_guard_dir':'/tmp/untrusted-guard'})
+
+    def test_guard_config_is_pinned_to_provider_identity_and_bounded_scope(self):
+        guard=self.root/'guard';guard.mkdir();(guard/'requests').mkdir();(guard/'receipts').mkdir()
+        runtime=self.targon_runtime();runtime['cleanup_guard_dir']=guard.as_posix()
+        value={'schema_version':1,'directory':guard.as_posix(),'org_slug':'offline-org',
+            'resource_names':['offline-resource'],'image_names':['offline-image'],
+            'approval_start':100,'approval_end':10000,'maximum_seconds':7200,
+            **runtime['provider_credentials']['targon']}
+        path=guard/'config.json';path.write_text(json.dumps(value))
+        with patch.object(host,'TARGON_GUARD',guard),patch.object(release,'protected_directory'), \
+             patch.object(host,'protected_file',side_effect=lambda path:path), \
+             patch.object(type(self.root),'lstat',return_value=NS(st_mode=0o40700,st_uid=10001)), \
+             patch.object(release,'_protected_json',side_effect=lambda path:json.loads(path.read_text())):
+            actual,files=host.guard_configuration(runtime)
+            self.assertEqual(actual,value)
+            self.assertEqual(files,{str(path):release.checksum(path)})
+            for changes in ({'secret_version_id':'unapproved-version'},{'resource_names':'offline-resource'},
+                {'schema_version':True},{'approval_end':float('inf')},{'maximum_seconds':15000}):
+                with self.subTest(changes=changes):
+                    path.write_text(json.dumps({**value,**changes}))
+                    with self.assertRaisesRegex(release.ReleaseError,'guard_identity_mismatch'):
+                        host.guard_configuration(runtime)
+
     def test_real_child_entrypoints_accept_factory_class_before_first_tick(self):
         # Real Python process/import behavior matters: calling main in the test
         # process never reproduced the __main__/canonical class split from -m.
@@ -254,15 +350,19 @@ class ComposeBoundaryTests(unittest.TestCase):
     def setUpClass(cls):
         if not shutil.which('docker'): raise unittest.SkipTest('Compose CLI unavailable')
         with tempfile.TemporaryDirectory() as td:
-            overlay=Path(td)/'overlay.json';overlay.write_text(json.dumps(host.overlay(IMAGE,PROFILE)))
+            overlay=Path(td)/'overlay.json'
             empty=Path(td)/'empty.env';empty.write_text('')
             env=dict(os.environ,SIXNINE_IMAGE=IMAGE,SIXNINE_POSTGRES_IMAGE='postgres@sha256:'+'b'*64,
                 SIXNINE_CADDY_IMAGE='caddy@sha256:'+'c'*64,SIXNINE_DB_ADMIN_SECRET_FILE='/run/sixnine-secrets/db_admin_password',
                 SIXNINE_APP_DSN_SECRET_FILE='/run/sixnine-secrets/app_database_url')
-            raw=subprocess.run(['docker','compose','--env-file',str(empty),'-f',str(DIRECTORY/'compose.yaml'),
-                '-f',str(overlay),'config','--format','json'],env=env,capture_output=True,timeout=30)
-            if raw.returncode: raise AssertionError('Synthetic compose render failed')
-            cls.value=json.loads(raw.stdout)
+            cls.targon_runtime={'provider_credentials':{'targon':{'secret_arn':'offline-arn','secret_version_id':'offline-version'}},
+                'cleanup_guard_dir':host.TARGON_GUARD.as_posix()}
+            for attribute,runtime in (('value',None),('targon_value',cls.targon_runtime)):
+                overlay.write_text(json.dumps(host.overlay(IMAGE,PROFILE,runtime)))
+                raw=subprocess.run(['docker','compose','--env-file',str(empty),'-f',str(DIRECTORY/'compose.yaml'),
+                    '-f',str(overlay),'config','--format','json'],env=env,capture_output=True,timeout=30)
+                if raw.returncode: raise AssertionError('Synthetic compose render failed')
+                setattr(cls,attribute,json.loads(raw.stdout))
             cls.version=subprocess.run(['docker','compose','version','--short'],check=True,capture_output=True,timeout=10).stdout.decode().strip()
 
     def check(self,value):
@@ -291,6 +391,18 @@ class ComposeBoundaryTests(unittest.TestCase):
             lambda c:c['services']['app']['environment'].update(SIXNINE_DEFAULT_DEPLOYMENT_PROFILE_ID='wrong')):
             changed=copy.deepcopy(self.value);mutate(changed)
             with self.assertRaises((release.ReleaseError,validator.ConfigurationError)):self.check(changed)
+
+    def test_rendered_guard_can_write_requests_only_and_api_cannot_access_guard(self):
+        def check(value):
+            return host.validate_rendered(value,DIRECTORY,self.version,IMAGE,PROFILE,self.targon_runtime)
+        self.assertTrue(check(self.targon_value))
+        for mutate in (
+            lambda c:next(m for m in c['services'][host.SERVICE]['volumes']
+                if m['source']==host.TARGON_GUARD.as_posix()).update(read_only=False),
+            lambda c:c['services']['app']['volumes'].append(host.bind(host.TARGON_GUARD,True)),
+            lambda c:c['services'][host.SERVICE]['volumes'].append(host.bind(host.TARGON_GUARD/'receipts'))):
+            changed=copy.deepcopy(self.targon_value);mutate(changed)
+            with self.assertRaises((release.ReleaseError,validator.ConfigurationError)):check(changed)
 
 
 if __name__=='__main__':unittest.main()

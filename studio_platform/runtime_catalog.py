@@ -14,6 +14,7 @@ PROFILE_IDS = (
     "h3-pruned-rank8-int8-quanto-int8-vae-int8-sdpa-p4-lowram-v1",
     "h3-unpruned33b-int8-qwenbf16-vaefp16-sdpa-p3-lowram-v1",
     "h3-unpruned33b-bf16-qwenbf16-vaefp16-sdpa-p3-splitqkv-v2",
+    "h3-pruned-rank8-int8-pro6000-quanto-int8-vae-int8-sdpa-p4-lowram-v1",
 )
 PROFILE_DIRECTORY = Path(__file__).resolve().parents[1] / "deploy" / "wangp" / "profiles"
 COMPILER_ID = "sixnine-h3-native-profile-v1"
@@ -58,6 +59,12 @@ def timing_hint(profile_id, mode, width, height, frames, fps, steps, roles):
             "warning": "Single-run historical observations with uncontrolled cache state; not a completion estimate or SLA."}
 
 
+def supported_cases(profile_id):
+    """Explicit request envelopes; qualification candidates have no timing proof."""
+    profile = get_profile(profile_id)
+    return profile["verified_cases"] + profile.get("qualification_cases", [])
+
+
 def model_for(profile_id, mode):
     for model in get_profile(profile_id)["models"]:
         if model["mode"] == mode:
@@ -89,7 +96,7 @@ def engine_manifest(profile_id, mode):
     model = model_for(profile_id, mode)
     runtime = profile["runtime"]
     runtime_digest = hashlib.sha256(canonical_json(runtime).encode()).hexdigest()
-    return EngineManifest.from_dict({
+    document = {
         "protocol_version": PROTOCOL_VERSION, "engine": "wangp",
         "source_repository": "https://github.com/deepbeepmeep/Wan2GP",
         "source_revision": profile["source_revision"], "compiler_id": COMPILER_ID,
@@ -102,7 +109,12 @@ def engine_manifest(profile_id, mode):
         "kernel_profile": "sdpa-strict-no-compile", "topology": {"slots": 1, "gpus": 1},
         "components": weights_manifest(profile_id, mode), "synthetic": False,
         "inference_qualified": False, "production_adapter_verified": False,
-    })
+    }
+    # Existing profile manifests remain byte-for-byte stable. New hardware is
+    # an explicit immutable binding, never inferred from the model's precision.
+    if "hardware_admission" in profile:
+        document["hardware_admission"] = copy.deepcopy(profile["hardware_admission"])
+    return EngineManifest.from_dict(document)
 
 
 def validate_manifest(manifest):

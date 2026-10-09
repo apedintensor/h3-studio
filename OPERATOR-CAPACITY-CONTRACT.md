@@ -12,7 +12,9 @@ Only explicitly configured operator browser identities can mutate capacity. Ordi
 
 A node is a billed provider host; a slot is an isolated GPU executor. A two-GPU node is not two independent nodes. Display whole-host price and GPU count. Each slot has one immutable deployment profile and functional mode. A change of profile requires drain and a separately prepared replacement; accepted attempts keep their identity. Multi-slot readiness cannot be inferred from one healthy GPU.
 
-Three explicit profiles are catalogued initially: pruned rank8 INT8 on RTX 5090, unpruned 33B INT8 on PRO 6000, and corrected unpruned BF16 on PRO 6000. The current user accepts pruning. Legacy BF16 jobs are not converted. Each profile binds source/weight revisions, component hashes, precision, model type, memory policy, kernel/QKV layout and exact control validation. Historical native experiments, adapter implementation, installed identity and live worker readiness are separate evidence.
+The catalog includes pruned rank8 INT8 on RTX 5090, unpruned 33B INT8 on PRO 6000, corrected unpruned BF16 on PRO 6000, and a separately identified single-PRO pruned rank8 INT8 qualification profile. The current user accepts pruning. Legacy BF16 jobs are not converted. Each profile binds source/weight revisions, component hashes, precision, model type, memory policy, kernel/QKV layout and exact control validation. Historical native experiments, adapter implementation, installed identity and live worker readiness are separate evidence.
+
+`h3-pruned-rank8-int8-pro6000-quanto-int8-vae-int8-sdpa-p4-lowram-v1` retains the pruned profile's weights, precision and bounded controls, but has a distinct engine manifest with explicit GPU/VRAM admission. Its `qualification_cases` permit only the listed candidate requests; they are not measurements and produce no historical timing hint. A generic supplier PRO 6000 label does not establish the GPU edition: startup verifies the actual driver identity, compute capability and memory. Existing profile/mode engine digests remain unchanged.
 
 `deployment_profile_id` is optional on new generation requests, Quick Chat settings/card revisions and saved shot generation settings. Omission retains legacy routing. A present value is explicit: unknown, unconfigured or incompatible profiles fail closed, never fall back to a different model. Public functional recipe IDs still distinguish FL2VA and Ref2VA; they are not model or deployment IDs. The compiled snapshot, policy hash and engine manifest preserve the choice through preflight, confirmation, worker claim and recovery.
 
@@ -62,15 +64,25 @@ not quoted as cheap one-GPU slices. An available resource count does not prove
 independent physical hosts. Price/metadata and runtime qualification blockers
 are visible even when a larger-GPU suggestion is useful.
 
-Targon stock is integrated; its paid lifecycle is not qualified by this change.
-Targon VM images/SSH identities differ from the Lium bootstrap, and the official
-VM/BM contract does not supply the sandbox-only TTL guarantee required by our
-current controller. Therefore Targon previews return
-`operator_provider_start_unqualified`; starts remain blocked. Public inventory
-does not certify account-specific allocation, runtime readiness, lifetime,
-deletion or billing. These require a separately qualified deployment binding
-and lifecycle under [#86](https://github.com/apedintensor/h3-studio/issues/86),
-not a bypass of Lium's proof checks.
+The Targon VM adapter under [#86](https://github.com/apedintensor/h3-studio/issues/86)
+requires an explicit immutable manifest and protected deployment binding. A
+generic registry still admits only Lium. Targon admission binds the provider,
+organization, resource/image, SSH-key IDs, topology, RAM/disk floors, whole-node
+price ceiling, maximum lifetime and original approval window. The price ceiling
+is enforced at preflight; unsupported network/country/CPU filters cannot be
+claimed as enforced. Registration, deployment and deletion retain exact remote
+identity and durable journals; an ambiguous submission is reconciled, never
+replayed as another rental.
+
+Targon VM lifetime uses an independent host guardian, not a provider-native TTL.
+Deployment, SSH/bootstrap and new generation require a fresh guardian proof for
+the exact instance and original deadline. The controller can write requests but
+cannot write guardian acknowledgements or health receipts. Missing, stale or
+degraded proof closes new admission while existing reconciliation and collection
+remain obligations. This mechanism does not cover loss of the guardian host,
+guarantee deletion through a provider outage, or establish billing settlement.
+Public inventory, adapter capability and bootstrap readiness each remain
+insufficient evidence of live inference acceptance.
 
 ## Historical generation hints
 

@@ -18,8 +18,8 @@ from sqlalchemy import select
 
 from .control import WorkerControl
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
-from .lium_bootstrap import BootConfig, BootController, BootError
-from .lium_provider import InferenceIdleProof, _uuid
+from .lium_bootstrap import BootConfig, BootController, BootError, idle_proof_type
+from .lium_provider import _uuid
 from .operator_capacity import operator_nodes, public_bootstrap
 from .qualification_profiles import QUEUED_TASK_PROFILE
 from .repository import Repository, instance_intents, registered_workers
@@ -78,6 +78,9 @@ class OperatorBoot:
                  *, boot_class=BootController, popen=None):
         self.repo,self.provider,self.binding = repo,provider,binding
         self.intent_id,self.instance_id = intent['id'],intent['provider_instance_id']
+        self.provider_id = binding.launch.provider
+        if intent['provider'] != self.provider_id:
+            raise BootError('operator_boot_provider_mismatch')
         self.runtime_config = runtime_config
         self._popen_impl = popen or subprocess.Popen
         self.stopping = False
@@ -95,13 +98,15 @@ class OperatorBoot:
             config = BootConfig(root/'boot'/self.intent_id/str(index),Path(sources[index]),
                 Path(runtime_config['ssh_key_file']),Path(runtime_config['known_hosts_file']),ports[index],
                 binding.configuration_id,model_id=binding.model_id,
-                min_gpu_bytes=(30 if 'Pruned' in profile['model_id'] else 90)*1024**3,
+                min_gpu_bytes=profile.get('hardware_admission', {}).get('minimum_total_vram_bytes',
+                    (30 if 'Pruned' in profile['model_id'] else 90)*1024**3),
                 enabled=True,trust_first_host_key=runtime_config.get('trust_first_host_key',False),
                 smoke_enabled=False,fleet_enabled=True,recipe_ids=binding.recipe_ids,
                 minimum_remaining_s=300,qualification_profile=QUEUED_TASK_PROFILE,
                 execution_backend='wangp-worker',engine_manifest_digest=binding.engine_manifest_digest,
                 output_delivery='native-frames-v1',deployment_profile_id=binding.runtime_profile_id,
-                runtime_python='/venv/main/bin/python',profile_slot_index=index,expected_host_gpus=binding.gpu_count)
+                runtime_python='/venv/main/bin/python',profile_slot_index=index,expected_host_gpus=binding.gpu_count,
+                provider=self.provider_id)
             boot = boot_class(repo,provider,config,ssh_factory=WanGPSSHHost,fleet_factory=self._fleet)
             boot.start_guard = self._start_allowed
             boot.enable_pollable_upload()
@@ -170,9 +175,10 @@ class OperatorBoot:
         if tag!=self.intent_id or instance_id!=self.instance_id:
             raise BootError('operator_idle_identity_mismatch')
         proofs = [boot.idle_probe(tag,instance_id) for boot in self.slots]
-        if not proofs or any(not isinstance(p,InferenceIdleProof) or p.instance_id!=instance_id for p in proofs):
+        proof_type = idle_proof_type(self.provider_id)
+        if not proofs or any(not isinstance(p,proof_type) or p.instance_id!=instance_id for p in proofs):
             return None
-        return InferenceIdleProof(instance_id,min(p.observed_at for p in proofs),
+        return proof_type(instance_id,min(p.observed_at for p in proofs),
             max(p.idle_since for p in proofs),all(p.idle for p in proofs))
 
     def shutdown_status(self):
@@ -183,7 +189,7 @@ class OperatorBoot:
             if callable(pending) and pending():
                 done = False
             directory = boot.config.work_dir/self.intent_id
-            worker_id = 'lium-'+self.intent_id.replace('-','')+'-gpu'+str(boot.config.profile_slot_index)
+            worker_id = self.provider_id+'-'+self.intent_id.replace('-','')+'-gpu'+str(boot.config.profile_slot_index)
             with self.repo.engine.connect() as conn:
                 worker = conn.execute(select(registered_workers).where(registered_workers.c.id==worker_id)).mappings().first()
             if worker and worker['current_job_id'] is not None:
@@ -238,7 +244,7 @@ class OperatorBoot:
                     state = json.loads(receipt.read_text())
                     if state.get('phase') in {'fleet_starting','fleet_started'} or 'fleet_recipe_ids' in state:
                         raise BootError('operator_child_ownership_unconfirmed')
-                worker_id = 'lium-'+self.intent_id.replace('-','')+'-gpu'+str(boot.config.profile_slot_index)
+                worker_id = self.provider_id+'-'+self.intent_id.replace('-','')+'-gpu'+str(boot.config.profile_slot_index)
                 with self.repo.engine.connect() as conn:
                     retained = conn.execute(select(registered_workers).where(registered_workers.c.id==worker_id)).first()
                 if retained is not None:
@@ -289,6 +295,8 @@ def run_worker(runtime_path, intent_id, fleet_path, worker_id, expected_hash):
         state = json.loads((expected_path.parent/'bootstrap-state.json').read_text())
         identity = state['identity']
         if (identity.get('intent_id')!=intent_id or identity.get('instance_id')!=intent['provider_instance_id']
+                or spec.provider != intent['provider'] or spec.provider != binding.launch.provider
+                or spec.provider != 'lium' and identity.get('provider') != spec.provider
                 or identity.get('sources')!=binding.boot['source_sha256'][index]
                 or spec.configuration_id!=binding.configuration_id or spec.model_id!=binding.model_id
                 or spec.pool!=binding.pool or spec.instance_id!=intent['provider_instance_id']

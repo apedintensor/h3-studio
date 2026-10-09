@@ -362,6 +362,14 @@ class SSHRecoveryTests(unittest.TestCase):
         self.assertTrue(0 < transport.open_session.call_args.kwargs['timeout'] <= 1)
         host.start.assert_not_called()
 
+    def test_targon_command_uses_noninteractive_privilege_and_preserves_shell_quoting(self):
+        host, channel, _ = self.command_host()
+        host.config = SimpleNamespace(provider='targon')
+        self.assertEqual(host.run('print("$HOME; synthetic")',timeout=1),{'ok':True})
+        import shlex
+        self.assertEqual(shlex.split(channel.commands[0]),['sudo','-n','python3','-c','print("$HOME; synthetic")'])
+        host.start.assert_not_called()
+
     def test_existing_tunnel_reuses_pinned_connection_without_replaying_start(self):
         from studio_platform.lium_bootstrap import SSHHost
         import tempfile

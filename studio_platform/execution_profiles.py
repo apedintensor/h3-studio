@@ -8,9 +8,8 @@ import copy
 
 def tested_envelope(profile_id, mode):
     """Public conservative scope; not approval, a price or a readiness promise."""
-    from .runtime_catalog import get_profile
-    profile = get_profile(profile_id)
-    cases = [c for c in profile['verified_cases'] if c['mode']==mode]
+    from .runtime_catalog import supported_cases
+    cases = [c for c in supported_cases(profile_id) if c['mode']==mode]
     if not cases:
         raise ValueError('Unknown profile mode')
     reference = mode=='ref'
@@ -112,8 +111,10 @@ def public_profiles(settings):
                 'constraints':constraints,'limits':limits,
                 'custom_canvas_constraints':{'maximum_pixel_area':constraints['max_pixels'],
                     'minimum_aspect_ratio':16/9,'maximum_aspect_ratio':16/9},
-                'input_notes':'仅开放已测组合；视频参考需规范化为56帧/24fps且关闭原声，独立参考音频2–5.2秒。',
+                'input_notes':('硬件验收待完成；仅开放固定候选组合。' if profile.get('qualification_cases') else '仅开放已测组合；')
+                    +'视频参考需规范化为56帧/24fps且关闭原声，独立参考音频2–5.2秒。',
                 'joint_cases':[{'input_roles':c['input_roles'],'width':c['width'],'height':c['height'],
-                    'frames':c['frames'],'steps':c['steps']} for c in profile['verified_cases'] if c['mode']==mode]}
+                    'frames':c['frames'],'steps':c['steps']} for c in
+                    profile['verified_cases']+profile.get('qualification_cases',[]) if c['mode']==mode]}
         profile["generation_support"] = modes
     return profiles

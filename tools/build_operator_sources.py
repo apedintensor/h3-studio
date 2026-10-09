@@ -57,7 +57,7 @@ def _runtime(profile_id, index, count, bundle_hash):
 
 
 def build(output):
-    """Create all catalog topologies (currently ten slot directories) once.
+    """Create all catalog topologies once.
 
     A failed build can leave an incomplete new directory. It is never resumed
     or overwritten; only a completed index.json is a build receipt.
