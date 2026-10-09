@@ -87,6 +87,51 @@ Drain stops new claims. Safe stop also waits for bound jobs, output collection a
 
 SIGINT/SIGTERM initiate a graceful controller drain: no new rentals, retained original node identities and continued reconciliation/collection. The process closes its local tunnels only after proving that its owned children and bound jobs are finished; this is not a supplier-removal or billing-settlement receipt. The default 900-second grace threshold reports attention rather than forcibly killing collectors. A service manager must not impose a shorter forced-kill timeout (`TimeoutStopSec=infinity` or an explicitly reviewed recovery policy). Forced termination, host loss and adopting a previous process's unknown fleet remain #60; do not claim this orderly shutdown path proves crash recovery.
 
+## Read-only multi-provider inventory
+
+The separate `studio_platform.capacity_scan` sampler performs only bounded GETs
+and writes allowlisted observations to `platform_capacity_market_observations`.
+It does not run the rental controller, alter budgets/policies, or initialize
+capacity. The API/worker remains a cache reader without provider egress or keys.
+The normal application schema migration creates the additive table first.
+
+For an already configured service environment, the explicit sampler command is:
+
+```text
+python -m studio_platform.capacity_scan --providers targon
+```
+
+`--once` performs one observation round. The default loop refreshes every 30
+seconds; each supplier has bounded transport/body limits and no automatic
+HTTP retries. Targon inventory uses the public pinned
+`https://api.targon.com/tha/v3/inventory` endpoint and requires no account key.
+`--providers lium targon` also uses the existing explicit central
+`lium/lium--rig-root` identity on this workstation. A Linux service must supply
+its existing approved in-memory Lium loader to `scan_lium`; do not copy a DPAPI
+vault or fall back to another account. The standalone default CLI does not
+invent that host credential bridge. Targon rental credentials are not loaded.
+
+Local opt-in preview (generation, rentals and assistant remain disabled):
+
+```text
+python tools/run_operator_preview.py --frontend <absolute-canonical-series-directory> --port 8898 --data <isolated-preview-directory> --scan-inventory lium targon
+```
+
+Without `--scan-inventory`, the preview still performs no provider requests.
+This change does not install a production sampler, publish the frontend or
+restart an active capacity controller. Track activation and lifecycle in
+[#86](https://github.com/apedintensor/h3-studio/issues/86). Deploy the reviewed API/cache schema,
+sampler and frontend through the existing exact-version release process. Do not
+replace an active controller just to refresh stock. Preserve old ledgers and
+the pending controller recovery work in #60. A scanner error leaves a visible
+failed/stale observation, never fake zero stock or a second rental intent.
+
+Provider sources: [Targon inventory](https://docs.targon.com/api/inventory),
+[workloads](https://docs.targon.com/api/workloads),
+[virtual machines](https://docs.targon.com/guides/virtual-machines).
+Inventory reads on 2026-10-09 verified the public PRO6000 VM listing and numeric
+units only. No Targon GPU was rented, booted, qualified or billed for this change.
+
 ## Acceptance before calling it operational
 
 Offline coverage establishes permissions, idempotency, accounting, slot isolation, native output delivery and profile matching. Release packaging includes the profile catalog and fingerprints it for both API/worker compatibility. A code merge does not publish the frontend or enable a rental service.

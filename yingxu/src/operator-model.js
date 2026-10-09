@@ -1,4 +1,5 @@
 export const epochMs=value=>typeof value==='number'&&Number.isFinite(value)?value*1000:null;
+export const providerLabel=value=>({lium:'Lium',targon:'Targon'}[value]||value||'供应商未知');
 export function dollars(value,{digits=2}={}){return typeof value==='number'&&Number.isFinite(value)?'$'+(value/1e6).toFixed(digits):'尚未核对';}
 export function age(value,now=Date.now()){
   const time=epochMs(value);if(time===null)return '尚未观测';
@@ -24,6 +25,56 @@ export const stateLabel=value=>states[value]||'状态待核对';
 export const stateTone=value=>['ready','healthy','complete','completed','succeeded'].includes(value)?'good':['failed','blocked','unknown','reconcile_required','stale','unavailable'].includes(value)?'warn':'neutral';
 const reasons={bootstrap_reconciliation_required:'启动结果需要核对，尚不能确认已准备好。',operator_bootstrap_failed:'启动检查未通过，请先处理已记录的原因。',wangp_configuration_permissions:'运行配置文件权限不符合要求，需要修复后核对原启动。',runtime_process_exited:'模型服务进程提前退出，需要核对原启动。',runtime_readiness_timeout:'模型服务未在规定时间内就绪，需要核对原启动。',wangp_runtime_dependency_missing:'运行环境缺少依赖，需要修复后核对原启动。',UnclassifiedBootstrapFailure:'启动检查异常，具体原因尚未确认。',operator_inventory_stale:'库存信息尚未更新，请等待控制器检查后刷新。',provider_inventory_unavailable:'目前无法核对供应商库存，请稍后刷新。',provider_inventory_unconfirmed:'供应商库存尚未确认，请等待控制器核对。',operator_ttl_below_provider_minimum:'所选期限短于供应商允许的最短期限，请调整本次运行时间后重新预览。',operator_deployment_not_configured:'此配方、模式与硬件尚无匹配的部署配置。',operator_binding_selection_mismatch:'所选条件与已配置部署不匹配。',operator_deployment_not_qualified:'此部署尚未完成执行验收。',operator_inventory_not_configured:'当前服务尚未配置供应商库存查询。',operator_ttl_limit:'所选运行期限超过策略上限。',operator_instance_limit:'将超过机器数量上限。',operator_gpu_limit:'将超过物理 GPU 数量上限。',operator_hourly_cost_limit:'将超过每小时费用上限。',operator_unpriced_existing_capacity:'已有容量的费用尚未核对，先保留原记录。',operator_authority_expiring:'已授权租赁期限不足，请核对原授权。',operator_reservation_insufficient:'预算预留不足以覆盖本次期限。',operator_policy_changed:'启动策略已改变，请核对当前操作。',operator_policy_version_conflict:'策略已被更新，请刷新后重新修改。',operator_binding_changed:'部署配置已改变，请核对原操作。',operator_bootstrap_unconfigured:'工作机启动流程尚未配置。',operator_provider_disabled:'供应商执行尚未启用。',operator_node_observation_stale:'机器观测已过期，请先核对。',operator_active_obligations:'仍有任务或租赁义务需要完成。',operator_capacity_disabled:'手动容量服务未启用。',operator_capacity_unconfigured:'手动容量服务尚未配置。',controller_unavailable:'控制器暂不可用。',controller_stale:'控制器状态已过期。',policy_disabled:'启动策略未启用。',provider_unconfigured:'供应商尚未连接。',no_matching_offers:'没有符合条件的机器。',inventory_unavailable:'目前无法核对库存。',max_instances_exceeded:'将超过机器数量上限。',max_physical_gpus_exceeded:'将超过 GPU 数量上限。',max_hourly_cost_exceeded:'将超过每小时费用上限。',budget_exceeded:'可用预算不足。',active_jobs:'仍有任务正在执行或收集。',pending_obligations:'仍有任务、租赁或费用需要核对。',unknown_rental:'原租赁结果未知，不能重复开机。',node_stale:'机器状态已过期，需先核对。',version_conflict:'机器或策略已改变，请刷新后重新预览。',preview_expired:'启动预览已过期，请重新预览。',profile_unavailable:'此部署配方尚未开放启动。',runtime_profile_unavailable:'此部署配方尚未开放启动。',capacity_not_configured:'容量控制尚未配置。'};
 export function reasonText(value){const code=typeof value==='string'?value:value?.code;return reasons[code]||'条件尚未满足，请核对状态后重试。';}
+Object.assign(reasons,{
+  operator_provider_start_unqualified:'此供应商的租赁与执行流程尚未验收，当前不能启动。',
+  inventory_ram_below_minimum:'系统内存低于当前要求。',inventory_disk_below_minimum:'可用磁盘低于当前要求。',
+  inventory_bandwidth_below_minimum:'下载带宽低于当前要求。',inventory_price_above_limit:'报价超过当前价格上限。',
+  inventory_country_mismatch:'地区不符合当前筛选条件。',inventory_insufficient_quantity:'库存数量不足以满足本次机器数量。',
+  inventory_unknown_ram:'系统内存尚未上报。',inventory_unknown_disk:'可用磁盘尚未上报。',
+  inventory_unknown_bandwidth:'下载带宽尚未上报，仍需核对。',inventory_unknown_country:'地区尚未上报，仍需核对。',
+  inventory_unknown_price:'整机价格尚未确认。',
+  inventory_unknown_allocation:'拆分或租赁状态尚未确认。',inventory_specs_unconfirmed:'库存已查询，但拆分或规格仍需核对，不能认定缺货。',
+  inventory_unknown_cpu:'CPU 核数尚未上报。',inventory_cpu_below_minimum:'CPU 核数低于当前要求。',
+  inventory_scan_failed:'供应商库存查询失败，请重新查询。',inventory_scan_stale:'库存观测已过期，请重新查询。',
+  inventory_scanner_not_configured:'此供应商尚未配置库存查询。',
+});
+export function operatorMarketProvider(market,provider,now=Date.now()){
+  const observation=market?.providers?.find(item=>item.provider===provider),observed=epochMs(observation?.observed_at);
+  const seconds=Number.isFinite(market?.fresh_seconds)&&market.fresh_seconds>0?market.fresh_seconds:120;
+  const fresh=observation?.status==='ok'&&observed!==null&&observed<=now&&now-observed<=seconds*1000;
+  const status=observation?.status==='ok'&&!fresh?'stale':observation?.status||'unconfirmed';
+  return {...observation,provider,fresh,status,label:{ok:'库存已核对',error:'库存查询失败',unconfigured:'尚未配置库存查询',stale:'库存已过期，需重新查询',unconfirmed:'库存尚未核对'}[status]||'库存尚未核对'};
+}
+export function operatorRecommendationsCurrent(market,selection,now=Date.now()){
+  return ['ok','partial'].includes(market?.status)&&market.reason_code==='inventory_no_matching_stock'&&operatorMarketProvider(market,selection.provider||'lium',now).fresh;
+}
+export function operatorOfferReadiness(row){
+  if(row.specs_confirmed===false)return '规格待核对';
+  const deploymentQualified=typeof row.deployment_qualified==='boolean'?row.deployment_qualified:row.qualification==='qualified';
+  if(!deploymentQualified)return '部署待验收';
+  return row.blockers?.length?'条件待调整':'待启动预览';
+}
+export function operatorInventorySummary(result,selection,now=Date.now()){
+  if(result?.market){
+    const provider=selection.provider||'lium',observation=operatorMarketProvider(result.market,provider,now);
+    if(!observation.fresh)return `${providerLabel(provider)} 库存尚未确认，当前不能判断有无库存。`;
+    if(result.market.reason_code==='inventory_specs_unconfirmed')return `库存已查询，但拆分或规格仍需核对，不能认定 ${selection.gpu_type} 缺货。`;
+    if(result.market.status==='unconfirmed')return '库存查询已返回，但筛选条件尚未确认，当前不能判断有无匹配库存。';
+    const count=result.market.offers?.length||0;
+    return count?`找到 ${count} 项所选硬件报价，筛选与部署条件见下方。`:`当前没有所选 ${selection.gpu_type} 的库存报价。`;
+  }
+  if(result?.status==='available')return result.offers?.length?`当前返回 ${result.offers.length} 项库存，仍需预览核对启动条件。`:'库存查询成功，供应商未返回逐项报价；请预览核对可用条件。';
+  return reasonText(result?.reason_code);
+}
+export function recommendationSelection(selection,row){
+  if(!['lium','targon'].includes(row?.provider)||typeof row?.gpu_type!=='string'||!row.gpu_type.trim())return null;
+  return {...selection,provider:row.provider,gpu_type:row.gpu_type};
+}
+export function operatorHardwareOptions(profile,selection){
+  const options=(profile?.gpu_models||[]).map(item=>typeof item==='string'?{id:item,label:item}:{id:item.gpu_type||item.id,label:item.label||item.gpu_type||item.id});
+  if(selection.gpu_type&&!options.some(item=>item.id===selection.gpu_type))options.push({id:selection.gpu_type,label:selection.gpu_type+' · 库存候选'});
+  return options;
+}
 export function staleSnapshot(snapshot,now=Date.now()){
   const observed=epochMs(snapshot?.observed_at);
   return !snapshot||observed===null||now-observed>30000;
@@ -48,7 +99,7 @@ export function hasBoundOperatorSelection(preview){
   return typeof preview?.configuration_id==='string'&&preview.configuration_id.trim().length>0&&!!preview.selection;
 }
 export function previewOperatorSelection(selection,preview){
-  return hasBoundOperatorSelection(preview)?{...preview.selection,filters:{...preview.selection.filters}}:selection;
+  return hasBoundOperatorSelection(preview)?{...preview.selection,provider:preview.selection.provider??selection.provider??'lium',filters:{...preview.selection.filters}}:selection;
 }
 export function runtimeDuration(policy,reportedMinimum=null,value=null){
   const maximumMinutes=Number.isFinite(policy?.max_ttl_seconds)?Math.floor(policy.max_ttl_seconds/60):null;
@@ -59,7 +110,7 @@ export function runtimeDuration(policy,reportedMinimum=null,value=null){
   return {minimumMinutes,maximumMinutes,suggestedSeconds,problem};
 }
 export function initialOperatorSelection(policy){
-  return {runtime_profile_id:'',mode:'fl',gpu_type:'',node_count:1,gpu_count:1,ttl_seconds:runtimeDuration(policy).suggestedSeconds??0,filters:{allowed_countries:[]}};
+  return {runtime_profile_id:'',mode:'fl',provider:'lium',gpu_type:'',node_count:1,gpu_count:1,ttl_seconds:runtimeDuration(policy).suggestedSeconds??0,filters:{allowed_countries:[]}};
 }
 export function operatorStartPayload(selection,customFilters=false){
   if(customFilters)return selection;

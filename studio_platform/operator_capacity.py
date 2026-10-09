@@ -107,8 +107,10 @@ def positive_int(value, maximum, minimum=1):
 
 def selection(value):
     required = {"runtime_profile_id", "mode", "gpu_type", "node_count", "gpu_count", "ttl_seconds"}
-    require(isinstance(value, dict) and required <= set(value) and not set(value)-required-{"filters"},
+    require(isinstance(value, dict) and required <= set(value) and not set(value)-required-{"filters", "provider"},
             "operator_selection_invalid", 422)
+    # Keep absent provider absent: historical selection hashes/replays remain exact.
+    require(value.get("provider", "lium") in ("lium", "targon"), "operator_provider_invalid", 422)
     require(safe_id(value["runtime_profile_id"]) and isinstance(value["gpu_type"], str)
             and 1 <= len(value["gpu_type"]) <= 120 and not any(ord(c)<32 for c in value["gpu_type"]),
             "operator_selection_identity_invalid", 422)
@@ -190,7 +192,7 @@ class DeploymentBinding:
 
     def matches(self, chosen):
         return (self.runtime_profile_id == chosen["runtime_profile_id"] and self.gpu_type == chosen["gpu_type"]
-                and self.mode == chosen["mode"]
+                and self.mode == chosen["mode"] and self.launch.provider == chosen.get("provider", "lium")
                 and self.gpu_count == chosen["gpu_count"] and chosen["ttl_seconds"] <= self.max_ttl_seconds
                 and (not chosen["filters"] or chosen["filters"] == self.filters))
 
@@ -213,6 +215,8 @@ class OperatorRegistry:
         self.inventory_required=inventory_required
 
     def resolve(self, chosen):
+        # Inventory support does not qualify a VM's paid lifecycle/bootstrap.
+        require(chosen.get("provider", "lium") == "lium", "operator_provider_start_unqualified")
         if self.resolver is not None:
             result = self.resolver(chosen)
             require(isinstance(result, DeploymentBinding) and result.matches(chosen), "operator_binding_selection_mismatch")
@@ -330,6 +334,20 @@ class OperatorCapacity:
         allowed = tuple(getattr(self.settings,"operator_capacity_owners",()) or ())
         require(not principal.machine and principal.owner in allowed,"operator_forbidden",403)
         return principal.owner
+
+    def offers(self, principal, chosen):
+        self.authorize(principal)
+        chosen = selection(chosen)
+        now = self.repo.clock()
+        try:
+            value = self.registry.offers(chosen, now)
+        except Exception:
+            value = {"status": "unavailable", "observed_at": None, "offers": [],
+                     "reason_code": "operator_inventory_unavailable"}
+        from .capacity_market import market_projection
+        with self.repo.engine.connect() as connection:
+            market = market_projection(connection, self.registry, chosen, now)
+        return {**value, "market": market}
 
     def _policy(self, connection):
         row=connection.execute(select(operator_policy).where(operator_policy.c.id=="global")).mappings().first()

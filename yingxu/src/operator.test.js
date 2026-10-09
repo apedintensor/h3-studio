@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createOperatorClient} from './operator-client.js';
 import {createOperatorController} from './operator-controller.js';
-import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload,operatorFilterEdit,hasBoundOperatorSelection,previewOperatorSelection} from './operator-model.js';
+import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload,operatorFilterEdit,hasBoundOperatorSelection,previewOperatorSelection,operatorMarketProvider,operatorRecommendationsCurrent,operatorOfferReadiness,operatorInventorySummary,recommendationSelection,operatorHardwareOptions,reasonText} from './operator-model.js';
 import {recipeFor,effectiveControlSchema,effectiveLimits,clipLimits,inputProblems} from './quick-chat-model.js';
 
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
@@ -50,6 +50,70 @@ test('inventory and preview preserve explicit FL/REF mode without initiating ren
   const requests=[],client=createOperatorClient({fetcher:async(path,options)=>{requests.push({path,options});return new Response('{}',{headers:{'Content-Type':'application/json','X-Authenticated-Account':'owner'}});}});
   client.setAccount('owner');const selection={runtime_profile_id:'p',mode:'ref',gpu_type:'GPU exact',gpu_count:2,node_count:1,ttl_seconds:3600};await client.offers(selection);await client.preview(selection);
   const query=new URL(requests[0].path,'https://local.invalid').searchParams;assert.equal(query.get('mode'),'ref');assert.equal(query.get('gpu_count'),'2');assert.deepEqual(JSON.parse(requests[1].options.body),selection);assert.equal(requests.some(r=>r.path.endsWith('/starts')),false);
+});
+test('provider-aware inventory sends full selection with optional filters and never starts a rental',async()=>{
+  const requests=[],client=createOperatorClient({fetcher:async(path,options)=>{requests.push({path,options});return new Response('{}',{headers:{'Content-Type':'application/json','X-Authenticated-Account':'owner'}});}});
+  client.setAccount('owner');
+  const selection={...initialOperatorSelection({max_ttl_seconds:10800}),runtime_profile_id:'pruned',mode:'ref',provider:'targon',gpu_type:'RTX PRO 6000',node_count:2,filters:{min_ram_gib:96,min_disk_gib:128,max_price_per_gpu_hour_microusd:850000}};
+  await client.offers(operatorStartPayload(selection));await client.offers(operatorStartPayload(selection,true));await client.preview(operatorStartPayload(selection));
+  const query=new URL(requests[0].path,'https://local.invalid').searchParams,customQuery=new URL(requests[1].path,'https://local.invalid').searchParams;
+  assert.equal(query.get('provider'),'targon');assert.equal(query.get('node_count'),'2');assert.equal(query.get('ttl_seconds'),'10800');assert.equal(query.get('mode'),'ref');assert.equal(query.has('filters'),false);
+  assert.deepEqual(JSON.parse(customQuery.get('filters')),selection.filters);assert.equal(JSON.parse(requests[2].options.body).provider,'targon');assert.equal(requests.some(item=>item.path.endsWith('/starts')),false);
+});
+test('default Lium and authored provider survive profile edits and authoritative previews',()=>{
+  const initial=initialOperatorSelection({max_ttl_seconds:10800});assert.equal(initial.provider,'lium');assert.equal(operatorStartPayload(initial).provider,'lium');
+  const selection={...initial,provider:'targon'},next=profileSelection({id:'same-recipe',gpu_models:['RTX 5090'],gpu_count_options:[1]},selection);
+  assert.equal(next.provider,'targon');assert.equal(operatorStartPayload(next).provider,'targon');
+  const {provider,...legacySelection}=initial;
+  assert.equal(previewOperatorSelection(initial,{configuration_id:'lium-bound',selection:legacySelection}).provider,'lium');
+  assert.equal(previewOperatorSelection(selection,{configuration_id:'targon-bound',selection:{...next,filters:{}}}).provider,'targon');
+});
+test('explicit hardware recommendation changes only provider and GPU while keeping recipe, precision, controls and authored limits',()=>{
+  const selection={...initialOperatorSelection({max_ttl_seconds:10800}),runtime_profile_id:'pruned-int8',mode:'ref',provider:'lium',gpu_type:'RTX 5090',node_count:2,precision:'int8',controls:{steps:20},filters:{min_ram_gib:96,min_download_mbps:200,max_price_per_gpu_hour_microusd:850000}};
+  const row={provider:'targon',gpu_type:'RTX PRO 6000 Blackwell Server Edition',selection:{runtime_profile_id:'different-bf16',mode:'fl',node_count:1,ttl_seconds:120,filters:{}}};
+  const next=recommendationSelection(selection,row);
+  assert.deepEqual(next,{...selection,provider:row.provider,gpu_type:row.gpu_type});assert.equal(next.filters,selection.filters);assert.equal(next.controls,selection.controls);assert.equal(selection.gpu_type,'RTX 5090');
+  assert.deepEqual(operatorHardwareOptions({gpu_models:['RTX 5090']},next).map(item=>item.id),['RTX 5090',row.gpu_type]);assert.equal(recommendationSelection(selection,{provider:'unknown',gpu_type:'GPU'}),null);
+});
+test('inventory distinguishes known empty stock from failed, missing, expired and future observations',()=>{
+  const now=1000000,selection={provider:'lium',gpu_type:'RTX 5090'},market={status:'partial',fresh_seconds:120,observed_at:990,providers:[{provider:'lium',status:'ok',observed_at:990},{provider:'targon',status:'error',observed_at:990}],offers:[]};
+  assert.equal(operatorMarketProvider(market,'lium',now).fresh,true);assert.match(operatorInventorySummary({market},selection,now),/没有所选 RTX 5090/);
+  assert.equal(operatorMarketProvider(market,'targon',now).fresh,false);assert.match(operatorInventorySummary({market},{...selection,provider:'targon'},now),/不能判断有无库存/);
+  for(const observation of [{status:'ok',observed_at:879},{status:'ok',observed_at:1001},{status:'ok'},{status:'stale',observed_at:990},{status:'unconfigured',observed_at:990}]){
+    const stale={...market,providers:[{provider:'lium',...observation}]};assert.equal(operatorMarketProvider(stale,'lium',now).fresh,false);assert.match(operatorInventorySummary({market:stale},selection,now),/不能判断有无库存/);
+  }
+  assert.equal(operatorMarketProvider({...market,status:'unconfirmed'},'lium',now).fresh,true);
+  assert.match(operatorInventorySummary({market:{...market,status:'unconfirmed'}},selection,now),/筛选条件尚未确认/);
+  assert.match(operatorInventorySummary({status:'available',offers:[]},selection,now),/未返回逐项报价/);
+  assert.match(reasonText('operator_provider_start_unqualified'),/尚未验收/);
+});
+test('fresh provider scans with unconfirmed matching specifications do not claim staleness or missing stock',()=>{
+  const now=1000000,selection={provider:'lium',gpu_type:'RTX 5090'},market={status:'unconfirmed',reason_code:'inventory_specs_unconfirmed',fresh_seconds:120,providers:[{provider:'lium',status:'ok',observed_at:990},{provider:'targon',status:'ok',observed_at:990}],offers:[{gpu_type:'RTX 5090',download_mbps:null}]};
+  for(const provider of ['lium','targon']){
+    const observation=operatorMarketProvider(market,provider,now);assert.equal(observation.fresh,true);assert.equal(observation.status,'ok');assert.equal(observation.label,'库存已核对');
+  }
+  assert.match(operatorInventorySummary({market},selection,now),/拆分或规格仍需核对，不能认定 RTX 5090 缺货/);
+  assert.equal(operatorRecommendationsCurrent(market,selection,now),false);
+  const empty={...market,status:'partial',reason_code:'inventory_no_matching_stock'};
+  assert.equal(operatorRecommendationsCurrent(empty,selection,now),true);
+  assert.equal(operatorRecommendationsCurrent({...empty,reason_code:'inventory_matches_found'},selection,now),false);
+  assert.equal(operatorRecommendationsCurrent({...empty,status:'unconfirmed'},selection,now),false);
+  assert.equal(operatorRecommendationsCurrent(empty,selection,now+121000),false);
+});
+test('stock readiness distinguishes missing specifications, deployment qualification and adjustable limits with legacy compatibility',()=>{
+  const row={qualification:'unqualified',deployment_qualified:true,specs_confirmed:false,blockers:['inventory_unknown_bandwidth']};
+  assert.equal(operatorOfferReadiness(row),'规格待核对');
+  assert.equal(operatorOfferReadiness({...row,deployment_qualified:false}),'规格待核对');
+  assert.equal(operatorOfferReadiness({...row,specs_confirmed:true,deployment_qualified:false,blockers:['operator_provider_start_unqualified']}),'部署待验收');
+  assert.equal(operatorOfferReadiness({...row,specs_confirmed:true,blockers:['inventory_price_above_limit']}),'条件待调整');
+  assert.equal(operatorOfferReadiness({...row,specs_confirmed:true,qualification:'qualified',blockers:[]}),'待启动预览');
+  assert.equal(operatorOfferReadiness({qualification:'qualified',blockers:[]}),'待启动预览');
+  assert.equal(operatorOfferReadiness({qualification:'unqualified',blockers:[]}),'部署待验收');
+});
+test('late inventory response from a previous account cannot be used for recommendations',async()=>{
+  const held=deferred(),controller=createOperatorController({client:fakeClient({offers:()=>held.promise}),storage:memory()});
+  await controller.setAccount('a');const scan=controller.offers({provider:'targon'});await controller.setAccount('b');held.resolve({market:{recommendations:[{provider:'targon',offer_id:'old-account-offer'}]}});
+  await assert.rejects(scan,/账户已改变/);assert.equal(controller.getState().account,'b');assert.equal(controller.getState().pending,null);
 });
 test('custom deployment profile selects reported GPU topology while preserving authored price/TTL and node count',()=>{
   const selection={node_count:2,ttl_seconds:1800,filters:{max_price_per_gpu_hour_microusd:1500000}};
