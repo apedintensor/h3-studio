@@ -148,6 +148,99 @@ class TargonCleanupTests(unittest.TestCase):
         self.assertEqual(_read(self.root/"receipts"/(self.uid+".json"))["state"],"cleanup_blocked")
         self.assertEqual(_read(self.root/"heartbeat.json")["state"],"degraded")
 
+    def arm_distinct_workload(self):
+        uid, deadline = "wkl-distinct", self.now+120
+        body = {**self.body,"uid":uid,"name":"2"*32,
+            "created_at":datetime.fromtimestamp(self.now,timezone.utc).isoformat()}
+        bodies = {self.uid:self.body,uid:body}
+        self.client.get.side_effect = lambda route:httpx.Response(200,json=bodies[route.rsplit('/',1)[1]])
+        with self.assertRaisesRegex(ValueError,"ack_pending"):
+            self.guard.arm(uid,deadline)
+        self.guardian().tick()
+        self.guard.arm(uid,deadline)
+        return uid,deadline
+
+    def test_distinct_armed_workload_survives_old_pending_cleanup_without_losing_retry(self):
+        self.arm()
+        self.now = self.deadline
+        self.guardian().tick()  # DELETE acknowledged; stale exact GET is not removal.
+        old_path = self.root/"receipts"/(self.uid+".json")
+        original = _read(old_path)
+        uid, deadline = self.arm_distinct_workload()
+        heartbeat = _read(self.root/"heartbeat.json")
+        self.assertEqual((heartbeat["process_state"],heartbeat["state"]),("running","degraded"))
+        self.assertEqual(self.guard.proof(uid),
+            {"instance_id":uid,"deadline":deadline,"independent":True,"armed":True})
+        self.assertEqual(_read(old_path),original)
+        self.assertEqual(self.client.delete.call_count,1)
+        for method in (self.guard.proof,self.guard.removal_proof):
+            with self.assertRaises(ValueError): method(self.uid)
+        self.now += 30
+        self.guardian().tick()
+        retried = _read(old_path)
+        self.assertEqual(self.client.delete.call_count,2)
+        self.assertEqual(retried["delete_attempts"],2)
+        self.assertEqual(retried["deadline"],original["deadline"])
+        self.assertEqual(retried["workload_identity"],original["workload_identity"])
+        self.assertEqual(retried["state"],"removal_pending")
+        self.assertNotIn("removal_evidence",retried)
+        self.assertTrue(self.guard.proof(uid)["armed"])
+        self.assertTrue(all(call.args[0].endswith('/'+self.uid) for call in self.client.delete.call_args_list))
+
+    def test_distinct_workload_does_not_reset_exhausted_old_cleanup(self):
+        self.arm()
+        self.now = self.deadline
+        old_path = self.root/"receipts"/(self.uid+".json")
+        for _ in range(12):
+            self.guardian().tick()
+            self.now = _read(old_path)["next_retry_at"]
+        self.guardian().tick()
+        original = _read(old_path)
+        uid, _ = self.arm_distinct_workload()
+        retained = _read(old_path)
+        self.assertTrue(self.guard.proof(uid)["armed"])
+        self.assertEqual(self.client.delete.call_count,12)
+        for field in ("state","deadline","request","workload_identity","delete_attempts",
+                      "delete_started_at","delete_acknowledged","next_retry_at","reason_code"):
+            self.assertEqual(retained[field],original[field])
+        self.assertEqual(retained["state"],"cleanup_blocked")
+        self.assertNotIn("removal_evidence",retained)
+        with self.assertRaisesRegex(ValueError,"removal_unconfirmed"):
+            self.guard.removal_proof(self.uid)
+
+    def test_explicit_process_health_and_known_aggregate_state_are_required(self):
+        self.arm()
+        path = self.root/"heartbeat.json"
+        original = _read(path)
+        cases = [{k:v for k,v in original.items() if k != "process_state"}]
+        cases += [{**original,"process_state":state} for state in ("stopped","failed","unknown",None)]
+        cases += [{**original,"state":"unknown"},
+            {**original,"state":"degraded","reason_code":"unrecognized_failure"},
+            {**original,"observed_at":self.now-46}, {**original,"observed_at":self.now+1}]
+        for value in cases:
+            with self.subTest(heartbeat=value):
+                _write(path,value)
+                with self.assertRaisesRegex(ValueError,"proof_unavailable"):
+                    self.guard.proof(self.uid)
+        path.unlink()
+        with self.assertRaises(OSError): self.guard.proof(self.uid)
+        self.client.delete.assert_not_called()
+
+    def test_healthy_sweep_cannot_replace_exact_fresh_armed_receipt(self):
+        self.arm()
+        path = self.root/"receipts"/(self.uid+".json")
+        original = _read(path)
+        cases = [{**original,"state":state} for state in ("removal_pending","cleanup_blocked","removed","unknown")]
+        cases += [{**original,"observed_at":self.now-46},
+            {**original,"guardian_id":"another-guardian"}, {**original,"instance_id":"wkl-distinct"}]
+        for value in cases:
+            with self.subTest(receipt=value):
+                _write(path,value)
+                with self.assertRaises(ValueError): self.guard.proof(self.uid)
+        path.unlink()
+        with self.assertRaises(OSError): self.guard.proof(self.uid)
+        self.client.delete.assert_not_called()
+
     def test_tampered_request_or_receipt_cannot_prove_guard_or_removal(self):
         self.arm()
         request_path = self.root/"requests"/(self.uid+".json")

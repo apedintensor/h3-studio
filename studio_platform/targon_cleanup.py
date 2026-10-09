@@ -146,7 +146,11 @@ class TargonCleanupGuard:
                 or not math.isfinite(request['deadline'])
                 or ack.get('instance_id') != instance_id or ack.get('request_hash') != _hash(request)
                 or ack.get('state') != 'armed' or ack.get('guardian_id') != heartbeat.get('guardian_id')
-                or heartbeat.get('state') != 'running' or type(observed) not in (int, float)
+                or heartbeat.get('process_state') != 'running'
+                or heartbeat.get('state') not in {'running', 'degraded'}
+                or (heartbeat.get('state') == 'degraded'
+                    and heartbeat.get('reason_code') != 'targon_cleanup_pending_or_blocked')
+                or type(observed) not in (int, float)
                 or not math.isfinite(observed) or not 0 <= now-observed <= 45
                 or type(acknowledged) not in (int, float) or not math.isfinite(acknowledged)
                 or not 0 <= now-acknowledged <= 45
@@ -220,7 +224,11 @@ class TargonDeadlineGuardian:
                 # An unrelated malformed file has no armed obligation. A
                 # previously acknowledged workload losing verification does.
                 degraded = name in receipts or degraded
+        # Completion of this sweep proves process health, not successful cleanup
+        # of every retained obligation. A distinct UID still needs its own fresh
+        # armed receipt; pending/blocked UIDs cannot borrow another UID's proof.
         _write(self.root / 'heartbeat.json', {'schema_version': 1, 'guardian_id': self.identity,
+            'process_state': 'running',
             'state': 'degraded' if degraded else 'running', 'observed_at': now,
             'reason_code': 'targon_cleanup_pending_or_blocked' if degraded else None})
 
