@@ -49,7 +49,11 @@ for profile in catalog['profiles']:
         assert profile.get('qualification_cases')
         assert all('measurements' not in case for case in profile['qualification_cases'])
     for case in profile['verified_cases']:
-        assert all(m['evidence'].startswith('https://github.com/apedintensor/h3-studio/blob/') for m in case['measurements'])
+        for measurement in case['measurements']:
+            if profile['id']==PROFILE_IDS[3]:
+                assert measurement['evidence']=='https://github.com/apedintensor/h3-studio/issues/86#issuecomment-6083341543'
+            else:
+                assert measurement['evidence'].startswith('https://github.com/apedintensor/h3-studio/blob/')
     for mode in ('fl','ref'):
         assert engine_manifest(profile['id'],mode).document['production_adapter_verified'] is False
 print(json.dumps({'profiles':len(catalog['profiles']),'manifests':len(PROFILE_IDS)*2}))

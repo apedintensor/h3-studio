@@ -184,6 +184,114 @@ class TargonProviderTests(unittest.TestCase):
             self.create(provider)
         self.assertEqual(len(self.mutations()),2)
 
+    def test_sparse_post_acknowledgements_use_exact_get_before_deploy_and_readiness(self):
+        def sparse(request):
+            response = self.handler(request)
+            if request.method == "POST":
+                # Registration supplies only a UID; deployment may be an empty
+                # acknowledgement for the already bound UID.
+                return httpx.Response(200,json={} if request.url.path.endswith("/deploy") else {"uid":INSTANCE})
+            return response
+        provider = self.provider(transport=httpx.MockTransport(sparse))
+        fact = self.create(provider)
+        self.assertEqual((fact.state,fact.instance_id),("starting",INSTANCE))
+        self.assertEqual(provider._journal.read(TAG)["phase"],"deployed")
+        workload_route = "/tha/v3/orgs/fixture-org/workloads"
+        self.assertEqual(self.requests[-4:],[
+            ("POST",workload_route),("GET",workload_route+"/"+INSTANCE),
+            ("POST",workload_route+"/"+INSTANCE+"/deploy"),("GET",workload_route+"/"+INSTANCE)])
+        self.assertEqual(self.guard.calls,[(INSTANCE,self.now+7200)])
+
+    def test_registration_observation_failure_retains_uid_and_recovers_without_listing(self):
+        fail_get = True
+        def sparse(request):
+            response = self.handler(request)
+            if request.method == "POST" and request.url.path.endswith("/workloads"):
+                return httpx.Response(201,json={"uid":INSTANCE})
+            if fail_get and request.method == "GET" and request.url.path.endswith("/"+INSTANCE):
+                raise httpx.ReadTimeout("fixture-secret")
+            return response
+        provider = self.provider(transport=httpx.MockTransport(sparse))
+        with self.assertRaisesRegex(TargonError,"request_unconfirmed"):
+            self.create(provider)
+        marker = provider._journal.read(TAG)
+        self.assertEqual((marker["phase"],marker["instance_id"]),("register_started",INSTANCE))
+        self.assertEqual(len(self.mutations()),1)
+        self.assertFalse(self.guard.calls)
+        fail_get = False
+        self.requests.clear()
+        provider = self.provider(transport=httpx.MockTransport(sparse))
+        provider.reconcile(TAG)
+        self.assertEqual(self.requests[0],("GET","/tha/v3/orgs/fixture-org/workloads/"+INSTANCE))
+        self.assertEqual(len(self.mutations()),1)  # Only the first deploy, never re-register.
+        self.assertEqual(provider._journal.read(TAG)["deadline"],marker["deadline"])
+
+    def test_post_get_404_is_unknown_not_permission_to_repeat_registration(self):
+        def invisible(request):
+            response = self.handler(request)
+            if request.method == "GET" and request.url.path.endswith("/"+INSTANCE):
+                return httpx.Response(404)
+            return response
+        provider = self.provider(transport=httpx.MockTransport(invisible))
+        with self.assertRaisesRegex(TargonError,"identity_unconfirmed"):
+            self.create(provider)
+        fact = provider.reconcile(TAG)
+        self.assertEqual((fact.state,fact.instance_id),("unknown",INSTANCE))
+        self.assertFalse(fact.absence_confirmed)
+        self.assertFalse(self.guard.calls)
+        with self.assertRaisesRegex(TargonError,"already_submitted"):
+            self.create(provider)
+        self.assertEqual(len(self.mutations()),1)
+        self.provider().reconcile(TAG)
+        self.assertEqual(len(self.mutations()),2)
+
+    def test_sparse_registration_cannot_adopt_foreign_exact_get_identity(self):
+        def foreign(request):
+            response = self.handler(request)
+            if request.method == "POST" and request.url.path.endswith("/workloads"):
+                return httpx.Response(201,json={"uid":INSTANCE})
+            if request.method == "GET" and request.url.path.endswith("/"+INSTANCE):
+                return httpx.Response(200,json=self.workload(name="foreign-workload"))
+            return response
+        provider = self.provider(transport=httpx.MockTransport(foreign))
+        with self.assertRaisesRegex(TargonError,"identity_unconfirmed"):
+            self.create(provider)
+        with self.assertRaisesRegex(TargonError,"identity_unconfirmed"):
+            provider.reconcile(TAG)
+        self.assertFalse(self.guard.calls)
+        self.assertEqual(len(self.mutations()),1)
+        self.assertEqual(provider._journal.read(TAG)["phase"],"register_started")
+
+    def test_conflicting_post_identity_is_not_ignored_even_if_get_would_match(self):
+        def conflict(request):
+            response = self.handler(request)
+            if request.method == "POST" and request.url.path.endswith("/deploy"):
+                return httpx.Response(200,json={"uid":"foreign-workload"})
+            return response
+        provider = self.provider(transport=httpx.MockTransport(conflict))
+        with self.assertRaisesRegex(TargonError,"instance_identity_conflict"):
+            self.create(provider)
+        self.assertEqual(provider._journal.read(TAG)["phase"],"deploy_started")
+        self.provider().reconcile(TAG)
+        self.assertEqual(len(self.mutations()),2)
+
+    def test_lost_post_deploy_get_keeps_single_deploy_barrier(self):
+        def delayed(request):
+            response = self.handler(request)
+            if (request.method == "GET" and request.url.path.endswith("/"+INSTANCE)
+                    and self.workloads[0]["state"]["status"] == "provisioning"):
+                raise httpx.ReadTimeout("fixture-secret")
+            return response
+        provider = self.provider(transport=httpx.MockTransport(delayed))
+        with self.assertRaisesRegex(TargonError,"request_unconfirmed"):
+            self.create(provider)
+        self.assertEqual(provider._journal.read(TAG)["phase"],"deploy_started")
+        self.workloads[0]["state"]["status"] = "registered"
+        provider = self.provider()
+        provider.reconcile(TAG)
+        provider.reconcile(TAG,INSTANCE)
+        self.assertEqual(len(self.mutations()),2)
+
     def test_ambiguous_deploy_is_never_repeated_even_if_get_says_registered(self):
         self.fail_deploy = True
         with self.assertRaisesRegex(TargonError,"request_unconfirmed"):
@@ -264,6 +372,34 @@ class TargonProviderTests(unittest.TestCase):
         self.assertEqual(provider.destroy(TAG,INSTANCE).state,"unknown")
         self.assertEqual(len(self.mutations()),3)
         self.missing_after_delete = False
+        self.assertEqual(provider.reconcile(TAG,INSTANCE).state,"destroyed")
+
+    def test_retained_delete_intent_never_reports_preparing_or_running(self):
+        def pending_delete(request):
+            response = self.handler(request)
+            if request.method == "DELETE":
+                self.workloads[0]["state"]["status"] = "provisioning"
+            return response
+        provider = self.provider(transport=httpx.MockTransport(pending_delete))
+        self.create(provider)
+        fact = provider.destroy(TAG,INSTANCE)
+        self.assertEqual((fact.state,fact.instance_id),("unknown",INSTANCE))
+        self.assertIsNone(fact.preparation_stage)
+        self.assertIsNone(fact.provider_status)
+        self.assertIsNone(fact.actual_cost_microusd)
+        self.assertTrue(provider._journal.read(TAG)["delete_acknowledged"])
+        self.workloads[0]["state"]["status"] = "running"
+        idle_probe = Mock(return_value=TargonIdleProof(INSTANCE,self.now,self.now-60,True))
+        provider = self.provider(idle_probe=idle_probe)
+        fact = provider.destroy(TAG,INSTANCE)
+        self.assertEqual(fact.state,"unknown")
+        self.assertIsNone(fact.preparation_stage)
+        self.assertFalse(fact.idle_confirmed)
+        idle_probe.assert_not_called()
+        self.assertFalse(provider.execution_allowed(TAG,INSTANCE))
+        self.assertEqual(len(self.mutations()),3)
+        self.assertIsNone(provider.billing(TAG,INSTANCE))
+        self.workloads[0]["state"]["status"] = "deleted"
         self.assertEqual(provider.reconcile(TAG,INSTANCE).state,"destroyed")
 
     def test_independent_guard_removal_proof_reconciles_external_delete(self):

@@ -26,13 +26,17 @@ GIB = 1024**3
 
 
 class CandidateProfileTests(unittest.TestCase):
-    def test_candidate_keeps_weights_runtime_and_envelopes_without_fabricating_measurements(self):
+    def test_partial_native_evidence_keeps_weights_runtime_and_pending_envelopes(self):
         source, candidate = get_profile(PROFILE_IDS[0]), get_profile(PROFILE)
         for key in ('components', 'runtime', 'model_id', 'models', 'minimum_ram_bytes', 'minimum_free_vram_bytes'):
             self.assertEqual(candidate[key], source[key])
-        self.assertEqual(candidate['verified_cases'], [])
-        self.assertIsNone(candidate['tested_topology'])
+        self.assertEqual({case['id'] for case in candidate['verified_cases']},
+                         {'pro6000-candidate-2', 'pro6000-candidate-8'})
+        self.assertEqual(candidate['tested_topology']['gpus_per_host'], 1)
+        self.assertEqual(candidate['tested_topology']['active_jobs_per_gpu'], 1)
+        self.assertEqual(len(candidate['qualification_cases']), 6)
         self.assertEqual(candidate['validation']['scope'], 'pending_hardware_qualification')
+        self.assertIs(candidate['validation']['production_adapter_verified'], False)
         for case in candidate['qualification_cases']:
             self.assertNotIn('measurements', case)
             request, metadata = example(PROFILE, case)

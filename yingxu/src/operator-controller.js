@@ -26,6 +26,7 @@ export function createOperatorController({client=createOperatorClient(),storage=
     async setAccount(account){epoch++;client.setAccount(account);loading=false;let saved=null;try{saved=account?JSON.parse(storage?.getItem(keyFor(account))||'null'):null;}catch{saved={corrupt:true};}emit({account,snapshot:null,catalog:null,pending:saved,busy:false,loading:false,error:'',denied:false,unavailable:false});if(account)try{await refresh();}catch{}},
     refresh,poll:()=>state.busy?Promise.resolve():refresh(),
     preview:selection=>act(()=>client.preview(selection)),
+    candidates:query=>act(()=>client.candidates(query)),
     offers:selection=>act(()=>client.offers(selection)),
     start:preview=>command('start',[],{preview_id:preview.preview_id}),
     drain:node=>command('drain',[node.id],{expected_version:node.version}),

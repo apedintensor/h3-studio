@@ -8,6 +8,8 @@ from studio_platform.runtime_catalog import (PROFILE_IDS, engine_manifest, get_p
 from studio_platform.inference.wangp_contract import EngineManifest
 from studio_platform.runtime_hosts.wangp_download import selected_files
 
+TARGON_EVIDENCE = 'https://github.com/apedintensor/h3-studio/issues/86#issuecomment-6083341543'
+
 
 class RuntimeCatalogTests(unittest.TestCase):
     def test_catalog_is_detached_public_and_unqualified(self):
@@ -39,13 +41,37 @@ class RuntimeCatalogTests(unittest.TestCase):
                 for sample in case['measurements']:
                     self.assertEqual(sample['cache_state'], 'not_controlled')
                     self.assertEqual(sample['sample_count'], 1)
-                    self.assertIn('/blob/ff2fa85678e77ba195380b148acc23a4c47ef347/', sample['evidence'])
+                    if profile['id'] == PROFILE_IDS[3]:
+                        self.assertEqual(sample['evidence'], TARGON_EVIDENCE)
+                    else:
+                        self.assertIn('/blob/ff2fa85678e77ba195380b148acc23a4c47ef347/', sample['evidence'])
 
     def test_failed_bf16_and_trimmed_reference_samples_are_excluded(self):
-        self.assertEqual([len(get_profile(p)['verified_cases']) for p in PROFILE_IDS], [8, 7, 7, 0])
+        self.assertEqual([len(get_profile(p)['verified_cases']) for p in PROFILE_IDS], [8, 7, 7, 2])
         self.assertEqual(get_profile(PROFILE_IDS[2])['runtime']['task_config'], 'bf16,bf16')
         self.assertTrue(get_profile(PROFILE_IDS[2])['runtime']['qkv_splitting'])
         self.assertEqual(get_profile(PROFILE_IDS[0])['model_id'], 'MiniMax-H3-Pruned-Rank8-INT8')
+
+    def test_targon_evidence_is_exact_and_keeps_existing_engine_identity(self):
+        profile_id = PROFILE_IDS[3]
+        expected = {
+            'fl': ('b73552b1015a6dbf7f5c4f0fe3d1c91caefc7c0706847e1bf476c4c3315af965',
+                   ['first_frame', 'last_frame'], 188.9950643719999),
+            'ref': ('4eb14f285908ac15339e06a285bc7627609296eb8ba02ce70d7bfee9f9f4ac5f',
+                    ['audio', 'image', 'video'], 162.733107087),
+        }
+        for mode, (digest, roles, seconds) in expected.items():
+            self.assertEqual(engine_manifest(profile_id, mode).digest, digest)
+            hint = timing_hint(profile_id, mode, 832, 480, 124, 24, 20, roles)
+            self.assertIsNone(hint['estimated_seconds'])
+            self.assertEqual(len(hint['cases']), 1)
+            self.assertAlmostEqual(hint['cases'][0]['measurements'][0]['total_seconds'], seconds)
+        pending = get_profile(profile_id)['qualification_cases']
+        self.assertEqual(len(pending), 6)
+        for case in pending:
+            self.assertNotIn('measurements', case)
+            self.assertIsNone(timing_hint(profile_id, case['mode'], case['width'], case['height'],
+                case['frames'], case['fps'], case['steps'], case['input_roles']))
 
     def test_one_mode_manifest_binds_exact_assets_and_runtime(self):
         for profile_id in PROFILE_IDS:
