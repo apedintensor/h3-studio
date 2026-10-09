@@ -123,9 +123,15 @@ replayed as another rental.
 Targon VM lifetime uses an independent host guardian, not a provider-native TTL.
 Deployment, SSH/bootstrap and new generation require a fresh guardian proof for
 the exact instance and original deadline. The controller can write requests but
-cannot write guardian acknowledgements or health receipts. Missing, stale or
-degraded proof closes new admission while existing reconciliation and collection
-remain obligations. This mechanism does not cover loss of the guardian host,
+cannot write guardian acknowledgements or health receipts. A completed guardian
+sweep publishes `process_state: running` separately from its aggregate obligation
+state. An unrelated pending/blocked cleanup keeps that aggregate state degraded;
+it does not invalidate another exact UID's fresh `armed` receipt. Missing/stale
+process health, unknown health states, or a missing/stale/non-armed receipt for
+the requested UID close admission. Earlier guardian versions without the explicit
+process-health field fail closed: update the protected guardian together with the
+controller before using this proof. Original unresolved receipts, deadlines,
+bounded retries and billing obligations remain retained. This mechanism does not cover loss of the guardian host,
 guarantee deletion through a provider outage, or establish billing settlement.
 Public inventory, adapter capability and bootstrap readiness each remain
 insufficient evidence of live inference acceptance.
