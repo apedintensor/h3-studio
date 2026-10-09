@@ -28,6 +28,12 @@ def offer(provider="targon", gpu="RTX PRO 6000 Blackwell", **changes):
         "unverified_fields":["download_mbps","country","gpu_edition"],**changes}
 
 
+def single_offer(offer_id, gpu="RTX 5090", provider="lium", **changes):
+    return offer(provider, gpu, **{"offer_id":offer_id,"available_count":1,"download_mbps":300,
+        "country":"SG","hourly_cost_microusd":750000,"price_per_gpu_hour_microusd":750000,
+        "unverified_fields":[],**changes})
+
+
 class MarketTests(LedgerCase):
     def setUp(self):
         super().setUp()
@@ -44,6 +50,77 @@ class MarketTests(LedgerCase):
     def project(self, chosen=None):
         with self.repo.engine.connect() as connection:
             return market_projection(connection,self.registry,chosen or self.chosen,self.now)
+
+    def qualify(self, gpu="RTX 5090"):
+        self.registry=OperatorRegistry([DeploymentBinding(binding_id="quantity-fixture",
+            runtime_profile_id=PROFILE_IDS[0],gpu_type=gpu,gpu_count=1,pool="test",
+            configuration_id="fixture",model_id="test",recipe_ids=("h3-base-ref2va-v1",),
+            engine_manifest_digest="a"*64,launch=LaunchSpec("lium","fixture","test"),scope=self.scope,
+            budget_account_ids=("owner-budget",),hourly_cost_microusd=750000,reservation_per_node_microusd=1500000,
+            expires_at=self.now+10000,max_ttl_seconds=7200,enabled=True,filters={"min_ram_gib":96,
+                "min_disk_gib":128,"min_download_mbps":200,"max_price_per_gpu_hour_microusd":850000,
+                "allowed_countries":["SG"]})])
+
+    def test_matching_quantity_aggregates_hosts_without_changing_quotes(self):
+        self.qualify()
+        self.publish("lium",[single_offer("first"),single_offer("second",hourly_cost_microusd=800000,
+            price_per_gpu_hour_microusd=800000)])
+        self.publish("targon")
+        chosen={**self.chosen,"node_count":2}
+        result=self.project(chosen)
+        self.assertEqual(result["reason_code"],"inventory_matches_found")
+        self.assertEqual([row["qualification"] for row in result["offers"]],["qualified","qualified"])
+        self.assertEqual([row["available_count"] for row in result["offers"]],[1,1])
+        self.assertEqual([row["hourly_cost_microusd"] for row in result["offers"]],[750000,800000])
+        self.assertTrue(all(row["selection"]["node_count"]==2 for row in result["offers"]))
+        result=self.project({**chosen,"node_count":3})
+        self.assertEqual(result["reason_code"],"inventory_no_matching_stock")
+        self.assertTrue(all("inventory_insufficient_quantity" in row["blockers"] for row in result["offers"]))
+        self.assertTrue(all(row["qualification"]=="unqualified" for row in result["offers"]))
+
+    def test_incompatible_or_uncertain_hosts_do_not_complete_qualified_quantity(self):
+        self.qualify()
+        self.publish("targon",[offer()])
+        for changes,uncertain in (({"ram_gib":64},False),({"disk_gib":64},False),
+                ({"download_mbps":100},False),({"country":"RO"},False),
+                ({"price_per_gpu_hour_microusd":900000},False),({"download_mbps":None},True),
+                ({"available_count":0,"available_gpu_count":1,"min_gpu_count_for_rental":1,
+                  "unverified_fields":["allocation"]},True)):
+            with self.subTest(changes=changes):
+                self.publish("lium",[single_offer("first"),single_offer("second",**changes)])
+                result=self.project({**self.chosen,"node_count":2})
+                self.assertTrue(all(row["qualification"]=="unqualified" for row in result["offers"]))
+                self.assertIn("inventory_insufficient_quantity",result["offers"][0]["blockers"])
+                self.assertEqual(result["reason_code"],"inventory_specs_unconfirmed" if uncertain
+                    else "inventory_no_matching_stock")
+                if uncertain:self.assertFalse(result["recommendations"])
+
+    def test_advisory_quantity_groups_preserve_blockers_prices_and_gpu_editions(self):
+        pro="RTX PRO 6000 Blackwell Workstation Edition"
+        self.qualify(pro)
+        first=single_offer("first",pro)
+        second=single_offer("second",pro,hourly_cost_microusd=1200000,
+            price_per_gpu_hour_microusd=1200000,download_mbps=None)
+        self.publish("lium",[first,second])
+        self.publish("targon")
+        chosen={**self.chosen,"node_count":2}
+        result=self.project(chosen)
+        candidates=result["recommendations"]
+        self.assertEqual(len(candidates),2)
+        self.assertEqual([row["available_count"] for row in candidates],[1,1])
+        self.assertEqual([row["hourly_cost_microusd"] for row in candidates],[750000,1200000])
+        self.assertTrue(all(row["selection"]["node_count"]==2 for row in candidates))
+        self.assertTrue(all(row["qualification"]=="unqualified" for row in candidates))
+        self.assertIn("inventory_insufficient_quantity",candidates[0]["blockers"])
+        self.assertIn("inventory_price_above_limit",candidates[1]["blockers"])
+        self.assertIn("inventory_unknown_bandwidth",candidates[1]["blockers"])
+        self.assertFalse(self.project({**chosen,"node_count":3})["recommendations"])
+        for other in ({**second,"provider":"targon"},
+                      {**second,"gpu_type":"RTX PRO 6000 Blackwell Server Edition"}):
+            with self.subTest(provider=other["provider"],gpu=other["gpu_type"]):
+                self.publish("lium",[first]+([other] if other["provider"]=="lium" else []))
+                self.publish("targon",[other] if other["provider"]=="targon" else [])
+                self.assertFalse(self.project(chosen)["recommendations"])
 
     def test_empty_5090_recommends_single_pro_without_changing_recipe_or_cost_limit(self):
         self.publish("lium")

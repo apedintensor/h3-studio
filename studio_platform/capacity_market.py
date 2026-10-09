@@ -141,10 +141,24 @@ def _constraints(row, filters):
     return blockers
 
 
-def _candidate(row, registry, chosen, filters, now):
+def _group(row):
+    return row["provider"], row["gpu_type"], row["gpu_count"]
+
+
+def _available_counts(rows):
+    counts = {}
+    for row in rows:
+        key = _group(row)
+        counts[key] = counts.get(key, 0) + row["available_count"]
+    return counts
+
+
+def _candidate(row, registry, chosen, filters, now, matching_count):
     choice = {**copy.deepcopy(chosen), "provider": row["provider"], "gpu_type": row["gpu_type"]}
     blockers = _constraints(row, filters)
-    if row["available_count"] < chosen["node_count"]:
+    # Quantity is shared by compatible hosts, but each row retains its own
+    # availability and price. A blocked row cannot contribute qualified stock.
+    if not blockers and matching_count < chosen["node_count"]:
         blockers.append("inventory_insufficient_quantity")
     try:
         binding = registry.resolve(choice)
@@ -188,7 +202,10 @@ def market_projection(connection, registry, chosen, now):
     reason = "inventory_scan_unconfirmed"
     status = "unconfirmed"
     if filters is not None:
-        offers = [_candidate(row, registry, chosen, filters, now) for row in selected_rows]
+        matching_counts = _available_counts(row for provider_rows in rows.values() for row in provider_rows
+                                            if not _constraints(row, filters))
+        offers = [_candidate(row, registry, chosen, filters, now, matching_counts.get(_group(row), 0))
+                  for row in selected_rows]
     if selected in rows and filters is not None:
         known_rejections, uncertain, matches = [], [], []
         # gpu_count is the requested allocation, not necessarily host size.
@@ -222,10 +239,11 @@ def market_projection(connection, registry, chosen, now):
         else:
             reason = "inventory_no_matching_stock"
             if chosen["gpu_type"] == "RTX 5090" and chosen["gpu_count"] == 1:
+                advisory_rows = []
                 for provider in PROVIDERS:
                     for row in rows.get(provider, []):
                         if ("RTX PRO 6000 Blackwell" not in row["gpu_type"] or row["gpu_count"] != 1
-                                or row["available_count"] < chosen["node_count"]):
+                                or row["available_count"] == 0):
                             continue
                         blockers = _constraints(row, filters)
                         # Price/bandwidth can be explicitly reviewed. A larger
@@ -234,7 +252,12 @@ def market_projection(connection, registry, chosen, now):
                                 "inventory_disk_below_minimum", "inventory_cpu_below_minimum",
                                 "inventory_country_mismatch", "inventory_unknown_allocation")):
                             continue
-                        recommendations.append(_candidate(row, registry, chosen, filters, now))
+                        advisory_rows.append(row)
+                advisory_counts = _available_counts(advisory_rows)
+                recommendations = [_candidate(row, registry, chosen, filters, now,
+                                              matching_counts.get(_group(row), 0))
+                                   for row in advisory_rows
+                                   if advisory_counts[_group(row)] >= chosen["node_count"]]
                 recommendations.sort(key=lambda x: (PROVIDERS.index(x["provider"]),
                     x.get("hourly_cost_microusd") if x.get("hourly_cost_microusd") is not None else math.inf,
                     x["offer_id"]))
