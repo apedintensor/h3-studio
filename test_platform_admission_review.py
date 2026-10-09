@@ -79,7 +79,7 @@ class AdmissionReviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_real_asset_stream_file_is_closed_after_full_stack_write_deadline(self):
         for middleware in self.app.user_middleware:
             if middleware.cls is RequestAdmissionMiddleware:
-                middleware.kwargs.update(download_seconds=.08, send_idle_seconds=.2)
+                middleware.kwargs.update(download_seconds=None, send_idle_seconds=None)
         key = "owners/superdan/assets/review/source.bin"
         self.app.state.storage.put(key, io.BytesIO(b"x"*(4*1024*1024)))
         asset = {"project_id": "story-one", "status": "ready", "mime": "application/octet-stream",
@@ -102,15 +102,24 @@ class AdmissionReviewTests(unittest.IsolatedAsyncioTestCase):
                 return {"type": "http.request", "body": b"", "more_body": False}
             await asyncio.Event().wait()
         messages = []
+        # Arm the real total deadline only once the file is streaming. Startup
+        # latency and a competing idle timer must not choose this test's cause.
+        download_deadline = None
+        real_timeout = asyncio.timeout
+        def capture_deadline(seconds):
+            nonlocal download_deadline
+            download_deadline = real_timeout(seconds)
+            return download_deadline
         async def send(message):
             messages.append(message)
             if message["type"] == "http.response.body" and message.get("body"):
                 entered.set()
+                download_deadline.reschedule(asyncio.get_running_loop().time())
                 await asyncio.Event().wait()
         try:
-            with patch.object(self.app.state.assets, "get", return_value=asset), patch.object(self.app.state.storage, "open", side_effect=tracked):
+            with patch("studio_platform.http_limits.asyncio.timeout", side_effect=capture_deadline), patch.object(self.app.state.assets, "get", return_value=asset), patch.object(self.app.state.storage, "open", side_effect=tracked):
                 with self.assertRaisesRegex(ResponseTimeout, "media_response_deadline"):
-                    await self.app(scope, receive, send)
+                    await asyncio.wait_for(self.app(scope, receive, send), 5)
             await asyncio.sleep(0)
             self.assertTrue(entered.is_set())
             self.assertEqual(messages[0]["status"], 200)
@@ -321,7 +330,7 @@ class AdmissionReviewTests(unittest.IsolatedAsyncioTestCase):
     async def test_download_deadline_waits_for_active_read_before_closing_file(self):
         for middleware in self.app.user_middleware:
             if middleware.cls is RequestAdmissionMiddleware:
-                middleware.kwargs.update(download_seconds=.08, send_idle_seconds=.3)
+                middleware.kwargs.update(download_seconds=None, send_idle_seconds=None)
         key = "owners/superdan/assets/review/blocked-read.bin"
         self.app.state.storage.put(key, io.BytesIO(b"x"*(2*1024*1024)))
         original, opened = self.app.state.storage.open, []
@@ -355,12 +364,23 @@ class AdmissionReviewTests(unittest.IsolatedAsyncioTestCase):
             return handle
         async def send(_):
             pass
+        # Start the total deadline from the acknowledged active read, not from
+        # cold application startup; the independent watchdog bounds the test.
+        download_deadline = None
+        real_timeout = asyncio.timeout
+        def capture_deadline(seconds):
+            nonlocal download_deadline
+            download_deadline = real_timeout(seconds)
+            return download_deadline
         task = None
         try:
-            with patch.object(self.app.state.assets, "get", return_value=self.asset(key)), patch.object(self.app.state.storage, "open", side_effect=tracked):
-                task = asyncio.create_task(self.app(self.scope(), self.receiver(), send))
-                self.assertTrue(await asyncio.to_thread(reading.wait, 1))
-                await asyncio.sleep(.12)
+            with patch("studio_platform.http_limits.asyncio.timeout", side_effect=capture_deadline), patch.object(self.app.state.assets, "get", return_value=self.asset(key)), patch.object(self.app.state.storage, "open", side_effect=tracked):
+                task = asyncio.create_task(asyncio.wait_for(self.app(self.scope(), self.receiver(), send), 5))
+                self.assertTrue(await asyncio.to_thread(reading.wait, 3))
+                download_deadline.reschedule(asyncio.get_running_loop().time())
+                async with real_timeout(1):
+                    while not download_deadline.expired():
+                        await asyncio.sleep(0)
                 self.assertFalse(task.done(), "A timed-out response must await its already-running sync read")
                 self.assertTrue(self.app.state.request_admission.counts)
                 self.assertTrue(opened and not opened[0].closed)
