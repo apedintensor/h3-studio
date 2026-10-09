@@ -34,6 +34,28 @@ class CleanupGuard:
 
 
 class TargonProviderTests(unittest.TestCase):
+    def test_exact_sku_and_quote_rechecked_before_workload_mutation(self):
+        for selection in (
+            {"provider":"targon","offer_id":"other-sku","gpu_count":1,"hourly_cost_microusd":1690000},
+            {"provider":"targon","offer_id":"rtx6000b-small","gpu_count":2,"hourly_cost_microusd":1690000},
+            {"provider":"targon","offer_id":"rtx6000b-small","gpu_count":1,"hourly_cost_microusd":1600000},
+        ):
+            with self.subTest(selection=selection):
+                provider=self.provider()
+                with self.assertRaises(CreationNotSubmitted):
+                    provider.create_selected_for_intent(self.tag,self.launch,selected_offer=selection,
+                        hard_deadline=self.now+7200,intent_created_at=self.now)
+                self.assertFalse(any(method=="POST" for method,path in self.requests))
+
+    def test_exact_targon_resource_preserves_existing_vm_lifecycle(self):
+        provider=self.provider()
+        result=provider.create_selected_for_intent(self.tag,self.launch,
+            selected_offer={"provider":"targon","offer_id":"rtx6000b-small","gpu_count":1,
+                            "hourly_cost_microusd":1690000},
+            hard_deadline=self.now+7200,intent_created_at=self.now)
+        self.assertEqual(result.instance_id,INSTANCE)
+        self.assertEqual(sum(method=="POST" for method,path in self.requests),2)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="h3-targon-test-")
         self.now = 1800000000.0

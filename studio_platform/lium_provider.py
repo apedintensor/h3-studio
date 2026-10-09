@@ -388,6 +388,56 @@ class LiumProvider:
         return self.create(tag, launch, hard_deadline=hard_deadline,
             intent_created_at=intent_created_at if self._journal is not None else None)
 
+    def create_selected_for_intent(self, tag, launch, *, selected_offer, hard_deadline, intent_created_at):
+        return self.create(tag, launch, hard_deadline=hard_deadline,
+            intent_created_at=intent_created_at, selected_offer=selected_offer)
+
+    def _select_exact_offer(self, manifest, expected):
+        """Recheck the selected complete host; never fall through to another ID."""
+        from .capacity_inventory import _lium, allocation_resources
+        from .capacity_market import _constraints
+        try:
+            identity=_uuid(expected.get("offer_id"))
+            if (expected.get("provider") != SERVICE or expected.get("gpu_count") != manifest.gpu_count
+                    or manifest.execution_slots != manifest.gpu_count
+                    or not manifest.compatible_gpu_names and identity != manifest.executor_id):
+                raise ValueError
+            cap=money(expected.get("hourly_cost_microusd"))
+            route="executors?available=true"
+            if manifest.min_download_mbps is not None:
+                route+="&"+urlencode({"min_download_mbps":manifest.min_download_mbps})
+            matches=[row for row in self._rows(route) if row.get("id")==identity]
+            if len(matches)!=1:
+                raise ValueError
+            raw=matches[0]
+            normalized=_lium([raw])
+            if len(normalized)!=1:
+                raise ValueError
+            row=normalized[0]
+            filters={"min_ram_gib":manifest.minimum_ram_gib,"min_disk_gib":manifest.minimum_disk_gib,
+                "max_price_per_gpu_hour_microusd":manifest.max_price_per_gpu_hour_microusd,
+                "allowed_countries":manifest.allowed_countries}
+            if manifest.min_download_mbps is not None:
+                filters["min_download_mbps"]=manifest.min_download_mbps
+            if (row["gpu_count"]!=manifest.gpu_count or row["available_count"]!=1
+                    or row["hourly_cost_microusd"]>cap or _constraints(allocation_resources(row),filters)
+                    or row["gpu_type"]!=expected.get("gpu_type")):
+                raise ValueError
+            details=raw["specs"]["gpu"]["details"]
+            if manifest.compatible_gpu_names and any(item.get("name") not in manifest.compatible_gpu_names
+                    or type(item.get("capacity")) is not int or item["capacity"]<manifest.minimum_vram_mib
+                    for item in details):
+                raise ValueError
+            if manifest.require_docker_in_docker and raw.get("docker_in_docker") is not True:
+                raise ValueError
+            if sum(row.get("id")==manifest.template_id for row in self._rows("templates"))!=1:
+                raise ValueError
+            return identity
+        except LiumError:
+            raise
+        except Exception:
+            raise LiumError("lium_selected_offer_unavailable") from None
+
     def _select_offer(self, manifest):
         # Selection is opt-in operator policy. Model, template, count, TTL and
         # money reservation stay unchanged. Recheck inventory at actual create.
@@ -762,7 +812,7 @@ class LiumProvider:
         return {"physical_gpus": manifest.gpu_count, "slots": manifest.execution_slots,
                 "ttl_cap_reservation_microusd": cap}
 
-    def create(self, tag, launch: LaunchSpec, *, hard_deadline, intent_created_at=None):
+    def create(self, tag, launch: LaunchSpec, *, hard_deadline, intent_created_at=None, selected_offer=None):
         if not self.enabled:
             raise LiumError("lium_provider_disabled")
         tag = _uuid(tag)
@@ -790,7 +840,8 @@ class LiumProvider:
             if existing is not None:
                 return self._running_fact(tag, existing)
             try:
-                selected_offer = self._select_offer(manifest)
+                selected_executor = (self._select_exact_offer(manifest,selected_offer)
+                    if selected_offer is not None else self._select_offer(manifest))
             except LiumError as exc:
                 # Only this pre-POST block provides absence proof. In particular
                 # a rejected/timed-out POST must NEVER use this exception type.
@@ -803,7 +854,8 @@ class LiumProvider:
             if hours < 1 or manifest.approved_until <= now:
                 self._journal_write(tag, "not_submitted")
                 raise LiumNotSubmitted("lium_launch_approval_expired")
-            post_executor = None if manifest.server_side_selection else selected_offer
+            server_select=manifest.server_side_selection and selected_offer is None
+            post_executor = None if server_select else selected_executor
             ttl = None
             if intent_created_at is not None:
                 deadline = min(intent_created_at+hours*3600, hard_deadline)
@@ -820,8 +872,8 @@ class LiumProvider:
                 "user_public_key": manifest.user_public_key, "gpu_count": manifest.gpu_count,
                 "termination_hours": hours,
             }
-            route = f"executors/{selected_offer}/rent"
-            if manifest.server_side_selection:
+            route = f"executors/{selected_executor}/rent"
+            if server_select:
                 route = "executors/rent-by-spec"
                 payload = self._spec_payload(manifest, name, dry_run=False, hours=hours)
             try:
@@ -834,7 +886,7 @@ class LiumProvider:
             instance = _uuid(response.get("pod_id"))
             # Preserve a successful pod identity even when a later response
             # validation fails. Reconciliation must retain that paid resource.
-            if manifest.server_side_selection:
+            if server_select:
                 try:
                     self._validate_spec_response(response, manifest, dry_run=False)
                 except LiumError:

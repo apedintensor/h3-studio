@@ -117,7 +117,7 @@ class LeaderLease:
 
 class ScaleCoordinator:
     def create_manual_once(self, leader_id, scope, pool, intent_key, *, launch, policy,
-                           budget_account_ids, authorize, on_reserved=None):
+                           budget_account_ids, authorize, on_reserved=None, selected_offer=None):
         """Explicit operator capacity, not a synthetic generation/queue demand.
 
         ``authorize(connection)`` is a trusted, pure application guard. It checks
@@ -132,6 +132,11 @@ class ScaleCoordinator:
             raise ValueError("manual_capacity_contract_required")
         if policy.dry_run or launch.provider != self.provider.provider_id:
             raise ValueError("manual_capacity_provider_mismatch")
+        if selected_offer is not None:
+            if (not isinstance(selected_offer,dict) or selected_offer.get("provider")!=launch.provider
+                    or not callable(getattr(self.provider,"create_selected_for_intent",None))):
+                raise Conflict("operator_exact_offer_unsupported")
+            _safe_id(selected_offer.get("offer_id"))
         lease = self.acquire(pool, leader_id)
         if lease is None:
             return {"state": "not_leader"}
@@ -175,7 +180,8 @@ class ScaleCoordinator:
                 # This invocation proves it has not sent its sole provider call.
                 # A pure guard failure is NOT an ambiguous network submission.
                 return False
-        fact, observed_at = self._call(intent, "create", launch=launch, before_create=still_authorized)
+        extra={"selected_offer":selected_offer} if selected_offer is not None else {}
+        fact, observed_at = self._call(intent, "create", launch=launch, before_create=still_authorized,**extra)
         self._apply(lease, intent["id"], fact, observed_at)
         return {"state": "creation_observed", "intent_id": intent["id"], "provider_state": fact.state}
 
@@ -398,7 +404,7 @@ class ScaleCoordinator:
                 value.pop(key)
         return value
 
-    def _call(self, intent, operation, *, launch=None, before_create=None):
+    def _call(self, intent, operation, *, launch=None, before_create=None, selected_offer=None):
         tag = intent["id"]
         if getattr(self.provider, "provider_id", None) != intent["provider"]:
             raise Conflict("scaler_provider_identity_mismatch")
@@ -411,7 +417,10 @@ class ScaleCoordinator:
                     fact = ProviderFact("not_created", actual_cost_microusd=0, absence_confirmed=True)
                 else:
                     bound_create = getattr(self.provider, "create_for_intent", None)
-                    if callable(bound_create):
+                    if selected_offer is not None:
+                        fact=self.provider.create_selected_for_intent(tag,launch,selected_offer=selected_offer,
+                            hard_deadline=intent["hard_deadline"],intent_created_at=intent["created_at"])
+                    elif callable(bound_create):
                         fact = bound_create(tag, launch, hard_deadline=intent["hard_deadline"],
                             intent_created_at=intent["created_at"])
                     else:

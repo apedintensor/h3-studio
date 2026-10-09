@@ -96,6 +96,83 @@ class MockAPI:
 
 
 class LiumProviderTests(unittest.TestCase):
+    def exact_fixture(self):
+        from studio_platform.capacity_inventory import _lium
+        raw = {"id":EXECUTOR,"gpu_count":2,"available_gpu_count":2,"price_per_gpu":"0.75",
+            "is_whole_host_free":True,"has_no_pending_rental":True,"min_gpu_count_for_rental":None,
+            "location":{"country_code":"SG"},"effective_download_speed_mbps":300,"docker_in_docker":True,
+            "specs":{"gpu":{"details":[{"name":"NVIDIA GeForce RTX 5090","capacity":32768}]*2},
+                "ram":{"total":125*1024**2},"hard_disk":{"free":320*1024**2},"cpu":{"count":32}}}
+        self.api.executors = [dict(raw,id=OTHER,price_per_gpu="0.50"), raw]
+        target = _lium([raw])[0]
+        config = manifest(executor_id="",compatible_gpu_names=("NVIDIA GeForce RTX 5090",),
+            minimum_vram_mib=32768,minimum_ram_gib=96,minimum_disk_gib=128,
+            execution_slots=2,allowed_countries=("SG",))
+        return raw, target, config, launch(offer_id="")
+
+    def test_exact_selection_uses_selected_executor_not_cheaper_candidate(self):
+        raw, target, config, selected_launch = self.exact_fixture()
+        provider = self.provider(manifests=(config,))
+        result = provider.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+            hard_deadline=8300,intent_created_at=None)
+        self.assertEqual(result.instance_id,POD)
+        self.assertEqual([path for method,path,_ in self.api.calls if method=="POST"],
+                         [f"/api/executors/{EXECUTOR}/rent"])
+
+    def test_exact_selection_rechecks_stock_price_and_resources_before_any_post(self):
+        from studio_platform.scaler import CreationNotSubmitted
+        for kind in ("missing","price","ram","disk","partial","gpu","slots"):
+            with self.subTest(kind=kind):
+                raw, target, config, selected_launch = self.exact_fixture()
+                self.api.calls.clear()
+                if kind=="missing": self.api.executors=self.api.executors[:1]
+                elif kind=="price": raw["price_per_gpu"]="0.76"
+                elif kind=="ram": raw["specs"]["ram"]["total"]=64*1024**2
+                elif kind=="disk": raw["specs"]["hard_disk"]["free"]=64*1024**2
+                elif kind=="partial": raw["available_gpu_count"]=1
+                elif kind=="gpu": raw["specs"]["gpu"]["details"]=[{"name":"other","capacity":32768}]*2
+                elif kind=="slots": config=replace(config,execution_slots=1)
+                provider=self.provider(manifests=(config,))
+                with self.assertRaises(CreationNotSubmitted):
+                    provider.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+                        hard_deadline=8300,intent_created_at=None)
+                self.assertEqual(self.api.count("POST"),0)
+
+    def test_exact_host_ram_keeps_lium_pod_reserve(self):
+        from studio_platform.scaler import CreationNotSubmitted
+        for total in (98,100):
+            with self.subTest(total=total):
+                raw,target,config,selected_launch=self.exact_fixture()
+                raw["specs"]["ram"]["total"]=total*1024**2
+                self.api.calls.clear()
+                provider=self.provider(manifests=(config,))
+                if total==98:
+                    with self.assertRaises(CreationNotSubmitted):
+                        provider.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+                            hard_deadline=8300,intent_created_at=None)
+                    self.assertEqual(self.api.count("POST"),0)
+                else:
+                    provider.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+                        hard_deadline=8300,intent_created_at=None)
+                    self.assertEqual(self.api.count("POST"),1)
+
+    def test_exact_rent_unknown_survives_restart_and_never_switches_offer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as journal:
+            raw,target,config,selected_launch=self.exact_fixture()
+            config=replace(config,server_side_selection=True)
+            def timeout(request): raise httpx.ReadTimeout("offline")
+            self.api.on_rent=timeout
+            provider=self.provider(manifests=(config,),journal_dir=journal)
+            with self.assertRaises(LiumError):
+                provider.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+                    hard_deadline=8300,intent_created_at=None)
+            restarted=self.provider(manifests=(config,),journal_dir=journal)
+            with self.assertRaises(LiumError):
+                restarted.create_selected_for_intent(TAG,selected_launch,selected_offer=target,
+                    hard_deadline=8300,intent_created_at=None)
+            self.assertEqual(self.api.count("POST"),1)
+
     def test_preparation_facts_allowlist_provider_status_and_never_infer_idle_or_eta(self):
         provider = self.provider()
         for status in ('PENDING', 'FAILED', 'STOPPED', 'provider-secret-status'):
