@@ -20,7 +20,7 @@ from sqlalchemy import insert, select, update
 
 from .autoscale import ScalePolicy
 from .operator_capacity import (ACTIVE_COMMANDS, OperatorError, operator_commands,
-    operator_heartbeats, operator_nodes, require, safe_id, public_bootstrap)
+    operator_heartbeats, operator_nodes, require, safe_id, public_bootstrap, offer_fingerprint, command_binding_fingerprint)
 from .repository import BudgetExceeded, Conflict, LeaseLost, instance_intents, registered_workers, scaler_actions
 from .scaler import ScaleCoordinator
 
@@ -31,7 +31,12 @@ SAFE_ERRORS = frozenset({"global_capacity_disabled", "global_capacity_exceeded",
     "operator_capacity_disabled", "operator_policy_changed", "operator_binding_changed",
     "operator_binding_unavailable", "operator_authority_expiring", "operator_bootstrap_unconfigured",
     "operator_deployment_not_qualified", "operator_hourly_cost_limit", "operator_instance_limit",
-    "operator_gpu_limit", "operator_unpriced_existing_capacity", "operator_provider_disabled"})
+    "operator_gpu_limit", "operator_unpriced_existing_capacity", "operator_provider_disabled",
+    "operator_offer_changed", "operator_selected_offer_unavailable", "operator_selected_offer_stale",
+    "operator_exact_offer_unsupported", "operator_selected_offer_invalid",
+    "operator_offer_observation_unavailable", "operator_offer_unavailable", "operator_offer_selection_mismatch",
+    "operator_topology_not_qualified", "operator_execution_slots_unqualified",
+    "operator_offer_quantity_invalid", "operator_offer_required"})
 
 LIFETIME_FRESH_SECONDS = 30
 
@@ -62,7 +67,9 @@ class OperatorController:
         self.service,self.repo=service,service.repo
         self.provider_factory,self.boot_factory=provider_factory,boot_factory
         self.enabled=enabled
-        self.leader_id=leader_id or "operator-"+uuid.uuid4().hex
+        # Versioned control protocol prevents a newly released API from handing
+        # an exact-machine command to an old controller that ignores the choice.
+        self.leader_id=leader_id or "operator-offers-v1-"+uuid.uuid4().hex
         require(safe_id(self.leader_id),"operator_controller_identity_invalid",422)
         self.coordinator_factory=coordinator_factory
         self.inventory_refresh=inventory_refresh
@@ -196,7 +203,12 @@ class OperatorController:
         require(policy["enabled"],"operator_capacity_disabled")
         require(policy["version"]==command["payload"]["policy_version"],"operator_policy_changed")
         require(binding.enabled,"operator_deployment_not_qualified")
-        require(binding.fingerprint==command["payload"]["binding_hash"],"operator_binding_changed")
+        chosen=command["payload"]["selection"]
+        require(command_binding_fingerprint(binding,chosen)==command["payload"]["binding_hash"],"operator_binding_changed")
+        if chosen.get("offer_id"):
+            from .capacity_candidates import resolve_selected_offer
+            offer=resolve_selected_offer(connection,self.service.registry,chosen,self.repo.clock())
+            require(offer_fingerprint(offer)==command["payload"].get("offer_fingerprint"),"operator_offer_changed")
         deadline=command["payload"]["hard_deadline"]
         require(self.repo.clock()<deadline<=binding.expires_at,"operator_authority_expiring")
         usage=self.service._committed_capacity(connection)
@@ -228,10 +240,11 @@ class OperatorController:
                     ordinal=ordinal,binding_id=binding.binding_id,binding_hash=binding.fingerprint,
                     payload={"selection":chosen,"hourly_cost_microusd":binding.hourly_cost_microusd},
                     desired_state="running",runtime_state="waiting_provider",updated_at=self.repo.clock()))
+            extra={"selected_offer":payload["selected_offer"]} if chosen.get("offer_id") else {}
             outcome=coordinator.create_manual_once(self.leader_id,binding.scope,binding.pool,
                 "operator-"+command["id"]+"-"+str(ordinal),launch=binding.launch,
                 policy=self._policy(binding,payload["hard_deadline"]),budget_account_ids=binding.budget_account_ids,
-                authorize=lambda connection:self._authorize_start(connection,command,binding),on_reserved=reserved)
+                authorize=lambda connection:self._authorize_start(connection,command,binding),on_reserved=reserved,**extra)
             if outcome["state"] in {"disabled","not_leader"}:
                 return outcome["state"]
         return "waiting"

@@ -105,9 +105,33 @@ def positive_int(value, maximum, minimum=1):
     return type(value) is int and minimum <= value <= maximum
 
 
+def command_binding_fingerprint(binding, chosen):
+    # Old controllers compare this field with the unversioned binding digest.
+    # Exact selection therefore fails closed even after a rollback/lease move.
+    if chosen.get("offer_id"):
+        return request_hash({"binding":binding.fingerprint,"protocol":"operator-exact-offer-v1"})
+    return binding.fingerprint
+
+
+def offer_fingerprint(offer):
+    # Availability is rechecked, but another allocation of a Targon SKU does
+    # not change the operator's selected hardware/price. Observation age is
+    # checked separately, never included in the immutable quote identity.
+    return request_hash({key:value for key,value in offer.items()
+                         if key not in {"available_count","available_gpu_count","observed_at"}})
+
+
+def exact_offer_controller_ready(connection, now):
+    heartbeat=connection.execute(select(operator_heartbeats).where(
+        operator_heartbeats.c.id=="global")).mappings().first()
+    return bool(heartbeat and heartbeat["controller_id"].startswith("operator-offers-v1-")
+        and heartbeat["state"] in {"running","degraded"}
+        and 0<=now-heartbeat["observed_at"]<=CONTROLLER_FRESH_SECONDS)
+
+
 def selection(value):
     required = {"runtime_profile_id", "mode", "gpu_type", "node_count", "gpu_count", "ttl_seconds"}
-    require(isinstance(value, dict) and required <= set(value) and not set(value)-required-{"filters", "provider"},
+    require(isinstance(value, dict) and required <= set(value) and not set(value)-required-{"filters", "provider", "offer_id"},
             "operator_selection_invalid", 422)
     # Keep absent provider absent: historical selection hashes/replays remain exact.
     require(value.get("provider", "lium") in ("lium", "targon"), "operator_provider_invalid", 422)
@@ -117,6 +141,9 @@ def selection(value):
     require(positive_int(value["node_count"], 32) and positive_int(value["gpu_count"], 8)
             and positive_int(value["ttl_seconds"], 14400, 120), "operator_selection_limits_invalid", 422)
     require(value["mode"] in ("fl","ref"),"operator_mode_invalid",422)
+    if "offer_id" in value:
+        require(safe_id(value["offer_id"]) and value["node_count"] == 1,
+                "operator_exact_offer_invalid", 422)
     filters = value.get("filters", {})
     require(isinstance(filters, dict) and not set(filters)-FILTER_FIELDS, "operator_filters_invalid", 422)
     for key, item in filters.items():
@@ -440,6 +467,7 @@ class OperatorCapacity:
                 blockers.append({"code":"operator_gpu_limit"})
             if usage["unpriced"]: blockers.append({"code":"operator_unpriced_existing_capacity"})
             hourly=reservation=None
+            selected_offer=None
             if binding:
                 chosen={**chosen,"filters":binding.filters}
                 hourly=binding.hourly_cost_microusd*chosen["node_count"]
@@ -451,7 +479,15 @@ class OperatorCapacity:
                     blockers.append({"code":"operator_hourly_cost_limit"})
                 if binding.reservation_per_node_microusd<math.ceil(binding.hourly_cost_microusd*chosen["ttl_seconds"]/3600):
                     blockers.append({"code":"operator_reservation_insufficient"})
-                if self.registry.inventory_required:
+                if chosen.get("offer_id"):
+                    if self.registry.inventory_required and not exact_offer_controller_ready(connection,now):
+                        blockers.append({"code":"operator_exact_offer_controller_unavailable"})
+                    try:
+                        from .capacity_candidates import resolve_selected_offer
+                        selected_offer=resolve_selected_offer(connection,self.registry,chosen,now)
+                    except OperatorError as error:
+                        blockers.append({"code":error.code})
+                elif self.registry.inventory_required:
                     inventory=inventory_projection(connection,binding,now)
                     if inventory["status"]!="available": blockers.append({"code":inventory["reason_code"]})
             public={"preview_id":str(uuid.uuid4()),"expires_at":now+120,"policy_version":policy["version"],
@@ -461,7 +497,13 @@ class OperatorCapacity:
                     "minimum_ttl_seconds":binding.min_ttl_seconds if binding else None,
                     "recipe_ids":list(binding.recipe_ids) if binding else []}
             private={**public,"binding_id":binding.binding_id if binding else None,
-                     "binding_hash":binding.fingerprint if binding else None}
+                     "binding_hash":command_binding_fingerprint(binding,chosen) if binding else None}
+            if selected_offer is not None:
+                # This quote is explicit; the protected ceiling/reservation above
+                # remains conservative and is not silently raised by stock.
+                public["selected_offer"]=selected_offer
+                private["selected_offer"]=selected_offer
+                private["offer_fingerprint"]=offer_fingerprint(selected_offer)
             connection.execute(insert(operator_previews).values(id=public["preview_id"],actor=actor,payload=private,
                 created_at=now,expires_at=public["expires_at"]))
         return public
@@ -498,11 +540,18 @@ class OperatorCapacity:
             require(value["can_start"],"operator_preview_blocked")
             require(policy["enabled"] and policy["version"]==value["policy_version"],"operator_policy_changed")
             binding=self.registry.get(value["binding_id"])
-            require(binding.enabled and binding.fingerprint==value["binding_hash"],"operator_binding_changed")
-            if self.registry.inventory_required:
+            chosen=value["selection"]
+            require(binding.enabled and command_binding_fingerprint(binding,chosen)==value["binding_hash"],
+                    "operator_binding_changed")
+            if chosen.get("offer_id"):
+                require(not self.registry.inventory_required or exact_offer_controller_ready(connection,now),
+                        "operator_exact_offer_controller_unavailable")
+                from .capacity_candidates import resolve_selected_offer
+                offer=resolve_selected_offer(connection,self.registry,chosen,now)
+                require(offer_fingerprint(offer)==value.get("offer_fingerprint"),"operator_offer_changed")
+            elif self.registry.inventory_required:
                 inventory=inventory_projection(connection,binding,now)
                 require(inventory["status"]=="available",inventory["reason_code"])
-            chosen=value["selection"]
             require(chosen["ttl_seconds"]>=binding.min_ttl_seconds,"operator_ttl_below_provider_minimum")
             require(now+chosen["ttl_seconds"]<=binding.expires_at,"operator_authority_expiring")
             usage=self._committed_capacity(connection)
@@ -511,9 +560,11 @@ class OperatorCapacity:
             require(usage["physical_gpus"]+chosen["node_count"]*chosen["gpu_count"]<=policy["max_physical_gpus"],"operator_gpu_limit")
             require(usage["hourly"]+value["estimated_hourly_cost_microusd"]<=policy["max_hourly_cost_microusd"],"operator_hourly_cost_limit")
             payload={"selection":chosen,"preview_id":row["id"],"policy_version":policy["version"],
-                     "binding_id":binding.binding_id,"binding_hash":binding.fingerprint,
+                     "binding_id":binding.binding_id,"binding_hash":value["binding_hash"],
                      "hourly_cost_microusd":binding.hourly_cost_microusd,
                      "hard_deadline":now+chosen["ttl_seconds"]}
+            if chosen.get("offer_id"):
+                payload.update(selected_offer=value["selected_offer"],offer_fingerprint=value["offer_fingerprint"])
             command=dict(id=str(uuid.uuid4()),actor=actor,idempotency_key=key,request_hash=hashed,
                 kind="start",state="accepted",payload=payload,reason_code=None,created_at=now,updated_at=now)
             connection.execute(insert(operator_commands).values(**command))

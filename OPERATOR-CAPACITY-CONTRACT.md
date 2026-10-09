@@ -30,7 +30,53 @@ Drain stops new claims and retains reconciliation/collection. Stop is drain-then
 
 An ambiguous bootstrap is `runtime_state: blocked` with `reason_code: bootstrap_reconciliation_required`, not indefinite preparation or proof of failure/removal. The node's optional `bootstrap` observation has a controller `observed_at`, aggregate state/reason and bounded per-slot `index`, `state`, `phase`, `failure_phase`, `error_code` and `error_type`. Only allowlisted static diagnostics are public; raw logs, exception messages, credentials and file paths are excluded. The last observation may remain visible after state changes and must be labelled historical. This projection preserves the original boot/rental journals, deadlines and reservations; it neither authorizes a restart nor converts unknown execution into safe destruction.
 
-## Provider stock and next-tier recommendations
+## Model-first stock selection
+
+The console first selects the exact model ID and FL2VA/Ref2VA mode, then reads
+`GET /v1/operator/capacity/candidates?model_id=...&mode=...&ttl_seconds=...`.
+[Issue #89](https://github.com/apedintensor/h3-studio/issues/89) replaces upfront
+provider/GPU/count selection with ranked Lium/Targon allocations. Each row is a
+complete Lium executor or a Targon resource SKU, not a promised physical host.
+It contains provider/offer identity, GPU type/count, whole-allocation quote,
+memory/disk/network observations, qualification blockers and its preview selection.
+One exact executor choice authorizes at most one allocation; additional machines
+require separate choices and confirmations.
+
+Only hardware explicitly catalogued for the selected model is considered.
+Known insufficient RAM/disk is excluded. Unknown specifications and unqualified
+topologies remain visibly blocked. Qualified deployments sort first, then
+whole-allocation hourly price, then known/higher download bandwidth. Multi-card
+hosts retain their full price and require one execution slot per GPU. There is
+no provider priority, automatic rental, weight/precision or mode substitution.
+Catalog bandwidth/price guidance produces hints; protected binding limits remain
+hard requirements. Historical timing applies only to its measured configuration.
+
+Lium eligibility uses allocatable RAM: host telemetry minus the larger of 4 GiB
+or 1% host reserve; displayed host RAM stays unchanged. Targon SKU RAM is already
+the allocated specification. See [Lium allocation documentation](https://docs.lium.io/developers/quickstart).
+
+Optional `offer_id` binds the preview, confirmation and durable start command to
+that allocation. A fresh normalized cache is checked at preview, confirmation
+and before reservation. Changed quote/specification requires a new preview;
+stock count changes alone do not invalidate the quote, but full availability is
+still required. Provider creation rechecks the exact executor/SKU, quoted ceiling
+and protected constraints before POST, with no fallback. Upstream prices remain
+preflight-only caps where atomic price enforcement is unsupported. Unknown POST
+outcomes retain the existing journal and intent, never another rental identity.
+
+Exact commands use a protocol-domain binding digest; old controllers reject it
+before reservation even after a lease change or rollback. Legacy command hashes,
+node binding hashes and LaunchSpec serialization are unchanged. Operational
+admission also requires a fresh `operator-offers-v1-` controller heartbeat.
+Roll out the API and controller together before enabling this frontend; a
+downgraded controller can block pending exact commands but cannot substitute a
+machine. No schema/data migration is required.
+
+Preview separates actual whole-allocation quote from conservative deployment
+ceiling and budget reservation. Changing model/mode/window/machine or an expired
+observation/preview clears consent. Stock is not a reservation or runtime proof.
+
+## Legacy stock and next-tier API compatibility
 
 [Issue #85](https://github.com/apedintensor/h3-studio/issues/85) adds advisory
 Lium/Targon stock, independently of the existing binding-based start admission.
@@ -51,7 +97,7 @@ admission evidence; `market.advisory_only` is always true.
 A successful observation expires after 120 seconds. Failed, malformed, partial,
 future-dated, stale or unconfigured observations do not prove absence. Unknown
 specs or possible GPU splitting must remain unconfirmed. When the selected
-provider has no matching single 5090 allocation, recommend only a single PRO
+provider has no matching single 5090 allocation, the legacy API recommends a single PRO
 6000 from fresh Lium/Targon stock (Lium first, then whole-node price). Never
 increase GPU/node count, switch weight/precision/mode, or raise the price cap.
 Each recommendation retains the original selection except provider/GPU type.

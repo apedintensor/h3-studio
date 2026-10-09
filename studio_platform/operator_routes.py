@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from .operator_capacity import OperatorCapacity, OperatorError, OperatorRegistry, selection
 from . import capacity_market  # Register additive observation table before startup DDL.
+from .capacity_candidates import candidates_projection
 
 PREFIX = "/v1/operator/capacity"
 
@@ -48,6 +49,15 @@ def register_routes(app, *, registry=None, service=None):
             "node_count":node_count,"gpu_count":gpu_count,"mode":mode,"ttl_seconds":ttl_seconds,
             "filters":parsed_filters,"provider":provider})
         return response(service.offers(principal(request), chosen))
+
+    @app.get(PREFIX+"/candidates")
+    def candidates(request: Request, model_id: str = Query(..., min_length=1, max_length=200),
+                   mode: str = Query(...), ttl_seconds: int = Query(120, ge=120, le=14400)):
+        service.authorize(principal(request))
+        with service.repo.engine.connect() as connection:
+            value = candidates_projection(connection, service.registry, model_id, mode,
+                                          ttl_seconds, service.repo.clock())
+        return response(value)
 
     @app.post(PREFIX+"/previews")
     def previews(request: Request, body: dict):

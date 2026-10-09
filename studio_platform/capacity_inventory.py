@@ -35,6 +35,20 @@ _GPU_NAMES = {
 }
 
 
+def allocation_resources(row):
+    """Constraint view of a whole allocation, preserving the raw stock quote.
+
+    Lium executor telemetry describes total host RAM. Its rental allocation
+    reserves the larger of 4 GiB or 1 percent for the host. Targon inventory RAM
+    already describes the resource SKU and needs no inferred subtraction.
+    """
+    value = dict(row)
+    ram = value.get("ram_gib")
+    if value.get("provider") == "lium" and ram is not None:
+        value["ram_gib"] = max(0, ram - max(4, ram * .01))
+    return value
+
+
 class _InventoryError(Exception):
     """Only our static codes may cross the adapter boundary."""
 

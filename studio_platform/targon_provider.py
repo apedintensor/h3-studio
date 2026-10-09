@@ -378,7 +378,11 @@ class TargonProvider:
     def create_for_intent(self, tag, launch, *, hard_deadline, intent_created_at):
         return self.create(tag, launch, hard_deadline=hard_deadline, intent_created_at=intent_created_at)
 
-    def create(self, tag, launch, *, hard_deadline, intent_created_at=None):
+    def create_selected_for_intent(self, tag, launch, *, selected_offer, hard_deadline, intent_created_at):
+        return self.create(tag,launch,hard_deadline=hard_deadline,
+            intent_created_at=intent_created_at,selected_offer=selected_offer)
+
+    def create(self, tag, launch, *, hard_deadline, intent_created_at=None, selected_offer=None):
         tag, manifest = _tag(tag), self._manifest(launch)
         if not self.enabled or self._journal is None:
             raise TargonError("targon_provider_disabled")
@@ -394,7 +398,14 @@ class TargonProvider:
         try:
             if deadline <= self.clock() + 60:
                 raise TargonError("targon_launch_approval_expired")
-            self.preflight_availability(launch)
+            stock=self.preflight_availability(launch)
+            if selected_offer is not None:
+                if (selected_offer.get("provider")!=SERVICE
+                        or selected_offer.get("offer_id")!=manifest.resource_name
+                        or selected_offer.get("gpu_count")!=manifest.gpu_count
+                        or not _number(selected_offer.get("hourly_cost_microusd"))
+                        or stock["hourly_cost_microusd"]>selected_offer["hourly_cost_microusd"]):
+                    raise TargonError("targon_selected_offer_unavailable")
         except TargonError as error:
             raise TargonNotSubmitted(str(error)) from None
         if deadline <= self.clock() + 60:
