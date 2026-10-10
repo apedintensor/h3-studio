@@ -57,7 +57,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Check classification safety without dependencies or network
-        run: python -m unittest test_ci_changes -v
+        run: python -m unittest test_ci_changes test_ci_test_shards -v
       - name: Select checks from the complete local diff and validate dispatch inputs
         id: scope
         run: python tools/ci_changes.py
@@ -67,6 +67,10 @@ jobs:
     if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -90,14 +94,25 @@ jobs:
         timeout-minutes: 10
         run: python tools/ci_media_tools.py install "${{ runner.temp }}/sixnine-ci-apt"
       - run: python -m pip install -r requirements.lock.txt
-      - name: Complete offline suite (temporary data, no model inference)
-        run: python -m unittest discover -s . -p 'test_*.py' -v
+      - name: Complete offline suite shard (temporary data, no model inference)
+        run: python tools/ci_test_shards.py --suite python --shard-index ${{ matrix.shard }} --shard-count 6 --timing-output ci-timings/python-${{ matrix.shard }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sixnine-ci-python-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ci-timings/python-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   postgres:
     needs: changes
     if: needs.changes.outputs.postgres == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5]
     services:
       postgres:
         image: postgres:17-alpine
@@ -134,25 +149,17 @@ jobs:
         timeout-minutes: 10
         run: python tools/ci_media_tools.py install "${{ runner.temp }}/sixnine-ci-apt"
       - run: python -m pip install -r requirements.lock.txt
-      - name: PostgreSQL concurrency and API contracts (isolated CI service)
+      - name: Complete PostgreSQL suite shard (isolated CI service)
         env:
           PLATFORM_TEST_DATABASE_URL: postgresql+psycopg://sixnine_test:sixnine-ci-test-only@127.0.0.1:5432/sixnine_test
-        run: python -m unittest test_platform_repository test_platform_queue test_platform_autoscale test_platform_control test_platform_worker test_platform_drain_safe_runner test_platform_production_scaler test_platform_on_demand_scaler test_platform_backlog_handoff test_platform_preparation_recovery test_platform_preparation_idle test_platform_production_boot_memory test_platform_fleet test_platform_scaler test_platform_api test_platform_execution_policy test_platform_batches test_platform_storage_multipart test_platform_artifact_writer test_platform_diagnostics test_platform_capacity test_platform_capacity_api test_platform_guided test_platform_generation_draft test_platform_generation_services test_platform_project_activity test_platform_capacity_cli test_platform_reliability test_platform_request_admission test_platform_admission_review test_platform_generated_audio test_platform_caption_plans test_platform_render_plans test_platform_render_backend test_platform_lium_provider test_platform_boyesir_backend test_platform_backup_postgres test_platform_upload_route test_platform_asset_recovery -v
-
-      - name: Queued user task startup and recovery contracts
-        env:
-          PLATFORM_TEST_DATABASE_URL: postgresql+psycopg://sixnine_test:sixnine-ci-test-only@127.0.0.1:5432/sixnine_test
-        run: python -m unittest test_platform_queued_task_policy test_platform_queued_boot test_platform_queued_task_runner test_platform_queued_task_hold test_platform_long_duration_policy test_platform_duration_quote test_platform_runtime_adoption test_platform_live_runtime_handoff -v
-
-      - name: Operator capacity and trusted runtime contracts
-        env:
-          PLATFORM_TEST_DATABASE_URL: postgresql+psycopg://sixnine_test:sixnine-ci-test-only@127.0.0.1:5432/sixnine_test
-        run: python -m unittest test_operator_capacity test_operator_runtime test_capacity_market test_targon_provider -v
-
-      - name: Engine-bound routing and WanGP API integration (synthetic CPU media only)
-        env:
-          PLATFORM_TEST_DATABASE_URL: postgresql+psycopg://sixnine_test:sixnine-ci-test-only@127.0.0.1:5432/sixnine_test
-        run: python -m unittest test_platform_engine_routing test_platform_wangp_api test_platform_wangp_recovery_integration test_platform_engine_cold_capacity test_platform_pool_members test_platform_pool_member_controller test_platform_pool_service test_platform_pool_member_replacement test_platform_member_readiness test_platform_wangp_service_hold test_platform_wangp_first_last_policy test_platform_wangp_ref test_platform_wangp_ref_api test_platform_preparation_hold_recovery test_platform_quick_chat_integration test_platform_quick_chat_admission test_platform_quick_chat_wangp test_platform_agent_connect test_platform_agent_connect_app -v
+        run: python tools/ci_test_shards.py --suite postgres --shard-index ${{ matrix.shard }} --shard-count 6 --timing-output ci-timings/postgres-${{ matrix.shard }}.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sixnine-ci-postgres-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: ci-timings/postgres-${{ matrix.shard }}.json
+          if-no-files-found: ignore
+          retention-days: 7
 
   frontend:
     needs: changes

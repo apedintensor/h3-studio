@@ -36,6 +36,7 @@ inventory.json
 !tools/manage_users.py
 !tools/check_container.py
 !tools/ci_media_tools.py
+!tools/ci_test_shards.py
 !tools/check_aws_release_account.py
 !tools/h3_pro6000_pilot_runtime.py
 !deploy/
