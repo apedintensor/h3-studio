@@ -25,6 +25,8 @@ export function agentHandoff({origin,account,workspace={},projectId,entityId,pro
   const brief=base?[
     '请使用映序的公开 Skill 与 API，帮助我完成创作。',
     `先阅读：${base}/for-agents/SKILL.md`,
+    `完整纯文本指南（无需登录）：${base}/for-agents/guide.md`,
+    `离线说明与工具包：${base}/for-agents/skill.zip`,
     `接口与流程：${base}/for-agents/guide.json`,
     ...(workUrl?[`工作位置：${workUrl}`,selectedEntity?'本次先处理链接定位的内容；更改其他部分前与我确认。':view==='/freestyle'?'本次只处理链接中的快速创作，准备这个视频的提示词与参考素材。':'本次只处理链接中的故事。']:['暂未指定可同步的云故事。先介绍可用流程，等我登录并选择、保存云故事后再操作。']),
     `建议授权范围：${access.label}。实际权限以已配置的 API Key 为准。`,

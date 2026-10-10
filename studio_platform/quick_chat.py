@@ -23,6 +23,7 @@ from .guided import empty_project, new_entity, now_iso
 from .project_validation import ID, validate_project
 from .project_activity import append_activity
 from .repository import Conflict, NotFound, Scope, BudgetExceeded, canonical, request_hash, documents, jobs, attempts, artifacts
+from .quick_chat_titles import DEFAULT_TITLE, TITLE_MODEL, QuickChatTitleMixin, public_title_state
 
 
 MODELS = {"gemini-3.8-flash": "Gemini 3.8 Flash", "gemma-4-31b-it": "Gemma 4 31B IT"}
@@ -128,11 +129,13 @@ def cursor_decode(value, principal, session_id, direction):
         raise QuickChatError("invalid_cursor", "分页位置无效，请重新加载记录。", 422) from None
 
 
-class QuickChatService:
-    def __init__(self, repository, assets, settings, storage, *, hooks=None, assistant=None, assistant_enabled=False):
+class QuickChatService(QuickChatTitleMixin):
+    def __init__(self, repository, assets, settings, storage, *, hooks=None, assistant=None, assistant_enabled=False,
+                 title_generator=None):
         self.repo, self.assets, self.settings, self.storage = repository, assets, settings, storage
         self.tenant, self.hooks = settings.tenant_id, hooks
         self.assistant, self.assistant_enabled = assistant, assistant_enabled
+        self.title_generator = title_generator
         with repository.transaction() as conn:
             if repository.engine.dialect.name == "postgresql":
                 conn.exec_driver_sql("SELECT pg_advisory_xact_lock(685939796868749721)")
@@ -242,6 +245,7 @@ class QuickChatService:
     def _session_public(self, row):
         p = row["payload"]
         return {"id": row["id"], "title": p["title"], "version": row["version"], "model_id": p["model_id"],
+            "title_generation": public_title_state(p),
             "next_settings": p["next_settings"], "input_refs": self._inputs(p["bindings"], p["next_settings"]["recipe_id"]),
             "latest_seq": p["latest_seq"], "web_url": "/quick-chat?session="+row["id"],
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
@@ -252,7 +256,7 @@ class QuickChatService:
         if principal.machine and not (principal.all_projects and all(s in principal.scopes
                 for s in ("projects:create", "projects:read", "projects:write"))):
             raise QuickChatError("insufficient_scope", "创建会话需要本人全部项目的创作权限。", 403)
-        title = body.get("title", "新的创作")
+        title = body.get("title", DEFAULT_TITLE)
         if not isinstance(title, str) or not title.strip() or len(title) > 160:
             raise QuickChatError("invalid_title", "会话标题须为1–160字符。", 422)
         model = model_check(body.get("model_id", DEFAULT_MODEL))
@@ -273,7 +277,7 @@ class QuickChatService:
                 occurred_at=self.repo.clock(), before=None, after=project, event_type="project.created")
             session = self._new(conn, principal, ident, "session", {"title": title, "model_id": model,
                 "project_id": project["id"], "next_settings": default_next_settings(self.settings), "bindings": [], "latest_seq": 0,
-                "active_turn_id": None}, ident=ident)
+                "active_turn_id": None, "title_generation": self._initial_title_state(title_supplied="title" in body)}, ident=ident)
             self._remember(conn, principal, "session-create", key, body, ident)
             return {"session": self._session_public(session)}
 
@@ -315,6 +319,10 @@ class QuickChatService:
                 if not isinstance(body["title"], str) or not body["title"].strip() or len(body["title"])>160:
                     raise QuickChatError("invalid_title", "会话标题无效。", 422)
                 p["title"] = body["title"]
+                # Even explicitly choosing the default label is a manual name.
+                # Fence pending/late supplier responses without cancelling or
+                # replaying the already claimed upstream request.
+                p["title_generation"] = {"status": "manual", "model_id": TITLE_MODEL, "error_code": None}
             if "model_id" in body:
                 p["model_id"] = model_check(body["model_id"])
             if "next_settings" in body:
@@ -517,6 +525,7 @@ class QuickChatService:
                         "turn_id": body.get("turn_id"), "current_revision_id": None})
                 revision = self._create_revision(conn, principal, session, card, snapshot, sources, body.get("source_revision_id"))
                 self._remember(conn, principal, namespace, key, body, revision["id"])
+                self._queue_title(conn, principal, session, revision)
         return {"card": self.get_card(principal, session_id, revision["payload"]["card_id"]),
                 "revision": self.get_revision(principal, session_id, revision["id"])}
 
@@ -979,6 +988,7 @@ class QuickChatService:
                 self._put(conn, session, {**session["payload"], "model_id": model,
                     "active_turn_id": turn["id"] if mode != "none" else session["payload"]["active_turn_id"]}, bump=True)
                 self._remember(conn, principal, "turn:"+session_id, key, body, turn["id"])
+                self._queue_title(conn, principal, session, turn)
         if not prior and mode != "none":
             self._run_assistant(principal, session_id, turn["id"])
         return self.get_turn(principal, session_id, turn["id"])

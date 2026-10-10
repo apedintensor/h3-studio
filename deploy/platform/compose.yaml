@@ -108,9 +108,10 @@ services:
       SIXNINE_STORAGE_PROVIDER: local
       SIXNINE_FRONTEND_DIR: /app/yingxu-dist
       SIXNINE_FRONTEND_RELEASE_DIR: /frontend
+      SIXNINE_TITLE_CONFIG_FILE: /run/secrets/google_titles
     # Trust only this Caddy container. Caddy overwrites the client-supplied XFF.
     command: [python, -m, uvicorn, "platform_app:app", --host, 0.0.0.0, --port, "8845", --workers, "1", --no-access-log, --proxy-headers, --forwarded-allow-ips, "172.29.69.2"]
-    secrets: [app_database_url]
+    secrets: [app_database_url, google_titles]
     volumes:
       - type: bind
         source: /srv/sixnine/platform-data
@@ -129,6 +130,7 @@ services:
     networks:
       database: {}
       web: {}
+      edge: {}
     depends_on:
       db: {condition: service_healthy}
       db-init: {condition: service_completed_successfully}
@@ -174,6 +176,8 @@ secrets:
     file: ${SIXNINE_DB_ADMIN_SECRET_FILE:?Set an existing protected admin secret file}
   app_database_url:
     file: ${SIXNINE_APP_DSN_SECRET_FILE:?Set an existing protected app DSN secret file}
+  google_titles:
+    file: /run/sixnine-secrets/google_titles
 
 networks:
   database:

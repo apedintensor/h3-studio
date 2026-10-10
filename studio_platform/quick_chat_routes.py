@@ -1,9 +1,10 @@
 """Thin authenticated chat routes. State and side effects live in one service."""
-from fastapi import File, Form, Header, Query, Request, UploadFile
+from fastapi import BackgroundTasks, File, Form, Header, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from .quick_chat import QuickChatService, QuickChatError, default_next_settings
 from .quick_chat_assistant import QuickChatAssistant, model_schema
+from .quick_chat_titles import TITLE_MODEL
 from .capabilities import capabilities
 from .upload_route import QuickChatAssetUploadRoute
 
@@ -19,17 +20,19 @@ def agent_contract():
         "media_scopes": ["assets:read", "assets:write"], "generation_scopes": ["jobs:read", "jobs:write"],
         "generation_authority": "A card or preflight does not start generation. Confirm only within the user's authorization; an HTTP202 is not inference success.",
         "same_session": "Materials and next_settings are visible authoring state. Revisions freeze their own explicit inputs and seeds. Different sessions are isolated.",
+        "history_titles": "Omit title when creating a session to allow optional Gemma 4 short history naming from the first meaningful accepted description. Any explicit title is manual, even the default label. Naming is independent of the conversational assistant and video engine; consult schema.history_titles.enabled. It sends only bounded first text, never media/full history, and failure keeps the original label without automatic retry.",
         "deployment_profiles": "Read capabilities.deployment_profiles and the session's complete next_settings. Preserve the user's selected deployment_profile_id and use that profile's generation_support[fl|ref] controls, limits and joint_cases. Turn-to-card inherits next_settings. Direct card creation/revision does not inherit an omitted profile: include top-level deployment_profile_id and explicit controls, copied from session next_settings for a new card or from the current revision when revising. Null or omission retains legacy routing; never drop a selected profile to bypass a blocker. Explicit session changes use PATCH with expected_version and complete next_settings. Catalog measurements are historical; preflight checks current matching workers. Ordinary generation keys do not grant operator rental access.",
         "replay": "Persist each write body and Idempotency-Key. Replaying the same revision's initial confirmation across Agents returns its original submission/items/jobs, not new variations.",
         "examples": {
-            "session": {"method": "POST", "path": PREFIX, "body": {"title": "My video"}},
+            "session": {"method": "POST", "path": PREFIX, "body": {},
+                "require": "Omit title for optional automatic history naming. Supply title only when intentionally choosing a manual name."},
             "upload": {"method": "POST", "path": PREFIX+"/{session_id}/assets",
                 "multipart": {"client_asset_id": "stable-input-001", "file": "{local_file}"},
                 "require": "Use returned ready asset_id. A lost response retains client_asset_id; query this session's assets and resume the same receipt."},
             "turn_to_card": {"method": "POST", "path": PREFIX+"/{session_id}/turns",
                 "body": {"expected_version": "{current_session_version}", "model_id": "{session_model_id}",
                     "assistant_mode": "none", "create_card": True, "text": "{complete_prompt}"},
-                "require": "For external Agents writing their own prompt; no website assistant call. Inherits the session's complete next_settings including deployment_profile_id and selected materials. Read card_id then the card's current_revision_id. Model selection here does not select or call a video engine."},
+                "require": "For external Agents writing their own prompt; no website conversational assistant call. Optional Gemma history naming can still run once for an eligible new session. Inherits the session's complete next_settings including deployment_profile_id and selected materials. Read card_id then the card's current_revision_id. Model selection here does not select or call a video engine."},
             "card": {"method": "POST", "path": PREFIX+"/{session_id}/cards",
                 "body": {"deployment_profile_id": "{selected_deployment_profile_id}",
                     "recipe_id": "{selected_recipe_id}", "prompt": "{complete_prompt}",
@@ -42,14 +45,14 @@ def agent_contract():
             "observe": {"method": "GET", "path": PREFIX+"/{session_id}/submissions/{submission_id}",
                 "read_response": "items[].job_id and items[].job are the existing shared jobs. Download returned artifacts[].content_url/download_url with the same owner authentication; verify size_bytes and sha256."}},
         "placeholder_rules": "Replace placeholders with returned IDs/values and use a stable Idempotency-Key for every POST. expected_version is an integer. Never edit hidden project/shot projections or submit them through legacy routes.",
-        "release_notice": "This is the backend contract. Quick Chat frontend integration and public onboarding have separate release gates; discovery does not prove a deployed UI, enabled assistant or GPU readiness."}
+        "release_notice": "This is the backend contract. Quick Chat frontend integration and public onboarding have separate release gates; discovery does not prove a deployed UI, enabled conversational assistant or GPU readiness."}
 
 
-def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False):
+def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False, title_generator=None):
     settings = app.state.settings
     service = QuickChatService(app.state.repository, app.state.assets, settings, app.state.storage,
         hooks=hooks, assistant=assistant or QuickChatAssistant(app.state.assets, app.state.storage),
-        assistant_enabled=assistant_enabled)
+        assistant_enabled=assistant_enabled, title_generator=title_generator)
     app.state.quick_chat = service
 
     @app.exception_handler(QuickChatError)
@@ -61,6 +64,12 @@ def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False)
         return {"version": 1, "agent_contract": agent_contract(),
             "models": model_schema(enabled=assistant_enabled), "capabilities": capabilities(settings),
             "assistant_enabled": assistant_enabled, "copies": {"minimum": 1, "maximum": 4},
+            "history_titles": {"enabled": title_generator is not None, "model_id": TITLE_MODEL,
+                "input": "first meaningful accepted turn or card prompt; at most 2000 characters; no media or full history",
+                "timing": "background after authoring response", "maximum_calls_per_session": 1,
+                "manual_title_preserved": True, "authoring_version_bump": False,
+                "failure": "keep the original title; no automatic paid retry",
+                "existing_sessions_backfilled": False},
             "default_next_settings": default_next_settings(settings),
             "turn_creation": {"create_card": {"type": "boolean", "default": False,
                 "allowed_assistant_modes": ["none"], "atomic_with_turn": True,
@@ -124,8 +133,11 @@ def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False)
             cursor=after_cursor or before_cursor or cursor, direction="newer" if after_cursor else "older" if before_cursor else direction)
 
     @app.post(PREFIX+"/{session_id}/turns", status_code=201)
-    def create_turn(session_id: str, request: Request, body: dict, key: str = Header(..., alias="Idempotency-Key")):
-        return service.create_turn(request.state.principal, session_id, body, key)
+    def create_turn(session_id: str, request: Request, body: dict, background_tasks: BackgroundTasks,
+                    key: str = Header(..., alias="Idempotency-Key")):
+        value = service.create_turn(request.state.principal, session_id, body, key)
+        background_tasks.add_task(service.generate_title, request.state.principal, session_id)
+        return value
 
     @app.get(PREFIX+"/{session_id}/turns/{turn_id}")
     def turn(session_id: str, turn_id: str, request: Request):
@@ -136,16 +148,22 @@ def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False)
         return service.acknowledge_unknown(request.state.principal, session_id, turn_id, body, key)
 
     @app.post(PREFIX+"/{session_id}/cards", status_code=201)
-    def create_card(session_id: str, request: Request, body: dict, key: str = Header(..., alias="Idempotency-Key")):
-        return service.save_card(request.state.principal, session_id, body, key)
+    def create_card(session_id: str, request: Request, body: dict, background_tasks: BackgroundTasks,
+                    key: str = Header(..., alias="Idempotency-Key")):
+        value = service.save_card(request.state.principal, session_id, body, key)
+        background_tasks.add_task(service.generate_title, request.state.principal, session_id)
+        return value
 
     @app.get(PREFIX+"/{session_id}/cards/{card_id}")
     def card(session_id: str, card_id: str, request: Request):
         return service.get_card(request.state.principal, session_id, card_id)
 
     @app.post(PREFIX+"/{session_id}/cards/{card_id}/revisions", status_code=201)
-    def revision(session_id: str, card_id: str, request: Request, body: dict, key: str = Header(..., alias="Idempotency-Key")):
-        return service.save_card(request.state.principal, session_id, body, key, card_id=card_id)
+    def revision(session_id: str, card_id: str, request: Request, body: dict, background_tasks: BackgroundTasks,
+                 key: str = Header(..., alias="Idempotency-Key")):
+        value = service.save_card(request.state.principal, session_id, body, key, card_id=card_id)
+        background_tasks.add_task(service.generate_title, request.state.principal, session_id)
+        return value
 
     @app.get(PREFIX+"/{session_id}/revisions/{revision_id}")
     def get_revision(session_id: str, revision_id: str, request: Request):

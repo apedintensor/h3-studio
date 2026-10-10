@@ -547,10 +547,10 @@ class ComposeBoundaryTests(unittest.TestCase):
     def check(self,value):
         return host.validate_rendered(value,DIRECTORY,self.version,IMAGE,PROFILE)
 
-    def test_real_render_keeps_app_off_edge_and_private_paths_controller_only(self):
+    def test_real_render_gives_titles_egress_and_keeps_provider_paths_controller_only(self):
         self.assertTrue(self.check(self.value))
         app=self.value['services']['app'];controller=self.value['services'][host.SERVICE]
-        self.assertEqual(set(app['networks']),{'database','web'})
+        self.assertEqual(set(app['networks']),{'database','web','edge'})
         self.assertEqual(set(controller['networks']),{'database','edge'})
         self.assertNotIn('--enabled',controller['command'])
         self.assertEqual(app['environment']['SIXNINE_DEFAULT_DEPLOYMENT_PROFILE_ID'],PROFILE)
@@ -563,7 +563,7 @@ class ComposeBoundaryTests(unittest.TestCase):
     def test_wrong_image_private_mount_network_env_or_enable_flag_rejected(self):
         for mutate in (
             lambda c:c['services'][host.SERVICE].update(image='sixnine-platform:'+'e'*40),
-            lambda c:c['services']['app']['networks'].update(edge={}),
+            lambda c:c['services']['app']['networks'].update(unreviewed={}),
             lambda c:c['services']['app']['volumes'].append(host.bind(host.KEY,True)),
             lambda c:c['services'][host.SERVICE]['environment'].update(AWS_ACCESS_KEY_ID='synthetic'),
             lambda c:c['services'][host.SERVICE]['command'].append('--enabled'),
@@ -591,7 +591,7 @@ class ComposeBoundaryTests(unittest.TestCase):
             lambda c:c['services'].update({host.SERVICE:self.value['services'][host.SERVICE]}),
             lambda c:c['services']['app']['volumes'].append(host.bind(host.KEY,True)),
             lambda c:c['services']['app']['environment'].update(SIXNINE_OPERATOR_CAPACITY_OWNERS='anyone'),
-            lambda c:c['services']['app']['networks'].update(edge={})):
+            lambda c:c['services']['app']['networks'].update(unreviewed={})):
             changed=copy.deepcopy(value);mutate(changed)
             with self.assertRaises((release.ReleaseError,validator.ConfigurationError)):
                 host.validate_app_rendered(changed,DIRECTORY,self.version,IMAGE,expected)

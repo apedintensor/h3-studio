@@ -21,6 +21,8 @@ class QuickChatRecovery:
         try:
             self.last_count = await run_in_threadpool(self.service.recover_assistant_runs,
                                                       older_than_s=self.older_than_s)
+            self.last_count += await run_in_threadpool(self.service.recover_title_runs,
+                                                       older_than_s=self.older_than_s)
             self.last_error_code = None
         except Exception:
             # Database/driver exception text may contain private values.

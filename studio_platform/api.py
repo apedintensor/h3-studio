@@ -43,7 +43,7 @@ TERMINAL = {"succeeded", "failed", "cancelled"}
 
 
 def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_hooks=None,
-               assistant=None, assistant_enabled=False, operator_registry=None):
+               assistant=None, assistant_enabled=False, operator_registry=None, title_generator=None):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     repo = repository or Repository(settings.database_url)
     repo.create_schema()
@@ -584,7 +584,7 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
         create_planned=generation_admission.create_planned, enqueue=lambda p, j: generation_admission.enqueue(p, j, business=True),
         public_job=generation_read.job, cancel=quick_cancel, refresh_planned=generation_admission.refresh_planned)
     register_quick_chat_routes(app, hooks=hooks, assistant=assistant,
-        assistant_enabled=assistant_enabled)
+        assistant_enabled=assistant_enabled, title_generator=title_generator)
     from .quick_chat_recovery import QuickChatRecovery
     app.state.quick_chat_recovery = QuickChatRecovery(app.state.quick_chat)
     register_agent_connect_routes(app)
