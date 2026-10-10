@@ -99,7 +99,7 @@ Swagger/OpenAPI由服务生成，访问仍需本账户身份。表中的模型�
 
 先检查 `/v1/capabilities` 每个配方的 `execution_support`，再创建预检。`implemented` 和模型最大输入限制不等于当前部署已开放；实际范围由 `execution_support.constraints` 给出。`status=runtime_required` 表示运营已允许在该范围内排队，新 GPU 启动后仍须完成对应套件的真实验证，才可执行用户任务；这不是已实测成功的声明，也不保证当前有可用 GPU。`qualified` 也仍需预检当下的预算、容量及有效窗口；`not_qualified`、`disabled` 或 `unavailable` 时可保存文稿和素材，不应提交生成。`input_limits` 的数量按参考与锚点的同类唯一素材计，首尾帧另计但仍受图片像素及全局文件数限制；音视频时长限制分别约束同类素材总和，原选段与模型副本均须满足。
 
-下面是请求结构示例，ID必须换成当前账号真实已有的项目、镜头和ready素材。这里没有执行生成，也没有给出凭据值。
+下面是请求结构示例，ID必须换成当前账号真实已有的项目、镜头和ready素材。这里没有执行生成，也没有给出凭据值。seed 用十进制字符串传递，上限读取当前能力的 `controls.seed.maximum_decimal`：已固定的 WanGP 为 `4294967295`，Comfy 保留 uint64 范围。超范围值会拒绝，不会静默截断。
 
 ```json
 {
@@ -115,7 +115,7 @@ Swagger/OpenAPI由服务生成，访问仍需本账户身份。表中的模型�
     "duration": 5,
     "resolution": "480P",
     "aspect_ratio": "16:9",
-    "seed": "18446744073709551615",
+    "seed": "424242",
     "steps": 50,
     "generate_audio": true
   }
