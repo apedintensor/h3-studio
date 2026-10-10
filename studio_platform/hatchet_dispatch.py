@@ -30,6 +30,7 @@ from .drain_safe_runner import collection_slot
 from .queue import TaskQueue
 from .repository import (Repository, canonical, dispatch_receipts,
                          identifier, jobs, outbox, request_hash)
+from .telemetry import configured_telemetry
 from .worker import WorkerRunner
 
 ROUTE = "hatchet-v1"
@@ -375,9 +376,20 @@ class HatchetSlotRunner(WorkerRunner):
             desired_worker_labels=[DesiredWorkerLabel(key=k, value=v, required=True) for k,v in task_labels.items()],
             idempotency=TTLBasedIdempotencyConfig(key_expression="input.event_id", ttl=timedelta(hours=24)))
         def execute(message: DispatchInput, context) -> dict:
+            telemetry_context = dict(self.telemetry_context)
+            telemetry_context.update(provider="local" if spec["provider"] == "mock" else spec["provider"],
+                node_id=getattr(self.backend, "slot_key", ""))
+            try:
+                # This pinned SDK property is a public identity, never its
+                # input/output/metadata/baggage. The exporter applies the
+                # closed identifier projection before emitting logs/traces.
+                telemetry_context["hatchet_run"] = context.workflow_run_id
+            except Exception:
+                pass  # Missing diagnostics cannot interrupt business work.
             runner = ExactJobRunner(self.repo, self.store, self.work_dir, message=message,
                 collection_lock_dir=self.collection_lock_dir, backend=self.backend, control=self.control,
-                submission_guard=self.submission_guard, stop_requested=self.stop_requested)
+                submission_guard=self.submission_guard, stop_requested=self.stop_requested,
+                telemetry=self.telemetry, telemetry_context=telemetry_context)
             deadline = time.monotonic()+self.broker_config.execution_timeout_s-30
             while not stop.is_set() and not context.is_cancelled and time.monotonic() < deadline:
                 with self.repo.engine.connect() as connection:
@@ -431,10 +443,24 @@ def main(argv=None):
         if not args.fleet_config or not args.worker_id or args.once:
             parser.error("worker requires --fleet-config and --worker-id; --once is dispatcher-only")
         from .fleet import read_config, run_slot
-        fleet = read_config(args.fleet_config)
-        return run_slot(fleet, args.worker_id, settings,
-            runner_factory=lambda *a, **kw: HatchetSlotRunner(*a, broker_config=config,
-                collection_lock_dir=fleet.work_dir/"collection-lock", **kw))
+        # Read only the explicit protected SIXNINE_TELEMETRY_CONFIG_FILE mount.
+        # It is optional and failsoft; no token is passed through CLI arguments
+        # or Hatchet's automatic payload/log instrumentation.
+        telemetry = configured_telemetry()
+        try:
+            fleet = read_config(args.fleet_config)
+            return run_slot(fleet, args.worker_id, settings,
+                runner_factory=lambda *a, **kw: HatchetSlotRunner(*a, broker_config=config,
+                    collection_lock_dir=fleet.work_dir/"collection-lock", telemetry=telemetry, **kw))
+        finally:
+            try:
+                telemetry.force_flush(timeout_millis=1000)
+            except Exception:
+                pass
+            try:
+                telemetry.close()
+            except Exception:
+                pass
     repo = Repository(settings.database_url)
     try:
         repo.create_schema()
