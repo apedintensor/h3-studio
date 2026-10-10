@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 from types import SimpleNamespace as NS
@@ -191,6 +192,40 @@ class InstanceHostKeyTests(unittest.TestCase):
         with self.assertRaisesRegex(subject.HostKeyError, 'migration_unconfirmed'):
             self.config()
 
+    def test_entire_boot_subtree_loss_does_not_allow_new_trust_or_legacy_downgrade(self):
+        config = self.config()
+        self.connect(config)
+        anchor = self.work/'ssh-host-selections'/(INTENT+'.json')
+        original = anchor.read_bytes()
+        directory = config.known_hosts_file.parent.parent.resolve()
+        self.assertTrue(directory.is_relative_to(self.work.resolve()))
+        self.assertEqual(directory.name, INTENT)
+        shutil.rmtree(directory)
+        client = Client(self.second)
+        with patch('paramiko.SSHClient', return_value=client):
+            with self.assertRaisesRegex(subject.HostKeyError, 'migration_unconfirmed'):
+                self.config()
+        self.assertEqual(client.calls, [])
+        # Recreating an apparently historical slot must not erase the anchor.
+        (directory/'0'/INTENT).mkdir(parents=True)
+        with self.assertRaisesRegex(subject.HostKeyError, 'migration_unconfirmed'):
+            self.config()
+        self.assertEqual(anchor.read_bytes(), original)
+        self.assertEqual(self.legacy.read_bytes(), self.legacy_bytes)
+
+    def test_partial_control_anchor_commit_requires_review_without_connecting(self):
+        receipt = self.work/'boot'/INTENT/'ssh-host-identity.json'
+        original = subject._write_once
+        def fail_local_receipt(path, raw):
+            if Path(path) == receipt:
+                raise OSError('synthetic local receipt interruption')
+            return original(path, raw)
+        with patch.object(subject, '_write_once', side_effect=fail_local_receipt), self.assertRaises(OSError):
+            self.config()
+        self.assertTrue((self.work/'ssh-host-selections'/(INTENT+'.json')).is_file())
+        with self.assertRaisesRegex(subject.HostKeyError, 'migration_unconfirmed'):
+            self.config()
+
     def test_old_bootstrap_with_different_instance_cannot_authorize_migration(self):
         slot = self.work/'boot'/INTENT/'0'/INTENT
         slot.mkdir(parents=True)
@@ -234,7 +269,7 @@ class InstanceHostKeyTests(unittest.TestCase):
             os.link(config.known_hosts_file, alias)
         except OSError:
             self.skipTest('hard links not available on this local test filesystem')
-        with self.assertRaisesRegex(BootError, 'pin_invalid'):
+        with self.assertRaisesRegex((BootError, subject.HostKeyError), 'pin_invalid'):
             self.connect(self.config())
         alias.unlink()
         before = config.known_hosts_file.read_bytes()
@@ -244,7 +279,7 @@ class InstanceHostKeyTests(unittest.TestCase):
             config.known_hosts_file.symlink_to(alias)
         except OSError:
             return  # Windows without symlink privileges still checked the hard link.
-        with self.assertRaisesRegex(BootError, 'pin_invalid'):
+        with self.assertRaisesRegex((BootError, subject.HostKeyError), 'pin_invalid'):
             self.connect(self.config())
 
 

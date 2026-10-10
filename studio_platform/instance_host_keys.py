@@ -166,50 +166,81 @@ def _record(path, identity):
     return value
 
 
+def _selection(path, identity):
+    try:
+        value = json.loads(_read(path))
+    except (ValueError, UnicodeError):
+        raise HostKeyError('bootstrap_ssh_pin_migration_unconfirmed') from None
+    require(isinstance(value, dict) and set(value) == {'version', 'identity', 'mode', 'known_hosts_file'}
+        and type(value.get('version')) is int and value['version'] == 1
+        and value['identity'] == identity and value['mode'] in {'instance', 'legacy'},
+        'bootstrap_ssh_pin_identity_changed')
+    _path(value['known_hosts_file'])
+    return value
+
+
 def known_hosts_for(work_dir, identity, legacy_file):
-    """Choose once before slot directories exist; never migrate old pins silently."""
+    """Choose once; a control-level anchor survives loss of the boot subtree."""
     expected = validate_identity(identity)
     root, legacy = _path(work_dir), _path(legacy_file)
     directory = _path(root/'boot'/expected['intent_id'])
-    existed = directory.exists()
-    with _lock(directory):
+    selections = _path(root/'ssh-host-selections')
+    # This order never reverses: selection lock -> boot pin lock. SSH only takes
+    # the latter and reads the immutable selection; it does not create anchors.
+    with _lock(selections):
+        anchor = selections/(expected['intent_id']+'.json')
         receipt, scoped = directory/'ssh-host-identity.json', directory/'ssh'/'known_hosts'
-        if receipt.exists():
-            value = _record(receipt, expected)
+        selected = _selection(anchor, expected) if anchor.exists() else None
+        if selected is not None:
+            require(directory.is_dir() and receipt.is_file(), 'bootstrap_ssh_pin_migration_unconfirmed')
         else:
-            entries = {item.name for item in directory.iterdir()} - {'ssh-host-identity.lock'}
-            # A failed/partial scoped selection is not permission to downgrade.
-            require('ssh' not in entries and 'ssh-host-identity.next' not in entries,
-                'bootstrap_ssh_pin_migration_unconfirmed')
-            slots = [item for item in directory.iterdir() if item.name.isdecimal() and item.is_dir()]
-            require(not existed or bool(slots), 'bootstrap_ssh_pin_migration_unconfirmed')
-            require(not entries or entries == {item.name for item in slots},
-                'bootstrap_ssh_pin_migration_unconfirmed')
-            for slot in slots:
-                old = slot/expected['intent_id']/'bootstrap-state.json'
-                if old.exists():
-                    try:
-                        previous = json.loads(_read(old, protected=False))
-                    except (ValueError, UnicodeError):
-                        raise HostKeyError('bootstrap_ssh_pin_migration_unconfirmed') from None
-                    require(isinstance(previous, dict) and isinstance(previous.get('identity'), dict)
-                        and previous['identity'].get('intent_id') == expected['intent_id']
-                        and previous['identity'].get('instance_id') == expected['instance_id']
-                        and previous['identity'].get('provider', 'lium') == expected['provider']
-                        and 'ssh_host_key_identity' not in previous['identity'],
-                        'bootstrap_ssh_pin_migration_unconfirmed')
-            value = {'version': 1, 'identity': expected, 'mode': 'legacy' if slots else 'instance'}
-            if slots:
-                value['known_hosts_file'] = str(legacy)
+            require(not receipt.exists(), 'bootstrap_ssh_pin_migration_unconfirmed')
+        existed = directory.exists()
+        with _lock(directory):
+            if receipt.exists():
+                value = _record(receipt, expected)
             else:
-                value['pin'] = None
-            _write_once(receipt, json.dumps(value, sort_keys=True).encode())
-        if value['mode'] == 'legacy':
-            require(value['known_hosts_file'] == str(legacy), 'bootstrap_ssh_pin_legacy_path_changed')
-            return legacy, ()
-        scoped.parent.mkdir(mode=0o700, exist_ok=True)
-        _directory(scoped.parent)
-        return scoped, identity
+                entries = {item.name for item in directory.iterdir()} - {'ssh-host-identity.lock'}
+                # A failed/partial scoped selection is not permission to downgrade.
+                require('ssh' not in entries and 'ssh-host-identity.next' not in entries,
+                    'bootstrap_ssh_pin_migration_unconfirmed')
+                slots = [item for item in directory.iterdir() if item.name.isdecimal() and item.is_dir()]
+                require(not existed or bool(slots), 'bootstrap_ssh_pin_migration_unconfirmed')
+                require(not entries or entries == {item.name for item in slots},
+                    'bootstrap_ssh_pin_migration_unconfirmed')
+                for slot in slots:
+                    old = slot/expected['intent_id']/'bootstrap-state.json'
+                    if old.exists():
+                        try:
+                            previous = json.loads(_read(old, protected=False))
+                        except (ValueError, UnicodeError):
+                            raise HostKeyError('bootstrap_ssh_pin_migration_unconfirmed') from None
+                        require(isinstance(previous, dict) and isinstance(previous.get('identity'), dict)
+                            and previous['identity'].get('intent_id') == expected['intent_id']
+                            and previous['identity'].get('instance_id') == expected['instance_id']
+                            and previous['identity'].get('provider', 'lium') == expected['provider']
+                            and 'ssh_host_key_identity' not in previous['identity'],
+                            'bootstrap_ssh_pin_migration_unconfirmed')
+                value = {'version': 1, 'identity': expected, 'mode': 'legacy' if slots else 'instance'}
+                if slots:
+                    value['known_hosts_file'] = str(legacy)
+                else:
+                    value['pin'] = None
+                selected = {'version': 1, 'identity': expected, 'mode': value['mode'],
+                    'known_hosts_file': str(legacy if slots else scoped)}
+                # Record selection outside disposable boot files first. Any
+                # incomplete commit is a review obligation, not fresh trust.
+                _write_once(anchor, json.dumps(selected, sort_keys=True).encode())
+                _write_once(receipt, json.dumps(value, sort_keys=True).encode())
+            path = legacy if value['mode'] == 'legacy' else scoped
+            require(selected == {'version': 1, 'identity': expected, 'mode': value['mode'],
+                'known_hosts_file': str(path)}, 'bootstrap_ssh_pin_identity_changed')
+            if value['mode'] == 'legacy':
+                require(value['known_hosts_file'] == str(legacy), 'bootstrap_ssh_pin_legacy_path_changed')
+                return legacy, ()
+            scoped.parent.mkdir(mode=0o700, exist_ok=True)
+            _directory(scoped.parent)
+            return scoped, identity
 
 
 def connect_pinned(client, config, coordinates, kwargs):
@@ -223,6 +254,9 @@ def connect_pinned(client, config, coordinates, kwargs):
     _directory(hosts.parent)
     receipt = directory/'ssh-host-identity.json'
     with _lock(directory):
+        anchor = directory.parent.parent/'ssh-host-selections'/(identity['intent_id']+'.json')
+        require(_selection(anchor, identity) == {'version': 1, 'identity': identity, 'mode': 'instance',
+            'known_hosts_file': str(hosts)}, 'bootstrap_ssh_pin_identity_changed')
         record = _record(receipt, identity)
         require(record['mode'] == 'instance')
 
