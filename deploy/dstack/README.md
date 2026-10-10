@@ -128,12 +128,19 @@ only when its admin user does not exist; changing the environment is **not** an
 existing-token rotation. `--log-level WARNING` prevents the upstream INFO startup
 message from printing that token. The automatic OTel enable variables must be
 absent: even the value `"0"` enables them in 0.22.3.
+Its CLI also writes a daily update-check marker in `/root/.cache` before starting
+the server. A 1 MiB private tmpfs provides that cache on the read-only container;
+the entrypoint seeds only this nonsecret marker to prevent startup update probes.
 
-Provision existing mode-0600 protected files outside the checkout, readable by
-their intended CPU UID (app/controller UID 10001, dstack service root). Docker's
-local-file secret mount does not automatically repair host ownership. Do not
-relax group/world permissions to fix a failed read. The original title config
-and app DB mounts remain attached. Additional file bindings are:
+Provision existing protected files outside the checkout, readable by their
+intended CPU UID. App/controller-only files belong to UID 10001 with mode 0600;
+the dstack infrastructure DSN and persistent state belong to root. Shared dstack
+API token/public-key files belong to `root:10001` with mode 0640, so both intended
+CPU identities can read them. Group write/execute and all world permissions stay
+disabled. Docker's local-file secret mount does not repair host ownership, and
+root with `cap_drop: ALL` cannot read another user's mode-0600 files. Do not add
+DAC override capabilities or weaken the protected loader. The original title
+config and app DB mounts remain attached. Additional file bindings are:
 
 | Protected source variable | Purpose and in-container path |
 | --- | --- |
@@ -182,6 +189,20 @@ unauthenticated user read and accept the configured admin token; Hatchet's
 readiness endpoint must respond. Its health response alone is not native GPU,
 broker-worker registration or inference proof. Authenticated Hatchet execution
 qualification remains the separate pinned engine proof.
+
+An opt-in isolated CPU proof runs the exact rendered protected-file entrypoint
+against a fresh non-admin PostgreSQL database, with synthetic credentials and
+provider configuration/background provisioning disabled. It requires Linux root
+to provision the same root-owned mount permissions; both pinned images must
+already exist locally. It creates only uniquely tagged temporary CPU containers
+and a private network, then removes only those owned resources in `finally`.
+
+```sh
+SIXNINE_DSTACK_CPU_PROOF=1 python3 -m unittest test_migration_deploy.DstackCPUProof -q
+```
+
+This opt-in is separate from the read-only deployment checker and does not use
+the live business database, Hatchet volumes, provider accounts or cloud hosts.
 
 **Shared namespace release boundary:** recreating `app` also replaces its network
 namespace. Coordinate recreation/reconnection of all four namespace members in
