@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createOperatorClient} from './operator-client.js';
 import {createOperatorController} from './operator-controller.js';
-import {operatorModels,operatorCandidateSelection,operatorCandidateCurrent,operatorCandidatePreviewMatches,initialOperatorMarket,operatorMarketReducer,operatorSlotsLabel,operatorMarketSummary,roundedSpec} from './operator-model.js';
+import {operatorModels,operatorCandidateSelection,operatorCandidateCurrent,operatorCandidatePreviewMatches,initialOperatorMarket,operatorMarketReducer,operatorSlotsLabel,operatorMarketSummary,operatorMarketProvider,roundedSpec} from './operator-model.js';
 
 const catalog={profiles:[
   {id:'pruned-5090',model_id:'MiniMax-H3-Pruned-Rank8-INT8',gpu_models:['RTX 5090']},
@@ -103,4 +103,73 @@ test('old-account candidate responses are rejected and never create a pending re
   await controller.setAccount('a');const read=controller.candidates(query);await controller.setAccount('b');finish(result);
   await assert.rejects(read,/账户已改变/);
   assert.equal(controller.getState().pending,null);assert.equal(controller.getState().account,'b');
+});
+
+const refreshReceipt={request_id:'refresh-1',requested_at:995,providers:['lium','targon'],coalesced:false};
+const refreshed=(lium,targon,patch={})=>({...result,...patch,providers:[['lium',lium],['targon',targon]].map(([provider,refresh_status])=>({provider,status:'ok',observed_at:999,refresh_request_id:'refresh-1',refresh_requested_at:995,refresh_status}))});
+const refreshClient=overrides=>{let account;return {setAccount(value){account=value;},reset(){},state:async()=>({operator:{account},nodes:[]}),catalog:async()=>catalog,...overrides};};
+
+test('one cookie-authenticated refresh targets the shared inventory endpoint without rental consent or journal',async()=>{
+  const calls=[],client=createOperatorClient({fetcher:async(path,options)=>{calls.push({path,options});return new Response(JSON.stringify(refreshReceipt),{status:202,headers:{'Content-Type':'application/json','X-Authenticated-Account':'owner'}});}});
+  client.setAccount('owner');await client.marketRefresh();
+  assert.equal(calls.length,1);assert.equal(calls[0].path,'/v1/operator/capacity/market-refreshes');assert.equal(calls[0].options.method,'POST');
+  assert.deepEqual(JSON.parse(calls[0].options.body),{});assert.equal(calls[0].options.credentials,'same-origin');assert.equal(calls[0].options.headers['X-Expected-Account'],'owner');
+});
+
+test('one refresh exposes independent supplier progress and preserves a successful supplier when the other fails',async()=>{
+  const responses=[refreshed('pending','pending'),refreshed('complete','pending'),refreshed('complete','failed')],updates=[],waits=[];let writes=0,reads=0;
+  const controller=createOperatorController({client:refreshClient({marketRefresh:async()=>{writes++;return refreshReceipt;},candidates:async selection=>{assert.deepEqual(selection,query);return responses[reads++];}}),storage:{getItem:()=>null,setItem(){throw Error('must not journal rental');}},wait:async ms=>waits.push(ms)});
+  await controller.setAccount('owner');const final=await controller.refreshCandidates(query,result=>updates.push(result));
+  assert.equal(writes,1);assert.equal(reads,3);assert.deepEqual(waits,[2000,2000]);assert.equal(updates.length,3);assert.equal(final,responses[2]);
+  assert.equal(operatorMarketProvider(final,'lium',1000000).fresh,true);assert.equal(operatorMarketProvider(final,'targon',1000000).fresh,false);
+  assert.equal(controller.getState().pending,null);assert.equal(controller.getState().busy,false);
+});
+
+test('refresh status never makes prior or stale stock fresh and does not erase a newer query revision',()=>{
+  for(const state of ['pending','failed','timeout'])assert.equal(operatorMarketProvider(refreshed(state,'complete'),'lium',1000000).fresh,false);
+  const stale=refreshed('complete','complete');stale.providers[0].observed_at=800;
+  assert.equal(operatorMarketProvider(stale,'lium',1000000).fresh,false);
+  const scanning=operatorMarketReducer(initialOperatorMarket({max_ttl_seconds:10800}),{type:'scan'});
+  const progress=operatorMarketReducer(scanning,{type:'refresh-progress',revision:scanning.revision,result:refreshed('complete','pending')});
+  assert.equal(progress.loading,'candidates');assert.match(operatorMarketSummary(progress.result,1000000),/Lium.*Targon/);
+  const changed=operatorMarketReducer(progress,{type:'change',patch:{mode:'ref'}});
+  assert.equal(operatorMarketReducer(changed,{type:'refresh-progress',revision:scanning.revision,result}),changed);
+});
+
+test('another operator can refresh advisory stock without changing this model selection or enabling older refresh data',async()=>{
+  const newer=refreshed('complete','complete');newer.providers=newer.providers.map(item=>({...item,refresh_request_id:'refresh-2',refresh_requested_at:996}));
+  let response=newer;const controller=createOperatorController({client:refreshClient({marketRefresh:async()=>refreshReceipt,candidates:async()=>response}),storage:{getItem:()=>null}});
+  await controller.setAccount('owner');assert.equal(await controller.refreshCandidates(query),newer);
+  response=refreshed('complete','complete');response.providers[0].refresh_requested_at=994;
+  await assert.rejects(controller.refreshCandidates(query),/本轮记录/);
+  assert.equal(controller.getState().pending,null);
+});
+
+test('bounded browser polling stops while keeping a pending supplier explicit; old account cannot receive refresh progress',async()=>{
+  let reads=0,waits=0;const controller=createOperatorController({client:refreshClient({marketRefresh:async()=>refreshReceipt,candidates:async()=>{reads++;return refreshed('complete','pending');}}),storage:{getItem:()=>null},wait:async()=>{waits++;}});
+  await controller.setAccount('owner');const final=await controller.refreshCandidates(query);
+  assert.equal(reads,31);assert.equal(waits,30);assert.equal(final.providers[1].refresh_status,'pending');assert.equal(operatorMarketProvider(final,'targon',1000000).fresh,false);
+  let finish;const updates=[],switched=createOperatorController({client:refreshClient({marketRefresh:async()=>refreshReceipt,candidates:()=>new Promise(resolve=>{finish=resolve;})}),storage:{getItem:()=>null}});
+  await switched.setAccount('a');const read=switched.refreshCandidates(query,value=>updates.push(value));await Promise.resolve();await switched.setAccount('b');finish(refreshed('complete','complete'));
+  await assert.rejects(read,/账户已改变/);assert.equal(updates.length,0);assert.equal(switched.getState().account,'b');assert.equal(switched.getState().pending,null);
+});
+
+test('slow reads respect the wall-clock refresh deadline and closing the drawer stops later reads',async()=>{
+  let clock=0,reads=0;
+  const controller=createOperatorController({client:refreshClient({marketRefresh:async()=>refreshReceipt,candidates:async()=>{reads++;clock+=40000;return refreshed('complete','pending');}}),storage:{getItem:()=>null},now:()=>clock,wait:async ms=>{clock+=ms;}});
+  await controller.setAccount('owner');const final=await controller.refreshCandidates(query);
+  assert.equal(reads,2);assert.equal(final.providers[1].refresh_status,'pending');assert.equal(controller.getState().busy,false);
+  const signal=new AbortController();let closedReads=0;
+  const closed=createOperatorController({client:refreshClient({marketRefresh:async()=>refreshReceipt,candidates:async()=>{closedReads++;return refreshed('complete','pending');}}),storage:{getItem:()=>null},wait:async()=>signal.abort()});
+  await closed.setAccount('owner');await closed.refreshCandidates(query,()=>{},signal.signal);
+  assert.equal(closedReads,1);assert.equal(closed.getState().busy,false);assert.equal(closed.getState().pending,null);
+});
+
+test('a saved pending refresh expires visibly after one minute even when browser polling has ended',()=>{
+  const waiting=refreshed('complete','pending');
+  assert.equal(operatorMarketProvider(waiting,'targon',1054000).refreshing,true);
+  const expired=operatorMarketProvider(waiting,'targon',1055000);
+  assert.equal(expired.refreshing,false);assert.equal(expired.refresh_status,'timeout');assert.equal(expired.refresh_reason_code,'inventory_refresh_timeout');assert.equal(expired.fresh,false);
+  assert.equal(waiting.providers[1].refresh_status,'pending');assert.doesNotMatch(operatorMarketSummary(waiting,1055000),/正在查询/);
+  assert.equal(operatorMarketProvider(waiting,'lium',1055000).fresh,true);
 });
