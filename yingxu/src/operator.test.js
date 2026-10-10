@@ -8,6 +8,33 @@ import {recipeFor,effectiveControlSchema,effectiveLimits,clipLimits,inputProblem
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
 function fakeClient(overrides={}){let account;return {setAccount(value){account=value;},reset(){},state:async()=>({observed_at:Date.now()/1000,operator:{account,permissions:{view:true,start:true}},nodes:[]}),catalog:async()=>({profiles:[]}),...overrides};}
+test('manual review binds exact UID and original version; uncertain replay retains its single operation',async()=>{
+  const storage=memory(),calls=[];let fail=true;
+  const client=fakeClient({manualReview:async(nodeId,body,key)=>{calls.push({nodeId,body,key});if(fail)throw Error('connection lost');return {operation:{id:'same-review'}};}});
+  const node={id:'original-node',provider_instance_id:'wrk-original',version:'original-version'};
+  const controller=createOperatorController({client,storage});await controller.setAccount('owner');
+  await assert.rejects(controller.manualReview(node,{account_absent:true,no_continuing_charge:true}));
+  const saved=controller.getState().pending;assert.equal(saved.method,'manualReview');
+  assert.deepEqual(calls[0].body,{expected_version:'original-version',provider_instance_id:'wrk-original',account_absent:true,no_continuing_charge:true});
+  await controller.poll();assert.equal(calls.length,1);fail=false;await controller.recover();
+  assert.deepEqual(calls[1],calls[0]);assert.equal(controller.getState().pending,null);
+});
+test('manual review projection stops scheduling without labelling provider removal or settled money',()=>{
+  const review={state:'manually_reviewed',requested_at:100,last_checked_at:200,next_check_at:null,
+    manual_review:{actor:'supervan',observed_at:300},last_observation:{state:'unknown',observed_at:200}};
+  const result=nodeRemovalConfirmation({provider:'targon',state:'destroying',removal_confirmation:review});
+  assert.equal(result.pending,false);assert.equal(result.reviewed,true);assert.equal(result.next_check_at,null);
+  assert.match(result.label,/人工审核/);assert.doesNotMatch(result.label,/已确认删除/);
+  assert.match(result.message,/预算预留未结算/);assert.equal(result.manual_review.actor,'supervan');
+});
+test('manual review client uses same-origin cookie API with attestation body and supplied idempotency',async()=>{
+  const requests=[],client=createOperatorClient({fetcher:async(path,options)=>{requests.push({path,options});return new Response('{}',{headers:{'Content-Type':'application/json','X-Authenticated-Account':'owner'}});}});
+  client.setAccount('owner');const body={expected_version:'v',provider_instance_id:'wrk-original',account_absent:true,no_continuing_charge:true};
+  await client.manualReview('node-original',body,'review-original');
+  assert.equal(requests[0].path,'/v1/operator/capacity/nodes/node-original/manual-review');
+  assert.equal(requests[0].options.credentials,'same-origin');assert.deepEqual(JSON.parse(requests[0].options.body),body);
+  assert.equal(requests[0].options.headers['Idempotency-Key'],'review-original');
+});
 test('uncertain start is retained across reload and retried only explicitly with original key and preview',async()=>{
   const storage=memory(),calls=[];let fail=true;
   const client=fakeClient({start:async(body,key)=>{calls.push({body,key});if(fail)throw Error('connection lost');return {operation:{id:'original',state:'accepted'}};}});
