@@ -364,6 +364,10 @@ class DstackCapacity:
         value["state"] = "runtime_unconfirmed"
         if self.readiness is None:
             return value
+        # Commit the exact provider identity before the CPU native callback can
+        # journal bootstrap. A timeout must reconcile this original instance.
+        self.store.record(binding["intent_id"], value)
+        binding = self.store.load(binding["intent_id"])
         try:
             native = self.readiness(copy.deepcopy(binding), copy.deepcopy(run))
         except Exception:
@@ -446,7 +450,7 @@ def native_bootstrap_config(request, *, source_bundle_sha256,
         "dependency_artifact_url": "", "dependency_artifact_path": "", "dependency_artifact_sha256": "0" * 64,
         "manifest_path": base + "/wangp-manifest.json", "model_root": model_root,
         "config_path": "/root/sixnine-cache/operator/profile-slot-0/wgp_config.json",
-        "status_path": "/root/sixnine-cache/operator/profile-slot-0/bootstrap-status.json",
+        "status_path": base + "/setup-status.json",
         "port": 8199, "prepared_root": prepared_root, "deployment_profile_id": request.profile_id,
         "profile_slot_index": 0, "expected_host_gpus": 1}
 
