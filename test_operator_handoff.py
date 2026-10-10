@@ -3,6 +3,7 @@ from contextlib import ExitStack, nullcontext
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -35,6 +36,35 @@ def ledger_rows():
                          'account_id':'owner', 'amount_microusd':500, 'state':'reserved', 'actual_cost_microusd':None}],
         'policy':[{'enabled':1, 'version':2}], 'gate':[{'max_instances':2}], 'limits':[{'pool':'existing'}],
     }
+
+
+UNKNOWN_TAG = '00000000-0000-4000-8000-000000000112'
+EXECUTOR = '00000000-0000-4000-8000-000000000113'
+
+
+def unknown_rows():
+    rows = ledger_rows()
+    rows['intents'][0].update(id=UNKNOWN_TAG, state='creation_unknown', provider='lium', provider_instance_id=None)
+    rows['nodes'][0].update(intent_id=UNKNOWN_TAG, runtime_state='creation_unknown')
+    rows['actions'][0].update(intent_id=UNKNOWN_TAG, destroy_started_at=None)
+    rows['commands'][0].update(state='unknown')
+    rows['commands'][0]['payload']['selected_offer'] = {'provider':'lium', 'offer_id':EXECUTOR}
+    rows['commands'][1]['payload']['node_id'] = UNKNOWN_TAG
+    rows['reservations'][0]['reference_id'] = UNKNOWN_TAG
+    return rows
+
+
+def unknown_marker():
+    return {'version':1, 'tag':UNKNOWN_TAG, 'phase':'post_started', 'executor_id':EXECUTOR,
+            'absolute_ttl':{'version':1, 'created_at':100, 'hard_deadline':1000, 'requested_hours':1,
+                'deadline':1000, 'effective_deadline':1000, 'instance_id':None,
+                'provider_created_at':None, 'attempts':[]}}
+
+
+def unknown_receipt():
+    marker = unknown_marker()
+    return {UNKNOWN_TAG:{key:marker[key] for key in ('tag', 'phase', 'executor_id', 'absolute_ttl')} |
+                       {'journal_sha256':'c'*64}}
 
 
 class LedgerTests(unittest.TestCase):
@@ -99,6 +129,128 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(current['immutable_hash'], original['immutable_hash'])
         self.assertNotEqual(current['accounting_hash'], original['accounting_hash'])
         self.assertEqual(current['pending_ids'], [])
+
+
+class UnknownLedgerTests(unittest.TestCase):
+    def summary(self, rows, receipt=None):
+        return handoff.ledger_summary(rows, {'binding':'frozen'}, unknown_receipt() if receipt is None else receipt)
+
+    def test_original_unknown_stop_and_accounting_are_preserved_as_unknown(self):
+        rows = unknown_rows(); original = copy.deepcopy(rows)
+        result = self.summary(rows)
+        self.assertEqual(result['pending_ids'], [UNKNOWN_TAG])
+        self.assertEqual(result['unknown_rent_journals'], unknown_receipt())
+        self.assertEqual(rows, original)
+        rows['actions'][0].update(last_observed_at=400, last_observation={'state':'unknown'})
+        rows['nodes'][0]['runtime_state'] = 'observation_failed'
+        rows['commands'][0]['updated_at'] = 400
+        self.assertEqual(self.summary(rows), result)
+
+    def test_unknown_requires_exact_durable_journal_and_original_stop(self):
+        for change in ({}, {UNKNOWN_TAG:{**unknown_receipt()[UNKNOWN_TAG], 'phase':'checking'}},
+                       {UNKNOWN_TAG:{**unknown_receipt()[UNKNOWN_TAG], 'tag':EXECUTOR}},
+                       {UNKNOWN_TAG:{**unknown_receipt()[UNKNOWN_TAG], 'journal_sha256':'not-a-hash'}}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.summary(unknown_rows(), change)
+        for section, field, value in (('nodes','desired_state','running'), ('intents','state','creating'),
+            ('intents','provider','targon'), ('intents','provider_instance_id','invented-id'),
+            ('actions','destroy_started_at',200), ('actions','create_started_at',None),
+            ('reservations','state','settled'), ('reservations','actual_cost_microusd',0),
+            ('reservations','amount_microusd',1), ('commands','state','completed')):
+            rows = unknown_rows()
+            rows[section][1 if section == 'commands' else 0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError): self.summary(rows)
+        rows = unknown_rows(); rows['commands'][1]['kind'] = 'drain'
+        with self.assertRaises(ValueError): self.summary(rows)
+        rows = unknown_rows(); rows['commands'][0]['payload']['selected_offer']['offer_id'] = UNKNOWN_TAG
+        with self.assertRaises(ValueError): self.summary(rows)
+
+    def test_unknown_deadline_model_budget_journal_or_missing_ordinal_fail_closed(self):
+        original = self.summary(unknown_rows())
+        changed = unknown_receipt(); changed[UNKNOWN_TAG]['journal_sha256'] = 'd'*64
+        self.assertNotEqual(self.summary(unknown_rows(), changed)['immutable_hash'], original['immutable_hash'])
+        for field in ('created_at', 'hard_deadline', 'deadline', 'effective_deadline'):
+            changed = unknown_receipt(); changed[UNKNOWN_TAG]['absolute_ttl'][field] += 1
+            with self.subTest(field=field), self.assertRaises(ValueError): self.summary(unknown_rows(), changed)
+        rows = unknown_rows(); rows['nodes'][0]['payload']['selection']['model'] = 'different-model'
+        self.assertNotEqual(self.summary(rows)['immutable_hash'], original['immutable_hash'])
+        rows = unknown_rows(); rows['accounts'][0]['limit_microusd'] += 1
+        self.assertNotEqual(self.summary(rows)['immutable_hash'], original['immutable_hash'])
+        rows = unknown_rows(); rows['commands'][0]['payload']['selection']['node_count'] = 2
+        with self.assertRaises(ValueError): self.summary(rows)
+        rows['commands'][0]['state'] = 'blocked'
+        with self.assertRaises(ValueError): self.summary(rows)
+        for field in ('active_jobs','unsafe_attempts','bound_workers'):
+            rows = unknown_rows(); rows['counts'][field] = 1
+            with self.subTest(field=field), self.assertRaises(ValueError): self.summary(rows)
+
+    def test_legacy_deletion_only_hash_matches_original_algorithm(self):
+        # Recorded by the pre-change 98bf26f helper against this existing fixture.
+        result = handoff.ledger_summary(ledger_rows(), {'binding':'frozen'})
+        self.assertEqual(result['immutable_hash'], 'c93fe6b4151d079457c2113d55908be901893052ef9c524dab2943a81606af43')
+        self.assertEqual(result['accounting_hash'], '43a6652b13c01fd1a75d35723b61168f67c18a3ebba71075995e32237fd6d45f')
+        self.assertEqual(result['unknown_rent_journals'], {})
+
+
+class UnknownJournalTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.directory = self.root/'rent-journal'; self.directory.mkdir(mode=0o700)
+        self.path = self.directory/(UNKNOWN_TAG+'.json')
+        self.write(unknown_marker())
+
+    def write(self, marker):
+        self.path.write_text(json.dumps(marker)); self.path.chmod(0o600)
+
+    def test_reads_original_raw_hash_without_creating_lock_or_rewriting_any_file(self):
+        import hashlib
+        before = [(p.name,p.read_bytes(),p.stat().st_mtime_ns) for p in self.directory.iterdir()]
+        result = handoff.unknown_rent_journals(unknown_rows(), self.root)
+        self.assertEqual(result[UNKNOWN_TAG]['journal_sha256'], hashlib.sha256(self.path.read_bytes()).hexdigest())
+        self.assertEqual(result[UNKNOWN_TAG]['absolute_ttl'], unknown_marker()['absolute_ttl'])
+        self.assertEqual(before, [(p.name,p.read_bytes(),p.stat().st_mtime_ns) for p in self.directory.iterdir()])
+        self.assertEqual(handoff.unknown_rent_journals(ledger_rows(), self.root/'missing'), {})
+
+    def test_missing_marker_or_directory_never_initializes_or_repairs_it(self):
+        self.path.unlink()
+        with self.assertRaises(FileNotFoundError): handoff.unknown_rent_journals(unknown_rows(), self.root)
+        self.assertEqual(list(self.directory.iterdir()), [])
+        with self.assertRaisesRegex(ValueError,'journal_unavailable'):
+            handoff.unknown_rent_journals(unknown_rows(), self.root/'missing')
+        self.assertFalse((self.root/'missing').exists())
+
+    def test_original_identity_phase_deadline_and_ttl_are_required(self):
+        for field,value in (('phase','checking'), ('tag',EXECUTOR), ('absolute_ttl',None)):
+            marker = unknown_marker(); marker[field] = value; self.write(marker)
+            with self.subTest(field=field), self.assertRaises((ValueError,TypeError)):
+                handoff.unknown_rent_journals(unknown_rows(), self.root)
+        marker = unknown_marker(); marker['absolute_ttl']['hard_deadline'] = 999
+        marker['absolute_ttl'].update(deadline=999,effective_deadline=999); self.write(marker)
+        with self.assertRaisesRegex(ValueError,'journal_mismatch'):
+            handoff.unknown_rent_journals(unknown_rows(), self.root)
+        marker = unknown_marker(); marker['absolute_ttl'].update(instance_id=EXECUTOR,provider_created_at=100)
+        self.write(marker)
+        with self.assertRaisesRegex(ValueError,'journal_mismatch'):
+            handoff.unknown_rent_journals(unknown_rows(), self.root)
+
+    def test_linked_oversized_duplicate_or_public_journal_is_rejected(self):
+        linked = self.directory/'another'; os.link(self.path, linked)
+        with self.assertRaisesRegex(ValueError,'not_private'):
+            handoff.unknown_rent_journals(unknown_rows(), self.root)
+        linked.unlink()
+        self.path.write_bytes(b' '*4097)
+        with self.assertRaisesRegex(ValueError,'journal_invalid'):
+            handoff.unknown_rent_journals(unknown_rows(), self.root)
+        raw = json.dumps(unknown_marker()).replace('"version": 1', '"version": 1, "version": 1', 1)
+        self.path.write_text(raw)
+        with self.assertRaisesRegex(ValueError,'journal_invalid'):
+            handoff.unknown_rent_journals(unknown_rows(), self.root)
+        self.write(unknown_marker())
+        if os.name != 'nt':
+            self.path.chmod(0o644)
+            with self.assertRaisesRegex(ValueError,'not_private'):
+                handoff.unknown_rent_journals(unknown_rows(), self.root)
 
 
 class HostHandoffTests(unittest.TestCase):
@@ -379,6 +531,53 @@ class HostHandoffTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root/'active.json').read_text()), self.pin)
         self.launch.assert_not_called()
 
+    def use_unknown_ledger(self):
+        self.ledger = handoff.ledger_summary(unknown_rows(), {'binding':'frozen'}, unknown_receipt())
+        self.record['ledger'] = self.ledger
+        self.probe.return_value = self.ledger
+        return self.new_journal('unknown-112')
+
+    def test_stopped_unknown_named_handoff_keeps_both_original_and_retired_proofs(self):
+        path = self.use_unknown_ledger()
+        original = handoff.record_path().read_bytes()
+        self.configure_start_inspection([{'Running':True,'Restarting':False,'OOMKilled':False}])
+        self.mock(handoff, 'successor_supervisor', return_value={'MainPID':'999'})
+        self.assertEqual(handoff.start(journal_id='unknown-112', successor_unit='sixnine-unknown.service'),
+                         {'state':'cpu_restored'})
+        record = json.loads(path.read_text())
+        self.assertEqual(record['ledger'], self.ledger)
+        self.assertEqual(record['retired_ledger'], self.ledger)
+        self.assertEqual(record['phase'], 'running')
+        self.assertEqual(handoff.record_path().read_bytes(), original)
+        self.assertEqual(self.probe.call_args_list[-1].kwargs, {'require_removal_cadence':True})
+        self.launch.assert_called_once()
+
+    def test_unknown_journal_change_before_or_after_staging_cannot_launch(self):
+        path = self.use_unknown_ledger()
+        changed = copy.deepcopy(self.ledger)
+        changed['unknown_rent_journals'][UNKNOWN_TAG]['journal_sha256'] = 'f'*64
+        self.probe.return_value = changed
+        with self.assertRaisesRegex(release.ReleaseError,'unknown_rent_journal_changed'):
+            handoff.successor(journal_id='unknown-112')
+        self.assertEqual(json.loads(path.read_text())['phase'], 'drain_requested')
+        self.probe.side_effect = [self.ledger,changed]
+        with self.assertRaisesRegex(release.ReleaseError,'ledger_changed_before_launch'):
+            handoff.successor(journal_id='unknown-112')
+        self.assertEqual(json.loads(path.read_text())['phase'], 'launch_intent')
+        self.launch.assert_not_called()
+
+    def test_unknown_handoff_requires_named_supervision_before_drain(self):
+        self.use_unknown_ledger()
+        handoff.record_path().unlink()
+        self.supervisor.return_value = {**self.unit,'MainPID':'321','ActiveState':'active'}
+        self.receipt.return_value = {'state':'running'}
+        self.mock(handoff, 'only_controller')
+        self.mock(handoff, 'supervisor_client', return_value={'supervisor_pid':321,'docker_client_pids':[322]})
+        with self.assertRaisesRegex(release.ReleaseError,'unknown_rent_requires_named_journal'):
+            handoff.prepare('b'*40,'sixnine-old.service')
+        self.drain.assert_not_called()
+        self.assertFalse(handoff.record_path().exists())
+
     def test_new_journal_start_binds_supervisor_and_preserves_original_through_success(self):
         path = self.new_journal()
         original = handoff.record_path().read_bytes()
@@ -616,6 +815,7 @@ class RealSchemaProbeTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch.object(sqlalchemy,'create_engine',return_value=engine), \
                         patch.object(runtime,'create_registry',return_value=case.registry), \
+                        patch.object(runtime,'load_runtime_config',return_value={'work_dir':'/unused-for-deletions'}), \
                         patch.object(Settings,'from_environment',return_value=SimpleNamespace(database_url='fixture')), \
                         redirect_stdout(output):
                     exec(compile(script,'<read-only-probe>','exec'),{})
@@ -633,6 +833,86 @@ class RealSchemaProbeTests(unittest.TestCase):
                 worker = conn.execute(select(registered_workers)).mappings().one()
                 self.assertEqual(worker['id'],'historical-worker')
                 self.assertNotEqual(worker['state'],'retired')
+        finally:
+            case.tearDown(); case.doCleanups()
+
+    def test_stopped_unknown_survives_shutdown_successor_and_repeated_ticks_without_rent(self):
+        from test_operator_capacity import OperatorTests, OperatorProvider, FakeBoot
+        from studio_platform.operator_controller import OperatorController
+        from studio_platform.rent_journal import RentJournal
+        from studio_platform.settings import Settings
+        from types import SimpleNamespace
+        import sqlalchemy
+        import studio_platform.operator_runtime as runtime
+        case = OperatorTests(); case.setUp()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                work_dir = Path(directory).resolve()
+                journal = RentJournal(work_dir/'rent-journal')
+                class UnknownProvider(OperatorProvider):
+                    def create(self, tag, launch, *, hard_deadline):
+                        self.creates.append((tag,launch,hard_deadline))
+                        journal.save(tag,'checking')
+                        deadline = min(case.now+3600,hard_deadline)
+                        ttl = {'version':1,'created_at':case.now,'hard_deadline':hard_deadline,'requested_hours':1,
+                               'deadline':deadline,'effective_deadline':deadline,'instance_id':None,
+                               'provider_created_at':None,'attempts':[]}
+                        journal.save(tag,'post_started',absolute_ttl=ttl)
+                        raise TimeoutError('synthetic original response lost')
+                case.provider = UnknownProvider()
+                case.create(); case.controller.tick()
+                node = case.service.state(case.actor)['nodes'][0]
+                stop = case.service.node_command(case.actor,node['id'],{'expected_version':node['version']},'stop-unknown','stop')
+                case.controller.tick()
+                intent = case.repo.list_instance_intents()[0]
+                marker_path = work_dir/'rent-journal'/(intent['id']+'.json')
+                original_marker = marker_path.read_bytes()
+                budget = case.repo.get_budget('owner-budget')
+                scripts = []
+                real_engine = case.repo.engine
+                class Connection:
+                    def __enter__(self):
+                        self.conn = real_engine.connect(); return self
+                    def __exit__(self,*args): self.conn.close()
+                    def execute(self,statement,*args,**kwargs):
+                        if str(statement).startswith('SET TRANSACTION'): return None
+                        return self.conn.execute(statement,*args,**kwargs)
+                engine = SimpleNamespace(connect=lambda:Connection(),dispose=lambda:None)
+                def compose(*args,**kwargs):
+                    script = args[-1]; scripts.append(script); output = io.StringIO()
+                    with patch.object(sqlalchemy,'create_engine',return_value=engine), \
+                            patch.object(runtime,'create_registry',return_value=case.registry), \
+                            patch.object(runtime,'load_runtime_config',return_value={'work_dir':str(work_dir)}), \
+                            patch.object(Settings,'from_environment',return_value=SimpleNamespace(database_url='fixture')), \
+                            redirect_stdout(output):
+                        exec(compile(script,'<read-only-probe>','exec'),{})
+                    return output.getvalue().encode()
+                with patch.object(host,'compose',side_effect=compose):
+                    original = handoff.ledger_probe(Path('/old-image'),{})
+                    case.controller.request_shutdown(); case.controller.tick()
+                    status = case.controller.shutdown_status()
+                    self.assertEqual(status['state'],'shutdown_complete')
+                    self.assertFalse(status['cloud_removal_confirmed'])
+                    self.assertFalse(status['billing_settled'])
+                    retired = handoff.ledger_probe(Path('/old-image'),{})
+                    successor = handoff.ledger_probe(Path('/new-image'),{},require_removal_cadence=True)
+                    self.assertEqual(original,retired)
+                    self.assertEqual(retired,successor)
+                case.now += 61  # Original exclusive leader lease expires before its replacement.
+                replacement = OperatorController(case.service,provider_factory=lambda _:case.provider,
+                    boot_factory=lambda *args:FakeBoot(case,*args),enabled=True,leader_id='successor')
+                for _ in range(3): replacement.tick()
+                after = case.repo.list_instance_intents()[0]
+                self.assertEqual((after['id'],after['state'],after['provider_instance_id'],after['hard_deadline']),
+                                 (intent['id'],'creation_unknown',None,intent['hard_deadline']))
+                self.assertEqual(marker_path.read_bytes(),original_marker)
+                self.assertEqual(case.repo.get_budget('owner-budget'),budget)
+                self.assertEqual(len(case.provider.creates),1)
+                self.assertEqual(case.provider.destroys,[])
+                self.assertEqual(replacement.boots,{})
+                operation = next(op for op in case.service.state(case.actor)['operations'] if op['id']==stop['operation']['id'])
+                self.assertEqual(operation['state'],'waiting')
+                self.assertTrue(all('READ ONLY' in script for script in scripts))
         finally:
             case.tearDown(); case.doCleanups()
 

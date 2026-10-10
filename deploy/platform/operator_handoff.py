@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""One-use, protected handoff of an operator controller with pending deletions.
+"""One-use, protected handoff of stopped operator rental obligations.
 
 Run ``prepare --target-commit SHA --unit OLD.service`` after the compatible
 app-only release. After the old supervisor exits, run ``start`` under a NEW
@@ -176,11 +176,64 @@ def successor_supervisor(unit, journal_id, *, proc_root=Path('/proc'), pid=None)
     return value
 
 
-def ledger_summary(rows, binding_hashes):
+def unknown_rent_journals(rows, work_dir):
+    """Read existing private markers only; never initialize or repair a journal."""
+    import hashlib
+    import json
+    import os
+    from pathlib import Path
+    import stat
+    import uuid
+    from studio_platform.rent_journal import RentJournal
+    result = {}
+    for intent in rows['intents']:
+        if intent['state'] != 'creation_unknown':
+            continue
+        tag = intent['id']
+        if (intent.get('provider') != 'lium' or intent.get('provider_instance_id') is not None
+                or not isinstance(tag, str) or str(uuid.UUID(tag)) != tag):
+            raise ValueError('operator_handoff_unknown_rent_unsafe')
+        directory = Path(work_dir)/'rent-journal'
+        if (not directory.is_absolute() or not directory.is_dir() or directory.is_symlink()
+                or directory.resolve() != directory):
+            raise ValueError('operator_handoff_unknown_rent_journal_unavailable')
+        info = directory.stat()
+        if os.name != 'nt' and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+            raise ValueError('operator_handoff_unknown_rent_journal_not_private')
+        path = directory/(tag+'.json')
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(descriptor, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if (path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or os.name != 'nt' and (info.st_uid != os.getuid() or info.st_mode & 0o077)):
+                raise ValueError('operator_handoff_unknown_rent_journal_not_private')
+            raw = source.read(4097)
+        if not 0 < len(raw) <= 4096:
+            raise ValueError('operator_handoff_unknown_rent_journal_invalid')
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError('operator_handoff_unknown_rent_journal_invalid')
+                value[key] = item
+            return value
+        marker = RentJournal._validate(json.loads(raw, object_pairs_hook=unique), tag)
+        ttl = marker.get('absolute_ttl')
+        if (marker['phase'] != 'post_started' or ttl is None or ttl['instance_id'] is not None
+                or ttl['created_at'] != intent['created_at'] or ttl['hard_deadline'] != intent['hard_deadline']):
+            raise ValueError('operator_handoff_unknown_rent_journal_mismatch')
+        result[tag] = {'tag':tag, 'phase':marker['phase'], 'journal_sha256':hashlib.sha256(raw).hexdigest(),
+                       'executor_id':marker.get('executor_id'), 'absolute_ttl':ttl}
+    return result
+
+
+def ledger_summary(rows, binding_hashes, unknown_journals=None):
     """Pure validation of a read-only snapshot; no ledger writes or provider calls."""
     import hashlib
     import json
     import math
+    import re
+    from studio_platform.rent_journal import RentJournal
     def check(condition):
         if not condition:
             raise ValueError('operator_handoff_ledger_unsafe')
@@ -193,21 +246,57 @@ def ledger_summary(rows, binding_hashes):
     intents = {row['id']:row for row in rows['intents']}
     nodes = {row['intent_id']:row for row in rows['nodes']}
     actions = {row['intent_id']:row for row in rows['actions']}
+    unknown_journals = {} if unknown_journals is None else unknown_journals
+    check(isinstance(unknown_journals, dict))
+    unknown = {i['id'] for i in intents.values() if i['state'] == 'creation_unknown'}
+    check(set(unknown_journals) == unknown)
+    active = {'accepted', 'running', 'waiting', 'unknown'}
     live = []
     for intent in intents.values():
         if intent['state'] == 'destroyed':
             continue
         node, action = nodes.get(intent['id']), actions.get(intent['id'])
-        check(intent['state'] == 'destroying' and bool(intent.get('provider_instance_id'))
-              and node is not None and node['desired_state'] == 'stopped' and action is not None
-              and type(action.get('destroy_started_at')) in (int, float)
-              and math.isfinite(action['destroy_started_at'])
+        check(node is not None and node['desired_state'] == 'stopped' and action is not None
               and node['binding_hash'] == binding_hashes.get(node['binding_id']))
+        if intent['id'] in unknown:
+            journal = unknown_journals[intent['id']]
+            check(isinstance(journal, dict) and set(journal) ==
+                  {'tag', 'phase', 'journal_sha256', 'executor_id', 'absolute_ttl'})
+            ttl = journal.get('absolute_ttl', {})
+            RentJournal._validate_ttl(ttl)
+            check(intent.get('provider') == 'lium' and intent.get('provider_instance_id') is None
+                  and journal.get('tag') == intent['id'] and journal.get('phase') == 'post_started'
+                  and isinstance(journal.get('journal_sha256'), str)
+                  and re.fullmatch(r'[a-f0-9]{64}', journal['journal_sha256']) is not None
+                  and ttl.get('created_at') == intent['created_at']
+                  and ttl.get('hard_deadline') == intent['hard_deadline'] and ttl.get('instance_id') is None
+                  and type(action.get('create_started_at')) in (int, float)
+                  and math.isfinite(action['create_started_at'])
+                  and action.get('destroy_started_at') is None)
+            check(any(c['kind'] == 'stop' and c['state'] in active
+                      and c['payload'].get('node_id') == intent['id'] for c in rows['commands']))
+            start = next((c for c in rows['commands'] if c['id'] == node['command_id'] and c['kind'] == 'start'), None)
+            check(start is not None and start['payload']['hard_deadline'] == intent['hard_deadline'])
+            owned = [n for n in nodes.values() if n['command_id'] == start['id']]
+            count = start['payload']['selection']['node_count']
+            check(type(count) is int and count > 0 and len(owned) == count
+                  and {n['ordinal'] for n in owned} == set(range(count)))
+            selected = start['payload'].get('selected_offer')
+            if selected is not None:
+                check(isinstance(selected, dict) and selected.get('provider') == 'lium'
+                      and bool(selected.get('offer_id')) and selected['offer_id'] == journal.get('executor_id'))
+        else:
+            check(intent['state'] == 'destroying' and bool(intent.get('provider_instance_id'))
+                  and type(action.get('destroy_started_at')) in (int, float)
+                  and math.isfinite(action['destroy_started_at']))
         reservations = [r for r in rows['reservations'] if r['reference_type'] == 'instance'
                         and r['reference_id'] == intent['id']]
         check(bool(reservations) and all(r['state'] == 'reserved' for r in reservations))
+        if intent['id'] in unknown:
+            check(type(intent.get('reserved_cost_microusd')) is int and intent['reserved_cost_microusd'] > 0
+                  and all(r['amount_microusd'] == intent['reserved_cost_microusd']
+                          and r.get('actual_cost_microusd') is None for r in reservations))
         live.append(intent['id'])
-    active = {'accepted', 'running', 'waiting', 'unknown'}
     for command in rows['commands']:
         if command['state'] not in active:
             continue
@@ -217,11 +306,13 @@ def ledger_summary(rows, binding_hashes):
             count = payload['selection']['node_count']
             check(type(count) is int and count > 0 and len(owned) == count
                   and {n['ordinal'] for n in owned} == set(range(count)))
-            check(all(n['intent_id'] in intents and intents[n['intent_id']]['state'] in {'destroying', 'destroyed'}
+            check(all(n['intent_id'] in intents and (intents[n['intent_id']]['state'] in {'destroying', 'destroyed'}
+                      or n['intent_id'] in unknown)
                       and n['desired_state'] == 'stopped' for n in owned))
         else:
             check(command['kind'] in {'stop', 'drain'} and payload.get('node_id') in intents
-                  and intents[payload['node_id']]['state'] in {'destroying', 'destroyed'})
+                  and (intents[payload['node_id']]['state'] in {'destroying', 'destroyed'}
+                       or payload['node_id'] in unknown))
     # Mutable observations/status may advance during graceful shutdown. Every
     # accepted identity, request, budget limit/reservation and original deadline
     # remains bound. Settlement is allowed only through the existing controller.
@@ -236,20 +327,24 @@ def ledger_summary(rows, binding_hashes):
         'reservations':[stable(r, {'state', 'actual_cost_microusd'}) for r in rows['reservations']],
         'policy':rows['policy'], 'gate':rows['gate'], 'limits':rows['limits'],
     }
+    if unknown_journals:
+        immutable['unknown_rent_journals'] = unknown_journals
     return {'schema_version':1, 'immutable_hash':digest(immutable), 'pending_ids':sorted(live),
+            'unknown_rent_journals':unknown_journals,
             'accounting_hash':digest([rows['accounts'], rows['reservations']])}
 
 
 def ledger_probe(directory, environment, *, require_removal_cadence=False):
     # Snapshot is consistent and read-only. No Repository/factory construction,
     # schema initialization, credentials, provider requests or mutation SQL.
-    script = inspect.getsource(ledger_summary) + '''
+    script = inspect.getsource(unknown_rent_journals) + inspect.getsource(ledger_summary) + '''
 from sqlalchemy import create_engine,text,select
 from studio_platform.settings import Settings
-from studio_platform.operator_runtime import create_registry
+from studio_platform.operator_runtime import create_registry,load_runtime_config
 from studio_platform.repository import metadata
 import json,time
 registry=create_registry(RUNTIME)
+runtime=load_runtime_config(RUNTIME,validate_private_paths=False)
 engine=create_engine(Settings.from_environment().database_url)
 with engine.connect() as conn:
  conn.execute(text('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY'))
@@ -264,10 +359,11 @@ with engine.connect() as conn:
  'bound_workers':"SELECT count(*) FROM platform_registered_workers WHERE current_job_id IS NOT NULL OR (state != 'retired' AND expires_at > :now)"}
  observed_at=time.time()
  rows['counts']={key:conn.execute(text(sql),{'now':observed_at}).scalar_one() for key,sql in queries.items()}
- print(json.dumps(ledger_summary(rows,{key:b.fingerprint for key,b in registry.bindings.items()})))
+ journals=unknown_rent_journals(rows,runtime['work_dir'])
+ print(json.dumps(ledger_summary(rows,{key:b.fingerprint for key,b in registry.bindings.items()},journals)))
 engine.dispose()
 '''
-    script = script.replace('create_registry(RUNTIME)', 'create_registry('+repr(host.RUNTIME.as_posix())+')')
+    script = script.replace('RUNTIME', repr(host.RUNTIME.as_posix()))
     if require_removal_cadence:
         script = ('from studio_platform.scaler import REMOVAL_CHECK_INTERVAL_SECONDS\n'
                   'assert REMOVAL_CHECK_INTERVAL_SECONDS == 60\n') + script
@@ -308,6 +404,8 @@ def prepare(commit, unit, *, journal_id=None):
         release.require(proof.get('state') in ('running', 'degraded'), 'operator_handoff_receipt_not_running')
         ledger = ledger_probe(directory, environment)
         release.require(bool(ledger['pending_ids']), 'operator_handoff_pending_deletion_required')
+        release.require(not ledger.get('unknown_rent_journals') or journal_id is not None,
+                        'operator_handoff_unknown_rent_requires_named_journal')
         value = {'schema_version':1, 'phase':'drain_requested', 'target_commit':target, 'target_image_id':image,
             'old_prepared':old, 'old_pin':pin, 'old_overlay':release._protected_json(host.ROOT/'overlay.json'),
             'supervisor_unit':unit, 'supervisor':unit_state, 'supervisor_client':client,
@@ -318,7 +416,9 @@ def prepare(commit, unit, *, journal_id=None):
         # retained for inspection; prepare never retries by removing this file.
         host.atomic(path, value)
         host.request_drain(directory, environment, pin)
-        return {'state':'drain_requested', 'target_commit':target, 'pending_deletions':len(ledger['pending_ids'])}
+        return {'state':'drain_requested', 'target_commit':target,
+                'pending_deletions':len(ledger['pending_ids'])-len(ledger.get('unknown_rent_journals', {})),
+                'pending_unknown_rentals':len(ledger.get('unknown_rent_journals', {}))}
 
 
 def successor(*, journal_id=None):
@@ -350,7 +450,10 @@ def successor(*, journal_id=None):
     ledger = ledger_probe(old_directory, old_environment)
     release.require(ledger['immutable_hash'] == value['ledger']['immutable_hash']
         and set(ledger['pending_ids']) <= set(value['ledger']['pending_ids']), 'operator_handoff_ledger_changed')
-    if journal_id is not None:
+    unknown = value['ledger'].get('unknown_rent_journals', {})
+    release.require(ledger.get('unknown_rent_journals', {}) == unknown
+        and (not unknown or journal_id is not None), 'operator_handoff_unknown_rent_journal_changed')
+    if journal_id is not None or unknown:
         release.require(ledger['accounting_hash'] == value['ledger']['accounting_hash'],
                         'operator_handoff_accounting_changed')
     commit, directory, environment, image = current_target(value['target_commit'])
