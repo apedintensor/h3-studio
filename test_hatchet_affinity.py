@@ -1,6 +1,7 @@
 """Original replica affinity and prompt callback yielding; no broker/GPU calls."""
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -66,10 +67,16 @@ class HatchetAffinityTests(LedgerCase):
         runner = HatchetSlotRunner(self.repo, self.store, self.directory / worker, backend=backend,
             control=self.control, broker_config=self.config, collection_lock_dir=self.directory / "collection-lock",
             client_factory=lambda _config: sdk, submission_guard=lambda _job: True)
+        # Replace only the callback's module reference. Patching the shared
+        # time.sleep function also intercepts legitimate Linux ffmpeg/Popen
+        # waits and turns valid CPU media collection into a false failure.
+        callback_time = SimpleNamespace(monotonic=time.monotonic,
+            sleep=Mock(side_effect=AssertionError("callback did not promptly yield")))
         with patch.dict("sys.modules", {"hatchet_sdk": self.sdk_module()}), \
                 patch("studio_platform.hatchet_dispatch.os", SimpleNamespace(name="posix")), \
-                patch("studio_platform.hatchet_dispatch.time.sleep", side_effect=AssertionError("callback did not promptly yield")):
+                patch("studio_platform.hatchet_dispatch.time", callback_time):
             runner.run_forever(worker, "hatchet-test")
+        callback_time.sleep.assert_not_called()
         self.assertEqual(sdk.worker_options["labels"]["sixnine_worker"], worker)
         # Workflow registration remains shared; an individual replica cannot
         # overwrite the common workflow's defaults with its own physical ID.
