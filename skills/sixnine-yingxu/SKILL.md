@@ -9,7 +9,7 @@ Use the user's exact Sixnine origin and scoped API key. The production origin is
 
 ## Connect and choose the workflow
 
-Read same-origin `/for-agents/guide.json` and `/for-agents/SKILL.md` without credentials. `/llms.txt` links both; `/for-agents/skill.zip` contains this skill, `scripts/sixnine.py` and `scripts/connect.py`. Public pages contain no private projects and do not report live GPU availability. Installing the skill is optional; the same HTTP API works directly.
+Read same-origin `/for-agents/guide.md` (plain Markdown instructions and complete public API examples), `/for-agents/guide.json` and `/for-agents/SKILL.md` without credentials. `/for-agents/guide.md?download=true` downloads one offline-readable document; `/for-agents/skill.zip` contains that guide as `README.md`, this skill, `scripts/sixnine.py` and `scripts/connect.py`. `/llms.txt` links these resources. If a browsing/search tool cannot read the documents, retrieve them directly over HTTPS from the same user-supplied origin or use the user's downloaded file; that failure does not mean login is required. Public reads need no API key or cookies. Public pages contain no private projects and do not report live GPU availability. Installing the skill is optional; the same HTTP API works directly.
 
 For conversation history and editable generation cards, use **Quick Chat** below. The legacy quick creation path remains valid for a single editable project clip; do not ask the user to design chapters for one clip. For a script, episodes or multiple scenes, use the story workflow. They share the same owner, asset and job authority; preserve unrelated content when using an existing project.
 

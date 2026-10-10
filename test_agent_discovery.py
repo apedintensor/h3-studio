@@ -28,7 +28,8 @@ class AgentDiscoveryTests(unittest.TestCase):
                 self.assertEqual(head.content, b"")
         html = self.client.get("/for-agents").text
         self.assertNotIn("<script", html)
-        for link in ("/for-agents/guide.json", "/for-agents/SKILL.md", "/for-agents/skill.zip", "/llms.txt"):
+        for link in ("/for-agents/guide.json", "/for-agents/guide.md", "/for-agents/guide.md?download=true",
+                     "/for-agents/SKILL.md", "/for-agents/skill.zip", "/llms.txt"):
             self.assertIn('href="'+link+'"', html)
         self.assertIn('rel="service-doc"', self.client.get("/for-agents").headers["Link"])
 
@@ -57,7 +58,8 @@ class AgentDiscoveryTests(unittest.TestCase):
         self.assertEqual(authenticated.json()["generation_availability"], contract)
 
     def test_public_content_does_not_change_after_private_edit(self):
-        paths = ("/for-agents", "/llms.txt", "/for-agents/guide.json", "/for-agents/SKILL.md")
+        paths = ("/for-agents", "/llms.txt", "/for-agents/guide.json", "/for-agents/guide.md",
+                 "/for-agents/guide.md?download=true", "/for-agents/SKILL.md")
         anonymous = {path: self.client.get(path).content for path in paths}
         self.login()
         self.client.post("/v1/projects", json={"title": "PRIVATE PROJECT NEVER ADVERTISE",
@@ -73,8 +75,10 @@ class AgentDiscoveryTests(unittest.TestCase):
         response = self.client.get("/for-agents/skill.zip")
         self.assertEqual(response.headers["content-type"], "application/zip")
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-            self.assertEqual(set(archive.namelist()), {"sixnine-yingxu/"+name for name in agent_discovery.SKILL_FILES})
+            self.assertEqual(set(archive.namelist()), {"sixnine-yingxu/SKILL.md", "sixnine-yingxu/README.md",
+                "sixnine-yingxu/scripts/sixnine.py", "sixnine-yingxu/scripts/connect.py"})
             self.assertEqual(archive.read("sixnine-yingxu/SKILL.md"), self.client.get("/for-agents/SKILL.md").content)
+            self.assertEqual(archive.read("sixnine-yingxu/README.md"), self.client.get("/for-agents/guide.md").content)
             for name in agent_discovery.SKILL_FILES:
                 self.assertEqual(archive.read("sixnine-yingxu/"+name), (agent_discovery.SKILL_ROOT/name).read_bytes())
         manifest = self.client.get("/for-agents/connect-manifest.json").json()
@@ -83,6 +87,29 @@ class AgentDiscoveryTests(unittest.TestCase):
         guide = self.client.get("/for-agents/guide.json").json()
         self.assertFalse(manifest["raw_api_key_response"])
         self.assertTrue(guide["connection"]["profile"]["owner_only"])
+
+    def test_markdown_read_and_download_include_current_contract_without_login(self):
+        guide = self.client.get("/for-agents/guide.json").json()
+        read = self.client.get(guide["public_resources"]["guide_markdown"])
+        download = self.client.get(guide["public_resources"]["guide_download"])
+        self.assertEqual(read.status_code, 200)
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(read.headers["content-type"], "text/markdown; charset=utf-8")
+        self.assertNotIn("content-disposition", read.headers)
+        self.assertEqual(download.headers["content-disposition"], 'attachment; filename="sixnine-agent-guide.md"')
+        self.assertEqual(download.content, read.content)
+        embedded = read.text.split("```json\n", 1)[1].rsplit("\n```", 1)[0]
+        self.assertEqual(json.loads(embedded), guide)
+        self.assertIn("same user-supplied origin", read.text)
+        self.assertIn("A tool-specific reading failure is not evidence", read.text)
+        self.assertIn("account/business API calls do require authentication", read.text)
+        self.assertIn("does not install software", read.text)
+        self.assertIn("/for-agents/guide.md?download=true", self.client.get("/llms.txt").text)
+        head = self.client.head(guide["public_resources"]["guide_download"])
+        self.assertEqual(head.status_code, 200)
+        self.assertEqual(head.content, b"")
+        self.assertEqual(head.headers["content-disposition"], download.headers["content-disposition"])
+        self.assertEqual(head.headers["content-length"], download.headers["content-length"])
 
     def test_missing_or_oversize_skill_fails_closed_without_local_path(self):
         with tempfile.TemporaryDirectory() as folder:

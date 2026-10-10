@@ -13,8 +13,8 @@ from .agent_connect import CODE_TTL_SECONDS, RECOVERY_TTL_SECONDS, PROFILE_ID, P
 from .agent_connect_routes import PUBLIC_GET_PATHS, HELPER_PATH, MANIFEST_PATH, helper_manifest
 
 PUBLIC_PATHS = frozenset({"/for-agents", "/for-agents/", "/llms.txt",
-    "/for-agents/guide.json", "/for-agents/SKILL.md", "/for-agents/skill.zip"}) | PUBLIC_GET_PATHS
-DISCOVERY_LINK = '</for-agents>; rel="service-doc"; type="text/html", </llms.txt>; rel="alternate"; type="text/plain"'
+    "/for-agents/guide.json", "/for-agents/guide.md", "/for-agents/SKILL.md", "/for-agents/skill.zip"}) | PUBLIC_GET_PATHS
+DISCOVERY_LINK = '</for-agents>; rel="service-doc"; type="text/html", </llms.txt>; rel="alternate"; type="text/plain", </for-agents/guide.md>; rel="alternate"; type="text/markdown"'
 SKILL_ROOT = Path(__file__).resolve().parent.parent / "skills" / "sixnine-yingxu"
 SKILL_FILES = ("SKILL.md", "scripts/sixnine.py", "scripts/connect.py")
 MAX_SKILL_BYTES = 512 * 1024
@@ -85,6 +85,7 @@ def public_guide():
             "boundary": "Advisory only; available is true only for ready/busy. This read never reserves, rents or submits. It does not replace capabilities/preflight or authorize operator calls. Reconcile an existing uncertain job using its original receipt/key regardless of current availability.",
         },
         "public_resources": {"html": "/for-agents", "text": "/llms.txt", "manifest": "/for-agents/guide.json",
+            "guide_markdown": "/for-agents/guide.md", "guide_download": "/for-agents/guide.md?download=true",
             "skill": "/for-agents/SKILL.md", "skill_download": "/for-agents/skill.zip",
             "connection_helper": HELPER_PATH, "connection_manifest": MANIFEST_PATH},
         "connection": {
@@ -213,6 +214,7 @@ def skill_bundle():
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
         for name in SKILL_FILES:
             bundle.writestr("sixnine-yingxu/" + name, read_skill_file(name))
+        bundle.writestr("sixnine-yingxu/README.md", guide_markdown().encode("utf-8"))
     return output.getvalue()
 
 
@@ -223,9 +225,13 @@ def llms_text():
 
 ## Start here
 - [Agent onboarding](/for-agents): Public HTML; no JavaScript or login is needed to read it.
+- [Complete Markdown guide](/for-agents/guide.md): Plain Agent-readable instructions and the structured API contract, no login needed.
+- [Download the Markdown guide](/for-agents/guide.md?download=true): Save one file to read offline or attach to Codex.
 - [Machine-readable guide](/for-agents/guide.json): Authentication, request examples and supported workflow.
 - [Skill instructions](/for-agents/SKILL.md): How to work safely on the user's story.
-- [Skill download](/for-agents/skill.zip): SKILL.md, scripts/sixnine.py and scripts/connect.py. The connection helper uses the Python standard library; the API/media helper also requires httpx.
+- [Skill download](/for-agents/skill.zip): README.md, SKILL.md, scripts/sixnine.py and scripts/connect.py. The README contains the complete public guide and API examples. The connection helper uses the Python standard library; the API/media helper also requires httpx.
+
+If a browsing/search tool cannot open these public documents, retrieve them directly over HTTPS from the user's supplied website origin, or ask the user to attach the downloaded guide. A tool-specific reading failure is not evidence that the documents require login. Public reads need no cookie or API key; account/business API calls do require authentication. Resolve all / paths against the same user-supplied origin and never forward credentials through redirects.
 
 ## Quick Chat: sessions and job cards
 Read the guide JSON's quick_chat section and authenticated GET /v1/quick-chat/schema. POST /v1/quick-chat/sessions and preserve returned next_settings including deployment_profile_id. Read capabilities.deployment_profiles and the selected profile's generation_support[fl|ref] controls, limits and joint_cases. POST the session's turns with current expected_version, session model_id, assistant_mode=none, create_card=true and text containing the complete prompt. This inherits session materials and next_settings, creates a card without calling the disabled-by-default website assistant and does not start generation. The chat model_id is not a video deployment profile.
@@ -253,18 +259,37 @@ Adopt successful artifacts into the target shot and verify the saved document. R
 """
 
 
+def guide_markdown():
+    """One offline-readable document generated from the current public contract."""
+    guide = public_guide()
+    return llms_text() + """
+## Using the downloaded package
+
+Start with this guide (`README.md` in the ZIP), then read the adjacent `SKILL.md` in that package. `scripts/connect.py` is the connection helper and `scripts/sixnine.py` is the API/media helper. Downloading the guide or ZIP does not install software, authorize a connection, call a model, start a GPU or submit generation.
+
+All endpoint paths in this document are relative to the HTTPS website origin supplied by the user (loopback HTTP is allowed only for a local preview). The package contains no credential, private account data or current GPU observations. Once connected, refresh the authenticated schemas, capabilities and exact profile/mode availability before creating or submitting work. Offline examples describe the contract, not current availability.
+
+## Structured API contract and request examples
+
+The JSON below is the same public contract served by `/for-agents/guide.json` in this release. It includes the Quick Chat session/card examples as well as the supported story workflow. Use returned IDs and current versions in place of example placeholders.
+
+```json
+""" + json.dumps(guide, ensure_ascii=False, indent=2) + "\n```\n"
+
+
 def landing_html():
     guide = public_guide()
     steps = "".join(f'<li><strong>{html.escape(item["step"])}</strong><p>{html.escape(item["action"])}</p></li>' for item in guide["workflow"])
     example = html.escape(json.dumps(guide["examples"]["create_quick_project"], ensure_ascii=False, indent=2))
     return '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>让 AI 和你一起创作 · 映序 Agent 接入</title><meta name="description" content="把映序交给 Codex：读取使用指南，授权指定故事，通过 API 创作，再回网页查看和调整。">
-<link rel="alternate" type="text/plain" href="/llms.txt"><link rel="alternate" type="application/json" href="/for-agents/guide.json">
+<link rel="alternate" type="text/plain" href="/llms.txt"><link rel="alternate" type="text/markdown" href="/for-agents/guide.md"><link rel="alternate" type="application/json" href="/for-agents/guide.json">
 <style>body{margin:0;background:#f7f8f3;color:#1a3028;font:17px/1.7 system-ui,sans-serif}main{max-width:960px;margin:auto;padding:40px 24px 72px}a{color:#245c42}nav{display:flex;gap:22px;flex-wrap:wrap}h1{font-size:clamp(32px,5vw,52px);line-height:1.2;margin:40px 0 20px}h2{margin-top:40px}p{max-width:78ch}.tag{font-size:13px;letter-spacing:.12em}.panel{background:white;border:1px solid #d3dfd1;border-radius:16px;padding:24px;margin:24px 0}.links{display:flex;gap:12px;flex-wrap:wrap}.links a{border:1px solid #afc4ac;border-radius:8px;padding:8px 14px;text-decoration:none}code,pre{font:14px/1.6 ui-monospace,monospace}pre{overflow:auto;background:#edf1e9;padding:20px;border-radius:10px}li{margin-bottom:18px}li p{margin:4px 0}small{color:#526556}</style></head><body><main>
-<nav><a href="/">← 回到映序</a><a href="/llms.txt">llms.txt</a><a href="/for-agents/guide.json">机器可读指南</a></nav>
+<nav><a href="/">← 回到映序</a><a href="/llms.txt">llms.txt</a><a href="/for-agents/guide.json">机器可读指南</a><a href="/for-agents/SKILL.md">Skill 指令</a></nav>
 <p class="tag">FOR AI AGENTS · API V1</p><h1>让 AI 创作，<br>让你随时接手。</h1>
 <p>把这个网站链接发给 Codex 或其他支持 API 的 Agent。一个短片可以直接用快速创作：提示词、图片、动作视频、音频和设置都保存到同一份网页草稿。需要改编剧本时，也能整理故事、章节和分镜。</p>
-<div class="links"><a href="/for-agents/SKILL.md">阅读 Skill</a><a href="/for-agents/skill.zip">下载 Skill 包</a><a href="/">登录并连接 Agent</a></div>
+<div class="links"><a href="/for-agents/guide.md">给 Agent 阅读的指南</a><a href="/for-agents/guide.md?download=true" download="sixnine-agent-guide.md">下载完整指南 .md</a><a href="/for-agents/skill.zip">下载 Skill 包 .zip</a><a href="/">登录并连接 Agent</a></div>
+<p><small>指南和下载公开可用，不需要登录或 API Key。可把 Markdown 文件直接发给 Codex；若网页读取工具打不开，使用同站 HTTPS 直接下载即可。连接账户、读取作品和提交任务时才需要授权。</small></p>
 <section class="panel"><h2 style="margin-top:0">三步开始</h2><ol><li><strong>先把链接和创作要求给 Agent。</strong>这页、Skill 和机器指南公开可读，无需登录。</li><li><strong>登录网站，明确授权一次连接。</strong>连接界面上线后，复制短时有效的连接说明给 Agent。辅助脚本在本机生成正式 Key，并通过系统凭据存储保存；无需安装我们的 AI Registry。正式 Key 不进入聊天或链接。当前页面是否提供连接按钮以实际前端发布为准；手动 API Key 是高级备用方式。</li><li><strong>回网站看结果，再继续调整。</strong>打开同一云故事，查看活动和任务；定位章节、角色或镜头，修改要求后只重做需要的部分。旧候选保留，选中哪一版由你决定。</li></ol>
 <small>分享链接只用于发现功能。写入需要账户授权；生成还取决于当前服务是否启用、输入是否合格和可用预算。此页不代表 GPU 已上线。</small></section>
 <h2>可直接发给 Agent 的任务示例</h2><p>“阅读这个网站的 /for-agents 使用指南。用我已配置的凭据，为这个广告想法创建一个快速视频草稿，把我的图片、动作视频和音频放到对应位置，返回网页让我继续修改。生成前核对可用能力、阻塞原因和费用；只有在我已经授权的范围内才提交。结果先放候选，不覆盖我已选择的版本。”</p><p>如果你在做短剧，可以要求 Agent 建立章节、角色和分镜；同一份故事也能在快速创作中单独调整某个镜头。</p>
@@ -273,7 +298,7 @@ def landing_html():
 <h2>原有快速草稿与故事接口</h2><p>使用本人全部项目范围和 projects:create 权限。为每次新建保存唯一的幂等键；重试原请求沿用原键。返回的 project.journey.reviewShotId 是单镜头 ID。随后用 shot.configure_generation 保存生成设置；创建草稿不会启动 GPU。</p><pre>''' + example + '''</pre><p>完整的纯文字、参考素材、预检、提交和候选采用示例见<a href="/for-agents/guide.json">机器可读指南</a>。</p>
 <h2>真实边界</h2><p>网站公开说明与已授权 API 文档分开。认证后的 <code>/v1/agent-guide</code>、<code>/v1/guided-schema</code>、<code>/v1/capabilities</code> 和 <code>/openapi.json</code> 是调用依据。若生成计划返回阻塞，保留草稿并说明原因；不要把演示素材当成生成成功。</p>
 <p>网站聊天助手默认关闭；不支持未配置的图像/音乐/Marble 生成、团队成员共享权限或服务器媒体 ZIP。外部 Agent 可以自行编写完整提示词并保存为任务卡或故事草稿；已有 API Key 不会扩大这些能力。</p>
-<p><small>Skill 包只包含 SKILL.md、scripts/sixnine.py 和 scripts/connect.py；连接脚本只需 Python 标准库与受支持的系统凭据存储，API/媒体辅助脚本还需要 httpx。你也可以直接使用同源 HTTP API，无需安装 Skill。下载不会自动安装或授权。</small></p></main></body></html>'''
+<p><small>Skill 包包含完整指南 README.md、SKILL.md、scripts/sixnine.py 和 scripts/connect.py；连接脚本只需 Python 标准库与受支持的系统凭据存储，API/媒体辅助脚本还需要 httpx。你也可以直接使用同源 HTTP API，无需安装 Skill。下载不会自动安装或授权。</small></p></main></body></html>'''
 
 
 def register_routes(app):
@@ -289,6 +314,11 @@ def register_routes(app):
     @app.api_route("/for-agents/guide.json", methods=["GET", "HEAD"], include_in_schema=False)
     def agent_manifest():
         return JSONResponse(public_guide())
+
+    @app.api_route("/for-agents/guide.md", methods=["GET", "HEAD"], include_in_schema=False)
+    def agent_markdown(download: bool = False):
+        headers = {"Content-Disposition": 'attachment; filename="sixnine-agent-guide.md"'} if download else {}
+        return Response(guide_markdown(), media_type="text/markdown", headers=headers)
 
     @app.api_route(HELPER_PATH, methods=["GET", "HEAD"], include_in_schema=False)
     def agent_connection_helper():
