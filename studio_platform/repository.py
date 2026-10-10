@@ -1015,6 +1015,8 @@ class Repository:
     def _global_usage(self, connection):
         resources = {}
         for row in connection.execute(select(instance_intents).where(instance_intents.c.state != "destroyed")).mappings():
+            if manually_reviewed_inactive(connection, row):
+                continue
             key = (row["provider"], row["provider_instance_id"] or "intent:" + row["id"])
             resources[key] = resources.get(key, 0) + row["physical_gpus"]
         device_counts = {}
@@ -1072,6 +1074,7 @@ class Repository:
                     raise BudgetExceeded("global_capacity_exceeded")
                 active = list(connection.execute(select(instance_intents).where(
                     instance_intents.c.pool == pool, instance_intents.c.state != "destroyed")).mappings())
+                active = [row for row in active if not manually_reviewed_inactive(connection, row)]
                 if len(active) + 1 > limits["max_instances"] or sum(r["physical_gpus"] for r in active) + physical_gpus > limits["max_physical_gpus"]:
                     raise BudgetExceeded("instance_capacity_exceeded")
                 row = dict(id=str(uuid.uuid4()), intent_key=intent_key, pool=pool, request_hash=digest,
@@ -1139,8 +1142,9 @@ class Repository:
             budget_reservations.c.reference_type == "instance", budget_reservations.c.reference_id == row["id"])).mappings())
         pending = any(r["state"] == "reserved" for r in reservations)
         actual = None if pending or not reservations else reservations[0]["actual_cost_microusd"]
+        review = manually_reviewed_inactive(connection, row)
         return {**row, "billing_status": "pending" if pending else "settled" if reservations else "unknown",
-                "actual_cost_microusd": actual}
+                "actual_cost_microusd": actual, **({"manual_review": review} if review else {})}
 
     def list_instance_intents(self, *, pool=None):
         statement = select(instance_intents)
@@ -1148,6 +1152,33 @@ class Repository:
             statement = statement.where(instance_intents.c.pool == pool)
         with self.engine.connect() as connection:
             return [self._instance_billing(connection, dict(r)) for r in connection.execute(statement.order_by(instance_intents.c.created_at)).mappings()]
+
+
+def manually_reviewed_inactive(connection, intent):
+    """Explicit operator risk acceptance, never provider removal or settlement.
+
+    Only a previously requested exact Targon teardown can be reviewed. Keeping
+    the underlying destroying state prevents manual closure from being reused
+    as physical removal evidence by replacement, settlement or recovery code.
+    """
+    if (intent["provider"] != "targon" or intent["state"] != "destroying"
+            or not intent["provider_instance_id"]):
+        return None
+    row = connection.execute(select(scaler_receipts).where(
+        scaler_receipts.c.intent_id == intent["id"],
+        scaler_receipts.c.operation == "manual_review").order_by(
+        scaler_receipts.c.observed_at.desc(), scaler_receipts.c.id.desc()).limit(1)).mappings().first()
+    facts = row["facts"] if row else None
+    if (not isinstance(facts, dict) or facts.get("schema_version") != 1
+            or facts.get("state") != "manually_reviewed"
+            or facts.get("intent_id") != intent["id"]
+            or facts.get("instance_id") != intent["provider_instance_id"]
+            or facts.get("account_absent") is not True
+            or facts.get("no_continuing_charge") is not True
+            or not isinstance(facts.get("actor"), str)
+            or not isinstance(facts.get("operation_id"), str)):
+        return None
+    return {**facts, "observed_at": row["observed_at"]}
 
 
 class _NullLock:

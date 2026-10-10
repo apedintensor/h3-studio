@@ -20,8 +20,10 @@ from sqlalchemy import insert, select, update
 
 from .autoscale import ScalePolicy
 from .operator_capacity import (ACTIVE_COMMANDS, OperatorError, operator_commands,
-    operator_heartbeats, operator_nodes, require, safe_id, public_bootstrap, offer_fingerprint, command_binding_fingerprint)
-from .repository import BudgetExceeded, Conflict, LeaseLost, instance_intents, registered_workers, scaler_actions
+    operator_heartbeats, operator_nodes, require, safe_id, public_bootstrap, offer_fingerprint, command_binding_fingerprint,
+    MANUAL_REVIEW_CONTROLLER_PREFIX)
+from .repository import (BudgetExceeded, Conflict, LeaseLost, instance_intents, registered_workers,
+                         scaler_actions, manually_reviewed_inactive)
 from .scaler import ScaleCoordinator
 
 
@@ -69,7 +71,7 @@ class OperatorController:
         self.enabled=enabled
         # Versioned control protocol prevents a newly released API from handing
         # an exact-machine command to an old controller that ignores the choice.
-        self.leader_id=leader_id or "operator-offers-v1-"+uuid.uuid4().hex
+        self.leader_id=leader_id or MANUAL_REVIEW_CONTROLLER_PREFIX+uuid.uuid4().hex
         require(safe_id(self.leader_id),"operator_controller_identity_invalid",422)
         self.coordinator_factory=coordinator_factory
         self.inventory_refresh=inventory_refresh
@@ -337,6 +339,10 @@ class OperatorController:
         return proof["state"]=="verified" and proof["safe_deadline"]>self.repo.clock()
 
     def _observe(self,node):
+        with self.repo.engine.connect() as connection:
+            intent=connection.execute(select(instance_intents).where(instance_intents.c.id==node["intent_id"])).mappings().one()
+            if manually_reviewed_inactive(connection,intent):
+                return "manually_reviewed"
         binding=self.service.registry.get(node["binding_id"])
         require(binding.fingerprint==node["binding_hash"],"operator_binding_changed")
         coordinator=self._coordinator(binding)
@@ -420,6 +426,9 @@ class OperatorController:
         if stopping and runtime=="ready": runtime="draining"
         with self.repo.transaction() as connection:
             current=self.repo._locked(connection,select(operator_nodes).where(operator_nodes.c.intent_id==intent_id))
+            current_intent=self.repo._locked(connection,select(instance_intents).where(instance_intents.c.id==intent_id))
+            if manually_reviewed_inactive(connection,current_intent):
+                return "manually_reviewed"
             values={"runtime_state":runtime,"updated_at":self.repo.clock()}
             if bootstrap is not None:
                 values["payload"]={**current["payload"],"bootstrap":bootstrap}

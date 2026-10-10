@@ -325,6 +325,8 @@ for policy in policies.values():
   and all(getattr(b,k)==policy[k] for k in ('pool','configuration_id','model_id','engine_manifest_digest'))]
  assert matches, 'operator_execution_binding_mismatch'
 engine=create_engine(settings.database_url)
+from studio_platform.repository import instance_intents, manually_reviewed_inactive
+from sqlalchemy import select
 with engine.connect() as conn:
  conn.execute(text('SET TRANSACTION READ ONLY'))
  queries={
@@ -335,6 +337,8 @@ with engine.connect() as conn:
  'pending_commands': "SELECT count(*) FROM platform_operator_capacity_commands WHERE state IN ('accepted','running','waiting','unknown')",
  'billing_pending': "SELECT count(*) FROM platform_instance_intents i WHERE NOT EXISTS (SELECT 1 FROM platform_budget_reservations r WHERE r.reference_type = 'instance' AND r.reference_id=i.id) OR EXISTS (SELECT 1 FROM platform_budget_reservations r WHERE r.reference_type='instance' AND r.reference_id=i.id AND r.state='reserved')"}
  counts={k:conn.execute(text(q),{'now':time.time()}).scalar_one() for k,q in queries.items()}
+ counts['live_instances']=sum(not manually_reviewed_inactive(conn,row) for row in
+  conn.execute(select(instance_intents).where(instance_intents.c.state!='destroyed')).mappings())
 engine.dispose()
 print(json.dumps({'schema_version':1,'observed_at':time.time(),'config_valid':True,'provider_calls_enabled':False,'counts':counts}))
 '''

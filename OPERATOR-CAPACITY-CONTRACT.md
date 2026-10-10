@@ -174,6 +174,61 @@ observations. Overdue is an attention signal, not a lifecycle transition.
 Retained slots and rates on a removal card describe historical allocation;
 they do not establish current hardware activity or final billing.
 
+### Explicit manual Targon removal review
+
+For the beta VM API's stale exact-UID `Stopping` records, an authorized browser
+operator may acknowledge an already requested teardown using
+`POST /v1/operator/capacity/nodes/{node_id}/manual-review` with the original
+`provider_instance_id`, current `expected_version`, both `account_absent: true`
+and `no_continuing_charge: true`, and `Idempotency-Key`. These fields are explicit
+human account/billing attestations; list absence or unchanged credit alone does
+not trigger the action automatically. The browser first shows a review reminder
+and requires both checks. Ordinary users and Agent credentials cannot mark it.
+
+The existing global lock protects the audit and capacity exclusion. Only an
+exact Targon intent already `destroying`, with its existing stop operation,
+deletion-start receipt and stopped desired state, is eligible. Fresh bound
+workers, current jobs, unreleased devices, unfinished/unsafe attempts and
+unconfirmed upstream stops reject the mark. Creation-unknown and active nodes
+cannot use this exception. Identical replay returns the same operation;
+conflicting replay rejects. Actor, time, exact instance, original intent,
+deadline and stop operation are durably bound in the existing command/scaler
+receipt authority, without a new schema or rental ledger.
+The mark also requires a fresh `operator-offers-v1-review-v1-` controller
+heartbeat. An earlier controller cannot accept the new command through an
+app-only rollout; activate the updated controller before enabling review.
+
+The public removal observation becomes `manually_reviewed`, its next check is
+null, and the node no longer counts toward operating capacity/hourly estimates.
+Controller reconciliation skips the reviewed UID. The underlying instance
+remains `destroying`: manual review is neither `destroyed`, provider stop proof,
+nor a final bill. Original jobs, IDs, requests, deadlines and reservations remain.
+Existing replacement/invoice gates requiring positive provider removal and
+settlement are not waived. The final provider API/billing defect remains #86 in
+backlog; no approximate charge is settled automatically.
+
+The independent root guardian consumes the same committed audit through an
+optional fixed read-only PostgreSQL bridge. Its service pins the verified full
+database container ID with `--manual-review-database-container`; Docker labels
+must still identify the Sixnine `db` service. It checks the audit/stop/node/UID
+relations and absence of active execution obligations, then records its own
+protected `manually_reviewed` receipt and stops polling that UID. DB failure or
+invalid review never disables ordinary deadline enforcement. Persisted review
+survives restart, and `removal_proof` still rejects it.
+
+Standalone historical test UIDs without a business node use a separate explicit
+root-only exception audit, enabled by `--manual-review-directory`. Each
+root-owned single-link `{exact_uid}.json` must bind the retained request hash,
+workload-identity hash and original deadline; it records a human auditor, review
+operation/time, both account attestations, and `accepted_delete: true`. The
+`intent_id` is null when no business intent exists; do not invent a ledger ID.
+The
+retained guardian must already have a deletion-start receipt. Writable/symlinked
+paths, wrong UID/identity/deadline and invalid audits fail closed. This narrowly
+authorizes stopping that historical polling obligation, never runtime, rental,
+budget release, positive physical removal or invoice settlement. The service
+config/window and retained request/receipt are not rewritten.
+
 Compatible application publication may retain an active operator execution
 release. The protected host checks an exact execution-to-app review receipt
 bound to both manifests, the original image and preparation hash. Schema/startup

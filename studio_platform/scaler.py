@@ -19,7 +19,7 @@ from .control import WorkerControl
 from .repository import (
     BudgetExceeded, Conflict, LeaseLost, NotFound, attempts, canonical, instance_intents,
     jobs, money, registered_workers, request_hash, scaler_actions, scaler_leaders,
-    scaler_observations, scaler_receipts,
+    scaler_observations, scaler_receipts, manually_reviewed_inactive,
 )
 
 REMOVAL_CHECK_INTERVAL_SECONDS = 60
@@ -196,6 +196,9 @@ class ScaleCoordinator:
         """
         with self.repo.engine.connect() as connection:
             row = connection.execute(select(instance_intents).where(instance_intents.c.id == intent_id)).mappings().one()
+            review = manually_reviewed_inactive(connection, row)
+        if review:
+            return {"state": "manually_reviewed", "intent_id": intent_id}
         lease = self.acquire(row["pool"], leader_id)
         if lease is None:
             return {"state": "not_leader"}
@@ -381,7 +384,8 @@ class ScaleCoordinator:
         return row
 
     def _active(self, pool):
-        return [row for row in self.repo.list_instance_intents(pool=pool) if row["state"] != "destroyed"]
+        return [row for row in self.repo.list_instance_intents(pool=pool)
+                if row["state"] != "destroyed" and not row.get("manual_review")]
 
     def _action(self, intent_id):
         with self.repo.engine.connect() as connection:
@@ -446,6 +450,8 @@ class ScaleCoordinator:
                 raise NotFound("instance_intent_not_found")
             if fact.instance_id is not None and row["provider_instance_id"] not in (None, fact.instance_id):
                 raise Conflict("provider_instance_conflict")
+            if manually_reviewed_inactive(connection, row):
+                return  # An in-flight provider response cannot undo human closure or settle an estimate.
             if row["state"] == "destroyed":
                 if fact.actual_cost_microusd is not None:
                     self.repo._settle(connection, "instance", intent_id, fact.actual_cost_microusd)
@@ -498,6 +504,8 @@ class ScaleCoordinator:
             fact = ProviderFact(**receipt["facts"])
             self._apply(lease, intent["id"], fact, receipt["observed_at"])
         current = next(row for row in self.repo.list_instance_intents(pool=lease.pool) if row["id"] == intent["id"])
+        if current.get("manual_review"):
+            return
         if current["state"] == "destroyed":
             return
         if current["state"] == "destroying" and not self._claim_removal_check(lease, current["id"]):
