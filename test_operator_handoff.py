@@ -333,13 +333,110 @@ class HostHandoffTests(unittest.TestCase):
             handoff.prepare('b'*40, 'sixnine-old.service')
         self.drain.assert_called_once()
 
+    def test_new_journal_prepare_preserves_consumed_historical_record(self):
+        original = handoff.record_path().read_bytes()
+        journal = handoff.record_path('inkseq-20261010')
+        self.supervisor.return_value = {**self.unit,'MainPID':'321','ActiveState':'active'}
+        self.receipt.return_value = {'state':'running'}
+        self.mock(handoff, 'only_controller')
+        self.mock(handoff, 'supervisor_client', return_value={'supervisor_pid':321,'docker_client_pids':[322]})
+        def before_term(*args):
+            value = json.loads(journal.read_text())
+            self.assertEqual(value['journal_id'], 'inkseq-20261010')
+            self.assertEqual(value['ledger'], self.ledger)
+            self.assertEqual(handoff.record_path().read_bytes(), original)
+        self.drain.side_effect = before_term
+        result = handoff.prepare('b'*40, 'sixnine-old.service', journal_id='inkseq-20261010')
+        self.assertEqual(result['pending_deletions'], 1)
+        with self.assertRaisesRegex(release.ReleaseError, 'already_recorded'):
+            handoff.prepare('b'*40, 'sixnine-old.service', journal_id='inkseq-20261010')
+        self.drain.assert_called_once()
+        self.assertEqual(handoff.record_path().read_bytes(), original)
+
+    def new_journal(self, token='inkseq-20261010'):
+        path = handoff.record_path(token)
+        path.write_text(json.dumps({**self.record,'journal_id':token}))
+        return path
+
+    def test_new_journal_rejects_copied_or_changed_record_identity(self):
+        path = self.new_journal()
+        original = handoff.record_path().read_bytes()
+        for token in (None, 'another-rollover'):
+            path.write_text(json.dumps({**self.record,'journal_id':token}))
+            with self.subTest(token=token), self.assertRaisesRegex(release.ReleaseError,'journal_identity_changed'):
+                handoff.successor(journal_id='inkseq-20261010')
+        self.assertEqual(handoff.record_path().read_bytes(), original)
+        self.launch.assert_not_called()
+
+    def test_new_journal_preserves_exact_accounting_before_launch(self):
+        path = self.new_journal()
+        original = handoff.record_path().read_bytes()
+        self.probe.return_value = {**self.ledger,'accounting_hash':'f'*64}
+        with self.assertRaisesRegex(release.ReleaseError,'accounting_changed'):
+            handoff.successor(journal_id='inkseq-20261010')
+        self.assertEqual(json.loads(path.read_text())['phase'],'drain_requested')
+        self.assertEqual(handoff.record_path().read_bytes(), original)
+        self.assertEqual(json.loads((self.root/'active.json').read_text()), self.pin)
+        self.launch.assert_not_called()
+
+    def test_new_journal_start_binds_supervisor_and_preserves_original_through_success(self):
+        path = self.new_journal()
+        original = handoff.record_path().read_bytes()
+        self.configure_start_inspection([{'Running':True,'Restarting':False,'OOMKilled':False}])
+        identity = {'MainPID':'999', 'unit_files':{'new.service':'exact-source'}}
+        own = self.mock(handoff, 'successor_supervisor', return_value=identity)
+        self.assertEqual(handoff.start(journal_id='inkseq-20261010',
+            successor_unit='sixnine-inkseq-rollover.service'),{'state':'cpu_restored'})
+        own.assert_called_once_with('sixnine-inkseq-rollover.service','inkseq-20261010')
+        value = json.loads(path.read_text())
+        self.assertEqual(value['phase'],'running')
+        self.assertEqual(value['journal_id'],'inkseq-20261010')
+        self.assertEqual(value['successor_supervisor'], identity)
+        self.assertEqual(value['ledger'], self.ledger)
+        self.assertEqual(value['retired_ledger'], self.ledger)
+        self.assertEqual(handoff.record_path().read_bytes(), original)
+        self.launch.assert_called_once()
+
+    def test_unknown_new_journal_launch_cannot_replay_or_overwrite_original(self):
+        path = self.new_journal()
+        original = handoff.record_path().read_bytes()
+        self.mock(handoff, 'successor_supervisor', return_value={'exact':'unit'})
+        self.launch.side_effect = TimeoutError('synthetic delivery uncertainty')
+        for error in (TimeoutError, release.ReleaseError):
+            with self.assertRaises(error):
+                handoff.start(journal_id='inkseq-20261010',successor_unit='sixnine-next.service')
+        self.assertEqual(json.loads(path.read_text())['phase'],'launch_intent')
+        self.assertEqual(handoff.record_path().read_bytes(), original)
+        self.launch.assert_called_once()
+
+    def test_wrong_successor_supervisor_rejects_before_journal_or_pin_writes(self):
+        path = self.new_journal()
+        original = path.read_bytes()
+        self.mock(handoff,'successor_supervisor',side_effect=release.ReleaseError('unit_mismatch'))
+        with self.assertRaisesRegex(release.ReleaseError,'unit_mismatch'):
+            handoff.start(journal_id='inkseq-20261010',successor_unit='sixnine-wrong.service')
+        self.assertEqual(path.read_bytes(), original)
+        self.launch.assert_not_called()
+        self.drain.assert_not_called()
+
+    def test_explicit_journal_cannot_use_custom_factory_or_unbound_unit(self):
+        factory = Mock()
+        with self.assertRaisesRegex(release.ReleaseError,'custom_factory_forbidden'):
+            handoff.start(journal_id='inkseq-20261010',successor_factory=factory)
+        with self.assertRaisesRegex(release.ReleaseError,'successor_unit_without_journal'):
+            handoff.start(successor_unit='sixnine-next.service')
+        factory.assert_not_called()
+        self.launch.assert_not_called()
+        self.drain.assert_not_called()
+
     def test_supervisor_process_must_own_exact_controller_client(self):
         proc = self.root/'proc'
         def process(pid, argv, children):
             folder = proc/str(pid); (folder/'task'/str(pid)).mkdir(parents=True)
             (folder/'cmdline').write_bytes(b'\0'.join(arg.encode() for arg in argv)+b'\0')
             (folder/'task'/str(pid)/'children').write_text(' '.join(str(child) for child in children))
-        unit = {**self.unit,'MainPID':'321'}
+        unit = {**self.unit,'MainPID':'321', 'ExecStart':{
+            'path':'/usr/bin/python3', 'argv':'/usr/bin/python3 /opt/sixnine-release/operator_capacity.py start'}}
         process(321, ['/usr/bin/python3','/opt/sixnine-release/operator_capacity.py','start'], [322])
         process(322, ['/usr/bin/docker','compose','-f',str(self.root/'compose.yaml'),'run',
                       '--name',self.pin['container_name'],'--label',host.LABEL+'='+self.pin['prepared_hash'],host.SERVICE], [])
@@ -399,10 +496,67 @@ class ControllerProcessTests(unittest.TestCase):
 
 
 class SystemdIdentityTests(unittest.TestCase):
+    def output(self, command, *, unit='sixnine-next.service', pid='321'):
+        return (f'MainPID={pid}\nExecMainPID={pid}\nRestart=no\nKillMode=process\nActiveState=active\nUser=root\n'
+            'TimeoutStopUSec=infinity\nSendSIGKILL=no\n'
+            f'FragmentPath=/etc/systemd/system/{unit}\nDropInPaths=\n'
+            f'ExecStart={{ path=/usr/bin/python3 ; argv[]={command} ; ignore_errors=no ; pid={pid} ; }}\n').encode()
+
+    def test_only_exact_helper_commands_and_matching_journal_unit_are_allowed(self):
+        commands = [
+            '/usr/bin/python3 /opt/sixnine-release/operator_capacity.py start',
+            '/usr/bin/python3 /opt/sixnine-release/operator_handoff.py start',
+            '/usr/bin/python3 /opt/sixnine-release/operator_handoff_continuation.py resume',
+            '/usr/bin/python3 /opt/sixnine-release/operator_handoff.py start --journal-id inkseq-20261010 --successor-unit sixnine-next.service',
+        ]
+        for command in commands:
+            with self.subTest(command=command), patch.object(handoff.subprocess,'run',return_value=Mock(stdout=self.output(command))), \
+                    patch.object(host,'protected_file',side_effect=lambda path:path), patch.object(release,'checksum',return_value='hash'):
+                self.assertEqual(handoff.supervisor('sixnine-next.service')['ExecStart']['argv'], command)
+        for command in (
+            commands[2]+' --journal-id extra', commands[3].replace('sixnine-next.service','sixnine-wrong.service'),
+            commands[3].replace('inkseq-20261010','../escape'), commands[0]+' --arbitrary',
+            '/usr/bin/python3 /tmp/operator_handoff.py start', commands[3]+' --unit another',
+        ):
+            with self.subTest(command=command), patch.object(handoff.subprocess,'run',return_value=Mock(stdout=self.output(command))), \
+                    self.assertRaisesRegex(release.ReleaseError,'command_changed'):
+                handoff.supervisor('sixnine-next.service')
+
+    def test_finite_timeout_or_sigkill_cannot_supervise_rollover(self):
+        command = '/usr/bin/python3 /opt/sixnine-release/operator_handoff_continuation.py resume'
+        for old,new in ((b'TimeoutStopUSec=infinity',b'TimeoutStopUSec=90s'), (b'SendSIGKILL=no',b'SendSIGKILL=yes')):
+            with self.subTest(new=new), patch.object(handoff.subprocess,'run',return_value=Mock(stdout=self.output(command).replace(old,new))), \
+                    self.assertRaisesRegex(release.ReleaseError,'supervisor_unsafe'):
+                handoff.supervisor('sixnine-next.service')
+
+    def test_journal_path_rejects_traversal_whitespace_and_long_tokens(self):
+        for token in ('', '../other', '/tmp/journal', 'a/b', 'a.b', 'UPPER', 'a\nb', 'a'*65, True, 1):
+            with self.subTest(token=token), self.assertRaisesRegex(release.ReleaseError,'journal_id_invalid'):
+                handoff.record_path(token)
+        self.assertEqual(handoff.record_path('inkseq-20261010').name,'handoff-inkseq-20261010.json')
+        self.assertEqual(handoff.record_path().name,'handoff.json')
+
+    def test_successor_unit_and_own_proc_must_bind_same_journal(self):
+        unit = 'sixnine-next.service'
+        arguments = ['/usr/bin/python3','/opt/sixnine-release/operator_handoff.py','start',
+                     '--journal-id','inkseq-20261010','--successor-unit',unit]
+        value = {'MainPID':'321','ActiveState':'active','ExecStart':{
+            'path':'/usr/bin/python3','argv':' '.join(arguments)}}
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory); (proc/'321').mkdir()
+            file = proc/'321'/'cmdline'; file.write_bytes(b'\0'.join(arg.encode() for arg in arguments)+b'\0')
+            with patch.object(handoff,'supervisor',return_value=value):
+                self.assertEqual(handoff.successor_supervisor(unit,'inkseq-20261010',proc_root=proc,pid=321), value)
+                with self.assertRaisesRegex(release.ReleaseError,'supervisor_mismatch'):
+                    handoff.successor_supervisor(unit,'different',proc_root=proc,pid=321)
+                file.write_bytes(file.read_bytes().replace(b'inkseq-20261010',b'different'))
+                with self.assertRaisesRegex(release.ReleaseError,'process_mismatch'):
+                    handoff.successor_supervisor(unit,'inkseq-20261010',proc_root=proc,pid=321)
     def test_exec_metadata_changes_do_not_change_supervisor_identity(self):
         command = '/usr/bin/python3 /opt/sixnine-release/operator_capacity.py start'
         def output(metadata):
             return ('MainPID=321\nExecMainPID=321\nRestart=no\nKillMode=process\nActiveState=active\nUser=root\n'
+                'TimeoutStopUSec=infinity\nSendSIGKILL=no\n'
                 'FragmentPath=/etc/systemd/system/sixnine-original.service\nDropInPaths=\n'
                 'ExecStart={ path=/usr/bin/python3 ; argv[]='+command+' ; ignore_errors=no ; '+metadata+' }\n').encode()
         with patch.object(handoff.subprocess,'run',side_effect=[Mock(stdout=output('pid=321 ; code=(null) ;')),
