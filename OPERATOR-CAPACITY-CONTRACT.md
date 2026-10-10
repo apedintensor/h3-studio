@@ -210,7 +210,13 @@ backlog; no approximate charge is settled automatically.
 The independent root guardian consumes the same committed audit through an
 optional fixed read-only PostgreSQL bridge. Its service pins the verified full
 database container ID with `--manual-review-database-container`; Docker labels
-must still identify the Sixnine `db` service. It checks the audit/stop/node/UID
+must still identify the Sixnine `db` service. Set the independently verified
+application database with `--manual-review-database-name`; `postgres` remains
+the compatibility default and may be only a maintenance database. The short
+nonsecret database name is validated and passed as a separate `psql -d`
+argument. The bridge retains the `postgres` OS/database role and read-only
+transaction; it never reads or forwards application credentials.
+It checks the audit/stop/node/UID
 relations and absence of active execution obligations, then records its own
 protected `manually_reviewed` receipt and stops polling that UID. DB failure or
 invalid review never disables ordinary deadline enforcement. Persisted review

@@ -1,4 +1,6 @@
 """Exact human review authority, capacity and guardian boundaries; offline only."""
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -16,6 +18,7 @@ from studio_platform.repository import (instance_intents, scaler_actions, scaler
 import test_operator_capacity as operator_fixtures
 import test_targon_cleanup as guardian_fixtures
 from tools.targon_cleanup_guard import OperatorManualReviewReader, ProtectedManualReviewReader
+from tools import targon_cleanup_guard as review_guard
 from studio_platform.scaler import ProviderFact
 from studio_platform.targon_cleanup import _hash
 
@@ -296,6 +299,35 @@ for _name in dir(operator_fixtures.OperatorTests):
 
 
 class ReviewReaderTests(unittest.TestCase):
+    def test_invalid_cli_database_options_reject_before_config_or_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config=Path(directory)/'not-read.json';config.write_text('{}')
+            for options in (['--manual-review-database-name','app'],
+                ['--manual-review-database-container','a'*64,'--manual-review-database-name','']):
+                with self.subTest(options=options),patch('studio_platform.targon_cleanup._read') as read, \
+                        patch('studio_platform.targon_runtime_aws.AwsTargonLoader') as loader,redirect_stdout(io.StringIO()):
+                    self.assertEqual(review_guard.main(['--config',str(config),*options]),1)
+                    read.assert_not_called();loader.assert_not_called()
+
+    def test_database_name_is_explicit_nonsecret_argument_and_cannot_inject_options(self):
+        container='a'*64;calls=[]
+        def run(arguments,**options):
+            calls.append(arguments)
+            if arguments[1]=='inspect':
+                return SimpleNamespace(returncode=0,stdout=json.dumps(container)+' '+json.dumps({
+                    'com.docker.compose.project':'sixnine-platform','com.docker.compose.service':'db'}))
+            return SimpleNamespace(returncode=0,stdout='')
+        reader=OperatorManualReviewReader(container,database_name='sixnine_platform',run=run)
+        self.assertIsNone(reader('wrk-offline'))
+        arguments=calls[-1]
+        self.assertEqual(arguments[arguments.index('-d')+1],'sixnine_platform')
+        self.assertEqual(arguments[arguments.index('-U')+1],'postgres')
+        self.assertEqual(arguments[arguments.index('--user')+1],'postgres')
+        for name in ('','--host=other',' db','db;DROP TABLE test',"db'",'a'*64,None,True,3):
+            with self.subTest(name=name),self.assertRaisesRegex(ValueError,'database_name_invalid'):
+                OperatorManualReviewReader(container,database_name=name,run=run)
+        self.assertEqual(len(calls),2)  # Validation precedes all subprocess calls.
+
     def test_fixed_read_only_query_bound_to_verified_db_container_and_uid(self):
         container='a'*64;calls=[]
         def run(args,**options):
@@ -311,6 +343,8 @@ class ReviewReaderTests(unittest.TestCase):
         self.assertIn("s.kind='stop'",calls[1][1]['input'])
         self.assertIn('platform_attempts',calls[1][1]['input'])
         self.assertNotIn('sh',calls[1][0])
+        arguments=calls[1][0]
+        self.assertEqual(arguments[arguments.index('-d')+1],'postgres')
         with self.assertRaisesRegex(ValueError,'identity_invalid'): reader("unsafe' OR true")
         with self.assertRaisesRegex(ValueError,'container_invalid'): OperatorManualReviewReader('mutable-name')
 
