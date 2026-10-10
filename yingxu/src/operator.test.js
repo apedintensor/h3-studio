@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createOperatorClient} from './operator-client.js';
 import {createOperatorController} from './operator-controller.js';
-import {allowed,profileSelection,nodeDeadline,runtimeDuration,initialOperatorSelection,operatorStartPayload,operatorFilterEdit,hasBoundOperatorSelection,previewOperatorSelection,operatorMarketProvider,operatorRecommendationsCurrent,operatorOfferReadiness,operatorInventorySummary,recommendationSelection,operatorHardwareOptions,reasonText} from './operator-model.js';
+import {allowed,profileSelection,nodeDeadline,nodeRemovalConfirmation,runtimeDuration,initialOperatorSelection,operatorStartPayload,operatorFilterEdit,hasBoundOperatorSelection,previewOperatorSelection,operatorMarketProvider,operatorRecommendationsCurrent,operatorOfferReadiness,operatorInventorySummary,recommendationSelection,operatorHardwareOptions,reasonText} from './operator-model.js';
 import {recipeFor,effectiveControlSchema,effectiveLimits,clipLimits,inputProblems} from './quick-chat-model.js';
 
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
@@ -228,4 +228,36 @@ test('safe stop deadline requires fresh verified evidence and never exceeds dura
     const result=nodeDeadline({...node,...patch},now);assert.equal(result.verified,false);assert.equal(result.deadline,1800);assert.match(result.label,/待核对/);
   }
   assert.equal(nodeDeadline({},now).deadline,null);
+});
+
+test('removal presentation follows saved confirmation without deriving success or attention from elapsed time',()=>{
+  const confirmation={state:'pending',requested_at:1,last_checked_at:null,next_check_at:100,check_interval_seconds:60,attention_after_seconds:300,last_observation:{state:'unknown',provider_status:null,observed_at:null}};
+  const node={id:'original-node',state:'destroying',runtime_state:'removal_pending',removal_confirmation:confirmation},original=structuredClone(node);
+  const pending=nodeRemovalConfirmation(node);
+  assert.equal(pending.label,'等待确认删除');assert.equal(pending.pending,true);assert.equal(pending.tone,'neutral');assert.equal(pending.last_checked_at,null);
+  assert.match(pending.message,/供应商尚未确认删除；后台每分钟继续核对/);assert.doesNotMatch(pending.message,/5 分钟|已确认|已停止|不再计费/);
+  assert.deepEqual(node,original);
+  assert.equal(nodeRemovalConfirmation({state:'destroyed'}),null);assert.equal(nodeRemovalConfirmation({removal_confirmation:{state:'unexpected'}}),null);
+  const overdue=nodeRemovalConfirmation({...node,removal_confirmation:{...confirmation,state:'overdue',last_checked_at:400,next_check_at:460}});
+  assert.equal(overdue.label,'删除尚未确认');assert.equal(overdue.tone,'warn');assert.equal(overdue.last_checked_at,400);assert.equal(overdue.next_check_at,460);assert.match(overdue.message,/5 分钟以上/);assert.match(overdue.message,/尚未确认删除/);
+  const confirmed=nodeRemovalConfirmation({...node,state:'destroyed',removal_confirmation:{...confirmation,state:'confirmed',next_check_at:null}});
+  assert.equal(confirmed.pending,false);assert.equal(confirmed.label,'已确认删除');assert.match(confirmed.message,/费用以账本核对结果为准/);assert.doesNotMatch(confirmed.message,/继续核对|结清|免费|不再计费/);
+});
+
+test('provider observations remain historical and unknown or conflicting facts do not imply final removal',()=>{
+  const node={removal_confirmation:{state:'overdue',last_checked_at:400,last_observation:{state:'running',provider_status:'STOPPED',observed_at:400}}};
+  const removal=nodeRemovalConfirmation(node);
+  assert.match(removal.observationText,/上次供应商观测/);assert.match(removal.observationText,/运行/);assert.match(removal.observationText,/已停止/);assert.match(removal.message,/尚未确认删除/);
+  for(const last_observation of [null,{state:'unknown',provider_status:null},{state:'unrecognized',provider_status:'private-raw-response'}]){
+    const unknown=nodeRemovalConfirmation({removal_confirmation:{...node.removal_confirmation,last_observation}});
+    assert.equal(unknown.observationText,'上次未能确认供应商状态。');assert.doesNotMatch(unknown.observationText,/private-raw-response/);
+  }
+});
+
+test('repeated console refresh reads saved deletion checks and retains original node and operation',async()=>{
+  const requests=[],node={id:'original-node',runtime_state:'removal_pending',removal_confirmation:{state:'overdue',requested_at:1,last_checked_at:400,next_check_at:460}},operation={id:'original-stop',kind:'stop',node_ids:[node.id],state:'waiting'};
+  const client=createOperatorClient({fetcher:async(path,options)=>{requests.push({path,options});return new Response(JSON.stringify(path.endsWith('/state')?{operator:{account:'owner'},nodes:[node],operations:[operation]}:{profiles:[]}),{headers:{'Content-Type':'application/json','X-Authenticated-Account':'owner'}});}});
+  const controller=createOperatorController({client,storage:memory()});await controller.setAccount('owner');await controller.refresh();await controller.poll();
+  assert.equal(requests.length,6);assert.ok(requests.every(({path,options})=>['/v1/operator/capacity/state','/v1/operator/capacity/catalog'].includes(path)&&options.method==='GET'));
+  assert.deepEqual(controller.getState().snapshot.nodes,[node]);assert.deepEqual(controller.getState().snapshot.operations,[operation]);assert.equal(controller.getState().snapshot.nodes[0].removal_confirmation.last_checked_at,400);controller.destroy();
 });

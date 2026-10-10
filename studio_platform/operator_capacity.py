@@ -16,8 +16,8 @@ import uuid
 from sqlalchemy import Column, Float, ForeignKey, Integer, JSON, String, Table, UniqueConstraint, func, insert, select, update
 
 from .repository import (Scope, metadata, canonical, request_hash, capacity_gate, instance_intents,
-                         jobs, registered_workers, scaler_actions, paused_capacity_pools)
-from .scaler import LaunchSpec
+                         jobs, registered_workers, scaler_actions, scaler_receipts, paused_capacity_pools)
+from .scaler import LaunchSpec, REMOVAL_CHECK_INTERVAL_SECONDS
 
 operator_policy = Table("platform_operator_capacity_policy", metadata,
     Column("id", String(30), primary_key=True), Column("version", Integer, nullable=False),
@@ -51,6 +51,28 @@ operator_inventory = Table("platform_operator_capacity_inventory", metadata,
 
 INVENTORY_FRESH_SECONDS = 120
 CONTROLLER_FRESH_SECONDS = 30
+REMOVAL_ATTENTION_SECONDS = 300
+
+
+def removal_confirmation(intent, action, check_started, requested_at, now):
+    """Read-only progress. A timeout or scheduling claim is never stop proof."""
+    if intent["state"] not in {"destroying", "destroyed"} or requested_at is None:
+        return None
+    confirmed = intent["state"] == "destroyed"
+    state = "confirmed" if confirmed else "overdue" if now-requested_at >= REMOVAL_ATTENTION_SECONDS else "pending"
+    observed = action.get("last_observed_at")
+    fact = action.get("last_observation") or {}
+    next_check = None if confirmed else max(value for value in (requested_at, observed, check_started)
+                                             if value is not None) + REMOVAL_CHECK_INTERVAL_SECONDS
+    return {"state": state, "requested_at": requested_at, "last_checked_at": observed,
+        "next_check_at": next_check, "check_interval_seconds": REMOVAL_CHECK_INTERVAL_SECONDS,
+        "attention_after_seconds": REMOVAL_ATTENTION_SECONDS,
+        "reason_code": None if confirmed else "provider_removal_confirmation_overdue" if state == "overdue"
+                       else "provider_removal_unconfirmed",
+        "last_observation": {"state": fact.get("state") if fact.get("state") in
+            {"unknown", "starting", "running", "destroyed", "not_created"} else "unknown",
+            "provider_status": fact.get("provider_status") if fact.get("provider_status") in
+            {"PENDING", "FAILED", "STOPPED", "RUNNING"} else None, "observed_at": observed}}
 
 
 def inventory_projection(connection, binding, now):
@@ -608,6 +630,13 @@ class OperatorCapacity:
             intents={row["id"]:row for row in connection.execute(select(instance_intents)).mappings()}
             actions={row["intent_id"]:row for row in connection.execute(select(scaler_actions)).mappings()}
             commands=list(connection.execute(select(operator_commands).order_by(operator_commands.c.created_at.desc()).limit(100)).mappings())
+            removal_checks=dict(connection.execute(select(scaler_receipts.c.intent_id,
+                func.max(scaler_receipts.c.observed_at)).where(scaler_receipts.c.operation=="removal_check_started")
+                .group_by(scaler_receipts.c.intent_id)).all())
+            stop_requests={}
+            for command in connection.execute(select(operator_commands).where(operator_commands.c.kind=="stop")
+                    .order_by(operator_commands.c.created_at.desc())).mappings():
+                stop_requests[command["payload"].get("node_id")]=command["created_at"]
             usage=self._committed_capacity(connection)
             running=connection.execute(select(func.count()).select_from(jobs).where(jobs.c.status.in_(("running","submitting","claimed")))).scalar_one()
             waiting=connection.execute(select(func.count()).select_from(jobs).where(jobs.c.status.in_(("waiting_capacity","queued")))).scalar_one()
@@ -617,6 +646,9 @@ class OperatorCapacity:
             if not intent: continue
             payload=row["payload"]
             observed=actions.get(intent["id"],{}).get("last_observed_at")
+            action=actions.get(intent["id"],{})
+            requested_at=action.get("destroy_started_at")
+            if requested_at is None: requested_at=stop_requests.get(intent["id"])
             stale=observed is None or not 0<=now-observed<=60
             slots=[]
             for worker in worker_rows:
@@ -633,6 +665,7 @@ class OperatorCapacity:
                 "provider_instance_id":intent["provider_instance_id"],"state":intent["state"],
                 "runtime_state":row["runtime_state"],"desired_state":row["desired_state"],
                 "bootstrap":bootstrap,
+                "removal_confirmation":removal_confirmation(intent,action,removal_checks.get(intent["id"]),requested_at,now),
                 "reason_code":bootstrap.get("reason_code") if bootstrap and row["runtime_state"] in {"blocked","failed"} else None,
                 "gpu_count":intent["physical_gpus"],"gpu_model":payload["selection"]["gpu_type"],
                 "runtime_profile_id":payload["selection"]["runtime_profile_id"],"observed_at":observed,"stale":stale,

@@ -22,6 +22,8 @@ from .repository import (
     scaler_observations, scaler_receipts,
 )
 
+REMOVAL_CHECK_INTERVAL_SECONDS = 60
+
 
 def _safe_id(value):
     if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:\-]{1,200}", value):
@@ -498,8 +500,34 @@ class ScaleCoordinator:
         current = next(row for row in self.repo.list_instance_intents(pool=lease.pool) if row["id"] == intent["id"])
         if current["state"] == "destroyed":
             return
+        if current["state"] == "destroying" and not self._claim_removal_check(lease, current["id"]):
+            return
         fact, at = self._call(current, "reconcile")
         self._apply(lease, intent["id"], fact, at)
+
+    def _claim_removal_check(self, lease, intent_id):
+        """Persist the per-node cadence before I/O; a restart cannot poll again.
+
+        A scheduling receipt is not a provider observation or deletion proof.
+        Late terminal receipts are consumed above even during this cooldown.
+        """
+        with self.repo.transaction() as connection:
+            self._leader(connection, lease)
+            row = self.repo._locked(connection, select(instance_intents).where(instance_intents.c.id == intent_id))
+            if row["state"] != "destroying":
+                return False
+            action = self.repo._locked(connection, select(scaler_actions).where(scaler_actions.c.intent_id == intent_id))
+            last_check = connection.execute(select(func.max(scaler_receipts.c.observed_at)).where(
+                scaler_receipts.c.intent_id == intent_id,
+                scaler_receipts.c.operation == "removal_check_started")).scalar_one()
+            times = [value for value in (last_check, action["last_observed_at"], action["destroy_started_at"])
+                     if value is not None]
+            now = self.repo.clock()
+            if times and now < max(times) + REMOVAL_CHECK_INTERVAL_SECONDS:
+                return False
+            connection.execute(insert(scaler_receipts).values(id=str(uuid.uuid4()), intent_id=intent_id,
+                operation="removal_check_started", observed_at=now, facts=canonical({"state": "unknown"})))
+            return True
 
     def _drain_or_destroy(self, lease, intent, policy):
         destroy = False

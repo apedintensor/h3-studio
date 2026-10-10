@@ -18,7 +18,7 @@ from studio_platform.operator_capacity import (DeploymentBinding, OperatorCapaci
     operator_commands, operator_nodes, selection,operator_inventory,operator_heartbeats, public_bootstrap)
 from studio_platform.operator_controller import OperatorController, main, provider_lifetime_current
 from studio_platform.operator_routes import register_routes
-from studio_platform.repository import instance_intents, jobs, registered_workers
+from studio_platform.repository import instance_intents, jobs, registered_workers, scaler_actions, scaler_receipts
 from studio_platform.scaler import LaunchSpec, ProviderFact
 from test_platform_repository import LedgerCase
 from test_platform_scaler import FakeProvider
@@ -602,10 +602,46 @@ class OperatorTests(LedgerCase):
         self.assertEqual(len(self.provider.creates),1)
         self.assertEqual(len(self.provider.destroys),1)
         self.provider.facts[intent["id"]]=ProviderFact("destroyed",intent["provider_instance_id"])
+        self.now+=60
         replacement.tick()
         current=self.service.state(self.actor)["nodes"][0]
         self.assertEqual((current["state"],current["runtime_state"]),("destroyed","destroyed"))
         self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+
+    def test_removal_feedback_times_out_without_mutating_ledger_or_calling_provider(self):
+        self.create();self.controller.tick()
+        node=self.service.state(self.actor)["nodes"][0]
+        self.assertIsNone(node["removal_confirmation"])
+        self.service.node_command(self.actor,node["id"],{"expected_version":node["version"]},"stop-feedback","stop")
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id==node["id"]).values(state="destroying"))
+            connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id==node["id"]).values(
+                destroy_started_at=self.now,last_observed_at=self.now,last_observation={"state":"unknown","private":"do-not-expose"}))
+            connection.execute(insert(scaler_receipts).values(id="feedback-claim",intent_id=node["id"],
+                operation="removal_check_started",observed_at=self.now+60,facts={"state":"unknown"}))
+        budget=self.repo.get_budget("owner-budget")
+        calls=(len(self.provider.creates),len(self.provider.destroys))
+        self.now+=299
+        feedback=self.service.state(self.actor)["nodes"][0]["removal_confirmation"]
+        self.assertEqual(feedback["state"],"pending")
+        self.assertEqual(feedback["next_check_at"],feedback["requested_at"]+120)
+        self.assertEqual(feedback["last_checked_at"],feedback["requested_at"])
+        self.now+=1
+        for _ in range(3):
+            state=self.service.state(self.actor)
+            self.assertEqual(state["nodes"][0]["removal_confirmation"]["state"],"overdue")
+            self.assertNotIn("do-not-expose",json.dumps(state))
+        self.assertEqual(self.repo.get_budget("owner-budget"),budget)
+        self.assertEqual(calls,(len(self.provider.creates),len(self.provider.destroys)))
+        self.assertEqual(self.repo.list_instance_intents()[0]["state"],"destroying")
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id==node["id"]).values(state="destroyed"))
+            connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id==node["id"]).values(
+                last_observed_at=self.now,last_observation={"state":"destroyed"}))
+        feedback=self.service.state(self.actor)["nodes"][0]["removal_confirmation"]
+        self.assertEqual(feedback["state"],"confirmed")
+        self.assertIsNone(feedback["next_check_at"])
+        self.assertIsNone(feedback["reason_code"])
 
     def test_drain_stops_admission_but_does_not_force_destroy(self):
         self.create()

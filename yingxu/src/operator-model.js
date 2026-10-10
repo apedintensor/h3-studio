@@ -20,6 +20,18 @@ export function nodeDeadline(node,now=Date.now()){
   const verified=node.provider_lifetime_state==='verified'&&Number.isFinite(safe)&&observed!==null&&observed<=now&&now-observed<=30000;
   return {verified,label:verified?'安全停止期限':'停止上限 · 供应商待核对',deadline:verified?(Number.isFinite(cap)?Math.min(cap,safe):safe):(Number.isFinite(cap)?cap:null)};
 }
+export function nodeRemovalConfirmation(node){
+  const confirmation=node?.removal_confirmation;
+  if(!['pending','overdue','confirmed'].includes(confirmation?.state))return null;
+  const pending=confirmation.state!=='confirmed',overdue=confirmation.state==='overdue';
+  const observation=confirmation.last_observation,observedState={starting:'启动中',running:'运行',destroyed:'删除',not_created:'未创建'}[observation?.state];
+  const providerStatus={PENDING:'准备中',FAILED:'失败',STOPPED:'已停止',RUNNING:'运行'}[observation?.provider_status];
+  const observed=[observedState&&`状态为“${observedState}”`,providerStatus&&`供应商报告“${providerStatus}”`].filter(Boolean).join('，');
+  return {...confirmation,pending,tone:overdue?'warn':pending?'neutral':'good',
+    label:overdue?'删除尚未确认':pending?'等待确认删除':'已确认删除',
+    message:pending?(overdue?'已等待 5 分钟以上。':'')+'供应商尚未确认删除；后台每分钟继续核对。':'机器删除已确认；费用以账本核对结果为准。',
+    observationText:observed?`上次供应商观测：${observed}。`:'上次未能确认供应商状态。'};
+}
 const states={reserved:'已预留预算',creating:'正在申请机器',creation_unknown:'租赁结果待核对',waiting_provider:'等待供应商启动',removal_pending:'等待供应商确认删除',awaiting_qualified_workers:'等待执行槽验收',bootstrap_unconfigured:'启动配置尚未就绪',provider_execution_unverified:'供应商执行尚未验收',observation_failed:'观测失败，待核对',ready:'可接单',running:'运行中',starting:'正在启动',provisioning:'正在租机',preparing:'正在准备',loading:'正在加载模型',loading_model:'正在加载模型',downloading:'正在下载权重',bootstrapping:'正在准备环境',checking:'正在检查',busy:'正在生成',idle:'空闲',draining:'正在排空',stopping:'正在停止',destroying:'正在销毁',stopped:'已停止',destroyed:'已销毁',disabled:'未启用',unconfigured:'未配置',unavailable:'暂不可用',unknown:'状态待核对',reconcile_required:'需要核对原操作',waiting:'等待核对',partial:'部分完成',pending:'已接受，等待处理',queued:'等待处理',accepted:'已接受',complete:'已完成',completed:'已完成',succeeded:'已完成',failed:'失败',blocked:'条件未满足',offline:'离线',healthy:'正常',stale:'状态已过期'};
 export const stateLabel=value=>states[value]||'状态待核对';
 export const stateTone=value=>['ready','healthy','complete','completed','succeeded'].includes(value)?'good':['failed','blocked','unknown','reconcile_required','stale','unavailable'].includes(value)?'warn':'neutral';

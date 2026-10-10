@@ -351,14 +351,95 @@ An absent marker does not authorize replacing an independently running process.
     require(not running.strip(),'operator_controller_still_running')
 
 
+def operator_app_compatibility(root, pin, execution, candidate):
+    """Exact independent review, not a weakening of source compatibility hashes.
+
+    The protected receipt attests the *complete* execution-to-app source delta,
+    including create_app/create_schema startup effects. It cannot authorize an
+    execution image, provider config, command protocol or schema transition.
+    """
+    original=validate_contracts(execution.get('contracts'))
+    target=validate_contracts(candidate.get('contracts'))
+    require(original['frontend_contract']==target['frontend_contract'],
+        'operator_frontend_contract_changed')
+    require(all(candidate.get('files',{}).get(name)==execution.get('files',{}).get(name)
+        and isinstance(execution.get('files',{}).get(name),str)
+        for name in ('compose.yaml','Caddyfile','init_database.py','check_config.py')),
+        'operator_host_configuration_change_requires_drain')
+    if candidate['commit']==execution['commit']:
+        require(all(candidate.get(key)==value for key,value in execution.items()),
+            'operator_execution_manifest_changed')
+        return
+    directory=root/'approved-app-compatibility'
+    protected_directory(directory)
+    path=directory/(execution['commit']+'--'+candidate['commit']+'.json')
+    value=_protected_json(path,maximum=16384)
+    expected={'schema_version':1,'execution_commit':execution['commit'],
+        'execution_image_id':pin['image_id'],'prepared_sha256':pin['prepared_hash'],
+        'execution_manifest_sha256':checksum(root/'releases'/execution['commit']/'release-manifest.json'),
+        'app_commit':candidate['commit'],
+        'app_manifest_sha256':checksum(root/'releases'/candidate['commit']/'release-manifest.json'),
+        'review':{'database_schema_and_startup_migrations':'unchanged',
+            'generation_admission':'reviewed_compatible_safety_tightening','operator_commands':'unchanged',
+            'accepted_jobs_and_attempts':'unchanged','controller_and_guardian':'preserved'}}
+    require(type(value.get('schema_version')) is int and value==expected,
+        'operator_app_compatibility_review_mismatch')
+
+
+def operator_execution_context(root):
+    # Import only the installed protected helper, never the incoming bundle.
+    import operator_capacity as operator
+    require(operator.ROOT==root/'operator-capacity','operator_host_root_mismatch')
+    runtime,prepared,directory,environment=operator.prepared()
+    pin=operator.checked_pin(prepared)
+    execution=manifest(directory,prepared['commit'])
+    return operator,runtime,pin,execution,environment
+
+
+def operator_deployment_context(root, target_manifest=None):
+    path=root/'operator-capacity'/'active.json'
+    if not path.exists() and not path.is_symlink(): return None
+    protected_directory(path.parent)
+    marker=_protected_json(path,maximum=16384)
+    if marker.get('active') is not True: return None
+    operator,runtime,pin,execution,environment=operator_execution_context(root)
+    require(pin.get('version')==1 and pin.get('active') is True and pin.get('state')=='running'
+        and isinstance(pin.get('controller_id'),str) and bool(pin['controller_id']),
+        'operator_execution_state_unknown')
+    state=operator.inspect_controller(environment,pin)
+    require(state.get('Running') is True and state.get('Restarting') is False
+        and state.get('OOMKilled') is False,'operator_controller_not_running')
+    raw=command(['ps','--quiet','--filter','label=com.docker.compose.project=sixnine-platform',
+        '--filter','label=com.docker.compose.service=operator-controller'],environment=environment,timeout=20).decode().strip()
+    require(bool(re.fullmatch(r'[0-9a-f]{12,64}',raw)),'operator_controller_not_uniquely_running')
+    # Resolve the listed container as well as the pinned name: an additional or
+    # substituted controller must not pass merely because the pin still exists.
+    observed=json.loads(command(['inspect',raw],environment=environment,timeout=20))
+    require(isinstance(observed,list) and len(observed)==1
+        and observed[0].get('Name')=='/'+pin['container_name']
+        and observed[0].get('Image')==pin['image_id'],'operator_controller_identity_changed')
+    proof=operator.receipt(pin,fresh=True)
+    require(proof.get('state') in ('running','degraded','draining','shutdown_waiting'),
+        'operator_controller_status_unknown')
+    if target_manifest is not None: operator_app_compatibility(root,pin,execution,target_manifest)
+    # Original overlay and preparation remain immutable. This derived file is
+    # app-only and only written while holding the existing release lock.
+    overlay=operator.app_overlay(admission=pin['admission'])
+    overlay_path=root/'operator-capacity'/'app-release-overlay.json'
+    if overlay_path.exists() or overlay_path.is_symlink(): regular(overlay_path,root_owned=True,maximum=16384)
+    operator.atomic(overlay_path,overlay)
+    return {**pin,'kind':'operator','root':root,'contracts':execution['contracts'],
+        'execution_manifest':execution,'app_overlay':overlay,'overlay_path':overlay_path}
+
+
 def gpu_deployment_context(root, target_manifest=None):
     """Validate a pinned v2 controller without changing its lifecycle or ledger.
 
     Caller holds release.lock. Old/unknown barriers remain strict; compatibility
     permits an app replacement, never a controller restart or policy change.
     """
-    operator_release_fence(root)
-    context = None
+    context = operator_deployment_context(root,target_manifest)
+    if context is None: operator_release_fence(root)
     for folder in ("gpu-acceptance", "gpu-scaler"):
         path = root / folder / "active.json"
         if not path.exists() and not path.is_symlink():
@@ -369,6 +450,7 @@ def gpu_deployment_context(root, target_manifest=None):
             and value["version"] in (1, 2), "gpu_acceptance_requires_explicit_safe_restore")
         if not value["active"]:
             continue
+        require(context is None,'operator_competing_controller')
         require(folder == "gpu-scaler" and value["version"] == 2,
             "gpu_acceptance_requires_explicit_safe_restore")
         required = {"version", "active", "commit", "image_id", "contracts", "cycle_id", "config_hash",
@@ -432,7 +514,7 @@ def gpu_deployment_context(root, target_manifest=None):
     for service in ("gpu-worker", "gpu-controller"):
         raw = command(["ps", "--quiet", "--filter", "label=com.docker.compose.project=sixnine-platform",
                        "--filter", "label=com.docker.compose.service="+service], environment=environment, timeout=20).decode().strip()
-        if context is None or service != "gpu-controller":
+        if context is None or context.get('kind')=='operator' or service != "gpu-controller":
             require(not raw, "gpu_acceptance_worker_still_running")
             continue
         # A lost/exited/unknown controller is not evidence that admission is safe.
@@ -464,6 +546,13 @@ def approved_application_configuration(directory, environment, *, gpu_context=No
     import copy
     version = command(["compose", "version", "--short"], environment=environment).decode("ascii").strip()
     original = json.loads(application_compose(directory, environment, "config", "--format", "json", gpu_context=gpu_context))
+    if gpu_context.get('kind')=='operator':
+        import operator_capacity as operator
+        operator.validate_app_rendered(original,directory,version,environment['SIXNINE_IMAGE'],gpu_context['app_overlay'])
+        require(original['services']['db']['image']==environment['SIXNINE_POSTGRES_IMAGE']
+            and original['services']['caddy']['image']==environment['SIXNINE_CADDY_IMAGE'],
+            'release_images_differ_from_trusted_site_config')
+        return original
     config = copy.deepcopy(original)
     app = config.get("services", {}).get("app", {})
     expected = app_admission_overlay(gpu_context["root"])["services"]["app"]
@@ -509,18 +598,17 @@ def restore_current_cpu_locked(root=ROOT, *, operator_pin=None):
     if operator_pin is None:
         operator_release_fence(root)
     else:
-        # Only the protected operator helper closes its own admission. This
-        # exception never authorizes a different app image, schema or lifecycle.
+        # Only the protected helper closes its own admission; compatibility is
+        # rechecked against the immutable execution release below.
         protected_directory(root/'operator-capacity')
         require(_protected_json(root/'operator-capacity'/'active.json')==operator_pin
             and operator_pin.get('version')==1 and operator_pin.get('active') is True
             and operator_pin.get('admission')=='closed', 'operator_admission_pin_invalid')
     commit, directory, environment = current_application(root)
     if operator_pin is not None:
-        require(commit==operator_pin.get('commit'), 'operator_admission_release_changed')
-        image=json.loads(command(['image','inspect',environment['SIXNINE_IMAGE']],environment=environment))
-        require(isinstance(image,list) and len(image)==1 and image[0].get('Id')==operator_pin.get('image_id'),
-            'operator_admission_image_changed')
+        _,_,checked,execution,_=operator_execution_context(root)
+        require(checked==operator_pin,'operator_admission_pin_invalid')
+        operator_app_compatibility(root,operator_pin,execution,manifest(directory,commit))
     application_compose(directory, environment, "up", "-d", "--no-deps", "app")
     wait_ready(directory, environment)
     expected = manifest(directory, commit)
@@ -738,8 +826,11 @@ def apply_locked(root, commit):
                 old_expected = load_approved_image(root, old_directory, fallback, old_environment)
                 if gpu_context is not None:
                     old_contracts = validate_contracts(old_expected.get("contracts"))
-                    require(old_contracts["worker_compatibility"] == gpu_context["contracts"]["worker_compatibility"],
-                        "gpu_rollback_contract_requires_reconciliation")
+                    if gpu_context.get('kind')=='operator':
+                        operator_app_compatibility(root,gpu_context,gpu_context['execution_manifest'],old_expected)
+                    else:
+                        require(old_contracts["worker_compatibility"] == gpu_context["contracts"]["worker_compatibility"],
+                            "gpu_rollback_contract_requires_reconciliation")
                 approved_application_configuration(old_directory, old_environment, gpu_context=gpu_context)
                 application_compose(old_directory, old_environment, "up", "-d", "--no-deps", "app", gpu_context=gpu_context)
                 wait_ready(old_directory, old_environment)

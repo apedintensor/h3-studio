@@ -74,9 +74,74 @@ class HostBoundaryTests(unittest.TestCase):
         (self.operator/'active.json').write_text(json.dumps(pin))
         with patch.object(release,'protected_directory'),patch.object(release.os,'name','nt'), \
              patch.object(release,'current_application',return_value=('e'*40,self.root,{})), \
-             patch.object(release,'command') as command,self.assertRaisesRegex(release.ReleaseError,'release_changed'):
+             patch.object(release,'operator_execution_context',return_value=(host,{},pin,{},{})), \
+             patch.object(release,'manifest',return_value={}), \
+             patch.object(release,'operator_app_compatibility',side_effect=release.ReleaseError('review_missing')), \
+             patch.object(release,'command') as command,self.assertRaisesRegex(release.ReleaseError,'review_missing'):
             release.restore_current_cpu_locked(self.root,operator_pin=pin)
         command.assert_not_called()
+
+    def test_prepared_keeps_execution_release_after_current_app_advances(self):
+        runtime={'secret_arn':'synthetic-arn','secret_version_id':'synthetic-version'}
+        value={**prepared(),'runtime_config_sha256':release.canonical_hash(runtime),'files':{'original':'digest'}}
+        original=host.overlay(IMAGE,PROFILE,owners='superdan')
+        (self.operator/'prepared.json').write_text(json.dumps(value))
+        (self.operator/'overlay.json').write_text(json.dumps(original))
+        expected={'commit':value['commit']}
+        with patch.object(host,'configuration',return_value=(runtime,value['files'])), \
+             patch.object(host,'default_profile',return_value=PROFILE), \
+             patch.object(host,'approved_current',side_effect=AssertionError('current app is not execution authority')), \
+             patch.object(release,'_protected_json',side_effect=lambda p,**kw:json.loads(p.read_text())), \
+             patch.object(release,'approved_manifest'),patch.object(release,'manifest',return_value=expected), \
+             patch.object(release,'deployment_environment',return_value={'SIXNINE_IMAGE':IMAGE}), \
+             patch.object(release,'approved_configuration'), \
+             patch.object(release,'validate_image_archive',return_value={value['image_id']}), \
+             patch.object(release,'command',return_value=json.dumps([{'Id':value['image_id']}]).encode()):
+            result=host.prepared()
+            self.assertEqual(result[1],value)
+            self.assertEqual(result[2],self.root/'releases'/value['commit'])
+            original['services'][host.SERVICE]['image']='sixnine-platform:'+'e'*40
+            (self.operator/'overlay.json').write_text(json.dumps(original))
+            with self.assertRaisesRegex(release.ReleaseError,'overlay_changed'):host.prepared()
+
+    def test_owner_setting_changes_only_derived_app_overlay(self):
+        original=host.overlay(IMAGE,PROFILE,owners='superdan')
+        original_bytes=json.dumps(original)
+        (self.operator/'overlay.json').write_text(original_bytes)
+        path=self.operator/'app-settings.json'
+        with patch.object(release,'_protected_json',side_effect=lambda p,**kw:json.loads(p.read_text())):
+            self.assertEqual(host.app_overlay(admission='open')['services']['app'],original['services']['app'])
+            path.write_text(json.dumps({'schema_version':1,'capacity_owners':['superdan','supervan']}))
+            derived=host.app_overlay(admission='open')
+            self.assertEqual(set(derived['services']),{'app'})
+            self.assertEqual(derived['services']['app']['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS'],
+                'superdan,supervan')
+            self.assertEqual((self.operator/'overlay.json').read_text(),original_bytes)
+            for value in ({'schema_version':True,'capacity_owners':['superdan','supervan']},
+                          {'schema_version':1,'capacity_owners':['superdan','someone-else']},
+                          {'schema_version':1,'capacity_owners':['superdan'],'extra':True}):
+                path.write_text(json.dumps(value))
+                with self.assertRaisesRegex(release.ReleaseError,'app_settings_invalid'):
+                    host.app_overlay(admission='open')
+
+    def test_compatible_current_app_closes_without_reverting_execution_release(self):
+        pin={**host.pin_for(prepared()),'admission':'closed'}
+        (self.operator/'active.json').write_text(json.dumps(pin))
+        current='e'*40;directory=self.root/'releases'/current
+        expected={'commit':current,'image_id':'sha256:'+'f'*64}
+        with patch.object(release,'protected_directory'), \
+             patch.object(release,'_protected_json',side_effect=lambda p,**kw:json.loads(p.read_text())), \
+             patch.object(release,'current_application',return_value=(current,directory,{})), \
+             patch.object(release,'operator_execution_context',return_value=(host,{},pin,{'commit':pin['commit']},{})), \
+             patch.object(release,'manifest',return_value=expected), \
+             patch.object(release,'operator_app_compatibility') as compatibility, \
+             patch.object(release,'application_compose') as compose,patch.object(release,'wait_ready'), \
+             patch.object(release,'validate_image_archive',return_value={expected['image_id']}), \
+             patch.object(release,'verify_running_app'):
+            self.assertEqual(release.restore_current_cpu_locked(self.root,operator_pin=pin),current)
+        compatibility.assert_called_once_with(self.root,pin,{'commit':pin['commit']},expected)
+        self.assertEqual(compose.call_args.args,(directory,{},'up','-d','--no-deps','app'))
+        self.assertEqual(json.loads((self.operator/'active.json').read_text()),pin)
 
     def test_credential_exists_only_in_closed_private_stdin(self):
         runtime={'secret_arn':'synthetic-pinned-arn','secret_version_id':'synthetic-version'}
@@ -235,6 +300,7 @@ class HostBoundaryTests(unittest.TestCase):
         self.stack.enter_context(patch.object(host.signal,'getsignal',return_value=None))
         self.stack.enter_context(patch.object(host.signal,'signal',side_effect=lambda key,fn:installed.update({key:fn})))
         self.stack.enter_context(patch.object(host,'prepared',return_value=({},prepared(),self.root,{})))
+        self.stack.enter_context(patch.object(host,'approved_current',return_value=(prepared()['commit'],self.root,{},prepared()['image_id'])))
         self.stack.enter_context(patch.object(host,'no_competing_controller'))
         self.stack.enter_context(patch.object(host,'probe',return_value=counts()))
         self.stack.enter_context(patch.object(host,'launch',side_effect=launch))
@@ -345,6 +411,119 @@ class HostBoundaryTests(unittest.TestCase):
                 else:self.assertEqual(host.receipt(pin,fresh=True),record)
 
 
+class AppReleaseCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name);self.operator=self.root/'operator-capacity';self.operator.mkdir()
+        self.stack=ExitStack();self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(host,'ROOT',self.operator))
+        self.stack.enter_context(patch.object(release,'ROOT',self.root))
+        self.stack.enter_context(patch.dict(sys.modules,{'operator_capacity':host}))
+        self.stack.enter_context(patch.object(release,'protected_directory'))
+        self.stack.enter_context(patch.object(release,'_protected_json',side_effect=lambda p,**kw:json.loads(p.read_text())))
+        self.execution={'commit':'a'*40,'image_id':'sha256:'+'b'*64,
+            'contracts':{'version':1,'api_compatibility':'1'*64,'worker_compatibility':'2'*64,
+                'frontend_contract':'sixnine-web-v1'},'files':{key:'3'*64 for key in release.FILES}}
+        self.target=copy.deepcopy(self.execution);self.target['commit']='e'*40
+        self.target['image_id']='sha256:'+'f'*64
+        self.target['files']['image.tar.gz']='4'*64
+        self.target['contracts'].update(api_compatibility='5'*64,worker_compatibility='6'*64)
+        for value in (self.execution,self.target):
+            folder=self.root/'releases'/value['commit'];folder.mkdir(parents=True)
+            (folder/'release-manifest.json').write_text(json.dumps(value))
+        self.pin={**host.pin_for(prepared()),'state':'running','admission':'open','controller_id':'controller-one'}
+        (self.operator/'active.json').write_text(json.dumps(self.pin))
+        original=host.overlay(IMAGE,PROFILE,owners='superdan')
+        (self.operator/'overlay.json').write_text(json.dumps(original))
+        self.approvals=self.root/'approved-app-compatibility';self.approvals.mkdir()
+        self.path=self.approvals/(self.execution['commit']+'--'+self.target['commit']+'.json')
+        self.review={'schema_version':1,'execution_commit':self.execution['commit'],
+            'execution_image_id':self.pin['image_id'],'prepared_sha256':self.pin['prepared_hash'],
+            'execution_manifest_sha256':release.checksum(self.root/'releases'/self.execution['commit']/'release-manifest.json'),
+            'app_commit':self.target['commit'],
+            'app_manifest_sha256':release.checksum(self.root/'releases'/self.target['commit']/'release-manifest.json'),
+            'review':{'database_schema_and_startup_migrations':'unchanged',
+            'generation_admission':'reviewed_compatible_safety_tightening','operator_commands':'unchanged',
+                'accepted_jobs_and_attempts':'unchanged','controller_and_guardian':'preserved'}}
+
+    def approve(self):self.path.write_text(json.dumps(self.review))
+
+    def check(self):release.operator_app_compatibility(self.root,self.pin,self.execution,self.target)
+
+    def test_exact_review_permits_app_delta_without_loosening_fingerprints(self):
+        self.assertNotEqual(self.execution['contracts']['worker_compatibility'],self.target['contracts']['worker_compatibility'])
+        with self.assertRaises(FileNotFoundError):self.check()
+        self.approve();self.check()
+        for key in ('execution_image_id','prepared_sha256','execution_manifest_sha256','app_manifest_sha256','app_commit'):
+            value={**self.review,key:'wrong'};self.path.write_text(json.dumps(value))
+            with self.subTest(key=key),self.assertRaisesRegex(release.ReleaseError,'review_mismatch'):self.check()
+        value={**self.review,'schema_version':True};self.path.write_text(json.dumps(value))
+        with self.assertRaisesRegex(release.ReleaseError,'review_mismatch'):self.check()
+        for key in self.review['review']:
+            value=copy.deepcopy(self.review);value['review'][key]='changed';self.path.write_text(json.dumps(value))
+            with self.subTest(key=key),self.assertRaisesRegex(release.ReleaseError,'review_mismatch'):self.check()
+
+    def test_review_cannot_authorize_host_configuration_or_wrong_original_manifest(self):
+        self.approve()
+        self.target['files']['compose.yaml']='7'*64
+        with self.assertRaisesRegex(release.ReleaseError,'host_configuration_change_requires_drain'):self.check()
+        self.target['files']['compose.yaml']=self.execution['files']['compose.yaml']
+        (self.root/'releases'/self.execution['commit']/'release-manifest.json').write_text('{}')
+        with self.assertRaisesRegex(release.ReleaseError,'review_mismatch'):self.check()
+
+    def test_original_release_rollback_accepts_verified_archive_metadata_only(self):
+        candidate={**self.execution,'archive_image_ids':{self.execution['image_id']}}
+        release.operator_app_compatibility(self.root,self.pin,self.execution,candidate)
+        candidate['image_id']='sha256:'+'f'*64
+        with self.assertRaisesRegex(release.ReleaseError,'execution_manifest_changed'):
+            release.operator_app_compatibility(self.root,self.pin,self.execution,candidate)
+
+    def context_patches(self):
+        self.stack.enter_context(patch.object(host,'prepared',return_value=({},prepared(),self.root/'releases'/self.execution['commit'],{})))
+        self.stack.enter_context(patch.object(host,'checked_pin',return_value=self.pin))
+        self.stack.enter_context(patch.object(release,'manifest',return_value=self.execution))
+        self.stack.enter_context(patch.object(host,'inspect_controller',return_value={'Running':True,'Restarting':False,'OOMKilled':False}))
+        self.stack.enter_context(patch.object(host,'receipt',return_value={'state':'degraded'}))
+        self.stack.enter_context(patch.object(host,'probe',side_effect=AssertionError('do not require quiet or touch the database')))
+        self.commands=[]
+        def command(args,**kwargs):
+            self.commands.append(args)
+            if args[0]=='ps': return b'abcd1234abcd'
+            if args==['inspect','abcd1234abcd']:
+                return json.dumps([{'Name':'/'+self.pin['container_name'],'Image':self.pin['image_id']}]).encode()
+            raise AssertionError(args)
+        self.stack.enter_context(patch.object(release,'command',side_effect=command))
+
+    def test_pending_cleanup_and_billing_survive_live_app_context(self):
+        self.approve();self.context_patches()
+        ledger=self.operator/'pending-records.json'
+        ledger.write_text(json.dumps({'pending_commands':1,'billing_pending':2,'delete_state':'unknown','reserved':17}))
+        guardian=self.root/'guardian-receipt.json';guardian.write_text('{"state":"pending"}')
+        before={p:p.read_bytes() for p in (ledger,guardian,self.operator/'active.json',self.operator/'overlay.json')}
+        (self.operator/'app-settings.json').write_text(json.dumps({'schema_version':1,'capacity_owners':['superdan','supervan']}))
+        context=release.operator_deployment_context(self.root,self.target)
+        self.assertEqual(context['kind'],'operator');self.assertEqual(context['image_id'],self.pin['image_id'])
+        self.assertEqual(context['commit'],self.execution['commit'])
+        self.assertEqual(set(context['app_overlay']['services']),{'app'})
+        self.assertEqual(context['app_overlay']['services']['app']['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS'],
+            'superdan,supervan')
+        self.assertTrue(all(p.read_bytes()==value for p,value in before.items()))
+        self.assertTrue(all(args[0] in ('ps','inspect') for args in self.commands))
+
+    def test_unknown_exited_or_stale_controller_cannot_authorize_release(self):
+        self.approve();self.context_patches()
+        for state in ({'Running':False,'Restarting':False,'OOMKilled':False},
+                      {'Running':True,'Restarting':True,'OOMKilled':False},
+                      {'Running':True,'Restarting':False,'OOMKilled':True}):
+            with patch.object(host,'inspect_controller',return_value=state), \
+                 self.assertRaisesRegex(release.ReleaseError,'not_running'):
+                release.operator_deployment_context(self.root,self.target)
+        with patch.object(host,'receipt',side_effect=release.ReleaseError('operator_status_stale')), \
+             self.assertRaisesRegex(release.ReleaseError,'status_stale'):
+            release.operator_deployment_context(self.root,self.target)
+        self.assertFalse((self.operator/'app-release-overlay.json').exists())
+
+
 class ComposeBoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -403,6 +582,19 @@ class ComposeBoundaryTests(unittest.TestCase):
             lambda c:c['services'][host.SERVICE]['volumes'].append(host.bind(host.TARGON_GUARD/'receipts'))):
             changed=copy.deepcopy(self.targon_value);mutate(changed)
             with self.assertRaises((release.ReleaseError,validator.ConfigurationError)):check(changed)
+
+    def test_app_only_render_has_no_controller_or_private_mounts(self):
+        value=copy.deepcopy(self.value);value['services'].pop(host.SERVICE)
+        expected={'services':{'app':host.overlay(IMAGE,PROFILE)['services']['app']}}
+        self.assertTrue(host.validate_app_rendered(value,DIRECTORY,self.version,IMAGE,expected))
+        for mutate in (
+            lambda c:c['services'].update({host.SERVICE:self.value['services'][host.SERVICE]}),
+            lambda c:c['services']['app']['volumes'].append(host.bind(host.KEY,True)),
+            lambda c:c['services']['app']['environment'].update(SIXNINE_OPERATOR_CAPACITY_OWNERS='anyone'),
+            lambda c:c['services']['app']['networks'].update(edge={})):
+            changed=copy.deepcopy(value);mutate(changed)
+            with self.assertRaises((release.ReleaseError,validator.ConfigurationError)):
+                host.validate_app_rendered(changed,DIRECTORY,self.version,IMAGE,expected)
 
 
 if __name__=='__main__':unittest.main()

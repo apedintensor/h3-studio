@@ -69,12 +69,194 @@ class TargonCleanupTests(unittest.TestCase):
         self.guardian().tick()
         self.client.delete.assert_called_once()
         self.get_status = 404
+        self.now += 60
         self.guardian().tick()
         proof = self.guard.removal_proof(self.uid)
         self.assertTrue(proof["removed"])
         self.assertEqual(proof["evidence"],"exact_uid_404_after_delete_ack")
         self.guardian().tick()
         self.client.delete.assert_called_once()
+
+    def test_removal_polling_survives_restart_and_keeps_heartbeat_fresh(self):
+        self.arm()
+        self.now = self.deadline-3
+        self.guardian().tick()
+        self.client.get.reset_mock()
+        self.now = self.deadline
+        self.guardian().tick()
+        self.client.get.assert_called_once()  # First cleanup never waits for the poll interval.
+        self.client.delete.assert_called_once()
+        path = self.root/"receipts"/(self.uid+".json")
+        pending = _read(path)
+        self.assertEqual(pending["next_removal_observation_at"],self.deadline+60)
+        self.client.get.reset_mock()
+        self.get_status = 404
+        for offset in (3,30,59):
+            self.now = self.deadline+offset
+            self.guardian().tick()  # Every tick uses a new guardian process identity.
+            self.client.get.assert_not_called()
+            self.assertEqual(_read(path),pending)
+            heartbeat = _read(self.root/"heartbeat.json")
+            self.assertEqual((heartbeat["process_state"],heartbeat["state"]),("running","degraded"))
+            self.assertEqual(heartbeat["observed_at"],self.now)
+            with self.assertRaisesRegex(ValueError,"removal_unconfirmed"):
+                self.guard.removal_proof(self.uid)
+        self.now = self.deadline+60
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        self.assertTrue(self.guard.removal_proof(self.uid)["removed"])
+        self.client.delete.assert_called_once()
+
+    def test_legacy_pending_receipt_uses_last_observation_without_resetting_obligation(self):
+        self.arm()
+        self.now = self.deadline
+        self.guardian().tick()
+        path = self.root/"receipts"/(self.uid+".json")
+        legacy = _read(path)
+        del legacy["next_removal_observation_at"]
+        _write(path,legacy)
+        self.client.get.reset_mock()
+        self.now += 59
+        self.guardian().tick()
+        self.client.get.assert_not_called()
+        self.assertEqual(_read(path),legacy)
+        self.now += 1
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        retained = _read(path)
+        for field in ("request","deadline","workload_identity","delete_started_at","delete_acknowledged"):
+            self.assertEqual(retained[field],legacy[field])
+        self.assertEqual(retained["next_removal_observation_at"],self.now+60)
+        self.assertEqual(retained["delete_attempts"],2)
+
+    def test_failed_removal_observations_persist_interval_before_io(self):
+        self.arm()
+        self.now = self.deadline
+        self.guardian().tick()
+        path = self.root/"receipts"/(self.uid+".json")
+        pending = _read(path)
+        for failure in ("timeout","http","malformed","identity"):
+            with self.subTest(failure=failure):
+                _write(path,pending)
+                self.now = self.deadline+60
+                persisted_before_get = []
+                def fail_get(route):
+                    persisted_before_get.append(_read(path)["next_removal_observation_at"])
+                    if failure == "timeout":
+                        raise httpx.ReadTimeout("fake failure")
+                    if failure == "http":
+                        return httpx.Response(503)
+                    if failure == "malformed":
+                        return httpx.Response(200,content=b"not json")
+                    return httpx.Response(200,json={**self.body,"name":"2"*32})
+                self.client.get.side_effect = fail_get
+                self.client.get.reset_mock()
+                self.guardian().tick()
+                self.client.get.assert_called_once()
+                self.assertEqual(persisted_before_get,[self.now+60])
+                retained = _read(path)
+                self.assertEqual(retained,{**pending,"next_removal_observation_at":self.now+60})
+                self.assertEqual(_read(self.root/"heartbeat.json")["state"],"degraded")
+                self.now += 59
+                self.guardian().tick()
+                self.client.get.assert_called_once()
+                self.assertEqual(_read(path),retained)
+                self.now += 1
+                self.client.get.side_effect = lambda route:httpx.Response(404)
+                self.guardian().tick()
+                self.assertEqual(self.client.get.call_count,2)
+                self.assertTrue(self.guard.removal_proof(self.uid)["removed"])
+        self.client.delete.assert_called_once()
+
+    def test_first_deadline_get_failure_is_throttled_without_delaying_first_attempt(self):
+        self.arm()
+        path = self.root/"receipts"/(self.uid+".json")
+        armed = _read(path)
+        self.now = self.deadline
+        self.client.get.reset_mock()
+        self.client.get.side_effect = httpx.ReadTimeout("fake failure")
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        self.assertEqual(_read(path),{**armed,"next_removal_observation_at":self.now+60})
+        self.client.delete.assert_not_called()
+        self.now += 59
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        self.now += 1
+        self.client.get.side_effect = lambda route:httpx.Response(200,json=self.body)
+        self.guardian().tick()
+        self.assertEqual(self.client.get.call_count,2)
+        self.client.delete.assert_called_once()
+
+    def test_provider_stopping_hint_polls_each_minute_without_postponing_deadline(self):
+        self.arm()
+        path = self.root/"receipts"/(self.uid+".json")
+        original, started = _read(path), self.now
+        for state in ({"status":"Stopping"},{"status":"pending","message":"sToPpInG"}):
+            with self.subTest(state=state):
+                _write(path,original)
+                self.body["state"] = state
+                self.now = started+1
+                self.client.get.reset_mock()
+                self.client.delete.reset_mock()
+                self.guardian().tick()
+                self.assertTrue(_read(path)["removal_poll_hint"])
+                self.assertEqual(_read(path)["state"],"armed")
+                for offset in (3,59):
+                    self.now = started+1+offset
+                    self.guardian().tick()
+                    self.client.get.assert_called_once()
+                self.now = started+61
+                self.guardian().tick()
+                self.assertEqual(self.client.get.call_count,2)
+                self.assertGreater(_read(path)["next_removal_observation_at"],self.deadline)
+                self.client.delete.assert_not_called()
+                with self.assertRaisesRegex(ValueError,"removal_unconfirmed"):
+                    self.guard.removal_proof(self.uid)
+                self.now = self.deadline
+                self.guardian().tick()
+                self.assertEqual(self.client.get.call_count,3)
+                self.client.delete.assert_called_once()
+                receipt = _read(path)
+                self.assertEqual((receipt["state"],receipt["deadline"]),("removal_pending",self.deadline))
+                self.assertNotIn("removal_poll_hint",receipt)
+                self.now += 59
+                self.guardian().tick()
+                self.assertEqual(self.client.get.call_count,3)
+
+    def test_stopping_hint_deadline_override_is_consumed_before_failed_get(self):
+        self.arm()
+        self.now = self.deadline-3
+        self.body["state"]["status"] = "Stopping"
+        self.guardian().tick()
+        self.now = self.deadline
+        self.client.get.reset_mock()
+        self.client.get.side_effect = httpx.ReadTimeout("fake failure")
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        receipt = _read(self.root/"receipts"/(self.uid+".json"))
+        self.assertNotIn("removal_poll_hint",receipt)
+        self.assertEqual(receipt["next_removal_observation_at"],self.now+60)
+        self.now += 59
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        self.client.delete.assert_not_called()
+
+    def test_stopping_hint_clears_after_fresh_running_observation(self):
+        self.arm()
+        self.body["state"]["status"] = "Stopping"
+        self.guardian().tick()
+        self.now += 60
+        self.body["state"]["status"] = "running"
+        self.guardian().tick()
+        receipt = _read(self.root/"receipts"/(self.uid+".json"))
+        self.assertNotIn("removal_poll_hint",receipt)
+        self.assertNotIn("next_removal_observation_at",receipt)
+        self.client.get.reset_mock()
+        self.now += 3
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        self.assertTrue(self.guard.proof(self.uid)["armed"])
 
     def test_disappearance_without_delete_ack_is_unknown(self):
         self.arm()
@@ -91,12 +273,14 @@ class TargonCleanupTests(unittest.TestCase):
         self.client.delete.side_effect = httpx.ReadTimeout("fake failure")
         self.guardian().tick()
         self.get_status = 404
+        self.now += 60
         self.guardian().tick()
         with self.assertRaisesRegex(ValueError,"removal_unconfirmed"):
             self.guard.removal_proof(self.uid)
         self.client.delete.assert_called_once()
         self.get_status = 200
         self.body["state"]["status"] = "deleted"
+        self.now += 60
         self.guardian().tick()
         self.assertEqual(self.guard.removal_proof(self.uid)["evidence"],"exact_uid_deleted")
 
@@ -130,8 +314,12 @@ class TargonCleanupTests(unittest.TestCase):
         self.client.delete.assert_called_once()
         self.now += 1
         self.guardian().tick()
+        self.client.delete.assert_called_once()
+        self.now += 30
+        self.guardian().tick()
         self.assertEqual(self.client.delete.call_count,2)
         self.get_status = 404
+        self.now += 60
         self.guardian().tick()
         self.assertTrue(self.guard.removal_proof(self.uid)["removed"])
 
@@ -142,11 +330,19 @@ class TargonCleanupTests(unittest.TestCase):
         for _ in range(12):
             self.guardian().tick()
             receipt = _read(self.root/"receipts"/(self.uid+".json"))
-            self.now = receipt["next_retry_at"]
+            self.now = max(receipt["next_retry_at"],receipt["next_removal_observation_at"])
         self.guardian().tick()
         self.assertEqual(self.client.delete.call_count,12)
         self.assertEqual(_read(self.root/"receipts"/(self.uid+".json"))["state"],"cleanup_blocked")
         self.assertEqual(_read(self.root/"heartbeat.json")["state"],"degraded")
+        self.client.get.reset_mock()
+        self.now += 59
+        self.guardian().tick()
+        self.client.get.assert_not_called()
+        self.now += 1
+        self.guardian().tick()
+        self.client.get.assert_called_once()
+        self.assertEqual(self.client.delete.call_count,12)
 
     def arm_distinct_workload(self):
         uid, deadline = "wkl-distinct", self.now+120
@@ -175,7 +371,14 @@ class TargonCleanupTests(unittest.TestCase):
         self.assertEqual(self.client.delete.call_count,1)
         for method in (self.guard.proof,self.guard.removal_proof):
             with self.assertRaises(ValueError): method(self.uid)
-        self.now += 30
+        for offset in (3,30,59):
+            self.now = self.deadline+offset
+            self.client.get.reset_mock()
+            self.guardian().tick()
+            self.client.get.assert_called_once_with('/tha/v3/orgs/fixture-org/workloads/'+uid)
+            self.assertEqual(_read(old_path),original)
+            self.assertTrue(self.guard.proof(uid)["armed"])
+        self.now = self.deadline+60
         self.guardian().tick()
         retried = _read(old_path)
         self.assertEqual(self.client.delete.call_count,2)
@@ -187,13 +390,43 @@ class TargonCleanupTests(unittest.TestCase):
         self.assertTrue(self.guard.proof(uid)["armed"])
         self.assertTrue(all(call.args[0].endswith('/'+self.uid) for call in self.client.delete.call_args_list))
 
+    def test_slow_earlier_workload_cannot_shorten_another_removal_poll_interval(self):
+        self.arm()
+        self.now = self.deadline
+        self.guardian().tick()
+        earlier_uid, _ = self.arm_distinct_workload()
+        original_get = self.client.get.side_effect
+        removal_reads = []
+        delayed = False
+        def slow_get(route):
+            nonlocal delayed
+            if route.endswith('/'+earlier_uid) and not delayed:
+                self.now += 15
+                delayed = True
+            if route.endswith('/'+self.uid):
+                removal_reads.append(self.now)
+            return original_get(route)
+        self.client.get.side_effect = slow_get
+        self.now = self.deadline+60
+        self.guardian().tick()
+        self.assertEqual(removal_reads,[self.deadline+75])
+        self.assertEqual(_read(self.root/"receipts"/(self.uid+".json"))["next_removal_observation_at"],
+                         self.deadline+135)
+        self.now = self.deadline+120
+        self.guardian().tick()
+        self.assertEqual(removal_reads,[self.deadline+75])
+        self.now = self.deadline+135
+        self.guardian().tick()
+        self.assertEqual(removal_reads,[self.deadline+75,self.deadline+135])
+
     def test_distinct_workload_does_not_reset_exhausted_old_cleanup(self):
         self.arm()
         self.now = self.deadline
         old_path = self.root/"receipts"/(self.uid+".json")
         for _ in range(12):
             self.guardian().tick()
-            self.now = _read(old_path)["next_retry_at"]
+            receipt = _read(old_path)
+            self.now = max(receipt["next_retry_at"],receipt["next_removal_observation_at"])
         self.guardian().tick()
         original = _read(old_path)
         uid, _ = self.arm_distinct_workload()
@@ -263,6 +496,7 @@ class TargonCleanupTests(unittest.TestCase):
         self.assertEqual(receipt["request"],original)
         self.assertEqual(receipt["deadline"],self.deadline)
         self.get_status = 404
+        self.now += 60
         self.guardian().tick()
         self.assertEqual(self.guard.removal_proof(self.uid)["deadline"],self.deadline)
         self.guardian().tick()
@@ -282,6 +516,7 @@ class TargonCleanupTests(unittest.TestCase):
         self.assertEqual(receipt["request"],original)
         self.assertEqual(receipt["workload_identity"]["name"],self.body["name"])
         self.get_status = 404
+        self.now += 60
         self.guardian().tick()
         self.assertTrue(self.guard.removal_proof(self.uid)["removed"])
 

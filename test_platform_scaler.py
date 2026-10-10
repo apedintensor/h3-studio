@@ -48,6 +48,55 @@ class FakeProvider:
 
 
 class ScalerTests(LedgerCase):
+    def test_pending_removal_checks_each_minute_across_restart_and_failed_reads(self):
+        row = self.create()
+        started = self.now
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id == row['id']).values(state='destroying'))
+            connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == row['id']).values(destroy_started_at=started))
+        budget = self.repo.get_budget('owner-budget')
+        self.provider.facts[row['id']] = ProviderFact('unknown', row['provider_instance_id'])
+        def observe():
+            self.scaler.observe_manual_instance('leader', row['id'], policy=self.policy, stop=True)
+        for elapsed in (0, 3, 30, 59):
+            self.now = started + elapsed
+            observe()
+        self.assertEqual(self.provider.lookups, [])
+        self.now = started + 60
+        with patch.object(self.provider, 'reconcile', side_effect=TimeoutError) as lookup:
+            observe()
+            self.assertEqual(lookup.call_count, 1)
+        self.scaler = ScaleCoordinator(self.repo, provider=self.provider, enabled=True)
+        self.now = started + 119
+        observe()
+        self.assertEqual(self.provider.lookups, [])
+        self.now = started + 120
+        observe()
+        self.assertEqual(len(self.provider.lookups), 1)
+        self.assertEqual(self.repo.list_instance_intents()[0]['state'], 'destroying')
+        self.assertEqual(self.repo.get_budget('owner-budget'), budget)
+        self.assertEqual(self.provider.destroys, [])
+
+    def test_pending_removal_crash_retains_cadence_but_late_terminal_receipt_wins(self):
+        row = self.create()
+        started = self.now
+        with self.repo.transaction() as connection:
+            connection.execute(update(instance_intents).where(instance_intents.c.id == row['id']).values(state='destroying'))
+            connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == row['id']).values(destroy_started_at=started))
+        class Crash(BaseException): pass
+        self.now += 60
+        with patch.object(self.scaler, '_call', side_effect=Crash), self.assertRaises(Crash):
+            self.scaler.observe_manual_instance('leader', row['id'], policy=self.policy)
+        self.scaler = ScaleCoordinator(self.repo, provider=self.provider, enabled=True)
+        self.now += 30
+        self.scaler.observe_manual_instance('leader', row['id'], policy=self.policy)
+        self.assertEqual(self.provider.lookups, [])
+        self.scaler._receipt(row['id'], 'destroy', ProviderFact('destroyed', row['provider_instance_id']))
+        self.scaler.observe_manual_instance('leader', row['id'], policy=self.policy)
+        self.assertEqual(self.repo.list_instance_intents()[0]['state'], 'destroyed')
+        self.assertEqual(self.provider.lookups, [])
+        self.assertEqual(self.repo.get_budget('owner-budget')['reserved_microusd'], 100_000)
+
     def test_disabled_preparation_preserves_historical_receipt_and_action_payloads(self):
         from studio_platform.repository import scaler_receipts
         row = self.create()
@@ -360,7 +409,7 @@ class ScalerTests(LedgerCase):
         self.tick(demands=[])
         self.assertEqual(len(self.provider.destroys), 1)
         self.provider.facts[instance["id"]] = ProviderFact("destroyed", instance["provider_instance_id"])
-        self.now += 16
+        self.now += 44
         self.tick(demands=[])
         self.assertEqual(self.repo.list_instance_intents()[0]["state"], "destroyed")
         self.assertEqual(self.repo.get_budget("owner-budget")["reserved_microusd"], 100_000)
