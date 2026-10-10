@@ -5,9 +5,15 @@ owns the bounded dstack/Hatchet/Grafana Cloud batch. The specification is
 [DSTACK-MIGRATION.md](DSTACK-MIGRATION.md). Source implements an original-ledger
 capacity adapter, authenticated broker dispatch, native slot supervision and an
 operator interface; the legacy route is retained. An authenticated local CPU
-simulation proved one original attempt/submission under duplicate delivery and
-exported eight worker stages to Cloud; the integration owner read these back on
-the dashboard. See the [engine/Cloud receipt](https://github.com/inkseq/h3-studio/issues/132#issuecomment-6099423238).
+simulation proved one original attempt/submission and one artifact fetch under
+response loss and a subsequent original-attempt recovery wakeup, saving validated
+video and independent audio. Exported worker stages reached Cloud; the integration
+owner read the matching completion, commit and upload events on the dashboard.
+See the [final CPU/Cloud checkpoint](https://github.com/inkseq/h3-studio/issues/132#issuecomment-6099975400).
+The configured 30-second recovery cadence is included in these simulation times;
+they are not GPU speed or cold-start measurements. Source integration is tracked
+in [PR #133](https://github.com/inkseq/h3-studio/pull/133); canonical frontend
+[PR #18](https://github.com/inkseq/sixnine-design/pull/18) is merged, not published.
 This is **not a production migration receipt or real dstack GPU acceptance**.
 Published runtime, actual warm GPU/mode checks, a protected CPU rollout and the
 14-day stability gate remain distinct acceptance in #132. This batch has not
