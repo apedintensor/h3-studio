@@ -165,7 +165,7 @@ class RealHatchetTests(unittest.TestCase):
                         break
                     time.sleep(1)
                 self.assertEqual(current["status"], "succeeded")
-                self.assertEqual(repo.get_job(scope, older["id"])["status"], "queued")
+                self.assertEqual(repo.get_job(scope, older["id"])["status"], "planned")
                 self.assertGreaterEqual(len(publisher.calls), 2)
                 self.assertEqual(len({event for event, run in publisher.calls}), 1)
                 # At-least-once broker deliveries may have different run IDs.

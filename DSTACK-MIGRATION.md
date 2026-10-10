@@ -50,6 +50,13 @@ do not create a new attempt to investigate it. Collection and conditional receip
 writes can retry safely without regenerating video.
 
 Required worker labels express route, configuration/manifest and supported mode.
+An existing attempt's recovery additionally requires its original immutable
+physical worker identity, proven from the attempt and still-bound registration.
+Shared workflow defaults never pin unrelated new jobs to one replica. A busy,
+incompatible or non-winning callback promptly yields its broker slot. The original
+business scheduler chooses among all compatible jobs under its pool lock, retaining
+owner fairness and FIFO aging; an identity delivery can claim only if its exact job
+wins that choice. Yielding creates no attempt and never authorizes another inference.
 Do not claim that Hatchet sticky assignment batches unrelated jobs by mode; it
 addresses related workflow steps. Optional loaded-mode affinity must never defeat
 resource safety, fairness or the exact model request.
