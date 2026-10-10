@@ -224,6 +224,101 @@ class HostHandoffTests(unittest.TestCase):
         pin = json.loads((self.root/'active.json').read_text())
         self.assertEqual((pin['controller_id'],pin['admission']),('new-controller','open'))
 
+    def configure_start_inspection(self, observations, *, original_retirement=True):
+        self.inspect.side_effect = ([self.inspect.return_value] if original_retirement else []) + observations
+        self.receipt.side_effect = ([self.receipt.return_value] if original_retirement else []) + [
+            {'state':'running','controller_id':'new-controller'}]
+        process = Mock(returncode=0)
+        process.poll.side_effect = [None]*len(observations) + [0]
+        self.launch.return_value = process
+        app = {'services':{'app':{}}}
+        self.mock(host,'app_overlay',return_value=app)
+        self.mock(host,'validate_app_rendered')
+        self.mock(release,'wait_ready')
+        restore = self.mock(host,'restore',return_value={'state':'cpu_restored'})
+        def command(arguments, **kwargs):
+            if arguments[-2:] == ['version','--short']: return b'2.38.2'
+            if arguments[-3:] == ['config','--format','json']: return json.dumps(app).encode()
+            return b''
+        self.mock(release,'command',side_effect=command)
+        return process, restore
+
+    def test_delayed_container_inspection_retries_same_launch_before_admission(self):
+        unavailable = release.ReleaseError('container_operation_failed_no_details_logged')
+        ready = {'Running':True,'Restarting':False,'OOMKilled':False}
+        process, restore = self.configure_start_inspection([unavailable, unavailable, ready])
+        def sleep(seconds):
+            self.assertEqual(seconds,2)
+            self.assertEqual(json.loads((self.root/'active.json').read_text())['admission'],'closed')
+            self.launch.assert_called_once()
+        wait = Mock(side_effect=sleep)
+        self.assertEqual(handoff.start(clock=lambda:0, sleep=wait),{'state':'cpu_restored'})
+        self.assertEqual(wait.call_count,2)
+        self.launch.assert_called_once()
+        restore.assert_called_once()
+        self.drain.assert_not_called()
+        self.assertEqual(json.loads(handoff.record_path().read_text())['phase'],'running')
+
+    def test_container_inspection_retry_stops_at_original_120_second_deadline(self):
+        unavailable = release.ReleaseError('container_operation_failed_no_details_logged')
+        self.configure_start_inspection([unavailable, unavailable])
+        wait = Mock()
+        with self.assertRaisesRegex(release.ReleaseError,'startup_timeout'):
+            handoff.start(clock=Mock(side_effect=[0,119,120]),sleep=wait)
+        wait.assert_called_once_with(2)
+        self.launch.assert_called_once()
+        self.drain.assert_called_once()
+        self.assertEqual(json.loads(handoff.record_path().read_text())['phase'],'launch_intent')
+        self.assertEqual(json.loads((self.root/'active.json').read_text())['admission'],'closed')
+
+    def test_container_identity_failure_is_fatal_without_retry_or_relaunch(self):
+        self.configure_start_inspection([release.ReleaseError('operator_container_identity_changed')])
+        wait = Mock()
+        with self.assertRaisesRegex(release.ReleaseError,'container_identity_changed'):
+            handoff.start(sleep=wait)
+        wait.assert_not_called()
+        self.launch.assert_called_once()
+        self.drain.assert_called_once()
+        self.assertEqual(json.loads(handoff.record_path().read_text())['phase'],'launch_intent')
+
+    def test_malformed_container_inspection_is_fatal_without_retry(self):
+        self.configure_start_inspection([ValueError('malformed container inspection')])
+        wait = Mock()
+        with self.assertRaisesRegex(ValueError,'malformed container inspection'):
+            handoff.start(sleep=wait)
+        wait.assert_not_called()
+        self.launch.assert_called_once()
+        self.drain.assert_called_once()
+
+    def test_client_exit_during_inspection_retry_is_not_relaunched(self):
+        process, _ = self.configure_start_inspection([
+            release.ReleaseError('container_operation_failed_no_details_logged')])
+        process.poll.side_effect = [None,0]
+        wait = Mock()
+        with self.assertRaisesRegex(release.ReleaseError,'startup_unconfirmed'):
+            handoff.start(clock=lambda:0,sleep=wait)
+        wait.assert_called_once_with(2)
+        self.launch.assert_called_once()
+        self.drain.assert_called_once()
+        self.assertEqual(json.loads(handoff.record_path().read_text())['phase'],'launch_intent')
+
+    def test_explicit_successor_factory_reuses_existing_supervision(self):
+        self.configure_start_inspection([{'Running':True,'Restarting':False,'OOMKilled':False}],
+                                       original_retirement=False)
+        prepared = {**self.old,'commit':'b'*40,'image_id':'new-image'}
+        pin = host.pin_for(prepared)
+        def reviewed_factory():
+            host.atomic(handoff.record_path(),{**self.record,'phase':'launch_intent'})
+            host.atomic(self.root/'active.json',pin)
+            return self.runtime,prepared,self.root,self.next_environment,pin
+        factory = Mock(side_effect=reviewed_factory)
+        with patch.object(handoff,'successor') as original:
+            self.assertEqual(handoff.start(successor_factory=factory),{'state':'cpu_restored'})
+        original.assert_not_called()
+        factory.assert_called_once()
+        self.launch.assert_called_once_with(self.root,self.next_environment,self.runtime,pin)
+        self.assertEqual(json.loads((self.root/'active.json').read_text())['admission'],'open')
+
     def test_prepare_records_original_identity_before_term(self):
         handoff.record_path().unlink()
         self.supervisor.return_value = {**self.unit,'MainPID':'321','ActiveState':'active'}

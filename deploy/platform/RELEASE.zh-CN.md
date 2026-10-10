@@ -50,3 +50,11 @@
 发布文件测试覆盖：commit/文件集合、篡改、硬链接、复制中断再试、原子发布、不复制 incoming 控制脚本、子进程不继承云凭据环境，以及 CI 发布目标。Compose 和隔离 Linux 数据库验证由 `test_platform_deployment.py` 覆盖。
 
 尚未执行真实主机发布；没有依据上述文件创建云资源、设置密码或修改域名。版本留存、旧镜像清理与备份期限待确定，发布程序不自行删除旧版或用户数据。
+
+## Pending-deletion controller handoff recovery
+
+`operator_handoff.py` retries only the generic Docker inspect failure during its existing 120-second startup window. A wrong identity remains fatal; launching and credential delivery happen once. A failed handoff never resets its consumed launch intent.
+
+For the specific case of a cleanly stopped first successor, the separately protected `operator_handoff_continuation.py approve --unit <failed-handoff-unit>` records the exact stopped container, released-local-ownership receipt, retired original and failed supervisors, unchanged approved release/configuration and read-only immutable ledger. It refuses active jobs, unsafe attempts, bound workers, incomplete start ordinals, unknown creation or changed budgets/deadlines. Approval alone starts nothing.
+
+Run `operator_handoff_continuation.py resume` only under a new reviewed root systemd unit with `Restart=no`, `KillMode=process`, `TimeoutStopSec=infinity`, and `SendSIGKILL=no`. It preserves the original handoff journal, archives the stopped container by rename without deletion, and records archive/launch intent before effects. It then reuses the existing credential loader and supervised startup/admission path for one CPU controller. A changed identity, interrupted rename or unknown delivery retains its barrier and must not be replayed. This is bounded incident recovery, not general host reconstruction or new GPU authorization. Guardian/deletion/accounting obligations remain independent.
