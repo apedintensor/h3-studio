@@ -192,6 +192,37 @@ class HatchetAffinityTests(LedgerCase):
         client.stubs.task.assert_not_called()
         self.assertEqual(self.repo.get_job(self.scope, job["id"])["attempt_no"], 1)
 
+    def test_proven_unsubmitted_preparation_deferral_retains_safe_replica_retry(self):
+        job = self.make_job()
+        self.ready("one")
+        class NotPrepared(MemoryBackend):
+            def prepare(self, *_args):
+                raise ValueError("temporary native preparation failure")
+        before = NotPrepared()
+        self.assertEqual(self.runner(job, before, worker="one").run_once("one", "hatchet-test")["state"], "queued")
+        self.assertEqual(before.submissions, [])
+        self.assertIsNone(self.control.get("one")["current_job_id"])
+        self.now += 31
+        self.assertNotIn("sixnine_worker", self.publish(job))
+        self.ready("two")
+        backend = CountingMock(self.directory / "native-two", enabled=True)
+        self.assertEqual(self.callback(job, backend, "two"), {"job_id": job["id"], "state": "succeeded"})
+        self.assertEqual(backend.submits, 1)
+        self.assertEqual(self.repo.get_job(self.scope, job["id"])["attempt_no"], 2)
+
+    def test_queued_status_cannot_remove_existing_submission_affinity(self):
+        job = self.make_job()
+        self.ready("one")
+        self.ready("two")
+        original = MemoryBackend(lose_response=True)
+        self.runner(job, original, worker="one").run_once("one", "hatchet-test")
+        with self.repo.transaction() as connection:
+            connection.execute(update(jobs).where(jobs.c.id == job["id"]).values(status="queued"))
+        self.assertEqual(self.publish(job)["sixnine_worker"], "one")
+        self.assertEqual(self.callback(job, MemoryBackend(), "two")["reason_code"], "hatchet_worker_incompatible")
+        self.assertEqual(len(original.submissions), 1)
+        self.assertEqual(self.repo.get_job(self.scope, job["id"])["attempt_no"], 1)
+
     def test_attempt_and_lease_disagreement_refuses_publication(self):
         job = self.make_job()
         self.ready("one")
