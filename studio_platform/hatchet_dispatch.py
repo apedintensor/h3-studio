@@ -95,6 +95,11 @@ def _original_worker(connection, job):
         attempts.c.id == job["current_attempt_id"], attempts.c.job_id == job["id"])).mappings().first()
     if attempt is None:
         raise ValueError("hatchet_original_attempt_unconfirmed")
+    if (job["status"] == "queued" and job["lease_worker_id"] is None
+            and attempt["submission_started_at"] is None and attempt["upstream_task_id"] is None):
+        # Original defer_unsubmitted/recover_expired proof permits another
+        # preparation claim. No inference intent exists to recover or repeat.
+        return None
     worker = connection.execute(select(registered_workers).where(
         registered_workers.c.id == attempt["worker_id"])).mappings().first()
     if (worker is None or worker["current_job_id"] != job["id"]
