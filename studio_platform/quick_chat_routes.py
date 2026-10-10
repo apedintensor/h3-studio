@@ -1,9 +1,10 @@
 """Thin authenticated chat routes. State and side effects live in one service."""
-from fastapi import File, Form, Header, Query, Request, UploadFile
+from fastapi import BackgroundTasks, File, Form, Header, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from .quick_chat import QuickChatService, QuickChatError, default_next_settings
 from .quick_chat_assistant import QuickChatAssistant, model_schema
+from .quick_chat_titles import TITLE_MODEL
 from .capabilities import capabilities
 from .upload_route import QuickChatAssetUploadRoute
 
@@ -45,11 +46,11 @@ def agent_contract():
         "release_notice": "This is the backend contract. Quick Chat frontend integration and public onboarding have separate release gates; discovery does not prove a deployed UI, enabled assistant or GPU readiness."}
 
 
-def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False):
+def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False, title_generator=None):
     settings = app.state.settings
     service = QuickChatService(app.state.repository, app.state.assets, settings, app.state.storage,
         hooks=hooks, assistant=assistant or QuickChatAssistant(app.state.assets, app.state.storage),
-        assistant_enabled=assistant_enabled)
+        assistant_enabled=assistant_enabled, title_generator=title_generator)
     app.state.quick_chat = service
 
     @app.exception_handler(QuickChatError)
@@ -61,6 +62,12 @@ def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False)
         return {"version": 1, "agent_contract": agent_contract(),
             "models": model_schema(enabled=assistant_enabled), "capabilities": capabilities(settings),
             "assistant_enabled": assistant_enabled, "copies": {"minimum": 1, "maximum": 4},
+            "history_titles": {"enabled": title_generator is not None, "model_id": TITLE_MODEL,
+                "input": "first meaningful accepted turn or card prompt; at most 2000 characters; no media or full history",
+                "timing": "background after authoring response", "maximum_calls_per_session": 1,
+                "manual_title_preserved": True, "authoring_version_bump": False,
+                "failure": "keep the original title; no automatic paid retry",
+                "existing_sessions_backfilled": False},
             "default_next_settings": default_next_settings(settings),
             "turn_creation": {"create_card": {"type": "boolean", "default": False,
                 "allowed_assistant_modes": ["none"], "atomic_with_turn": True,
@@ -124,8 +131,11 @@ def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False)
             cursor=after_cursor or before_cursor or cursor, direction="newer" if after_cursor else "older" if before_cursor else direction)
 
     @app.post(PREFIX+"/{session_id}/turns", status_code=201)
-    def create_turn(session_id: str, request: Request, body: dict, key: str = Header(..., alias="Idempotency-Key")):
-        return service.create_turn(request.state.principal, session_id, body, key)
+    def create_turn(session_id: str, request: Request, body: dict, background_tasks: BackgroundTasks,
+                    key: str = Header(..., alias="Idempotency-Key")):
+        value = service.create_turn(request.state.principal, session_id, body, key)
+        background_tasks.add_task(service.generate_title, request.state.principal, session_id)
+        return value
 
     @app.get(PREFIX+"/{session_id}/turns/{turn_id}")
     def turn(session_id: str, turn_id: str, request: Request):
@@ -136,16 +146,22 @@ def register_routes(app, *, hooks=None, assistant=None, assistant_enabled=False)
         return service.acknowledge_unknown(request.state.principal, session_id, turn_id, body, key)
 
     @app.post(PREFIX+"/{session_id}/cards", status_code=201)
-    def create_card(session_id: str, request: Request, body: dict, key: str = Header(..., alias="Idempotency-Key")):
-        return service.save_card(request.state.principal, session_id, body, key)
+    def create_card(session_id: str, request: Request, body: dict, background_tasks: BackgroundTasks,
+                    key: str = Header(..., alias="Idempotency-Key")):
+        value = service.save_card(request.state.principal, session_id, body, key)
+        background_tasks.add_task(service.generate_title, request.state.principal, session_id)
+        return value
 
     @app.get(PREFIX+"/{session_id}/cards/{card_id}")
     def card(session_id: str, card_id: str, request: Request):
         return service.get_card(request.state.principal, session_id, card_id)
 
     @app.post(PREFIX+"/{session_id}/cards/{card_id}/revisions", status_code=201)
-    def revision(session_id: str, card_id: str, request: Request, body: dict, key: str = Header(..., alias="Idempotency-Key")):
-        return service.save_card(request.state.principal, session_id, body, key, card_id=card_id)
+    def revision(session_id: str, card_id: str, request: Request, body: dict, background_tasks: BackgroundTasks,
+                 key: str = Header(..., alias="Idempotency-Key")):
+        value = service.save_card(request.state.principal, session_id, body, key, card_id=card_id)
+        background_tasks.add_task(service.generate_title, request.state.principal, session_id)
+        return value
 
     @app.get(PREFIX+"/{session_id}/revisions/{revision_id}")
     def get_revision(session_id: str, revision_id: str, request: Request):
