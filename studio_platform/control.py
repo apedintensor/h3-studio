@@ -142,7 +142,7 @@ class WorkerControl:
 
     def pool_status(self, pool, *, model_id, configuration_id, recipe_id=None,
                     backend="comfy-worker", engine_manifest_digest=None, output_delivery="",
-                    expected_runtime_s=None, deployment_profile_id=None):
+                    expected_runtime_s=None, deployment_profile_id=None, dispatch_backend="legacy"):
         """Read-only readiness of exact operator-bound slots, not a GPU probe.
 
         An expired registration is reported as unknown without modifying its
@@ -151,6 +151,8 @@ class WorkerControl:
         """
         for value in (pool, model_id, configuration_id):
             identifier(value)
+        if dispatch_backend not in {"legacy", "hatchet-v1"}:
+            raise ValueError("invalid_dispatch_backend")
         validate_delivery_policy(backend, output_delivery)
         if recipe_id is not None:
             identifier(recipe_id)
@@ -180,6 +182,7 @@ class WorkerControl:
             for row in rows:
                 spec = row["spec"]
                 if (spec["backend"] != backend or spec["model_id"] != model_id
+                    or spec.get("dispatch_backend", "legacy") != dispatch_backend
                     or spec["configuration_id"] != configuration_id
                     or backend == "wangp-worker" and spec.get("engine_manifest_digest") != engine_manifest_digest
                     or spec.get("output_delivery", "") != output_delivery
@@ -480,7 +483,8 @@ class WorkerControl:
             counts = self.pool_status(job["pool"], model_id=request["model"],
                 configuration_id=plan["configuration_id"], backend=plan["backend"], recipe_id=stored.get("recipe_id"),
                 engine_manifest_digest=plan.get("engine_manifest_digest"), output_delivery=plan.get("output_delivery", ""),
-                expected_runtime_s=job.get("expected_runtime_s"), deployment_profile_id=stored.get("deployment_profile_id"))
+                expected_runtime_s=job.get("expected_runtime_s"), deployment_profile_id=stored.get("deployment_profile_id"),
+                dispatch_backend=plan.get("dispatch_backend", "legacy"))
         except (KeyError, ValueError):
             result["reason_code"] = "queue_configuration_unconfirmed"
             return result

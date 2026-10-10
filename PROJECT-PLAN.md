@@ -19,6 +19,20 @@ Every accepted job has a traceable owner, immutable request, execution history, 
 The immediate priority is a reliable generation path and understandable failure recovery.
 Repeated frontend redesign is not a substitute for proving that path.
 
+### Accepted capacity/dispatch migration (2026-10-11)
+
+Use [DSTACK-MIGRATION.md](DSTACK-MIGRATION.md) and [#132](https://github.com/inkseq/h3-studio/issues/132)
+for the dstack 0.22.3 / Hatchet / Grafana Cloud implementation. dstack replaces
+new-path provider provisioning and Hatchet replaces dispatch; the current business
+ledger and native WanGP execution/reconciliation/collection remain authoritative.
+New jobs freeze their dispatch route; missing historical values mean legacy.
+Existing Lium/Targon jobs, leases and billing recovery retain their original path.
+Grafana Cloud stores telemetry, with no additional local metrics database or
+self-hosted Grafana. Legacy retirement requires at least 14 stable days and
+resolution of original tasks and obligations. This direction supersedes building
+additional bespoke new-path provider schedulers; source, release and real-path
+acceptance remain separate. Detailed legacy observations below remain historical.
+
 ## 2. Facts, limitations, and targets
 
 The following is a source-code and historical-record baseline, not a fresh production inspection.

@@ -17,6 +17,15 @@ Keep IDs stable. A material reversal receives a new decision ID and a `supersede
 - **Revisit when:** A measured availability or scaling requirement cannot be met within these boundaries; any replacement must first specify identity, obligation and recovery continuity.
 - **Evidence / current contract:** [Pinned plan §§3–4][P-platform]; [generation contract §1](GENERATION-CONTRACT.md#1-one-business-api-and-ledger).
 
+## DEC-013 — Use dstack capacity, Hatchet dispatch and Grafana Cloud telemetry
+
+- **Status / scope:** Accepted user direction, 2026-10-11; phased implementation in [#132](https://github.com/inkseq/h3-studio/issues/132).
+- **Decision:** dstack 0.22.3 owns new-path provider offers and long-running Vast/RunPod allocations. Hatchet owns durable dispatch, with CPU workers reusing the existing atomic job/slot claim, WanGP SSH transport and original-attempt recovery. Freeze `legacy` or `hatchet-v1` in each accepted execution plan. Grafana Cloud stores safe OTLP metrics/logs/traces; do not deploy a local Grafana or long-term telemetry SQL store. Business identities, immutable requests, attempts, receipts, budgets and unknown obligations remain in the existing ledger.
+- **Why:** Replace repeated custom provider/dispatch maintenance without rewriting the working creator API or discarding protections against duplicate generation and lost outputs. Reuse the warm native runtime across jobs.
+- **Alternatives:** Another bespoke scheduler, a parallel backend/job database, per-video GPU cold starts and a self-hosted telemetry database are rejected for this migration. GPU pull workers and custom Lium/Targon dstack plugins are deferred pending measured benefit.
+- **Constraints:** Hatchet is at-least-once; no automatic retry of uncertain inference. dstack RUNNING is not proof of model-loaded readiness or stopped billing. Initial runs request one physical GPU; larger allocations need all-device execution evidence. Legacy retirement waits for >=14 stable days and recovered tasks/obligations. Existing user authorization governs spending; the plan itself does not reset budgets.
+- **Evidence / contract:** [Migration specification](DSTACK-MIGRATION.md), [generation contract](GENERATION-CONTRACT.md). This record accepts direction, not completion or production enablement.
+
 ## DEC-002 — Use a thin WanGP runtime adapter; preserve original Comfy recovery
 
 - **Status / scope:** Accepted; inference execution. Original decision date **2026-10-06**, explicitly recorded in the plan.

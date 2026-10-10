@@ -16,12 +16,14 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 from types import MappingProxyType
 from typing import Protocol
 from uuid import UUID, uuid4
 
 from .control import WorkerSpec
 from .dstack_capacity import DstackError
+from .operator_capacity import OperatorError
 from .fleet import SlotConfig
 from .inference.wangp_contract import HostReadiness
 from .inference.wangp_factory import create_backend, read_document
@@ -210,9 +212,44 @@ class DstackNativeRuntime:
             with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as out:
                 json.dump(state, out, sort_keys=True); out.flush(); os.fsync(out.fileno())
             temporary.replace(path)
+            DstackNativeRuntime._sync_directory(path.parent)
         finally:
             if temporary.exists():
                 temporary.unlink()
+
+    @staticmethod
+    def _sync_directory(directory):
+        if os.name == "posix":
+            descriptor=os.open(directory,os.O_RDONLY|os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+
+    @staticmethod
+    def _recover_token_alias(token_path):
+        # A hard interruption between link and unlink can retain our staging
+        # alias. Remove only one exact owned inode in this locked intent dir;
+        # unknown hard links still fail checked_reader, never mint a new token.
+        info=token_path.lstat()
+        if info.st_nlink != 2 or not stat.S_ISREG(info.st_mode):
+            return
+        aliases=[]
+        for index,candidate in enumerate(token_path.parent.glob("wangp-token.*.tmp")):
+            if index>=32:
+                return
+            if not re.fullmatch(r"wangp-token\.[0-9a-f]{32}\.tmp",candidate.name):
+                continue
+            current=candidate.lstat()
+            if ((current.st_dev,current.st_ino)==(info.st_dev,info.st_ino)
+                    and stat.S_ISREG(current.st_mode) and current.st_uid==info.st_uid
+                    and (os.name!="posix" or current.st_uid==os.getuid() and not current.st_mode & 0o077)):
+                aliases.append(candidate)
+            if len(aliases)>1:
+                return
+        if len(aliases)==1:
+            aliases[0].unlink()
+            DstackNativeRuntime._sync_directory(token_path.parent)
 
     def readiness(self, binding, run):
         """Explicit controller callback; import/construction has no SSH work."""
@@ -226,7 +263,10 @@ class DstackNativeRuntime:
             with _slot_lock(config.work_dir, "dstack-bootstrap-" + intent_id) as locked:
                 _require(locked, "dstack_runtime_observation_busy")
                 directory = _absolute(config.work_dir / intent_id)
+                created = not directory.exists()
                 directory.mkdir(mode=0o700, exist_ok=True)
+                if created:
+                    self._sync_directory(config.work_dir)
                 receipt = directory / "bootstrap-state.json"
                 identity = {"intent_id": intent_id, "instance_id": binding["provider_instance_id"],
                     "configuration_id": config.configuration_id, "provider": config.provider, "backend": "wangp-worker",
@@ -240,8 +280,14 @@ class DstackNativeRuntime:
                         "dstack_runtime_receipt_changed")
                     _require(state.get("phase") in {"journaled", "start_unknown", "booting", "runtime_ready"},
                         "dstack_runtime_receipt_phase_invalid")
+                    if state["phase"] == "start_unknown" and current.get("bootstrap_launch_started") is False:
+                        # The durable launch journal proves no remote call was
+                        # permitted yet (e.g. DB failed before launch CAS).
+                        # Absent/historical or true journals remain unknown.
+                        state["phase"] = "journaled"
+                        self._save(receipt, state)
                 _require(current.get("bootstrap_started") is True
-                    or state is None and not (directory / "wangp-token").exists(),
+                    or state is None or state.get("phase") == "journaled",
                     "dstack_runtime_existing_receipt_requires_reconciliation")
                 # dstack RUNNING can precede SSH metadata/availability. Only
                 # read-only connection work belongs before the nonreplayable
@@ -262,22 +308,38 @@ class DstackNativeRuntime:
                     host.ensure_connected()
                 except Exception:
                     raise DstackError("dstack_runtime_ssh_unavailable_or_host_key_untrusted") from None
-                first = self.store.begin_bootstrap(intent_id, binding["run_id"], binding["provider_instance_id"])
-                if first:
-                    _require(state is None, "dstack_runtime_existing_receipt_requires_reconciliation")
-                    state = {"identity": identity, "phase": "journaled", "local_port": config.local_port}
-                    self._save(receipt, state)
+                if state is None and not current.get("bootstrap_started"):
                     # Stage the original private runtime credential once on
                     # CPU. WanGPSSHHost.start uploads these same bytes; it must
                     # never mint a replacement during routine reconnect.
                     token_path = directory / "wangp-token"
-                    with os.fdopen(os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as out:
-                        out.write(secrets.token_urlsafe(48)); out.flush(); os.fsync(out.fileno())
-                else:
+                    if token_path.exists():
+                        self._recover_token_alias(token_path)
+                        private_token_file(token_path)  # Crash during local staging; no remote launch yet.
+                    else:
+                        temporary=directory/("wangp-token."+uuid4().hex+".tmp")
+                        try:
+                            with os.fdopen(os.open(temporary, os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600), "w") as out:
+                                out.write(secrets.token_urlsafe(48)); out.flush(); os.fsync(out.fileno())
+                            os.link(temporary,token_path)  # Atomic no-overwrite install of complete bytes.
+                        finally:
+                            if temporary.exists():
+                                temporary.unlink()
+                        self._sync_directory(directory)
+                    state = {"identity": identity, "phase": "journaled", "local_port": config.local_port}
+                    self._save(receipt, state)
+                # Material is staged before the database journal. A CPU disk
+                # failure cannot consume a one-shot remote launch. Resuming
+                # staged material always retains its original token/identity.
+                self.store.begin_bootstrap(intent_id, binding["run_id"], binding["provider_instance_id"])
+                if state is not None:
                     _require(state is not None and (directory / "wangp-token").is_file(),
                         "dstack_runtime_recovery_material_missing")
                     private_token_file(directory / "wangp-token")  # Verify, never recreate.
+                else:
+                    raise DstackError("dstack_runtime_recovery_material_missing")
                 if state["phase"] == "journaled":
+                    self.store.authorize_bootstrap_launch(intent_id, binding["run_id"], binding["provider_instance_id"])
                     # Source upload is immutable and has no setup launch. A
                     # failed upload can retry the same bytes/token; an existing
                     # partial file instead requires reconciliation below. No
@@ -295,6 +357,8 @@ class DstackNativeRuntime:
                         raise DstackError("dstack_runtime_upload_unconfirmed") from None
                     state["phase"] = "start_unknown"
                     self._save(receipt, state)  # Before the non-replayable launch.
+                    _require(self.store.begin_runtime_launch(intent_id, binding["run_id"], binding["provider_instance_id"]),
+                        "dstack_runtime_launch_requires_reconciliation")
                     try:
                         host.start(identity)
                     except Exception:
@@ -348,6 +412,8 @@ class DstackNativeRuntime:
                 return native
         except DstackError:
             raise
+        except OperatorError as error:
+            raise DstackError(error.code) from None
         except Exception:
             raise DstackError("dstack_native_runtime_unconfirmed") from None
 

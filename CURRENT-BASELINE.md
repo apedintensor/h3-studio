@@ -1,5 +1,18 @@
 # Sixnine implementation and production baseline
 
+Migration checkpoint **2026-10-11**: [#132](https://github.com/inkseq/h3-studio/issues/132)
+owns the bounded dstack/Hatchet/Grafana Cloud batch. The specification is
+[DSTACK-MIGRATION.md](DSTACK-MIGRATION.md). Source implements an original-ledger
+capacity adapter, authenticated broker dispatch, native slot supervision and an
+operator interface; the legacy route is retained. An authenticated local CPU
+simulation proved one original attempt/submission under duplicate delivery and
+exported eight worker stages to Cloud; the integration owner read these back on
+the dashboard. See the [engine/Cloud receipt](https://github.com/inkseq/h3-studio/issues/132#issuecomment-6099423238).
+This is **not a production migration receipt or real dstack GPU acceptance**.
+Published runtime, actual warm GPU/mode checks, a protected CPU rollout and the
+14-day stability gate remain distinct acceptance in #132. This batch has not
+renewed old rentals, widened budgets or replaced accepted-job bindings.
+
 Checkpoint: **2026-10-10 Australia/Sydney / local QA repair batch [#128](https://github.com/inkseq/h3-studio/issues/128)**. Public source repositories remain `inkseq/h3-studio` and `inkseq/sixnine-design`; the active private [Delivery Project](https://github.com/orgs/inkseq/projects/1) and `workflow/project.json` identify the same project. Organization transfer/OIDC receipts are retained in [#107](https://github.com/inkseq/h3-studio/issues/107), not repeated as current runtime observations.
 
 ## Current source, release and observation boundaries

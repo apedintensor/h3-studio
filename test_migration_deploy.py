@@ -109,7 +109,9 @@ class MigrationDeployTests(unittest.TestCase):
         with patch("tools.check_migration_deploy.check", side_effect=RuntimeError("SECRET DSN")), contextlib.redirect_stdout(output):
             self.assertEqual(main([]), 1)
         self.assertEqual(json.loads(output.getvalue()), {"state": "failed", "code": "migration_deploy_check_failed"})
-        with self.assertRaises(OSError):
+        # Rendered host paths are Linux absolute paths; on Windows they are
+        # rejected before any file read, and on Linux they do not exist.
+        with self.assertRaises((OSError,ValueError)):
             local_inputs(self.document)
 
 

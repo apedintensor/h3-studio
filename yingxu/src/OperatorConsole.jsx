@@ -7,6 +7,7 @@ import {age,allowed,dollars,duration,hasBoundOperatorSelection,runtimeDuration,r
 import './operator.css';
 import {operatorNodeGroups,operatorCapacitySummary,filterOperatorHistory,operatorExtensionCurrent,operatorExtensionReadback} from './operator-presentation.js';
 import {Reasons,Badge,NodeCard,MachineRow,CandidateCard} from './operator-machine-view.jsx';
+import DstackCapacity from './DstackCapacity.jsx';
 export {NodeCard} from './operator-machine-view.jsx';
 
 const quietly=promise=>promise.catch(()=>{});
@@ -178,6 +179,7 @@ export default function OperatorConsole(){
   return <div className="op-shell"><a className="skip" href="#operator-main">跳到 GPU 控制台</a><aside className="op-sidebar"><a className="op-brand" href="/quick-chat">Ⅱ <b>映序</b><small>STUDIO</small></a><a className="op-back" href="/quick-chat"><ArrowLeft size={15}/>返回创作</a><div className="op-sidebar-label">运营工作区</div><a className="active" href="/operator" aria-current="page"><Server size={17}/>GPU 控制台</a><div className="op-side-note"><ShieldCheck size={17}/><p>一个控制台，共用现有任务与租赁账本。</p></div><div className="op-sidebar-account"><span>{(c.account||'访').slice(0,1).toUpperCase()}</span><div><b>{c.account||'未登录'}</b><small>管理权限由服务器确认</small></div>{c.account&&<button className="op-icon" aria-label="退出登录" onClick={()=>quietly(cloud.logout())}><LogOut size={16}/></button>}</div></aside>
     <main id="operator-main"><header className="op-topbar"><span>工作室 / 计算资源</span><div><span>{snapshot?`更新于 ${age(snapshot.observed_at,now)}`:'等待连接'}</span><button className="op-icon" aria-label="刷新机器状态" disabled={state.loading||!c.account} onClick={refresh}><RefreshCw size={17}/></button></div></header><div className="op-content"><div className="op-page-heading"><div><span className="op-eyebrow">GPU WORKSPACE</span><h1>让算力准备好。</h1><p>配置机器、看清准备进度，让创作接上真实生成。</p></div><button disabled={busy||!allowed(snapshot,'update_policy',now)} onClick={()=>setDialog({type:'policy'})}><Settings2 size={16}/>运行上限</button></div>
       {state.error&&!state.denied&&<div className="op-banner warn" role="alert"><Info size={17}/><span>{state.error}</span></div>}{snapshot&&stale&&<div className="op-banner warn" role="status">当前机器观测已过期，管理操作暂不可用。保留上次记录，等待重新核对。</div>}{state.pending&&<div className="op-banner warn" role="alert"><div><b>原操作结果待核对</b><p>不要重复开机。刷新和核对沿用原操作标识，账户切换也不会删除记录。</p></div><button disabled={state.busy} onClick={()=>quietly(controller.recover())}>核对原操作</button></div>}{content}
+      {c.account&&!state.denied&&<DstackCapacity account={c.account}/>}
       <footer className="op-page-foot"><ShieldCheck size={14}/>启动、排空和停止均写入同一控制服务；浏览器不直连供应商。</footer></div></main>
     {dialog?.type==='detail'&&selectedNode&&<Dialog key={'detail-'+selectedNode.id} title="机器详情" subtitle="以当前服务器观测为准" onClose={()=>setDialog(null)}><NodeCard node={selectedNode} profiles={profiles} now={now} disabled={busy||stale} onAction={nodeAction}/></Dialog>}
     {dialog?.type==='extend'&&selectedNode&&<ExtensionDialog key={'extend-'+selectedNode.id} node={selectedNode} now={now} controller={controller} busy={busy||stale} onClose={()=>setDialog(null)}/>}

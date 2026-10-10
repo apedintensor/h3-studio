@@ -144,7 +144,8 @@ class WorkerRunner:
         request, output = compiled.get("request", {}), compiled.get("output_spec", {})
         context = dict(self.telemetry_context)
         context.update(job_id=job["id"], attempt_id=lease.attempt_id,
-            profile_id=job.get("execution_plan", {}).get("deployment_profile_id", "unknown"),
+            profile_id=job.get("execution_plan", {}).get("deployment_profile_id")
+                or compiled.get("deployment_profile_id") or "unknown",
             mode=request.get("mode", "unknown"), simulation=self._summary(job)["simulation"])
         for name in ("width", "height", "fps", "frames"):
             value = output.get("frame_count" if name == "frames" else name, request.get(name))

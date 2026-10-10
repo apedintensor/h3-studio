@@ -47,6 +47,41 @@ def _finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def plan_offers(plan, request):
+    """Project pinned 0.22.3 offers; no backend_data, SSH or user/job payload."""
+    require(isinstance(plan,dict) and isinstance(plan.get("job_plans"),list)
+        and len(plan["job_plans"])==1, "dstack_plan_unconfirmed")
+    offered=plan["job_plans"][0].get("offers")
+    require(isinstance(offered,list),"dstack_plan_unconfirmed")
+    normalize=lambda text:"".join(c.lower() for c in text if c.isalnum())
+    result=[]
+    for item in offered:
+        if not isinstance(item,dict) or item.get("backend")!=request.backend:
+            continue
+        instance=item.get("instance",{})
+        resources=instance.get("resources",{})
+        gpus=resources.get("gpus")
+        price=item.get("price")
+        memory=resources.get("memory_mib"); disk=resources.get("disk",{}).get("size_mib")
+        cpus=resources.get("cpus")
+        availability=item.get("availability")
+        if (not isinstance(gpus,list) or len(gpus)!=1 or not isinstance(gpus[0],dict)
+                or not isinstance(gpus[0].get("name"),str)
+                or normalize(gpus[0]["name"]) not in {normalize(name) for name in request.gpu_names}
+                or not all(_finite(v) and v>0 for v in (memory,disk,cpus,gpus[0].get("memory_mib")))
+                or memory<request.memory_gib*1024 or disk<request.disk_gib*1024
+                or cpus<request.cpu_count or gpus[0]["memory_mib"]<request.gpu_memory_gib*1024
+                or not _finite(price) or price<=0 or math.ceil(price*1_000_000)>request.max_price_microusd
+                or availability not in {"available","idle","unknown"}):
+            continue
+        result.append({"backend":request.backend,"region":item.get("region"),
+            "gpu_type":gpus[0]["name"],"gpu_count":1,"memory_gib":memory/1024,
+            "disk_gib":disk/1024,"gpu_memory_gib":gpus[0]["memory_mib"]/1024,"cpu_count":cpus,
+            "hourly_cost_microusd":math.ceil(price*1_000_000),"availability":availability,
+            "inventory_confirmed":availability in {"available","idle"}})
+    return sorted(result,key=lambda row:(not row["inventory_confirmed"],row["hourly_cost_microusd"]))[:100]
+
+
 def _request(document):
     document = copy.deepcopy(document)
     for key in ("gpu_names", "regions"):
@@ -97,7 +132,9 @@ class LedgerDstackStore:
             stored = payload["dstack"]
             require(stored.get("spec_digest") == binding["spec_digest"] and
                 all(stored.get(key) == value for key, value in binding.items()), "dstack_intent_binding_changed")
-            if stored.get("apply_started") or node["desired_state"] != "running":
+            action = self.repo._locked(connection, select(scaler_actions).where(scaler_actions.c.intent_id == intent_id))
+            if (stored.get("apply_started") or node["desired_state"] != "running"
+                    or action is None or action["create_started_at"] is not None):
                 return False
             require(intent["state"] == "reserved" and self.repo.clock() < intent["hard_deadline"],
                 "dstack_start_window_expired")
@@ -183,6 +220,8 @@ class LedgerDstackStore:
             value["ready"] = bool(value.get("ready") is True and value.get("state") == "ready"
                 and node["desired_state"] == "running"
                 and self.repo.clock() < intent["hard_deadline"])
+            if value.get("runtime_incarnation") and value.get("state") in {"ready", "busy"}:
+                binding.setdefault("first_runtime_ready_at", value["observed_at"])
             binding.update(value)
             payload["dstack"] = binding
             payload["dstack_observation"] = {"run_id": binding.get("run_id"),
@@ -195,14 +234,55 @@ class LedgerDstackStore:
             connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == intent_id)
                 .values(last_observation=value, last_observed_at=value["observed_at"]))
 
-    def begin_stop(self, intent_id, run_id):
+    def record_broker(self, intent_id, worker_id, observation):
+        """Separate transport eligibility from native/provider readiness."""
+        require(isinstance(observation,dict) and set(observation) <= {
+            "ready","observed_at","heartbeat_at","reason_code","worker_id"},
+            "dstack_broker_observation_invalid")
+        require(_finite(observation.get("observed_at")) and
+            0 <= observation["observed_at"] <= self.repo.clock() and
+            observation.get("worker_id") == worker_id, "dstack_broker_observation_invalid")
+        with self.repo.transaction() as connection:
+            self.repo._lock_capacity(connection)
+            node,intent=self._node(connection,intent_id)
+            payload=copy.deepcopy(node["payload"])
+            binding=payload["dstack"]
+            prior=binding.get("broker_observation",{})
+            if prior.get("observed_at",0)>observation["observed_at"]:
+                return
+            worker=connection.execute(select(registered_workers).where(registered_workers.c.id==worker_id)).mappings().one_or_none()
+            require(worker is not None and worker["instance_id"]==intent["provider_instance_id"]
+                and worker["provider"]==intent["provider"]
+                and worker["spec"].get("dispatch_backend")=="hatchet-v1"
+                and worker["spec"].get("engine_manifest_digest")==binding["manifest_digest"]
+                and worker["spec"].get("configuration_id")==binding["configuration_id"],
+                "dstack_broker_binding_changed")
+            value=copy.deepcopy(observation)
+            value["ready"]=bool(value.get("ready") is True and node["desired_state"]=="running"
+                and self.repo.clock()<intent["hard_deadline"])
+            binding["broker_observation"]=value
+            self._save(connection,node,payload)
+
+    def begin_stop(self, intent_id, run_id, *, retry=False):
         with self.repo.transaction() as connection:
             self.repo._lock_capacity(connection)
             node, intent = self._node(connection, intent_id)
             payload = copy.deepcopy(node["payload"])
             binding = payload["dstack"]
             require(binding.get("run_id") == run_id, "dstack_stop_identity_unconfirmed")
-            if binding.get("stop_started") or node["desired_state"] != "stopped":
+            if node["desired_state"] != "stopped":
+                return False
+            now = self.repo.clock()
+            if retry:
+                observed = binding.get("observed_at")
+                if (not binding.get("stop_started") or binding.get("stop_attempt_count", 0) >= 5
+                        or now < binding.get("stop_next_retry_at", float("inf"))):
+                    return False
+                if (binding.get("dstack_status") != "running" or not _finite(observed)
+                        or not 0 <= now-observed <= self.observation_fresh_seconds
+                        or binding.get("provider_instance_id") != intent.get("provider_instance_id")):
+                    return False
+            elif binding.get("stop_started"):
                 return False
             workers = list(connection.execute(select(registered_workers).where(
                 registered_workers.c.provider == intent["provider"],
@@ -219,18 +299,54 @@ class LedgerDstackStore:
                         return False
             # Once bootstrap may have run, require exact fresh native idle proof,
             # including after a worker row expires or is retired.
-            if binding.get("bootstrap_started") or workers or binding.get("runtime_incarnation"):
+            launch_started = binding.get("bootstrap_launch_started", binding.get("bootstrap_started"))
+            if not retry and (launch_started or workers or binding.get("runtime_incarnation")):
                 observed = binding.get("observed_at")
                 if not (binding.get("state") == "ready" and binding.get("runtime_incarnation")
                         and _finite(observed) and 0 <= self.repo.clock() - observed <= self.observation_fresh_seconds):
                     return False
-            now = self.repo.clock()
-            binding.update(stop_started=True, stop_started_at=now)
+            count = binding.get("stop_attempt_count", 0) + 1
+            binding.update(stop_started=True, stop_attempt_count=count, stop_last_attempt_at=now,
+                stop_next_retry_at=now + min(30 * 2**(count-1), 300))
+            binding.setdefault("stop_started_at", now)
             payload["dstack"] = binding
             connection.execute(update(scaler_actions).where(scaler_actions.c.intent_id == intent_id)
                 .values(destroy_started_at=now))
             self._save(connection, node, payload, runtime_state="stopping")
-            self._receipt(connection, intent_id, "destroy", {"state": "journaled", "run_id": run_id})
+            self._receipt(connection, intent_id, "destroy", {"state": "retry_journaled" if retry else "journaled",
+                "run_id": run_id, "attempt_count": count})
+            return True
+
+    def authorize_bootstrap_launch(self, intent_id, run_id, instance_id):
+        """Recheck authority for immutable uploads which have not launched yet."""
+        with self.repo.transaction() as connection:
+            self.repo._lock_capacity(connection)
+            node, intent = self._node(connection, intent_id)
+            binding = node["payload"]["dstack"]
+            require(binding.get("bootstrap_started") and binding.get("run_id") == run_id
+                and binding.get("provider_instance_id") == instance_id,
+                "dstack_bootstrap_identity_unconfirmed")
+            require(node["desired_state"] == "running" and self.repo.clock() < intent["hard_deadline"],
+                "dstack_bootstrap_window_expired")
+            return True
+
+    def begin_runtime_launch(self, intent_id, run_id, instance_id):
+        """Durable launch journal; a response gap cannot run setup twice."""
+        with self.repo.transaction() as connection:
+            self.repo._lock_capacity(connection)
+            node, intent = self._node(connection, intent_id)
+            payload = copy.deepcopy(node["payload"])
+            binding = payload["dstack"]
+            require(binding.get("bootstrap_started") and binding.get("run_id") == run_id
+                and binding.get("provider_instance_id") == instance_id,
+                "dstack_bootstrap_identity_unconfirmed")
+            require(node["desired_state"] == "running" and self.repo.clock() < intent["hard_deadline"],
+                "dstack_bootstrap_window_expired")
+            if binding.get("bootstrap_launch_started", True):
+                return False
+            binding.update(bootstrap_launch_started=True, bootstrap_launch_started_at=self.repo.clock())
+            self._save(connection, node, payload)
+            self._receipt(connection, intent_id, "bootstrap", {"state": "launch_journaled", "run_id": run_id})
             return True
 
     def begin_bootstrap(self, intent_id, run_id, instance_id):
@@ -247,7 +363,7 @@ class LedgerDstackStore:
                 return False
             require(node["desired_state"] == "running" and self.repo.clock() < intent["hard_deadline"],
                 "dstack_bootstrap_window_expired")
-            binding.update(bootstrap_started=True, bootstrap_started_at=self.repo.clock())
+            binding.update(bootstrap_started=True, bootstrap_started_at=self.repo.clock(), bootstrap_launch_started=False)
             payload["dstack"] = binding
             self._save(connection, node, payload)
             self._receipt(connection, intent_id, "bootstrap", {"state": "journaled", "run_id": run_id,
@@ -358,6 +474,7 @@ class DstackOperator:
         fields = ("id", "runtime_profile_id", "model_id", "mode", "pool", "backend", "gpu_names",
             "memory_gib", "disk_gib", "gpu_memory_gib", "cpu_count", "max_price_microusd", "max_ttl_seconds")
         return {"capacity_backend": BACKEND_MARKER, "enabled": self.policy.get("enabled") is True,
+            "operator": {"account": owner},
             "profiles": [{key: copy.deepcopy(profile[key]) for key in fields}
                 for profile in self.profiles.values() if profile["owner_id"] == owner]}
 
@@ -375,7 +492,8 @@ class DstackOperator:
         require(now + ttl <= self.policy["expires_at"], "dstack_authority_window_exceeded")
         preview_id = str(uuid.uuid4())
         request = self._capacity_request(profile, preview_id, now, now + ttl, ttl)
-        self.capacity.plan(request, self.config["ssh_public_key"])
+        offers=plan_offers(self.capacity.plan(request, self.config["ssh_public_key"]),request)
+        require(bool(offers),"dstack_no_compatible_offers")
         # Reserve the full approved ceiling from the first paid request, plus
         # the pinned 300s shutdown grace. Provisioning is inside the absolute TTL.
         cost = math.ceil(profile["max_price_microusd"] * (ttl + 300) / 3600) + profile["extra_reservation_microusd"]
@@ -388,7 +506,7 @@ class DstackOperator:
         return {"preview_id": preview_id, "expires_at": min(now + 120, request.hard_deadline),
             "hard_deadline": request.hard_deadline, "reservation_microusd": cost,
             "hourly_cost_microusd": profile["max_price_microusd"], "price_basis": "approved_ceiling",
-            "offer_status": "advisory", "capacity_backend": BACKEND_MARKER}
+            "offer_status": "advisory", "offers": offers, "can_start": True, "capacity_backend": BACKEND_MARKER}
 
     def _existing_command(self, connection, actor, key, digest):
         require(safe_id(key), "operator_idempotency_key_invalid", 422)
@@ -453,6 +571,7 @@ class DstackOperator:
             payload = {"capacity_backend": BACKEND_MARKER, "tenant_id": self.settings.tenant_id, "owner_id": owner,
                 "project_id": profile["project_id"], "provider": PROVIDERS[profile["backend"]],
                 "configuration_id": profile["configuration_id"], "hard_deadline": request.hard_deadline,
+                "observation_fresh_seconds": self.policy["observation_fresh_seconds"],
                 "hourly_cost_microusd": profile["max_price_microusd"], "hold_until": 0,
                 "selection": {"runtime_profile_id": profile["runtime_profile_id"], "mode": profile["mode"],
                     "gpu_type": profile["gpu_names"][0], "node_count": 1, "gpu_count": 1,
@@ -496,16 +615,35 @@ class DstackOperator:
                 binding = payload["dstack"]
                 observed = binding.get("observed_at")
                 fresh = _finite(observed) and 0 <= now - observed <= self.policy.get("observation_fresh_seconds", 30)
-                ready = bool(fresh and binding.get("ready") is True and node["desired_state"] == "running"
+                native_ready = bool(fresh and binding.get("ready") is True and node["desired_state"] == "running"
                     and now < payload["hard_deadline"])
+                intent = connection.execute(select(instance_intents).where(instance_intents.c.id==node["intent_id"])).mappings().one()
+                workers = list(connection.execute(select(registered_workers).where(
+                    registered_workers.c.provider==intent["provider"],
+                    registered_workers.c.instance_id==intent["provider_instance_id"])).mappings()) if intent["provider_instance_id"] else []
+                from .worker_admission import worker_window_reason
+                eligible = [worker for worker in workers if worker["state"]=="ready" and not worker["drain_requested"]
+                    and not worker["current_job_id"] and worker["expires_at"]>now
+                    and worker_window_reason(connection,worker,now,
+                        deployment_profile_id=payload["selection"]["runtime_profile_id"]) is None]
+                ready = bool(native_ready and eligible)
+                dispatch_reason = None
+                if native_ready and not ready:
+                    dispatch_reason = next((reason for worker in workers if
+                        (reason := worker_window_reason(connection,worker,now,
+                            deployment_profile_id=payload["selection"]["runtime_profile_id"]))),
+                        "matching_worker_unavailable")
                 result.append({"node_id": node["intent_id"], "provider": payload["provider"],
                     "runtime_profile_id": payload["selection"]["runtime_profile_id"], "mode": payload["selection"]["mode"],
                     "desired_state": node["desired_state"], "state": node["runtime_state"], "ready": ready,
+                    "native_ready": native_ready, "slots_ready": len(eligible) if native_ready else 0,
                     "observation_fresh": bool(fresh), "observed_at": observed, "hard_deadline": payload["hard_deadline"],
                     "hold_until": payload["hold_until"], "hourly_cost_microusd": payload["hourly_cost_microusd"],
                     "billing_state": binding.get("billing_state", "unsettled"),
-                    "reason_code": binding.get("reason_code"), "version": node["updated_at"]})
+                    "reason_code": binding.get("reason_code") or dispatch_reason,
+                    "dispatch_reason_code": dispatch_reason, "version": node["updated_at"]})
         return {"capacity_backend": BACKEND_MARKER, "enabled": self.policy.get("enabled") is True,
+            "operator": {"account": owner},
             "nodes": result, "summary": {"ready": sum(node["ready"] for node in result),
                 "starting": sum(node["state"] in {"reserved", "creating", "starting", "runtime_unconfirmed"} for node in result),
                 "unknown": sum("unknown" in node["state"] or not node["observation_fresh"] for node in result)}}

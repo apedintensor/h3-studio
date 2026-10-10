@@ -19,10 +19,11 @@ from .inference.wangp_contract import EngineManifest
 from .inference.wangp_factory import read_document
 from .repository import request_hash
 from .runtime_catalog import validate_manifest
+from .worker_admission import BROKER_HEARTBEAT_SECONDS
 
 SDK_VERSION = "1.42.1"
 POLL_SECONDS = 15
-HEARTBEAT_SECONDS = 60
+HEARTBEAT_SECONDS = BROKER_HEARTBEAT_SECONDS
 MAX_SLOTS = 128
 MAX_RESPONSE_BYTES = 1024 * 1024
 

@@ -35,7 +35,10 @@ class Client:
         self.absent = False
 
     def plan(self, spec):
-        return {"run_spec": spec, "job_plans": []}
+        return {"run_spec": spec, "job_plans": [{"offers":[{"backend":"vastai","region":"test-region",
+            "price":.7,"availability":"available","backend_data":"SECRET",
+            "instance":{"resources":{"cpus":12,"memory_mib":96*1024,"disk":{"size_mib":128*1024},
+                "gpus":[{"name":"RTX5090","memory_mib":32*1024}]}}}]}]}
 
     def get(self, *, run_name=None, run_id=None):
         if self.absent:
@@ -191,9 +194,30 @@ class DstackOperatorTests(LedgerCase):
         self.assertFalse(self.service.state(self.owner)["nodes"][0]["ready"])
         self.capacity.readiness = lambda binding, run: HostReadiness(binding["manifest_digest"], node, "c"*32, True)
         self.running(node)
-        self.assertTrue(self.service.state(self.owner)["nodes"][0]["ready"])
+        state=self.service.state(self.owner)["nodes"][0]
+        self.assertTrue(state["native_ready"])
+        self.assertFalse(state["ready"])  # Native endpoint alone has no CPU consumer.
         self.now += 31
         self.assertFalse(self.service.state(self.owner)["nodes"][0]["ready"])
+        self.assertFalse(self.service.state(self.owner)["nodes"][0]["native_ready"])
+
+    def test_no_stock_or_unconfirmed_plan_cannot_offer_paid_start(self):
+        self.client.plan=lambda spec:{"job_plans":[{"offers":[]}]}
+        with self.assertRaisesRegex(OperatorError,"dstack_no_compatible_offers"):self.preview()
+        self.client.plan=lambda spec:{"job_plans":[]}
+        with self.assertRaisesRegex(OperatorError,"dstack_plan_unconfirmed"):self.preview()
+        self.assertEqual(self.counts(),(0,0,0,0))
+
+    def test_quote_projection_is_safe_and_unknown_is_not_confirmed_stock(self):
+        original=self.client.plan
+        def unknown(spec):
+            value=original(spec)
+            value["job_plans"][0]["offers"][0]["availability"]="unknown"
+            return value
+        self.client.plan=unknown
+        preview=self.preview()
+        self.assertFalse(preview["offers"][0]["inventory_confirmed"])
+        self.assertNotIn("SECRET",json.dumps(preview))
 
     def test_hold_does_not_extend_deadline_increase_budget_or_repeat(self):
         node = self.start()["node_id"]
@@ -257,6 +281,7 @@ class DstackOperatorTests(LedgerCase):
         binding = self.store.load(node)
         self.assertTrue(self.store.begin_bootstrap(node, binding["run_id"], "gpu-123"))
         self.assertFalse(self.store.begin_bootstrap(node, binding["run_id"], "gpu-123"))
+        self.assertTrue(self.store.begin_runtime_launch(node, binding["run_id"], "gpu-123"))
         self.service.node_command(self.owner, node, {}, "stop-1")
         self.assertEqual(self.capacity.stop(node)["state"], "draining")
         self.assertEqual(self.client.stopped, [])

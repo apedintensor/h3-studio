@@ -2,8 +2,10 @@
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sqlalchemy import func, select
 
@@ -70,6 +72,35 @@ class NativeRuntimeTests(LedgerCase):
         self.store.record(binding["intent_id"], {"run_id": run["id"], "provider_instance_id": "gpu-" + mode,
             "state": "runtime_unconfirmed", "observed_at": self.repo.clock()})
         return self.store.load(binding["intent_id"]), run
+
+    def test_hard_interruption_after_token_link_reuses_original_complete_token(self):
+        binding,run=self.allocation()
+        directory=self.configs["fl"].work_dir/binding["intent_id"]
+        directory.mkdir(parents=True,mode=0o700)
+        token=directory/"wangp-token"
+        token.write_text("x"*64,encoding="ascii");token.chmod(0o600)
+        alias=directory/("wangp-token."+"a"*32+".tmp")
+        os.link(token,alias)
+        self.assertEqual(token.stat().st_nlink,2)
+        self.assertTrue(self.bridge().readiness(binding,run).idle)
+        self.assertFalse(alias.exists())
+        self.assertEqual(private_token_file(token),"x"*64)
+        self.assertEqual(self.remotes["fl"]["starts"],1)
+
+    def test_unknown_token_hardlink_is_not_removed_or_replaced(self):
+        binding,run=self.allocation()
+        directory=self.configs["fl"].work_dir/binding["intent_id"]
+        directory.mkdir(parents=True,mode=0o700)
+        token=directory/"wangp-token"
+        token.write_text("x"*64,encoding="ascii");token.chmod(0o600)
+        alias=directory/"unrecognized-private-copy"
+        os.link(token,alias)
+        with self.assertRaises(DstackError):
+            self.bridge().readiness(binding,run)
+        self.assertTrue(alias.exists())
+        self.assertEqual(token.read_text(encoding="ascii"),"x"*64)
+        self.assertEqual(self.remotes["fl"]["starts"],0)
+        self.assertFalse(self.store.load(binding["intent_id"]).get("bootstrap_started"))
 
     def bridge(self, *, coordinates_for_run=None, ssh_factory=None):
         outer = self
@@ -196,8 +227,57 @@ class NativeRuntimeTests(LedgerCase):
         self.assertEqual((self.remotes["fl"]["starts"], self.remotes["fl"]["uploads"]), (1, 1))
         with self.repo.engine.connect() as conn:
             self.assertEqual(conn.execute(select(func.count()).select_from(scaler_receipts).where(
-                scaler_receipts.c.intent_id == binding["intent_id"], scaler_receipts.c.operation == "bootstrap")).scalar_one(), 1)
+                scaler_receipts.c.intent_id == binding["intent_id"], scaler_receipts.c.operation == "bootstrap")).scalar_one(), 2)
             self.assertEqual(conn.execute(select(func.count()).select_from(registered_workers)).scalar_one(), 0)
+
+    def test_local_staging_failure_does_not_consume_bootstrap_then_reuses_original_token(self):
+        binding,run=self.allocation()
+        bridge=self.bridge()
+        with patch.object(bridge,"_save",side_effect=OSError("disk fixture")):
+            with self.assertRaisesRegex(DstackError,"native_runtime_unconfirmed"):
+                bridge.readiness(binding,run)
+        self.assertFalse(self.store.load(binding["intent_id"]).get("bootstrap_started"))
+        token=private_token_file(self.configs["fl"].work_dir/binding["intent_id"]/"wangp-token")
+        bridge.readiness(self.store.load(binding["intent_id"]),run)
+        self.assertEqual(self.remotes["fl"]["starts"],1)
+        self.assertEqual(token,private_token_file(self.configs["fl"].work_dir/binding["intent_id"]/"wangp-token"))
+
+    def test_launch_database_failure_proves_no_remote_start_and_resumes_once(self):
+        binding,run=self.allocation()
+        bridge=self.bridge()
+        with patch.object(self.store,"begin_runtime_launch",side_effect=RuntimeError("db fixture")):
+            with self.assertRaisesRegex(DstackError,"native_runtime_unconfirmed"):
+                bridge.readiness(binding,run)
+        self.assertFalse(self.store.load(binding["intent_id"])["bootstrap_launch_started"])
+        self.assertEqual(self.remotes["fl"]["starts"],0)
+        bridge.readiness(self.store.load(binding["intent_id"]),run)
+        bridge.readiness(self.store.load(binding["intent_id"]),run)
+        self.assertEqual(self.remotes["fl"]["starts"],1)
+
+    def test_resumed_upload_after_stop_cannot_launch_but_exact_capacity_can_stop(self):
+        binding,run=self.allocation()
+        self.remotes["fl"]={"starts":0,"uploads":0,"incarnation":"c"*32,"gpu":GPU,
+            "idle":True,"identity":None,"fail_upload_once":True}
+        bridge=self.bridge()
+        with self.assertRaisesRegex(DstackError,"upload_unconfirmed"):
+            bridge.readiness(binding,run)
+        self.operator.node_command(self.owner,binding["intent_id"],{},"stop-1")
+        with self.assertRaisesRegex(Exception,"bootstrap_window_expired"):
+            bridge.readiness(self.store.load(binding["intent_id"]),run)
+        self.assertEqual(self.remotes["fl"]["starts"],0)
+        self.assertEqual(self.capacity.stop(binding["intent_id"])["state"],"stopping")
+
+    def test_resumed_upload_after_deadline_cannot_launch(self):
+        binding,run=self.allocation()
+        self.remotes["fl"]={"starts":0,"uploads":0,"incarnation":"c"*32,"gpu":GPU,
+            "idle":True,"identity":None,"fail_upload_once":True}
+        bridge=self.bridge()
+        with self.assertRaisesRegex(DstackError,"upload_unconfirmed"):
+            bridge.readiness(binding,run)
+        self.now+=1000
+        with self.assertRaisesRegex(Exception,"bootstrap_window_expired"):
+            bridge.readiness(self.store.load(binding["intent_id"]),run)
+        self.assertEqual(self.remotes["fl"]["starts"],0)
 
     def test_lost_start_reply_reconnects_original_marker_without_install_start_or_token_recreation(self):
         binding, run = self.allocation()

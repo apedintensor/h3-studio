@@ -130,6 +130,8 @@ class FactoryTests(LedgerCase):
         def ssh_factory(config, coordinates):
             remote = remotes.setdefault(config.local_port, {"starts": 0, "uploads": 0, "config": config})
             class Host:
+                def ensure_connected(self):
+                    pass  # Verified read-only fake SSH handshake; no network.
                 def upload(inner, files):
                     self.assertEqual(set(files), set(config.source_sha256)); remote["uploads"] += 1
                 def start(inner, identity):

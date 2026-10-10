@@ -51,3 +51,14 @@ deploy/wangp/profiles/*
 !skills/sixnine-yingxu/scripts/
 !skills/sixnine-yingxu/scripts/sixnine.py
 !skills/sixnine-yingxu/scripts/connect.py
+
+# CPU dispatch/telemetry only; never send protected config or provider tokens.
+!Dockerfile.dispatch
+!requirements.dispatch.lock.txt
+!requirements.hatchet.txt
+!deploy/observability/
+!deploy/observability/requirements.lock.txt
+!deploy/dstack/
+!deploy/dstack/Dockerfile.wangp
+!deploy/dstack/repair_decord_metadata.py
+!deploy/wangp/bootstrap.py

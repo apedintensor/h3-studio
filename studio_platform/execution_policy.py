@@ -40,8 +40,12 @@ def positive(value, maximum):
 
 def validate_policy(value):
     """Reject ambiguous/misspelled operator settings rather than broadening them."""
-    if not isinstance(value, dict) or not FIELDS <= set(value) or set(value) - FIELDS - {"engine_manifest_digest", "output_delivery", "deployment_profile_id"}:
+    if not isinstance(value, dict) or not FIELDS <= set(value) or set(value) - FIELDS - {"engine_manifest_digest", "output_delivery", "deployment_profile_id", "dispatch_backend"}:
         raise ValueError("Invalid execution policy fields")
+    if value.get("dispatch_backend", "legacy") not in {"legacy", "hatchet-v1"}:
+        raise ValueError("Invalid dispatch backend")
+    if value.get("dispatch_backend") == "hatchet-v1" and value.get("backend") != "wangp-worker":
+        raise ValueError("Hatchet dispatch requires the explicit WanGP execution path")
     expected_model = MODEL
     if "deployment_profile_id" in value:
         from .runtime_catalog import get_profile
@@ -452,6 +456,7 @@ class ExecutionPolicies:
                 configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend,
                 **({"engine_manifest_digest": policy["engine_manifest_digest"]} if backend == "wangp-worker" else {}),
                 expected_runtime_s=quote["expected_runtime_s"], deployment_profile_id=policy.get("deployment_profile_id"),
+                dispatch_backend=policy.get("dispatch_backend", "legacy"),
                 **({"output_delivery": policy["output_delivery"]} if "output_delivery" in policy else {}))
             if capacity["ready"] + capacity["busy"] > 0:
                 from .capacity import pool_members_require_warm_binding
@@ -499,6 +504,8 @@ class ExecutionPolicies:
         base["admission_state"] = "blocked" if blockers else "waiting_capacity" if approval else "queued"
         if backend == "wangp-worker":
             base["engine_manifest_digest"] = policy["engine_manifest_digest"]
+        if "dispatch_backend" in policy:
+            base["dispatch_backend"] = policy["dispatch_backend"]
         if compiled.get("deployment_profile_id") is not None:
             base["deployment_profile_id"] = compiled["deployment_profile_id"]
         if "output_delivery" in policy:

@@ -1,5 +1,19 @@
 # Generation lifecycle and compatibility contract
 
+## Dispatch migration extension (2026-10-11)
+
+The operator-owned execution policy can specify `dispatch_backend=hatchet-v1`
+for WanGP. Admission freezes it into the existing immutable execution plan;
+missing historical values mean `legacy`. Neither user input nor a rollout flag
+can change an accepted job's route. Exact-job claims and all recovery purposes
+filter that route. The existing business ledger, physical slot locks, fencing,
+submission intent and output receipts remain authority under at-least-once
+Hatchet dispatch. Lost dispatch responses may be delivered again; uncertain GPU
+submission is reconciled on the original attempt, never regenerated blindly.
+Worker/timeouts/cancellation do not establish an idle GPU. See
+[DSTACK-MIGRATION.md](DSTACK-MIGRATION.md) and [#132](https://github.com/inkseq/h3-studio/issues/132).
+Cloud telemetry is best effort and cannot alter task or accounting outcomes.
+
 ## Current authoring and admission refinements
 
 As clarified in [#126](https://github.com/inkseq/h3-studio/issues/126), historic measurements are not a parameter whitelist. The pinned adapter implements text-only, first-only, last-only and paired first/last FL inputs; REF inputs remain a separate mapped mode. Capability discovery describes implemented model/API support and explicit adapter gaps. Preflight separately checks ownership, valid parameters, configured resource ceilings and budget. A supported but unmeasured combination requires no extra confirmation; a historical timing hint is optional. Static diagnostic codes identify invalid/unmapped inputs without exposing raw exception text, credentials, prompts or media paths. Source support does not upgrade a running worker bundle or widen a protected policy implicitly.

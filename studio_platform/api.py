@@ -43,7 +43,8 @@ TERMINAL = {"succeeded", "failed", "cancelled"}
 
 
 def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_hooks=None,
-               assistant=None, assistant_enabled=False, operator_registry=None, title_generator=None):
+               assistant=None, assistant_enabled=False, operator_registry=None, title_generator=None,
+               dstack_operator=None):
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     repo = repository or Repository(settings.database_url)
     repo.create_schema()
@@ -73,6 +74,9 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
             yield
         finally:
             await app.state.quick_chat_recovery.close()
+            capacity = getattr(getattr(app.state, "dstack_operator", None), "capacity", None)
+            if capacity is not None:
+                capacity.client.close()
             if repository is None:
                 repo.close()
 
@@ -604,6 +608,8 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
     if registry is None:
         registry = OperatorRegistry.from_environment(catalog=public_catalog, repository=app.state.repository)
     register_operator_routes(app, registry=registry)
+    from .dstack_routes import register_routes as register_dstack_routes
+    register_dstack_routes(app, service=dstack_operator)
     from .frontend import register_routes as register_frontend_routes
     register_frontend_routes(app)
     # Last-added middleware is outermost, including the authentication guard.

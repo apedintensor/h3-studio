@@ -792,14 +792,16 @@ class OperatorCapacity(OperatorExtensions):
             from .worker_admission import worker_window_reason
             controller_fresh=bool(controller and controller["state"]=="running"
                 and 0<=now-controller["observed_at"]<=CONTROLLER_FRESH_SECONDS)
-            managed=list(connection.execute(select(operator_nodes)).mappings())
+            managed=[node for node in connection.execute(select(operator_nodes)).mappings()
+                if node["payload"].get("capacity_backend") != "dstack-v1"]
             intents={row["id"]:row for row in connection.execute(select(instance_intents)).mappings()}
             node_profiles={(intents[node["intent_id"]]["provider"],intents[node["intent_id"]]["provider_instance_id"]):
                 node["payload"].get("selection",{}).get("runtime_profile_id") for node in managed if node["intent_id"] in intents}
             worker_admission={worker["id"]:worker_window_reason(connection,worker,now,
                 deployment_profile_id=node_profiles.get((worker["provider"],worker["instance_id"]))) for worker in worker_rows}
             actions={row["intent_id"]:row for row in connection.execute(select(scaler_actions)).mappings()}
-            commands=list(connection.execute(select(operator_commands).order_by(operator_commands.c.created_at.desc()).limit(100)).mappings())
+            commands=list(connection.execute(select(operator_commands).where(
+                ~operator_commands.c.kind.startswith("dstack_", autoescape=True)).order_by(operator_commands.c.created_at.desc()).limit(100)).mappings())
             removal_checks=dict(connection.execute(select(scaler_receipts.c.intent_id,
                 func.max(scaler_receipts.c.observed_at)).where(scaler_receipts.c.operation=="removal_check_started")
                 .group_by(scaler_receipts.c.intent_id)).all())
