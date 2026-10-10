@@ -73,9 +73,19 @@ def only_controller(environment, pin):
     release.require(state.get('Running') is True and state.get('Paused') is False
         and state.get('Restarting') is False and state.get('OOMKilled') is False,
         'operator_handoff_controller_not_running')
-    rows = release.command(['top', pin['container_name'], '-eo', 'comm'],
-                           environment=environment, timeout=20).decode().splitlines()[1:]
-    names = [row.strip() for row in rows if row.strip()]
+    # Docker uses the PID column to select this container's processes. Request
+    # only PID and comm: omitting PID fails on the production daemon, while
+    # default ps arguments would expose full command lines unnecessarily.
+    rows = release.command(['top', pin['container_name'], '-eo', 'pid,comm'],
+                           environment=environment, timeout=20).decode().splitlines()
+    release.require(bool(rows) and rows[0].split() == ['PID', 'COMMAND'],
+                    'operator_handoff_process_inspection_invalid')
+    fields = [row.split() for row in rows[1:] if row.strip()]
+    release.require(bool(fields) and all(len(row) == 2 and row[0].isdigit()
+        and int(row[0]) > 0 for row in fields)
+        and len({row[0] for row in fields}) == len(fields),
+        'operator_handoff_process_inspection_invalid')
+    names = [row[1] for row in fields]
     actual = [name for name in names if name not in ('docker-init', 'tini')]
     release.require(len(names) <= 2 and len(actual) == 1 and actual[0] in ('python', 'python3'),
                     'operator_handoff_owned_children_present')

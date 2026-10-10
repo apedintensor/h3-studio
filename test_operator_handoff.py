@@ -258,6 +258,51 @@ class HostHandoffTests(unittest.TestCase):
             handoff.supervisor_client(unit,self.pin,self.root,proc_root=proc)
 
 
+class ControllerProcessTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack(); self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(host, 'inspect_controller', return_value={
+            'Running':True, 'Paused':False, 'Restarting':False, 'OOMKilled':False}))
+        self.command = self.stack.enter_context(patch.object(release, 'command'))
+        self.pin = {'container_name':'exact-original-controller'}
+
+    def test_native_pid_comm_output_accepts_only_controller_and_optional_init(self):
+        for output in (b'PID COMMAND\n101 python\n',
+                       b'PID COMMAND\n100 docker-init\n101 python\n',
+                       b'PID COMMAND\n100 tini\n101 python3\n'):
+            with self.subTest(output=output):
+                self.command.return_value = output
+                handoff.only_controller({}, self.pin)
+        self.assertEqual(self.command.call_args.args[0],
+            ['top','exact-original-controller','-eo','pid,comm'])
+
+    def test_extra_processes_and_shell_wrappers_block(self):
+        for output in (b'PID COMMAND\n100 python\n101 python\n',
+                       b'PID COMMAND\n100 python\n101 ssh\n',
+                       b'PID COMMAND\n100 sh\n',
+                       b'PID COMMAND\n100 tini\n101 docker-init\n102 python\n'):
+            with self.subTest(output=output):
+                self.command.return_value = output
+                with self.assertRaisesRegex(release.ReleaseError,'owned_children_present'):
+                    handoff.only_controller({}, self.pin)
+
+    def test_empty_malformed_or_unexpected_process_format_blocks(self):
+        for output in (b'', b'PID COMMAND\n', b'COMMAND\npython\n',
+                       b'PID CMD\n100 python\n', b'PID COMMAND\nx python\n',
+                       b'PID COMMAND\n0 python\n', b'PID COMMAND\n100 python extra\n',
+                       b'PID COMMAND\n100 tini\n100 python\n'):
+            with self.subTest(output=output):
+                self.command.return_value = output
+                with self.assertRaisesRegex(release.ReleaseError,'process_inspection_invalid'):
+                    handoff.only_controller({}, self.pin)
+
+    def test_failed_inspection_blocks_without_fallback(self):
+        self.command.side_effect = release.ReleaseError('container_operation_failed_no_details_logged')
+        with self.assertRaisesRegex(release.ReleaseError,'container_operation_failed'):
+            handoff.only_controller({}, self.pin)
+        self.command.assert_called_once()
+
+
 class SystemdIdentityTests(unittest.TestCase):
     def test_exec_metadata_changes_do_not_change_supervisor_identity(self):
         command = '/usr/bin/python3 /opt/sixnine-release/operator_capacity.py start'
