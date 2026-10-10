@@ -81,7 +81,44 @@ def check_response(response):
     if not 200 <= response.status_code < 300:
         retry = retry_delay(response)
         suffix = f" (Retry-After: {retry:g} seconds)" if retry is not None else ""
-        raise ValueError(f"API returned HTTP {response.status_code}{suffix}; response details suppressed")
+        # Standalone helper: preserve only closed, source-level diagnostics.
+        # Arbitrary bodies/messages/paths/prompts/credentials stay suppressed.
+        codes = {'preflight_rejected','incompatible_fl_ref_inputs','invalid_duration',
+            'invalid_canvas_grid','invalid_canvas_area','invalid_canvas_aspect','reference_required',
+            'reference_video_exceeds_output','invalid_request','invalid_controls','invalid_inputs',
+            'revision_hash_conflict','version_conflict','budget_exceeded','job_capacity_exceeded',
+            'reference_conflict','reference_not_ready','invalid_bindings','invalid_prompt','invalid_settings',
+            'shot_version_conflict','asset_not_ready','source_hash_conflict','insufficient_scope',
+            'execution_adapter_unavailable','profile_not_published','validation_error',
+            'wangp_invalid_request','wangp_invalid_prompt','wangp_invalid_steps','wangp_invalid_seed',
+            'wangp_invalid_duration','wangp_output_spec_mismatch','wangp_invalid_native_frames',
+            'wangp_invalid_inputs','wangp_profile_model_mismatch','wangp_input_kind_mismatch',
+            'wangp_input_snapshot_mismatch','wangp_profile_reference_count_exceeded',
+            'wangp_ref_media_not_ready','wangp_ref_invalid_dimensions','wangp_ref_aligned_video_required',
+            'wangp_ref_selected_audio_required','wangp_ref_reference_required',
+            'wangp_ref_audio_requires_visual_reference','wangp_ref_total_video_duration_exceeded',
+            'wangp_ref_total_audio_duration_exceeded','wangp_adapter_fl_reference_inputs_unmapped',
+            'wangp_adapter_ref_first_last_unmapped','wangp_adapter_reference_video_soundtrack_unmapped',
+            'wangp_unknown_deployment_profile','wangp_profile_mode_unsupported'}
+        codes |= {'wangp_unsupported_'+name for name in ('controls','steps','sampler_name','scheduler',
+            'denoise','shift_video','shift_audio','video_decode','video_tile_size','video_overlap',
+            'audio_decode','encoder_device','generate_audio','export_crf')}
+        codes |= {f'wangp_{stage}_{category}' for stage in ('validation','generation','runtime','unknown')
+            for category in ('unclassified','cuda_out_of_memory','tensor_shape_mismatch',
+                'media_decode_failed','dependency_missing','seed_out_of_range')}
+        safe = ''
+        try:
+            if len(response.content) <= 16384:
+                body = response.json()
+                code = body.get('code') if type(body) is dict else None
+                if type(code) is str and code in codes:
+                    safe = '; code='+code
+                    stage = body.get('stage',body.get('error_stage'))
+                    if stage in ('preflight','validation','generation','runtime','unknown'):
+                        safe += '; stage='+stage
+        except (ValueError, TypeError, AttributeError, httpx.ResponseNotRead):
+            pass
+        raise ValueError(f"API returned HTTP {response.status_code}{suffix}{safe}; other response details suppressed")
 
 
 def retry_delay(response):

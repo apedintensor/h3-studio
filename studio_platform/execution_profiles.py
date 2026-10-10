@@ -7,22 +7,12 @@ import copy
 
 
 def tested_envelope(profile_id, mode):
-    """Public conservative scope; not approval, a price or a readiness promise."""
-    from .runtime_catalog import supported_cases
-    cases = [c for c in supported_cases(profile_id) if c['mode']==mode]
-    if not cases:
-        raise ValueError('Unknown profile mode')
-    reference = mode=='ref'
-    inputs = {'max_images':1 if reference else 0,'max_videos':1 if reference else 0,
-        'max_audios':1 if reference else 0,'max_image_pixels':832*480 if reference else 2048**2,
-        'max_video_pixels':832*480,'max_video_duration_seconds':56/24,
-        'max_audio_duration_seconds':5.2,'guide_kinds':[],'guide_recipe_ids':[],
-        'max_guide_time_seconds':5,'allow_video_audio':False}
-    return {'max_pixels':max(c['width']*c['height'] for c in cases),'max_duration_seconds':124/24,
-        'max_steps':max(c['steps'] for c in cases),'max_reference_files':3 if reference else 2,
-        'max_guides':0,'allow_first_last':not reference,'allow_audio':True,
-        'controls':{'sampler_name':['euler'],'scheduler':['auto'],'video_decode':['tiled'],
-            'audio_decode':['normal'],'encoder_device':['default']},'input_limits':inputs}
+    """Compatibility name for supported mapping, not a historical allowlist.
+
+This does not change a saved protected policy or renew its cost/time authority.
+"""
+    from .h3_profile_support import envelope
+    return envelope(profile_id,mode)
 
 
 def read_profiles(path):
@@ -82,6 +72,7 @@ def default_profile_id(settings, profiles=None):
 def public_profiles(settings):
     from .runtime_catalog import public_catalog
     from .inference.wangp_profile_compiler import control_schema
+    from .h3_profile_support import limits as supported_limits, INPUT_SUPPORT, ADAPTER_GAPS, envelope
     import time
     profiles = public_catalog()["profiles"]
     try:
@@ -94,11 +85,7 @@ def public_profiles(settings):
         for mode, recipe in (("fl", "h3-base-fl2va-v1"), ("ref", "h3-base-ref2va-v1")):
             policy = policies.get((profile["id"], recipe))
             constraints = copy.deepcopy(policy['envelope']) if policy else tested_envelope(profile['id'],mode)
-            limits = {'max_images':1 if mode=='ref' else 0,'max_videos':1 if mode=='ref' else 0,
-                'max_audios':1 if mode=='ref' else 0,'max_total_files':3 if mode=='ref' else 2,
-                'max_guides':0,'min_clip_duration':2,'max_clip_duration':5.2,
-                'max_video_clip_duration':56/24,'max_audio_clip_duration':5.2,
-                'max_total_video_duration':56/24,'max_total_audio_duration':5.2}
+            limits = supported_limits(mode)
             current = bool(policy and policy["enabled"]
                 and policy["qualification"]["status"] in {"accepted", "runtime_required"}
                 and policy["qualification"]["verified_at"] <= now
@@ -109,11 +96,14 @@ def public_profiles(settings):
                 "reason": "仍需预检实际容量和账户额度" if enabled else "此配置尚未接入当前执行池",
                 "capacity_checked": False, "controls": control_schema(profile["id"], mode),
                 'constraints':constraints,'limits':limits,
+                'support_basis':'implemented_pinned_model_api','input_support':copy.deepcopy(INPUT_SUPPORT[mode]),
+                'adapter_gaps':list(ADAPTER_GAPS),'supported_constraints':envelope(profile['id'],mode),
+                'execution_policy_constraints':copy.deepcopy(policy['envelope']) if policy else None,
                 'custom_canvas_constraints':{'maximum_pixel_area':constraints['max_pixels'],
-                    'minimum_aspect_ratio':16/9,'maximum_aspect_ratio':16/9},
-                'input_notes':(('部分组合已有单次实测；其余候选仍待验收。' if profile['verified_cases']
-                    else '硬件验收待完成；仅开放固定候选组合。') if profile.get('qualification_cases') else '仅开放已测组合；')
-                    +'视频参考需规范化为56帧/24fps且关闭原声，独立参考音频2–5.2秒。',
+                    'minimum_aspect_ratio':.4,'maximum_aspect_ratio':2.5},
+                'input_notes':'按模型和适配器支持范围使用；历史实测组合仅供时间参考。'
+                    +'当前适配器分开FL/REF输入；参考视频须24fps原生帧网格且关闭原声，音频2–15秒。实际资源和费用范围仍须预检。',
+                'joint_cases_scope':'historical_examples_not_admission_allowlist',
                 'joint_cases':[{'input_roles':c['input_roles'],'width':c['width'],'height':c['height'],
                     'frames':c['frames'],'steps':c['steps']} for c in
                     profile['verified_cases']+profile.get('qualification_cases',[]) if c['mode']==mode]}

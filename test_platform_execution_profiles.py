@@ -160,6 +160,35 @@ class ExecutionProfileTests(unittest.TestCase):
         self.write()
         self.assertFalse(policies.activation_allowed(job))
 
+    def test_supported_unmeasured_combinations_admit_without_changing_protected_resource_policy(self):
+        from studio_platform.h3_profile_support import envelope
+        from studio_platform.execution_profiles import public_profiles
+        self.values[0]['envelope']=envelope(PRUNED,'fl')
+        self.values[0]['envelope'].update(max_pixels=832*480,max_steps=50,max_duration_seconds=124/24)
+        self.write(); self.register(0)
+        before=self.path.read_bytes()
+        asset={'metadata':{'kind':'image','model_ready':True,'width':832,'height':480},
+            'model':{'key':'owners/superdan/assets/image/model','sha256':'a'*64,'size_bytes':4}}
+        for roles in ({'first_frame':'image'},{'last_frame':'image'}):
+            body=generation_request(deployment_profile_id=PRUNED,
+                controls={'duration':5,'resolution':'480P','steps':30,'seed':'42'},inputs=roles)
+            compiled,fingerprint=compile_request(body,lambda _:copy.deepcopy(asset),backend='wangp-worker')
+            admission=ExecutionPolicies(self.settings,self.repo).evaluate(compiled,self.scope,fingerprint)
+            self.assertTrue(admission.execution['enabled'],admission.execution['blockers'])
+            self.assertNotIn('timing_hint',admission.execution)
+        body['controls']['steps']=51
+        compiled,fingerprint=compile_request(body,lambda _:copy.deepcopy(asset),backend='wangp-worker')
+        admission=ExecutionPolicies(self.settings,self.repo).evaluate(compiled,self.scope,fingerprint)
+        self.assertFalse(admission.execution['enabled'])
+        self.assertTrue(any('50' in blocker for blocker in admission.execution['blockers']))
+        self.assertEqual(self.path.read_bytes(),before)
+        public=next(p for p in public_profiles(self.settings) if p['id']==PRUNED)['generation_support']['fl']
+        self.assertTrue(public['input_support']['first_frame'])
+        self.assertTrue(public['input_support']['last_frame'])
+        self.assertEqual(public['joint_cases_scope'],'historical_examples_not_admission_allowlist')
+        self.assertEqual(public['execution_policy_constraints']['max_steps'],50)
+        self.assertEqual(public['controls']['steps']['maximum'],100)
+
     def test_profile_config_absence_invalid_id_and_ambiguous_bindings_fail_closed(self):
         compiled, fingerprint = self.compiled()
         policies = ExecutionPolicies(replace(self.settings, execution_profiles_file=None), self.repo)

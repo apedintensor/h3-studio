@@ -98,7 +98,8 @@ def validate_policy(value):
             if type(limits[field]) is not int or not 0 <= limits[field] <= maximum:
                 raise ValueError("Invalid per-kind input count")
         for field, maximum in (("max_image_pixels", 5760**2), ("max_video_pixels", 5760**2),
-                ("max_video_duration_seconds", 15), ("max_audio_duration_seconds", 15), ("max_guide_time_seconds", 15)):
+                ("max_video_duration_seconds", 362/24 if 'deployment_profile_id' in value else 15),
+                ("max_audio_duration_seconds", 15), ("max_guide_time_seconds", 15)):
             if not positive(limits[field], maximum):
                 raise ValueError("Invalid per-kind input size or duration")
         for field, allowed in (("guide_kinds", {"image", "video", "audio"}), ("guide_recipe_ids", set(recipes))):
@@ -108,7 +109,7 @@ def validate_policy(value):
                 raise ValueError("Invalid qualified guide scope")
         if type(limits["allow_video_audio"]) is not bool:
             raise ValueError("Invalid reference video audio feature")
-    if qualification.get("profile") in RUNTIME_PROFILES:
+    if qualification.get("profile") in RUNTIME_PROFILES and "deployment_profile_id" not in value:
         limits = envelope.get("input_limits")
         if limits is None or not set(recipes) <= set(PROFILE_RECIPES[qualification["profile"]]):
             raise ValueError("Runtime qualification requires its explicit input scope")
@@ -137,7 +138,8 @@ def validate_policy(value):
     if any(not isinstance(options, list) or not options or any(not isinstance(x, str) or len(x)>80 for x in options) for options in controls.values()):
         raise ValueError("Invalid execution control values")
     if "deployment_profile_id" in value:
-        from .runtime_catalog import engine_manifest, get_profile, supported_cases
+        from .runtime_catalog import engine_manifest, get_profile
+        from .h3_profile_support import envelope as support_envelope
         mode = "fl" if recipes == ["h3-base-fl2va-v1"] else "ref"
         profile = get_profile(value["deployment_profile_id"])
         candidates = profile.get("qualification_cases", [])
@@ -146,22 +148,33 @@ def validate_policy(value):
                 or qualification["status"] != "runtime_required"
                 or any("measurements" in case for case in candidates)):
             raise ValueError("Deployment profile candidate qualification is not pending")
-        cases = [c for c in supported_cases(profile["id"]) if c["mode"] == mode]
+        supported = support_envelope(profile['id'],mode)
         if (value.get("output_delivery") != "native-frames-v1"
                 or qualification.get("profile") != QUEUED_TASK_PROFILE
                 or value["engine_manifest_digest"] != engine_manifest(profile["id"], mode).digest
-                or not cases
-                or envelope["max_pixels"] > max(c["width"]*c["height"] for c in cases)
-                or envelope["max_steps"] > max(c["steps"] for c in cases)
-                or envelope["max_duration_seconds"] > 124/24 + 1e-6
-                or envelope["max_reference_files"] > (3 if mode == "ref" else 2)
+                or envelope["max_pixels"] > supported['max_pixels']
+                or envelope["max_steps"] > supported['max_steps']
+                or envelope["max_duration_seconds"] > supported['max_duration_seconds'] + 1e-6
+                or envelope["max_reference_files"] > supported['max_reference_files']
                 or envelope["max_guides"] != 0
                 or mode == "ref" and envelope["allow_first_last"]):
-            raise ValueError("Deployment profile envelope exceeds tested scope")
-        # Marginal limits only restrict admission; the compiler additionally
-        # checks the exact recorded combination of mode, controls and inputs.
-        # Pending candidates still require runtime qualification; these limits
-        # grant neither measured performance nor worker readiness.
+            raise ValueError("Deployment profile policy exceeds implemented model support")
+        for field,options in controls.items():
+            if not set(options) <= set(supported['controls'][field]):
+                raise ValueError('Deployment profile policy includes unmapped controls')
+        limits = envelope.get('input_limits')
+        if limits is None:
+            raise ValueError('Deployment profile requires explicit input limits')
+        # FL policies historically carry unused REF-limit fields. Preserve their
+        # serialized identity; the compiler rejects every actual REF input in FL.
+        for field,maximum in supported['input_limits'].items() if mode=='ref' else ():
+            current = limits[field]
+            outside = not set(current)<=set(maximum) if isinstance(maximum,list) else (
+                current and not maximum if isinstance(maximum,bool) else current>maximum)
+            if outside:
+                raise ValueError('Deployment profile policy exceeds implemented input support')
+        # Saved resource/cost policy remains authoritative. Measurements neither
+        # constrain combinations nor promise performance or worker readiness.
     elif value["backend"] == "wangp-worker" and recipes == ["h3-base-ref2va-v1"]:
         from .inference.wangp_ref_compiler import validate_envelope
         if (recipes != ["h3-base-ref2va-v1"] or value.get("output_delivery") != "native-frames-v1"
