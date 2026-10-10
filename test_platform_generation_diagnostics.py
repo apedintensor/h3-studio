@@ -44,3 +44,19 @@ class DiagnosticTests(unittest.TestCase):
             self.assertNotIn(body,str(error.exception))
         with self.assertRaisesRegex(ValueError,'HTTP 503'):
             helper.check_response(httpx.Response(503,stream=httpx.ByteStream(b'PRIVATE SECRET')))
+
+    def test_business_api_preflight_uses_static_diagnostic_projection(self):
+        import asyncio,json,tempfile
+        from studio_platform.api import create_app
+        from studio_platform.settings import Settings
+        from starlette.requests import Request
+        with tempfile.TemporaryDirectory(prefix='sixnine-diagnostic-') as folder:
+            app=create_app(Settings(data_dir=Path(folder),auth_mode='local-test',generation_enabled=False))
+            request=Request({'type':'http','path':'/v1/generations/preflight','headers':[], 'scheme':'http', 'server':('localhost',8899)})
+            handler=app.exception_handlers[ValueError]
+            known=asyncio.run(handler(request,ValueError('wangp_invalid_inputs')))
+            self.assertEqual(json.loads(known.body)['error_code'],'wangp_invalid_inputs')
+            private=asyncio.run(handler(request,ValueError('PRIVATE SECRET /media/a.png')))
+            self.assertNotIn('SECRET',private.body.decode())
+            self.assertEqual(private.status_code,422)
+            app.state.repository.close()

@@ -8,6 +8,23 @@ import {recipeFor,effectiveControlSchema,effectiveLimits,clipLimits,inputProblem
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
 const deferred=()=>{let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};};
 function fakeClient(overrides={}){let account;return {setAccount(value){account=value;},reset(){},state:async()=>({observed_at:Date.now()/1000,operator:{account,permissions:{view:true,start:true}},nodes:[]}),catalog:async()=>({profiles:[]}),...overrides};}
+test('extension preview binds version and duration; uncertain confirmation recovers its exact original intent',async()=>{
+  const calls=[],storage=memory();let fail=true;
+  const controller=createOperatorController({storage,client:fakeClient({extensionPreview:async(id,body)=>{calls.push({preview:true,id,body});return {preview_id:'e1',node_id:id};},extend:async(id,body,key)=>{calls.push({id,body,key});if(fail)throw Error('lost response');return {operation:{id:'same-extension'}};}})});
+  await controller.setAccount('owner');const preview=await controller.extensionPreview({id:'node',version:'original'},1800);
+  assert.deepEqual(calls[0],{preview:true,id:'node',body:{expected_version:'original',additional_seconds:1800}});assert.equal(controller.getState().pending,null);
+  await assert.rejects(controller.extend(preview));const saved=structuredClone(controller.getState().pending);assert.equal(saved.method,'extend');
+  assert.deepEqual(calls[1].body,{preview_id:'e1'});assert.equal(calls[1].id,'node');
+  await controller.poll();assert.equal(calls.length,2);fail=false;await controller.recover();assert.deepEqual(calls[2],calls[1]);assert.equal(controller.getState().pending,null);
+});
+test('extension client preserves cookie identity and same-origin exact endpoint with idempotency only on confirmation',async()=>{
+  const calls=[],client=createOperatorClient({fetcher:async(path,options)=>{calls.push({path,options});return new Response('{}',{headers:{'Content-Type':'application/json','X-Authenticated-Account':'owner'}});}});
+  client.setAccount('owner');await client.extensionPreview('node/one',{expected_version:'v1',additional_seconds:600});await client.extend('node/one',{preview_id:'e1'},'original-extension-key');
+  assert.equal(calls[0].path,'/v1/operator/capacity/nodes/node%2Fone/extension-previews');assert.equal(calls[1].path,'/v1/operator/capacity/nodes/node%2Fone/extensions');
+  for(const call of calls){assert.equal(call.options.method,'POST');assert.equal(call.options.credentials,'same-origin');assert.equal(call.options.headers['X-Expected-Account'],'owner');}
+  assert.equal(calls[0].options.headers['Idempotency-Key'],undefined);assert.equal(calls[1].options.headers['Idempotency-Key'],'original-extension-key');
+  assert.deepEqual(JSON.parse(calls[0].options.body),{expected_version:'v1',additional_seconds:600});assert.deepEqual(JSON.parse(calls[1].options.body),{preview_id:'e1'});
+});
 test('manual review binds exact UID and original version; uncertain replay retains its single operation',async()=>{
   const storage=memory(),calls=[];let fail=true;
   const client=fakeClient({manualReview:async(nodeId,body,key)=>{calls.push({nodeId,body,key});if(fail)throw Error('connection lost');return {operation:{id:'same-review'}};}});

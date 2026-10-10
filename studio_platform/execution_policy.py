@@ -451,6 +451,7 @@ class ExecutionPolicies:
             capacity = self.control.pool_status(policy["pool"], model_id=policy["model_id"],
                 configuration_id=policy["configuration_id"], recipe_id=compiled["recipe_id"], backend=backend,
                 **({"engine_manifest_digest": policy["engine_manifest_digest"]} if backend == "wangp-worker" else {}),
+                expected_runtime_s=quote["expected_runtime_s"], deployment_profile_id=policy.get("deployment_profile_id"),
                 **({"output_delivery": policy["output_delivery"]} if "output_delivery" in policy else {}))
             if capacity["ready"] + capacity["busy"] > 0:
                 from .capacity import pool_members_require_warm_binding
@@ -469,6 +470,7 @@ class ExecutionPolicies:
             if approval is not None and not self.capacity_approval_current(approval["payload"]):
                 approval = None
             if approval is None:
+                blockers.extend(f"执行机暂不接收本任务：{reason}" for reason in sorted(capacity.get("reason_counts", {})))
                 blockers.append("暂无已登记且心跳有效的匹配工作机，也无有效的独立冷启动审批")
             else:
                 # A provider starting/running record is not a qualified slot.

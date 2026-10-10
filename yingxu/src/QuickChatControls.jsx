@@ -17,7 +17,7 @@ function Control({field,schema,value,onChange}){
 function ProfileInputBoundary({support}){
   const roles={first_frame:'首帧',last_frame:'尾帧',image:'图片参考',video:'视频参考',audio:'音频参考'};
   if(!support?.input_notes&&!support?.joint_cases?.length)return null;
-  return <section className="qc-profile-boundary"><strong>此配方已验收的输入组合</strong>{support.input_notes&&<p className="qc-muted">{support.input_notes}</p>}{support.joint_cases?.length>0&&<ul className="qc-muted">{support.joint_cases.map((item,index)=><li key={index}>{item.width} × {item.height} · {item.steps} 步 · {item.frames} 帧：{item.input_roles?.length?item.input_roles.map(role=>roles[role]||role).join(' ＋ '):'纯文字'}</li>)}</ul>}<p className="qc-muted">这些是已验证的组合，不代表可以任意混搭。最终以后台预检为准。</p></section>;
+  return <section className="qc-profile-boundary"><strong>此配方的历史测试示例</strong>{support.input_notes&&<p className="qc-muted">{support.input_notes}</p>}{support.joint_cases?.length>0&&<ul className="qc-muted">{support.joint_cases.map((item,index)=><li key={index}>{item.width} × {item.height} · {item.steps} 步 · {item.frames} 帧：{item.input_roles?.length?item.input_roles.map(role=>roles[role]||role).join(' ＋ '):'纯文字'}</li>)}</ul>}<p className="qc-muted">这些示例不限制可选组合。可用输入与参数以模型支持范围、当前执行策略和后台预检为准。</p></section>;
 }
 export default function QuickChatControls({capabilities,settings,bindings=[],cardPrompt,scope='next',modeIntent,busy=false,onSave,onClose,onEditMaterials,availability,operator=false,onRefreshAvailability,availabilityChecking=false}){
   const [draft,setDraft]=useState(()=>clone(settings)),[prompt,setPrompt]=useState(cardPrompt||''),[error,setError]=useState(''),[pendingMode,setPendingMode]=useState(null);

@@ -111,6 +111,10 @@ def create_app(settings: Settings, *, repository=None, storage=None, quick_chat_
 
     @app.exception_handler(ValueError)
     async def invalid(_request, error):
+        if _request.url.path == "/v1/generations/preflight":
+            from .generation_diagnostics import preflight_diagnostic
+            diagnostic = preflight_diagnostic(error)
+            return JSONResponse({"detail": diagnostic["error_message"], **diagnostic}, status_code=422)
         return JSONResponse({"detail": str(error)}, status_code=422)
 
     @app.exception_handler(MediaBusy)

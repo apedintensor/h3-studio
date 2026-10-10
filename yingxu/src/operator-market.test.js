@@ -106,7 +106,7 @@ test('old-account candidate responses are rejected and never create a pending re
 });
 
 const refreshReceipt={request_id:'refresh-1',requested_at:995,providers:['lium','targon'],coalesced:false};
-const refreshed=(lium,targon,patch={})=>({...result,...patch,providers:[['lium',lium],['targon',targon]].map(([provider,refresh_status])=>({provider,status:'ok',observed_at:999,refresh_request_id:'refresh-1',refresh_requested_at:995,refresh_status}))});
+const refreshed=(lium,targon,patch={})=>({...result,...patch,providers:[['lium',lium],['targon',targon]].map(([provider,refresh_status])=>({provider,status:'ok',observed_at:refresh_status==='pending'?800:999,refresh_request_id:'refresh-1',refresh_requested_at:995,refresh_status}))});
 const refreshClient=overrides=>{let account;return {setAccount(value){account=value;},reset(){},state:async()=>({operator:{account},nodes:[]}),catalog:async()=>catalog,...overrides};};
 
 test('one cookie-authenticated refresh targets the shared inventory endpoint without rental consent or journal',async()=>{
@@ -126,7 +126,9 @@ test('one refresh exposes independent supplier progress and preserves a successf
 });
 
 test('refresh status never makes prior or stale stock fresh and does not erase a newer query revision',()=>{
-  for(const state of ['pending','failed','timeout'])assert.equal(operatorMarketProvider(refreshed(state,'complete'),'lium',1000000).fresh,false);
+  for(const state of ['failed','timeout'])assert.equal(operatorMarketProvider(refreshed(state,'complete'),'lium',1000000).fresh,false);
+  const pending=refreshed('pending','complete');pending.providers[0].observed_at=800;
+  assert.equal(operatorMarketProvider(pending,'lium',1000000).fresh,false);
   const stale=refreshed('complete','complete');stale.providers[0].observed_at=800;
   assert.equal(operatorMarketProvider(stale,'lium',1000000).fresh,false);
   const scanning=operatorMarketReducer(initialOperatorMarket({max_ttl_seconds:10800}),{type:'scan'});
@@ -134,6 +136,34 @@ test('refresh status never makes prior or stale stock fresh and does not erase a
   assert.equal(progress.loading,'candidates');assert.match(operatorMarketSummary(progress.result,1000000),/Lium.*Targon/);
   const changed=operatorMarketReducer(progress,{type:'change',patch:{mode:'ref'}});
   assert.equal(operatorMarketReducer(changed,{type:'refresh-progress',revision:scanning.revision,result}),changed);
+});
+
+test('valid cached candidates remain usable during background refresh but stale, failed and unknown reads do not',()=>{
+  const original={...result,providers:[{provider:'targon',status:'ok',observed_at:990,refresh_status:'pending',refresh_requested_at:999}]};
+  assert.equal(operatorCandidateCurrent(original,query,row,1000000),true);
+  assert.match(operatorMarketProvider(original,'targon',1000000).label,/上次库存仍有效/);
+  assert.equal(operatorCandidateCurrent(original,query,row,1111000),false);
+  assert.equal(operatorCandidateCurrent({...original,providers:[{...original.providers[0],status:'unconfirmed'}]},query,row,1000000),false);
+  for(const refresh_status of ['failed','timeout'])assert.equal(operatorCandidateCurrent({...original,providers:[{...original.providers[0],refresh_status}]},query,row,1000000),false);
+  const state={...initialOperatorMarket({max_ttl_seconds:10800}),query,result:original,selection:row.selection,preview:{preview_id:'old'}};
+  const next=operatorMarketReducer(state,{type:'scan'});assert.equal(next.result,original);assert.equal(next.selection,null);assert.equal(next.preview,null);assert.equal(next.loading,'candidates');
+});
+
+test('a fresh candidate enters exact preview while the other supplier is still pending',async()=>{
+  for(const readyProvider of ['lium','targon']){
+    let release,waiting=new Promise(resolve=>{release=resolve;}),reads=0,previewCalls=0;
+    const candidate={...row,provider:readyProvider,selection:{...row.selection,provider:readyProvider}};
+    const first={...refreshed(readyProvider==='lium'?'complete':'pending',readyProvider==='targon'?'complete':'pending'),candidates:[candidate]};
+    const final={...refreshed('complete','complete'),candidates:[candidate]};
+    const controller=createOperatorController({client:refreshClient({marketRefresh:async()=>refreshReceipt,candidates:async()=>reads++?final:first,preview:async selection=>{previewCalls++;assert.deepEqual(selection,candidate.selection);return {preview_id:'preview-exact',selection};}}),storage:{getItem:()=>null},wait:()=>waiting,now:()=>1000000});
+    await controller.setAccount('owner');let partial;
+    const scan=controller.refreshCandidates(query,value=>{partial=value;});
+    while(!partial)await Promise.resolve();
+    assert.equal(controller.getState().busy,false);assert.equal(controller.getState().refreshingCandidates,true);
+    assert.equal(operatorCandidateCurrent(partial,query,candidate,1000000),true);
+    const preview=await controller.preview(candidate.selection);assert.equal(preview.preview_id,'preview-exact');assert.equal(previewCalls,1);assert.equal(controller.getState().pending,null);
+    release();await scan;assert.equal(controller.getState().refreshingCandidates,false);
+  }
 });
 
 test('another operator can refresh advisory stock without changing this model selection or enabling older refresh data',async()=>{

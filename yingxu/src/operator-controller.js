@@ -4,7 +4,7 @@ const uid=()=>crypto.randomUUID();
 const keyFor=account=>'sixnine:operator:pending:'+account;
 const clone=value=>structuredClone(value);
 export function createOperatorController({client=createOperatorClient(),storage=globalThis.localStorage,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms)),now=()=>Date.now()}={}){
-  let epoch=0,loading=false,state={account:null,snapshot:null,catalog:null,pending:null,busy:false,loading:false,error:'',denied:false,unavailable:false};
+  let epoch=0,loading=false,scanEpoch=0,state={account:null,snapshot:null,catalog:null,pending:null,busy:false,loading:false,refreshingCandidates:false,error:'',denied:false,unavailable:false};
   const listeners=new Set();
   const emit=patch=>{state={...state,...patch};listeners.forEach(fn=>fn());};
   function guard(account,version){if(state.account!==account||epoch!==version)throw Error('登录账户已改变，原账户响应未展示。');}
@@ -23,18 +23,20 @@ export function createOperatorController({client=createOperatorClient(),storage=
   }
   function command(method,args,body){return act(async()=>{if(state.pending)throw Error('有原管理操作待核对，请先核对原操作。');const operation={account:state.account,method,args,body:clone(body),key:'operator-'+uid(),created_at:Date.now()};pending(operation);return send(operation);});}
   return {client,subscribe(fn){listeners.add(fn);return()=>listeners.delete(fn);},getState:()=>state,
-    async setAccount(account){epoch++;client.setAccount(account);loading=false;let saved=null;try{saved=account?JSON.parse(storage?.getItem(keyFor(account))||'null'):null;}catch{saved={corrupt:true};}emit({account,snapshot:null,catalog:null,pending:saved,busy:false,loading:false,error:'',denied:false,unavailable:false});if(account)try{await refresh();}catch{}},
+    async setAccount(account){epoch++;scanEpoch++;client.setAccount(account);loading=false;let saved=null;try{saved=account?JSON.parse(storage?.getItem(keyFor(account))||'null'):null;}catch{saved={corrupt:true};}emit({account,snapshot:null,catalog:null,pending:saved,busy:false,loading:false,refreshingCandidates:false,error:'',denied:false,unavailable:false});if(account)try{await refresh();}catch{}},
     refresh,poll:()=>state.busy?Promise.resolve():refresh(),
     preview:selection=>act(()=>client.preview(selection)),
     candidates:query=>act(()=>client.candidates(query)),
-    refreshCandidates:(query,onUpdate=()=>{},signal)=>act(async()=>{
-      const account=state.account,current=epoch,selection=clone(query),receipt=await client.marketRefresh();guard(account,current);
+    refreshCandidates:async(query,onUpdate=()=>{},signal)=>{
+      const account=state.account,current=epoch,scan=++scanEpoch,selection=clone(query);emit({refreshingCandidates:true});
+      try{
+      const receipt=await client.marketRefresh();guard(account,current);
       if(typeof receipt?.request_id!=='string'||!receipt.request_id||!Number.isFinite(receipt.requested_at)||!['lium','targon'].every(provider=>receipt.providers?.includes(provider)))throw Error('供应商库存刷新尚未确认，请稍后重新查询。');
       const deadline=now()+60000;let last=null;
       for(let read=0;read<31;read++){
-        if(signal?.aborted||last&&now()>=deadline)return last;
+        if(signal?.aborted||scan!==scanEpoch||last&&now()>=deadline)return last;
         const result=await client.candidates(selection);guard(account,current);
-        if(signal?.aborted)return result;
+        if(signal?.aborted||scan!==scanEpoch)return result;
         if(result.model_id!==selection.model_id||result.mode!==selection.mode)throw Error('库存响应与当前模型或模式不一致，请重新查询。');
         if(!['lium','targon'].every(provider=>result.providers?.some(item=>item.provider===provider&&typeof item.refresh_request_id==='string'&&Number.isFinite(item.refresh_requested_at)&&item.refresh_requested_at>=receipt.requested_at&&['pending','complete','failed','timeout'].includes(item.refresh_status))))throw Error('供应商库存刷新尚未返回本轮记录，请重新查询。');
         last=result;
@@ -42,14 +44,17 @@ export function createOperatorController({client=createOperatorClient(),storage=
         if(!result.providers.some(item=>item.refresh_status==='pending')||read===30||now()>=deadline)return result;
         await wait(Math.max(0,Math.min(2000,deadline-now())));guard(account,current);
       }
-    }),
+      }finally{if(current===epoch&&scan===scanEpoch)emit({refreshingCandidates:false});}
+    },
     offers:selection=>act(()=>client.offers(selection)),
     start:preview=>command('start',[],{preview_id:preview.preview_id}),
     drain:node=>command('drain',[node.id],{expected_version:node.version}),
     stop:node=>command('stop',[node.id],{expected_version:node.version}),
     manualReview:(node,attestation)=>command('manualReview',[node.id],{expected_version:node.version,provider_instance_id:node.provider_instance_id,...attestation}),
+    extensionPreview:(node,additionalSeconds)=>act(()=>client.extensionPreview(node.id,{expected_version:node.version,additional_seconds:additionalSeconds})),
+    extend:preview=>command('extend',[preview.node_id],{preview_id:preview.preview_id}),
     updatePolicy:body=>act(async()=>{if(state.pending)throw Error('请先核对原管理操作。');const result=await client.updatePolicy(body);await refresh();return result;}),
-    recover:()=>act(async()=>{const op=state.pending;if(!op||op.corrupt||op.account!==state.account||!['start','drain','stop','manualReview'].includes(op.method)||!Array.isArray(op.args)||typeof op.key!=='string')throw Error('原操作记录无法核对，请保留记录并联系管理员。');return send(op);}),
+    recover:()=>act(async()=>{const op=state.pending;if(!op||op.corrupt||op.account!==state.account||!['start','drain','stop','manualReview','extend'].includes(op.method)||!Array.isArray(op.args)||typeof op.key!=='string')throw Error('原操作记录无法核对，请保留记录并联系管理员。');return send(op);}),
     destroy(){epoch++;client.reset();listeners.clear();},
   };
 }

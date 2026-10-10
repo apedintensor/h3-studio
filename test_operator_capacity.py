@@ -60,7 +60,7 @@ class FakeBoot:
         return "ready"
 
 
-class OperatorTests(LedgerCase):
+class OperatorCase(LedgerCase):
     def setUp(self):
         super().setUp()
         self.actor=Principal("superdan","browser",auth_mode="password")
@@ -89,6 +89,8 @@ class OperatorTests(LedgerCase):
         self.assertTrue(preview["can_start"],preview["blockers"])
         return self.service.start(self.actor,{"preview_id":preview["preview_id"]},key)["operation"]
 
+
+class OperatorTests(OperatorCase):
     def test_cookie_operator_required_and_machine_key_never_grants_rental(self):
         for actor,code in ((None,"operator_login_required"),(Principal("supervan","browser"),"operator_forbidden"),
             (Principal("superdan","pat",machine=True,all_projects=True),"operator_forbidden")):
@@ -785,7 +787,7 @@ class OperatorTests(LedgerCase):
         self.controller.tick()
         node=self.service.state(self.actor)["nodes"][0]
         worker_id=node["slots"][0]["id"]
-        plan=self.repo.create_plan(self.scope,{"recipe_id":"h3-base-fl2va-v1","request":{"model":"test-h3"}},
+        plan=self.repo.create_plan(self.scope,{"recipe_id":"h3-base-fl2va-v1","deployment_profile_id":self.binding.runtime_profile_id,"request":{"model":"test-h3"}},
             {"pool":self.binding.pool,"backend":"wangp-worker","configuration_id":self.binding.configuration_id,
              "engine_manifest_digest":self.binding.engine_manifest_digest,"enabled":True},expires_at=9000)
         job=self.repo.create_job(self.scope,plan["id"],"busy-test")

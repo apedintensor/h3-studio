@@ -6,7 +6,7 @@ import secrets
 import unittest
 
 from fastapi.testclient import TestClient
-from sqlalchemy import insert, update
+from sqlalchemy import insert, update, select
 
 from studio_platform.api import create_app
 from studio_platform.control import WorkerControl, WorkerSpec
@@ -126,8 +126,17 @@ class AvailabilityTests(unittest.TestCase):
             connection.execute(update(operator_nodes).values(desired_state="stopped"))
         self.assertEqual(self.modes()["fl"]["state"], "unavailable")
 
+    def confirmed_node(self):
+        intent = self.node()
+        with self.repo.transaction() as connection:
+            node = connection.execute(select(operator_nodes)).mappings().one()
+            connection.execute(update(operator_nodes).values(runtime_state="ready", payload={**node["payload"],
+                "lifetime": {"state": "verified", "instance_id": "private-provider-instance",
+                    "observed_at": self.now, "safe_deadline": intent["hard_deadline"]}}))
+        return intent
+
     def test_stop_request_excludes_fresh_worker_and_invalidates_prior_preflight(self):
-        self.node()
+        self.confirmed_node()
         self.worker(0, provider="lium", instance="private-provider-instance")
         compiled, fingerprint = self.compiled()
         policies = ExecutionPolicies(self.settings, self.repo)
@@ -156,7 +165,7 @@ class AvailabilityTests(unittest.TestCase):
         self.assertEqual(self.modes()["fl"]["state"], "unknown")
 
     def test_expired_known_instance_excludes_fresh_worker_and_invalidates_prior_preflight(self):
-        intent = self.node()
+        intent = self.confirmed_node()
         self.worker(0, provider="lium", instance="private-provider-instance")
         compiled, fingerprint = self.compiled()
         policies = ExecutionPolicies(self.settings, self.repo)

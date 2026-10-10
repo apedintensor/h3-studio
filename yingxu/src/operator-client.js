@@ -22,6 +22,8 @@ export function createOperatorClient(options={}){
     drain:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/drain`,{method:'POST',body,key}),
     stop:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/stop`,{method:'POST',body,key}),
     manualReview:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/manual-review`,{method:'POST',body,key}),
+    extensionPreview:(nodeId,body)=>api.request(ROOT+`/nodes/${id(nodeId)}/extension-previews`,{method:'POST',body}),
+    extend:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/extensions`,{method:'POST',body,key}),
     updatePolicy:body=>api.request(ROOT+'/policy',{method:'PUT',body}),
   };
 }

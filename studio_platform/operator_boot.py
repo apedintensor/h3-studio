@@ -410,8 +410,9 @@ def _admission_window(repo, intent_id, binding):
         intent = conn.execute(select(instance_intents).where(instance_intents.c.id==intent_id)).mappings().one()
     now = repo.clock()
     deadline = min(intent['hard_deadline'],binding.expires_at)
-    stop = (node['desired_state']!='running' or node['binding_hash']!=binding.fingerprint
-            or intent['state'] not in {'starting','ready','busy'} or now>=deadline-300)
+    from .worker_admission import managed_window_reason
+    reason = managed_window_reason(intent, node, now, binding=binding)
+    stop = reason not in {None, 'managed_provider_lifetime_unverified'}
     from .operator_controller import provider_lifetime_current
     verified = provider_lifetime_current(node.get('payload',{}),intent,now)
     return stop,deadline,verified
@@ -471,13 +472,14 @@ def run_worker(runtime_path, intent_id, fleet_path, worker_id, expected_hash):
         def stop_new():
             return quarantined or _admission_window(repo,intent_id,binding)[0]
         def job_allowed(job):
+            from .worker_admission import COMPLETION_MARGIN_SECONDS
             stop,deadline,verified = _admission_window(repo,intent_id,binding)
             duration = job.get('expected_runtime_s')
             return (not quarantined and not stop and verified
                 and job['request'].get('deployment_profile_id')==binding.runtime_profile_id
                 and job['execution_plan'].get('configuration_id')==binding.configuration_id
                 and type(duration) in (int,float) and math.isfinite(duration)
-                and duration>0 and repo.clock()+duration+120<deadline)
+                and duration>0 and repo.clock()+duration+COMPLETION_MARGIN_SECONDS<deadline)
         return run_slot(fleet,worker_id,settings,repository=repo,
             runner_factory=lambda *a,**kw:QueuedTaskRunner(*a,stop_new=stop_new,job_allowed=job_allowed,
                 collection_lock_dir=Path(runtime['work_dir'])/'collection-lock',
