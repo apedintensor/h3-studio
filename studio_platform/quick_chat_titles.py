@@ -62,10 +62,10 @@ def title_error_code(error):
 
 
 class QuickChatTitleMixin:
-    def _initial_title_state(self, title):
+    def _initial_title_state(self, *, title_supplied):
         if self.title_generator is None:
             return None
-        return {"status": "awaiting_input" if title.strip() == DEFAULT_TITLE else "manual",
+        return {"status": "manual" if title_supplied else "awaiting_input",
                 "model_id": TITLE_MODEL, "error_code": None}
 
     def _queue_title(self, conn, principal, session, source):

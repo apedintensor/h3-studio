@@ -10,7 +10,8 @@ whether it is enabled; the default without a generator remains disabled.
 
 Only sessions created while naming is configured are eligible. Omit `title`
 when creating a session to receive the default `新的创作` label and automatic
-naming. A supplied nondefault title is manual. Existing sessions are not
+naming. Any explicitly supplied title is manual, including `新的创作` or a
+whitespace-padded version of that label. Existing sessions are not
 backfilled when the feature is enabled later.
 
 The first meaningful accepted turn or direct card/revision prompt becomes the
@@ -34,7 +35,7 @@ request never runs inside a database transaction or blocks card/video
 admission. Claiming `pending -> running` under the session lock limits multiple
 API processes and idempotent replays to one supplier call per session.
 
-An explicit `PATCH` containing `title`, including choosing `新的创作` again,
+An explicit creation or `PATCH` containing `title`, including choosing `新的创作` again,
 makes the name manual and fences any pending or late supplier response. Naming
 completion re-reads and locks the current session, preserving concurrent
 settings, references, ownership and the current authoring `version`. It emits

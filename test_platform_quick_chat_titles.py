@@ -110,6 +110,31 @@ class QuickChatTitleTests(LedgerCase):
         self.assertEqual(self.current()["title_generation"]["status"], "manual")
         self.assertEqual(self.generator.calls, [])
 
+    def test_explicit_default_title_creation_is_manual_by_field_presence(self):
+        for index, title in enumerate(("新的创作", " 新的创作 ", "\t新的创作\t")):
+            with self.subTest(title=title):
+                session = self.service.create_session(self.agent, {"title": title}, f"explicit-default-{index}")["session"]
+                self.assertEqual(session["title_generation"]["status"], "manual")
+                self.service.create_turn(self.agent, session["id"],
+                    {**self.turn_body(), "expected_version": 1}, f"explicit-turn-{index}")
+                self.assertFalse(self.service.generate_title(self.agent, session["id"]))
+                self.assertEqual(self.service.get_session(self.agent, session["id"])["session"]["title"], title)
+        self.assertEqual(self.generator.calls, [])
+
+    def test_omitted_title_all_creation_shapes_remain_eligible(self):
+        for index, body in enumerate(({}, {"model_id": "gemini-3.8-flash"}, {"model_id": "gemma-4-31b-it"})):
+            with self.subTest(body=body):
+                session = self.service.create_session(self.agent, body, f"omitted-title-{index}")["session"]
+                self.assertEqual(session["title"], "新的创作")
+                self.assertEqual(session["title_generation"]["status"], "awaiting_input")
+                self.service.create_turn(self.agent, session["id"],
+                    {**self.turn_body(), "expected_version": 1}, f"omitted-turn-{index}")
+                self.assertTrue(self.service.generate_title(self.agent, session["id"]))
+                current = self.service.get_session(self.agent, session["id"])["session"]
+                self.assertEqual(current["title"], "夜林水刃对决")
+                self.assertEqual(current["title_generation"]["status"], "completed")
+        self.assertEqual(len(self.generator.calls), 3)
+
     def test_manual_update_while_network_running_wins_without_holding_database_lock(self):
         self.service.create_turn(self.principal, self.sid, self.turn_body(), "first-turn")
         self.generator.release = threading.Event()

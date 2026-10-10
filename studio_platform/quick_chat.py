@@ -277,7 +277,7 @@ class QuickChatService(QuickChatTitleMixin):
                 occurred_at=self.repo.clock(), before=None, after=project, event_type="project.created")
             session = self._new(conn, principal, ident, "session", {"title": title, "model_id": model,
                 "project_id": project["id"], "next_settings": default_next_settings(self.settings), "bindings": [], "latest_seq": 0,
-                "active_turn_id": None, "title_generation": self._initial_title_state(title)}, ident=ident)
+                "active_turn_id": None, "title_generation": self._initial_title_state(title_supplied="title" in body)}, ident=ident)
             self._remember(conn, principal, "session-create", key, body, ident)
             return {"session": self._session_public(session)}
 
