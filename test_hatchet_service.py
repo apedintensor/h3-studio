@@ -133,12 +133,10 @@ class RealHatchetTests(unittest.TestCase):
                 "configuration_id": configuration_id, "dispatch_backend": "hatchet-v1"}
             plan = repo.create_plan(scope, request, execution, expires_at=time.time()+2000,
                 estimated_cost_microusd=100_000)
-            older = repo.create_job(scope, plan["id"], "older-not-dispatched", budget_account_ids=["proof-budget"])
-            # Keep the older *eligible* original job's broker retry pending.
-            # A generic queue scan would steal it; exact-job execution must not.
-            with repo.transaction() as connection:
-                connection.execute(update(dispatch_receipts).where(dispatch_receipts.c.job_id == older["id"])
-                    .values(not_before=time.time()+2000))
+            older = repo.create_job(scope, plan["id"], "older-not-dispatched", initial_status="planned")
+            # Another original draft must remain untouched. Eligible runnable
+            # jobs now retain business fairness even when their broker delivery
+            # is delayed; a broker delay cannot authorize bypassing that order.
             job = repo.create_job(scope, plan["id"], "exact-dispatched", budget_account_ids=["proof-budget"])
             control = WorkerControl(repo)
             control.register(WorkerSpec("hatchet-service-proof", "proof-pool", "mock",
