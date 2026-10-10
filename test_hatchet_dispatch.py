@@ -93,7 +93,8 @@ class HatchetDispatchTests(LedgerCase):
         self.directory = Path(self.temp.name)
         self.store = LocalObjectStore(self.directory/"objects")
 
-    def make_job(self, key="job", *, dispatch=ROUTE, status="queued", audio=False):
+    def make_job(self, key="job", *, dispatch=ROUTE, status="queued", audio=False, scope=None):
+        scope = scope or self.scope
         request = {"recipe_id": "test-recipe", "request": {"model": "SIMULATION", "prompt": "test only",
             "duration": 4, "resolution": "custom", "width": 256, "height": 256,
             "generate_audio": audio, "export_crf": 18},
@@ -102,10 +103,10 @@ class HatchetDispatchTests(LedgerCase):
             "configuration_id": "test-config", "expected_runtime_s": 1}
         if dispatch is not None:
             execution["dispatch_backend"] = dispatch
-        plan = self.repo.create_plan(self.scope, request, execution,
-            expires_at=self.now+1000, estimated_cost_microusd=100_000)
-        return self.repo.create_job(self.scope, plan["id"], key, initial_status=status,
-            budget_account_ids=["owner-budget"])
+        plan = self.repo.create_plan(scope, request, execution,
+            expires_at=self.now+1000, estimated_cost_microusd=100_000 if scope == self.scope else 0)
+        return self.repo.create_job(scope, plan["id"], key, initial_status=status,
+            budget_account_ids=["owner-budget"] if scope == self.scope else [])
 
     def ready(self, worker="worker", dispatch=ROUTE):
         spec = WorkerSpec(worker, "hatchet-test", "mock", "instance-"+worker,
@@ -200,15 +201,52 @@ class HatchetDispatchTests(LedgerCase):
         self.assertEqual(len(publisher.runs), 1)
         self.assertEqual(self.repo.get_job(self.scope, job["id"])["attempt_no"], 0)
 
-    def test_exact_job_is_selected_even_when_another_eligible_job_is_older(self):
+    def test_exact_delivery_yields_to_older_job_without_stealing_or_creating_attempt(self):
         older = self.make_job("older")
+        self.now += 1
         intended = self.make_job("intended")
         self.ready()
         backend = MemoryBackend()
         result = self.runner(intended, backend).run_once("worker", "hatchet-test")
-        self.assertEqual(result["job_id"], intended["id"])
+        self.assertEqual(result["state"], "idle")
         self.assertEqual(self.repo.get_job(self.scope, older["id"])["status"], "queued")
-        self.assertEqual(len(backend.submissions), 1)
+        self.assertEqual(self.repo.get_job(self.scope, intended["id"])["attempt_no"], 0)
+        self.assertEqual(backend.submissions, [])
+        self.assertEqual(self.runner(older, backend).run_once("worker", "hatchet-test")["job_id"], older["id"])
+
+    def test_already_published_jobs_obey_original_owner_fairness_at_claim(self):
+        active = self.make_job("active")
+        self.now += 1
+        same_owner = self.make_job("same-owner")
+        self.now += 1
+        other_owner = self.make_job("other-owner", scope=self.other)
+        publisher = Publisher()
+        dispatcher = self.dispatcher(publisher)
+        for _ in range(3):
+            self.assertEqual(dispatcher.publish_once()["state"], "published")
+        self.ready("one")
+        self.ready("two")
+        backend = MemoryBackend()
+        self.runner(active, backend, worker="one").run_once("one", "hatchet-test")
+        self.assertEqual(self.runner(same_owner, backend, worker="two").run_once("two", "hatchet-test")["state"], "idle")
+        self.assertEqual(self.control.get("two")["state"], "ready")
+        self.assertEqual(self.repo.get_job(self.scope, same_owner["id"])["attempt_no"], 0)
+        result = self.runner(other_owner, backend, worker="two").run_once("two", "hatchet-test")
+        self.assertEqual(result["job_id"], other_owner["id"])
+        self.assertEqual(len(backend.submissions), 2)
+
+    def test_aged_exact_job_keeps_original_fifo_priority_over_new_owner(self):
+        active = self.make_job("active")
+        self.ready("one")
+        backend = MemoryBackend()
+        self.runner(active, backend, worker="one").run_once("one", "hatchet-test")
+        older = self.make_job("aged")
+        self.now += 901
+        newer = self.make_job("new-owner", scope=self.other)
+        self.ready("two")
+        result = self.runner(older, backend, worker="two").run_once("two", "hatchet-test")
+        self.assertEqual(result["job_id"], older["id"])
+        self.assertEqual(self.repo.get_job(self.other, newer["id"])["attempt_no"], 0)
 
     def test_running_broker_delivery_is_not_reenqueued_on_every_gpu_poll(self):
         job = self.make_job()

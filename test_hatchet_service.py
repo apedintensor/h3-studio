@@ -149,7 +149,7 @@ class RealHatchetTests(unittest.TestCase):
             process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "worker",
                 str(config_path), str(root), str(delay)], stdout=worker_log, stderr=subprocess.STDOUT,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-            sdk = SDKPublisher(create_client(config))
+            sdk = SDKPublisher(create_client(config), repo)
             publisher = LoseAcceptedResponse(sdk)
             dispatcher = OutboxDispatcher(repo, publisher, publisher_id="proof-dispatcher", retry_seconds=1)
             start = time.monotonic()

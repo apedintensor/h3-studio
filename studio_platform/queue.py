@@ -49,7 +49,8 @@ class TaskQueue:
         return self.repository._locked(connection, select(scheduler_state).where(scheduler_state.c.pool == pool))
 
     def claim(self, worker_id, pool, *, lease_seconds=90, purpose="generate", connection=None, job_ids=None,
-              job_filter=None, validator=None, dispatch_backend="legacy"):
+              job_filter=None, validator=None, dispatch_backend="legacy", selected_job_id=None,
+              selected_validator=None):
         """Claim one task; returns Claim or None. Collection reuses its original attempt.
 
         Per-pool row locking serializes short scheduling transactions on PostgreSQL.
@@ -60,6 +61,8 @@ class TaskQueue:
         """
         identifier(worker_id)
         identifier(pool)
+        if selected_job_id is not None:
+            identifier(selected_job_id)
         if dispatch_backend not in {"legacy", "hatchet-v1"}:
             raise ValueError("invalid_dispatch_backend")
         if not math.isfinite(lease_seconds) or not 0 < lease_seconds <= 3600:
@@ -86,25 +89,9 @@ class TaskQueue:
                 .order_by(jobs.c.created_at, jobs.c.id)).mappings()]
             if not candidates:
                 return None
-            usage = {r["owner_key"]: r["work_s"] for r in connection.execute(
-                select(owner_usage).where(owner_usage.c.pool == pool)).mappings()}
-            active = {}
-            if purpose == "generate":
-                for row in connection.execute(select(jobs.c.tenant_id, jobs.c.owner_id).where(
-                    jobs.c.pool == pool, jobs.c.status.in_(
-                        ("claimed", "submitting", "running", "submission_unknown", "cancel_requested", "recovery_hold")))).mappings():
-                    key = self._owner_key(row)
-                    active[key] = active.get(key, 0) + 1
-            def priority(job):
-                key = self._owner_key(job)
-                age = max(0, repo.clock() - job["created_at"])
-                # An unresolved held/running attempt must not make this owner's
-                # separate eligible work lose forever to a stream of fresh work.
-                if age >= 900:
-                    return (0, job["created_at"], job["id"])
-                return (1, active.get(key, 0), usage.get(key, 0), job["created_at"], job["id"])
+            ordered, usage = self.schedule_order(connection, candidates, pool, purpose=purpose)
             job = None
-            for candidate in sorted(candidates, key=priority):
+            for candidate in ordered:
                 selected = repo._job(connection, candidate["id"], lock=True)
                 # An API cancellation may commit after candidate selection.
                 # Eligibility must be checked again under the selected row lock.
@@ -129,6 +116,12 @@ class TaskQueue:
                 job = selected
                 break
             if job is None:
+                return None
+            # Identity-only broker delivery cannot choose a lower-priority
+            # business job or steal the selected job. Yield without an attempt;
+            # recovery will publish another wakeup after the broker run ends.
+            if (selected_job_id is not None and job["id"] != selected_job_id
+                    or selected_validator is not None and selected_validator(job) is not True):
                 return None
             fence = job["fence"] + 1
             expires = repo.clock() + float(lease_seconds)
@@ -157,6 +150,26 @@ class TaskQueue:
             repo._emit(connection, "job.leased", job["id"],
                        {"job_id": job["id"], "attempt_id": attempt_id, "fence": fence, "purpose": purpose})
             return Claim(repo._job(connection, job["id"]), Lease(job["id"], attempt_id, worker_id, fence, expires))
+
+    def schedule_order(self, connection, candidates, pool, *, purpose="generate"):
+        """The shared business priority; reading it neither claims nor bills."""
+        repo = self.repository
+        usage = {r["owner_key"]: r["work_s"] for r in connection.execute(
+            select(owner_usage).where(owner_usage.c.pool == pool)).mappings()}
+        active = {}
+        if purpose == "generate":
+            for row in connection.execute(select(jobs.c.tenant_id, jobs.c.owner_id).where(
+                    jobs.c.pool == pool, jobs.c.status.in_(
+                    ("claimed", "submitting", "running", "submission_unknown", "cancel_requested", "recovery_hold")))).mappings():
+                key = self._owner_key(row)
+                active[key] = active.get(key, 0) + 1
+        def priority(job):
+            key = self._owner_key(job)
+            age = max(0, repo.clock() - job["created_at"])
+            if age >= 900:
+                return (0, job["created_at"], job["id"])
+            return (1, active.get(key, 0), usage.get(key, 0), job["created_at"], job["id"])
+        return sorted(candidates, key=priority), usage
 
     @staticmethod
     def _owner_key(row):
