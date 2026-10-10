@@ -35,8 +35,11 @@ class WorkerSpec:
     backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
     output_delivery: str = ""
+    dispatch_backend: str = "legacy"
 
     def __post_init__(self):
+        if self.dispatch_backend not in {"legacy", "hatchet-v1"}:
+            raise ValueError("invalid_dispatch_backend")
         validate_delivery_policy(self.backend, self.output_delivery)
         for value in (self.worker_id, self.pool, self.provider, self.instance_id, self.model_id, self.configuration_id):
             identifier(value)
@@ -77,6 +80,9 @@ def worker_spec_payload(spec):
         value.pop("engine_manifest_digest")
     if not spec.output_delivery:
         value.pop("output_delivery")
+    # Preserve all historical registration hashes for the original route.
+    if spec.dispatch_backend == "legacy":
+        value.pop("dispatch_backend")
     return canonical(value)
 
 
@@ -310,6 +316,7 @@ class WorkerControl:
         if not isinstance(effective, dict):
             return False
         if (job["pool"] != spec["pool"] or execution.get("backend") != spec["backend"]
+            or execution.get("dispatch_backend", "legacy") != spec.get("dispatch_backend", "legacy")
             or execution.get("enabled") is not True
             or execution.get("output_delivery", "") != spec.get("output_delivery", "")):
             return False
@@ -349,6 +356,8 @@ class WorkerControl:
                 return None
             spec = worker["spec"]
             bindings = [jobs.c.pool == pool,
+                func.coalesce(jobs.c.execution_plan["dispatch_backend"].as_string(), "legacy")
+                    == spec.get("dispatch_backend", "legacy"),
                 jobs.c.execution_plan["backend"].as_string() == spec["backend"],
                 # JSON boolean extraction is text on PG and integer on SQLite.
                 # Avoid casting arbitrary legacy strings to PG BOOLEAN, which
@@ -388,6 +397,7 @@ class WorkerControl:
             from .capacity import capacity_member_claim_allowed
             from .worker_admission import worker_window_reason
             claim = self.queue.claim(worker_id, pool, purpose=purpose, lease_seconds=lease_seconds,
+                dispatch_backend=spec.get("dispatch_backend", "legacy"),
                 connection=connection, job_filter=and_(*bindings), validator=lambda job: self.matches(worker, job)
                     and (purpose != "generate" or capacity_member_claim_allowed(self.repo, connection, job, worker))
                     and (purpose != "generate" or worker_window_reason(connection, worker, self.repo.clock(),
