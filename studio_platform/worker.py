@@ -22,6 +22,7 @@ from .media import ffmpeg, probe
 from .queue import TaskQueue
 from .repository import Conflict, LeaseLost, Scope, money
 from .storage import ObjectAlreadyExists, ObjectNotFound, StorageWriteUncertain
+from .telemetry import ERROR_CODES as TELEMETRY_ERROR_CODES, NullStage, NullTelemetry
 # Compatibility exports retain the same objects for existing worker callers.
 from .inference.comfy import ComfyBackend
 from .inference.outputs import _request, _shape, delivery_spec
@@ -123,7 +124,7 @@ class MockBackend:
 
 class WorkerRunner:
     def __init__(self, repository, store, work_dir, *, backend: InferenceBackend | None = None, retry_after_s=5, control=None,
-                 submission_guard=None, stop_requested=None):
+                 submission_guard=None, stop_requested=None, telemetry=None, telemetry_context=None):
         self.repo, self.store = repository, store
         self.queue = TaskQueue(repository)
         self.work_dir = Path(work_dir).resolve()
@@ -132,7 +133,112 @@ class WorkerRunner:
         self.control = control
         self.submission_guard = submission_guard
         self.stop_requested = stop_requested
+        self.telemetry = telemetry if telemetry is not None else NullTelemetry()
+        self.telemetry_context = dict(telemetry_context) if type(telemetry_context) is dict else {}
+        # One observed generation per physical slot; this is not execution state.
+        self._generation_observation = None
         self._drain = threading.Event()
+
+    def _telemetry_context(self, job, lease):
+        compiled = job.get("request", {})
+        request, output = compiled.get("request", {}), compiled.get("output_spec", {})
+        context = dict(self.telemetry_context)
+        context.update(job_id=job["id"], attempt_id=lease.attempt_id,
+            profile_id=job.get("execution_plan", {}).get("deployment_profile_id", "unknown"),
+            mode=request.get("mode", "unknown"), simulation=self._summary(job)["simulation"])
+        for name in ("width", "height", "fps", "frames"):
+            value = output.get("frame_count" if name == "frames" else name, request.get(name))
+            if value is not None:
+                context[name] = value
+        if "steps" in request:
+            context["steps"] = request["steps"]
+        inputs = request.get("inputs", {})
+        if type(inputs) is dict:
+            for name, plural in (("image_refs", "images"), ("video_refs", "videos"), ("audio_refs", "audios")):
+                if type(inputs.get(plural)) is list:
+                    context[name] = len(inputs[plural])
+        return context
+
+    def _stage_start(self, name, job, lease, *, started_at=None):
+        try:
+            return self.telemetry.start(name, self._telemetry_context(job, lease), started_at=started_at)
+        except Exception:
+            return NullStage()
+
+    @staticmethod
+    def _stage_finish(stage, outcome="success", *, error_code=None, duration_seconds=None, timing_basis=None):
+        try:
+            stage.finish(outcome, error_code=error_code, duration_seconds=duration_seconds, timing_basis=timing_basis)
+        except Exception:
+            pass
+
+    @contextmanager
+    def _stage(self, name, job, lease):
+        stage = self._stage_start(name, job, lease)
+        try:
+            yield
+        except BaseException as error:
+            code = {"collect": "collection_failed", "validate_output": "artifact_validation_failed",
+                "upload": "upload_failed", "input_transfer": "worker_preparation_failed"}.get(name, "stage_failed")
+            if len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in TELEMETRY_ERROR_CODES:
+                code = error.args[0]
+            self._stage_finish(stage, "failure", error_code=code)
+            raise
+        else:
+            self._stage_finish(stage)
+
+    def _observe_interval(self, name, job, lease, started_at, *, outcome="success", error_code=None):
+        try:
+            ended_at = self.repo.clock()
+            if (type(started_at) not in (float, int) or not math.isfinite(started_at)
+                    or not math.isfinite(ended_at) or ended_at < started_at):
+                return
+            stage = self._stage_start(name, job, lease, started_at=started_at)
+            self._stage_finish(stage, outcome, error_code=error_code, duration_seconds=ended_at-started_at,
+                timing_basis="durable_cpu_interval")
+        except Exception:
+            pass
+
+    def _generation_start(self, job, lease, started_at):
+        # Polls/reconciliation keep the same span; replacing an old observation
+        # does not free, cancel or otherwise change its original execution.
+        if type(started_at) not in (float, int) or not math.isfinite(started_at):
+            return
+        old = self._generation_observation
+        if old is not None and old[0] == lease.attempt_id:
+            return
+        if old is not None:
+            self._stage_finish(old[2], "unknown", error_code="worker_reconciliation_needed")
+        self._generation_observation = (lease.attempt_id, started_at,
+            self._stage_start("generate", job, lease, started_at=started_at))
+
+    def _generation_note(self, error_code):
+        observation = self._generation_observation
+        if observation is not None:
+            try:
+                observation[2].note(error_code)
+            except Exception:
+                pass
+
+    def _generation_finish(self, lease, outcome, *, error_code=None):
+        observation = self._generation_observation
+        if observation is None or observation[0] != lease.attempt_id:
+            return
+        self._generation_observation = None
+        try:
+            duration = self.repo.clock() - observation[1]
+        except Exception:
+            duration = None
+        self._stage_finish(observation[2], outcome, error_code=error_code,
+            duration_seconds=duration, timing_basis="durable_cpu_interval")
+
+    def _commit_result(self, job, lease, specs, cost, settlement):
+        with self._stage("commit_result", job, lease):
+            result = self.queue.complete(lease, specs, actual_cost_microusd=cost, settlement=settlement)
+        # Complete only after validation, object publication and the original
+        # result transaction. This observation never authorizes a replay.
+        self._observe_interval("end_to_end", result, lease, job.get("created_at"))
+        return self._summary(result)
 
     def drain(self):
         self._drain.set()
@@ -205,6 +311,8 @@ class WorkerRunner:
             return {"state": "idle", "simulation": isinstance(self.backend, MockBackend)}
         job, lease = claim.job, claim.lease
         tag = lease.attempt_id
+        if purpose == "generate":
+            self._observe_interval("queue_wait", job, lease, job.get("created_at"))
         slot_fence = self.control.get(worker_id)["fence"] if self.control else None
         def heartbeat():
             self._check_external_stop()
@@ -226,7 +334,8 @@ class WorkerRunner:
                         actual_cost_microusd=0, upstream_stopped=True))
                 try:
                     delivery_spec(job)  # Reject unknown/malformed export policy before any engine preparation.
-                    prepared = self.backend.prepare(job, tag, self.store, heartbeat)
+                    with self._stage("input_transfer", job, lease):
+                        prepared = self.backend.prepare(job, tag, self.store, heartbeat)
                 except RenderCacheCapacityExceeded:
                     # No submission intent/POST exists. Retained input/cache
                     # evidence stays untouched; do not grow attempts forever
@@ -245,20 +354,26 @@ class WorkerRunner:
                 if not self._submission_allowed(job):
                     return self._summary(self.queue.fail(lease, "execution_policy_unavailable_before_submission",
                         actual_cost_microusd=0, upstream_stopped=True))
-                self.queue.begin_submission(lease)
+                submitting = self.queue.begin_submission(lease)
+                self._generation_start(job, lease, submitting["updated_at"])
                 try:
                     task_id = self.backend.submit(prepared, tag)
                 except SubmissionRejected:
+                    self._generation_finish(lease, "failure", error_code="submission_rejected")
                     return self._summary(self.queue.fail(lease, "submission_rejected", actual_cost_microusd=0, upstream_stopped=True))
                 except Exception:
+                    self._generation_note("submission_response_unknown")
                     return self._summary(self.queue.mark_submission_unknown(lease))
                 job = self.queue.record_submitted(lease, task_id)
             else:
                 attempt = self.queue.get_attempt(self._scope(job), job["id"])
                 task_id = attempt["upstream_task_id"]
+                if attempt["status"] not in ("collecting", "succeeded", "failed", "cancelled"):
+                    self._generation_start(job, lease, attempt["submission_started_at"])
                 if not task_id:
                     outcome = self.backend.reconcile(tag)
                     if not outcome.task_id:
+                        self._generation_note("submission_needs_reconciliation")
                         return self._summary(self.queue.release(lease, retry_after_s=30, error_code="submission_needs_reconciliation"))
                     task_id = outcome.task_id
                     job = self.queue.record_submitted(lease, task_id)
@@ -271,9 +386,12 @@ class WorkerRunner:
                 return self._collect(job, lease, tag, task_id, heartbeat)
             outcome = self.backend.poll(tag, task_id)
             if outcome.state == "succeeded":
+                self._generation_finish(lease, "success")
                 job = self.queue.begin_collection(lease)
                 return self._collect(job, lease, tag, task_id, heartbeat)
             if outcome.state in ("failed", "cancelled"):
+                self._generation_finish(lease, "cancelled" if outcome.state == "cancelled" else "failure",
+                    error_code=safe_failure_code(getattr(outcome, "error_code", None)) or "upstream_generation_failed")
                 cost = self._cost(job, task_id, outcome)
                 if job["status"] == "cancel_requested":
                     return self._summary(self.queue.confirm_cancel(lease, upstream_stopped=True, actual_cost_microusd=cost))
@@ -283,11 +401,15 @@ class WorkerRunner:
                     if self.backend.kind == "wangp-worker" and outcome.state == "failed" else None)
                 return self._summary(self.queue.fail(lease, code or "upstream_generation_failed",
                     actual_cost_microusd=cost, upstream_stopped=True))
+            if outcome.state == "unknown":
+                self._generation_note("upstream_status_unknown")
             return self._summary(self.queue.release(lease, retry_after_s=self.retry_after_s,
                 error_code="upstream_status_unknown" if outcome.state == "unknown" else None))
         except LeaseLost:
+            self._generation_note("lease_lost_reconcile_required")
             return self._summary(job, "lease_lost_reconcile_required")
         except Exception:
+            self._generation_note("worker_reconciliation_needed")
             # No raw exception response, URL, request or prompt escapes this worker.
             fresh = self.repo.get_job(self._scope(job), job["id"])
             try:
@@ -325,82 +447,82 @@ class WorkerRunner:
         writer = ArtifactWriter(self.repo.engine, self.store, self.work_dir, tenant=job["tenant_id"])
         receipt = writer.get(job, lease.attempt_id, tag)
         if receipt is not None and receipt["phase"] != "staging":
-            with _lease_keepalive(heartbeat):
+            with _lease_keepalive(heartbeat), self._stage("upload", job, lease):
                 specs = writer.write(receipt, heartbeat)
-            return self._summary(self.queue.complete(lease, specs, actual_cost_microusd=self._cost(job, task_id),
-                                                     settlement=writer.settlement(receipt)))
+            return self._commit_result(job, lease, specs, self._cost(job, task_id), writer.settlement(receipt))
         width, height, duration, audio = _shape(job)
         delivery = delivery_spec(job)
         if delivery is not None:
             duration = delivery["duration_s"]
-        writer.begin_staging(job, lease.attempt_id, tag, kinds=("video", "audio") if audio else ("video",))
-        directory = self.work_dir / tag
-        directory.mkdir(parents=True, exist_ok=True)
-        heartbeat()
-        paths = self.backend.fetch(job, tag, task_id, directory, heartbeat)
-        raw = probe(paths["video"])
-        stream = next((s for s in raw.get("streams", []) if s.get("codec_type") == "video"), {})
-        if (stream.get("width"), stream.get("height")) != (width, height):
-            raise BackendError("output_dimensions_mismatch")
-        if delivery is not None:
-            _validate_native_timing(stream, delivery)
+        with self._stage("collect", job, lease):
+            writer.begin_staging(job, lease.attempt_id, tag, kinds=("video", "audio") if audio else ("video",))
+            directory = self.work_dir / tag
+            directory.mkdir(parents=True, exist_ok=True)
+            heartbeat()
+            paths = self.backend.fetch(job, tag, task_id, directory, heartbeat)
+        with self._stage("validate_output", job, lease):
+            raw = probe(paths["video"])
+            stream = next((s for s in raw.get("streams", []) if s.get("codec_type") == "video"), {})
+            if (stream.get("width"), stream.get("height")) != (width, height):
+                raise BackendError("output_dimensions_mismatch")
+            if delivery is not None:
+                _validate_native_timing(stream, delivery)
+                if audio:
+                    if "audio" not in paths:
+                        raise BackendError("independent_audio_missing")
+                    _validate_audio(paths["audio"], duration)
+            try:
+                if float(raw["format"]["duration"]) < duration - .1:
+                    raise BackendError("output_too_short")
+            except (ValueError, KeyError):
+                raise BackendError("output_duration_unknown") from None
+            final = directory / "verified.mp4"
+            request = _request(job)
+            media_timeout = 1800 if job["request"].get("recipe_id") == "chapter-roughcut-v1" else 180
+            heartbeat()
+            args = ["-i", paths["video"], "-t", duration, "-frames:v", round(duration*24),
+                "-vf", "fps=24", "-c:v", "libx264", "-preset", "veryfast", "-crf", request.get("export_crf", 18),
+                "-pix_fmt", "yuv420p"]
+            args += ["-c:a", "aac", "-ar", "32000", "-ac", "2"] if audio else ["-an"]
+            if delivery is not None:
+                # Keep the complete native timeline. Both audio deliveries use the
+                # original generated waveform; no trim, pad, fps filter or atempo.
+                args = ["-i", paths["video"]]
+                if audio:
+                    args += ["-i", paths["audio"], "-map", "0:v:0", "-map", "1:a:0"]
+                args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", request.get("export_crf", 18),
+                         "-pix_fmt", "yuv420p", "-fps_mode", "passthrough"]
+                args += ["-c:a", "aac", "-ar", "32000", "-ac", "2"] if audio else ["-an"]
+            with _lease_keepalive(heartbeat):
+                ffmpeg([*args, "-fs", 512*1024*1024+1, "-movflags", "+faststart", final], timeout=media_timeout)
+                video_evidence = _validate_video(final, width, height, duration, audio, timeout=media_timeout)
+                if delivery is not None:
+                    observed = probe(final)
+                    observed_video = next(s for s in observed["streams"] if s.get("codec_type") == "video")
+                    _validate_native_timing(observed_video, delivery)
+                    video_evidence.update(delivery_spec=delivery, frame_count=delivery["frame_count"],
+                        container_duration_s=float(observed["format"]["duration"]))
+                    if audio:
+                        observed_audio = next(s for s in observed["streams"] if s.get("codec_type") == "audio")
+                        video_evidence["audio_duration_s"] = float(observed_audio.get("duration", observed["format"]["duration"]))
+            files = [("video", final, "video/mp4", video_evidence)]
             if audio:
                 if "audio" not in paths:
                     raise BackendError("independent_audio_missing")
-                _validate_audio(paths["audio"], duration)
-        try:
-            if float(raw["format"]["duration"]) < duration - .1:
-                raise BackendError("output_too_short")
-        except (ValueError, KeyError):
-            raise BackendError("output_duration_unknown") from None
-        final = directory / "verified.mp4"
-        request = _request(job)
-        media_timeout = 1800 if job["request"].get("recipe_id") == "chapter-roughcut-v1" else 180
-        heartbeat()
-        args = ["-i", paths["video"], "-t", duration, "-frames:v", round(duration*24),
-            "-vf", "fps=24", "-c:v", "libx264", "-preset", "veryfast", "-crf", request.get("export_crf", 18),
-            "-pix_fmt", "yuv420p"]
-        args += ["-c:a", "aac", "-ar", "32000", "-ac", "2"] if audio else ["-an"]
-        if delivery is not None:
-            # Keep the complete native timeline. Both audio deliveries use the
-            # original generated waveform; no trim, pad, fps filter or atempo.
-            args = ["-i", paths["video"]]
-            if audio:
-                args += ["-i", paths["audio"], "-map", "0:v:0", "-map", "1:a:0"]
-            args += ["-c:v", "libx264", "-preset", "veryfast", "-crf", request.get("export_crf", 18),
-                     "-pix_fmt", "yuv420p", "-fps_mode", "passthrough"]
-            args += ["-c:a", "aac", "-ar", "32000", "-ac", "2"] if audio else ["-an"]
-        with _lease_keepalive(heartbeat):
-            ffmpeg([*args, "-fs", 512*1024*1024+1, "-movflags", "+faststart", final], timeout=media_timeout)
-            video_evidence = _validate_video(final, width, height, duration, audio, timeout=media_timeout)
-            if delivery is not None:
-                observed = probe(final)
-                observed_video = next(s for s in observed["streams"] if s.get("codec_type") == "video")
-                _validate_native_timing(observed_video, delivery)
-                video_evidence.update(delivery_spec=delivery, frame_count=delivery["frame_count"],
-                    container_duration_s=float(observed["format"]["duration"]))
-                if audio:
-                    observed_audio = next(s for s in observed["streams"] if s.get("codec_type") == "audio")
-                    video_evidence["audio_duration_s"] = float(observed_audio.get("duration", observed["format"]["duration"]))
-        files = [("video", final, "video/mp4", video_evidence)]
-        if audio:
-            if "audio" not in paths:
-                raise BackendError("independent_audio_missing")
-            output = directory / "verified.flac"
-            heartbeat()
+                output = directory / "verified.flac"
+                heartbeat()
+                with _lease_keepalive(heartbeat):
+                    ffmpeg(["-i", paths["audio"], *([] if delivery is not None else ["-t", duration]),
+                            "-c:a", "flac", "-ar", "32000", "-ac", "2",
+                            "-fs", 512*1024*1024+1, output], timeout=media_timeout)
+                    actual_audio_duration = _validate_audio(output, duration, flac=True, timeout=media_timeout)
+                files.append(("audio", output, "audio/flac", {"duration_s": actual_audio_duration, "has_audio": True,
+                    **({"delivery_spec": delivery} if delivery is not None else {})}))
             with _lease_keepalive(heartbeat):
-                ffmpeg(["-i", paths["audio"], *([] if delivery is not None else ["-t", duration]),
-                        "-c:a", "flac", "-ar", "32000", "-ac", "2",
-                        "-fs", 512*1024*1024+1, output], timeout=media_timeout)
-                actual_audio_duration = _validate_audio(output, duration, flac=True, timeout=media_timeout)
-            files.append(("audio", output, "audio/flac", {"duration_s": actual_audio_duration, "has_audio": True,
-                **({"delivery_spec": delivery} if delivery is not None else {})}))
-        with _lease_keepalive(heartbeat):
-            receipt = writer.prepare(job, lease.attempt_id, tag, files)
+                receipt = writer.prepare(job, lease.attempt_id, tag, files)
+        with _lease_keepalive(heartbeat), self._stage("upload", job, lease):
             specs = writer.write(receipt, heartbeat)
-        result = self.queue.complete(lease, specs, actual_cost_microusd=self._cost(job, task_id),
-                                     settlement=writer.settlement(receipt))
-        return self._summary(result)
+        return self._commit_result(job, lease, specs, self._cost(job, task_id), writer.settlement(receipt))
 
     def run_forever(self, worker_id, pool, *, poll_interval_s=1):
         """Explicit CLI lifecycle; SIGTERM drains without globally interrupting Comfy."""

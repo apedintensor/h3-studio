@@ -103,6 +103,38 @@ class TelemetryTests(unittest.TestCase):
         self.assertLessEqual(self.telemetry.status()["metric_labelsets"], 128)
         self.assertTrue(any(attrs.get("stage") == "unknown" for _, attrs in self.telemetry.duration.points))
 
+    def test_recovered_interval_and_unknown_note_keep_observation_time_and_original_duration(self):
+        stage = self.telemetry.start("generate", {}, started_at=1769999900.25)
+        stage.note("submission_response_unknown")
+        stage.note("submission_response_unknown")
+        self.assertEqual([e["event"] for e in self.logger.events], ["stage_started", "stage_observation"])
+        self.assertEqual(self.logger.events[0]["time_unix_ns"], 1770000000000000000)
+        # Repository epoch seconds are floats; this is a reconstructed CPU
+        # interval, not a nanosecond-precision GPU timestamp.
+        self.assertLess(abs(self.logger.events[0]["interval_start_unix_ns"] - 1769999900250000000), 1000)
+        self.assertFalse(self.telemetry.duration.points)
+        self.clock[0] += .2
+        self.assertEqual(stage.finish(duration_seconds=47, timing_basis="durable_cpu_interval"), 47)
+        self.assertEqual(self.logger.events[-1]["timing_basis"], "durable_cpu_interval")
+        self.assertEqual(self.logger.events[-1]["duration_seconds"], 47)
+        stage.note("submission_response_unknown")
+        self.assertEqual(len(self.logger.events), 3)
+
+    def test_invalid_interval_and_broken_clock_do_not_invent_samples_or_replace_errors(self):
+        for duration in (-1, float("nan"), float("inf"), True, 31536001):
+            stage = self.telemetry.start("generate", {}, started_at=float("nan"))
+            self.clock[0] += 2
+            self.assertEqual(stage.finish(duration_seconds=duration, timing_basis="durable_cpu_interval"), 2)
+            self.assertNotIn("interval_start_unix_ns", self.logger.events[-1])
+            self.assertEqual(self.logger.events[-1]["timing_basis"], "monotonic")
+        before = len(self.telemetry.duration.points)
+        with self.assertRaisesRegex(RuntimeError, "PRIVATE original error"):
+            with self.telemetry.start("generate", {}):
+                self.telemetry.monotonic = lambda: (_ for _ in ()).throw(RuntimeError("PRIVATE clock error"))
+                raise RuntimeError("PRIVATE original error")
+        self.assertEqual(len(self.telemetry.duration.points), before)
+        self.assertNotIn("PRIVATE", json.dumps(self.logger.events))
+
 
 class ConfigurationTests(unittest.TestCase):
     def test_https_cloud_destination_and_authorization_are_required_and_not_represented(self):

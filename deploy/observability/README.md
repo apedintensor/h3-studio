@@ -69,7 +69,7 @@ unrecognized error becomes `unknown_error`. Repeated `finish` is inert.
 
 Stages are `queue_wait`, `capacity_provision`, `image_pull`, `weights_download`,
 `model_load`, `mode_switch`, `input_transfer`, `generate`, `collect`,
-`validate_output`, `upload`, `commit_result` and `end_to_end`. They are observations,
+`validate_output`, `upload`, `commit_result`, `end_to_end` and `runtime_ready`. They are observations,
 not another state machine. A GPU process must not be called ready solely because
 dstack reports `RUNNING`. A completion/end-to-end event is valid only when the
 original business operation has durably committed validated video and independent
@@ -80,10 +80,30 @@ Start logs enqueue immediately, independently of span completion. SDK batches
 flush asynchronously every 250 ms; a long stage or later process crash therefore
 does not require an ended span before its start can be observed. Crash/network
 loss before delivery can still lose an event: these are best-effort diagnostics,
-not durable execution/receipt evidence. Durations use one process's monotonic
-clock. Never subtract unrelated CPU/GPU wall clocks or invent unobserved phase
-timing; GPU-local stages must supply measured durations through reviewed runtime
-receipts or instrumentation without provider credentials.
+not durable execution/receipt evidence. Live synchronous stages use one process's
+monotonic clock. Worker queue/end-to-end intervals and generation recovery use
+the original CPU repository timestamps with `timing_basis=durable_cpu_interval`.
+`start(..., started_at=epoch_seconds)` reconstructs that span start;
+`finish(..., duration_seconds=seconds, timing_basis="durable_cpu_interval")`
+accepts only a finite, non-negative bounded interval. Start log time remains the
+current observation time, with the original `interval_start_unix_ns` retained.
+Never subtract unrelated CPU/GPU wall clocks or invent unobserved phase timing;
+GPU-local stages need measured runtime receipts or instrumentation without
+provider credentials.
+
+`WorkerRunner(..., telemetry=telemetry, telemetry_context=static_context)` is
+optional and defaults to `NullTelemetry`. It instruments the existing operations:
+claim queue wait, prepare inputs, submit-to-terminal observation, original output
+collection, full media validation, object publication and result transaction.
+`generate` starts at the durable submission intent and ends only upon an observed
+upstream terminal state. It includes submission transport and terminal polling
+delay; it is **not** measured GPU denoise time. The ledger has no separate immutable
+accepted-response timestamp. Recovery reconstructs the same original attempt
+interval without resubmission. `stage.note(static_error_code)` emits a deduplicated
+unknown observation while leaving that interval open; missing/lost responses do
+not produce a false completion. Stage measurements can be repeated after a
+process failure and are not exactly-once execution counters. `simulation=true`
+marks CPU demo observations in logs/spans; they cannot qualify H3 performance.
 
 Only named profile/provider/mode/GPU/warmth choices, trusted job/attempt/runtime
 IDs and bounded numeric comparison dimensions are projected. There is no raw
@@ -132,4 +152,6 @@ Official sources: [Cloud OTLP gateway](https://grafana.com/docs/grafana-cloud/se
 
 Local tests use fake Cloud transport and decoded real OTLP protobuf; they do not
 certify real Cloud ingestion or production instrumentation. Cloud provisioning,
-actual queries and runtime stage integration remain the root rollout scope.
+actual queries, service configuration and runtime startup integration remain the
+root rollout scope. Worker tests exercise the original CPU video/audio and ledger
+path, failure/recovery and unknown-response behavior; no paid generation is used.

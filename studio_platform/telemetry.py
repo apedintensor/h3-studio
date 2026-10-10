@@ -21,20 +21,25 @@ import uuid
 
 from .runtime_catalog import PROFILE_IDS
 from .generation_diagnostics import WANGP_VALIDATION_CODES, COMMON_CODES
+from .inference.protocol import INFERENCE_FAILURE_CODES
 
 STAGES = frozenset({"queue_wait", "capacity_provision", "image_pull", "weights_download",
     "model_load", "mode_switch", "input_transfer", "generate", "collect",
-    "validate_output", "upload", "commit_result", "end_to_end", "unknown"})
+    "validate_output", "upload", "commit_result", "end_to_end", "runtime_ready", "unknown"})
 OUTCOMES = frozenset({"success", "failure", "unknown", "cancelled"})
 PROVIDERS = frozenset({"vast", "runpod", "lium", "targon", "local", "unknown"})
 GPU_TYPES = frozenset({"rtx5090", "rtx-pro6000", "h100", "h200", "b200", "b300", "unknown"})
-ERROR_CODES = WANGP_VALIDATION_CODES | COMMON_CODES | frozenset({"unknown_error",
+ERROR_CODES = WANGP_VALIDATION_CODES | COMMON_CODES | INFERENCE_FAILURE_CODES | frozenset({"unknown_error",
     "stage_failed", "cancel_requested", "submission_rejected", "submission_needs_reconciliation",
     "upstream_status_unknown", "worker_preparation_not_ready", "worker_preparation_failed",
     "worker_reconciliation_needed", "worker_draining", "worker_backend_not_authorized",
     "execution_policy_unavailable_before_submission", "artifact_validation_failed",
     "wangp_generation_cuda_out_of_memory", "wangp_generation_failed", "capacity_unavailable",
-    "runtime_not_ready", "collection_failed", "upload_failed"})
+    "runtime_not_ready", "collection_failed", "upload_failed", "submission_response_unknown",
+    "lease_lost_reconcile_required", "upstream_generation_failed", "output_dimensions_mismatch",
+    "independent_audio_missing", "output_too_short", "output_duration_unknown",
+    "native_output_timing_mismatch", "output_video_verification_failed", "unexpected_output_audio",
+    "output_audio_verification_failed"})
 _LABEL_FIELDS = ("stage", "provider", "profile_id", "mode", "gpu_type", "warmth")
 _UUID = re.compile(r"(?:[a-z]+-)?(?:[0-9a-f]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\Z")
 _SERVICES = frozenset({"sixnine-api", "sixnine-worker", "sixnine-controller", "sixnine-acceptance"})
@@ -54,6 +59,8 @@ def _context(value):
         "gpu_type": _choice(source.get("gpu_type"), GPU_TYPES),
         "warmth": _choice(source.get("warmth"), {"cold", "warm", "mode_switch", "unknown"}),
     }
+    if type(source.get("simulation")) is bool:
+        result["simulation"] = source["simulation"]
     for name in ("job_id", "attempt_id", "node_id", "hatchet_run"):
         item = source.get(name)
         if isinstance(item, str) and len(item) <= 80 and _UUID.fullmatch(item):
@@ -135,8 +142,11 @@ def read_config(filename):
 
 
 class NullStage:
-    def finish(self, outcome="success", *, error_code=None):
+    def finish(self, outcome="success", *, error_code=None, duration_seconds=None, timing_basis=None):
         return None
+
+    def note(self, error_code):
+        pass
 
     def __enter__(self):
         return self
@@ -152,7 +162,7 @@ class NullTelemetry:
     def __init__(self, reason="disabled"):
         self.reason = reason
 
-    def start(self, stage, context=None):
+    def start(self, stage, context=None, *, started_at=None):
         return NullStage()
 
     def call(self, stage, context, operation, *args, **kwargs):
@@ -170,14 +180,16 @@ class NullTelemetry:
 
 
 class Stage:
-    def __init__(self, telemetry, stage, context):
+    def __init__(self, telemetry, stage, context, started_at=None):
         self.telemetry, self.stage, self.context = telemetry, stage, context
         self.stage_id = uuid.uuid4().hex
         self.started = telemetry.monotonic()
-        self._lock, self._finished = threading.Lock(), False
+        self._lock, self._finished, self._notes = threading.Lock(), False, set()
+        self.started_at = (started_at if type(started_at) in (float, int)
+            and math.isfinite(started_at) and 0 <= started_at <= 4102444800 else None)
         self.span = telemetry._begin(self)
 
-    def finish(self, outcome="success", *, error_code=None):
+    def finish(self, outcome="success", *, error_code=None, duration_seconds=None, timing_basis=None):
         with self._lock:
             if self._finished:
                 return None
@@ -185,9 +197,35 @@ class Stage:
         outcome = _choice(outcome, OUTCOMES)
         code = error_code if isinstance(error_code, str) and error_code in ERROR_CODES else (
             "unknown_error" if error_code is not None else None)
-        duration = max(0.0, self.telemetry.monotonic() - self.started)
-        self.telemetry._end(self, outcome, code, duration)
-        return duration
+        try:
+            duration = self.telemetry.monotonic() - self.started
+            if not math.isfinite(duration):
+                raise ValueError("telemetry_clock_unavailable")
+            duration, basis = max(0.0, duration), "monotonic"
+            if (timing_basis == "durable_cpu_interval" and type(duration_seconds) in (float, int)
+                    and math.isfinite(duration_seconds) and 0 <= duration_seconds <= 31536000):
+                duration, basis = float(duration_seconds), "durable_cpu_interval"
+            self.telemetry._end(self, outcome, code, duration, basis)
+            return duration
+        except Exception:
+            # A failed clock/observer cannot replace the business exception or
+            # invent a duration sample. Release the optional span best-effort.
+            try:
+                self.span.end()
+            except Exception:
+                pass
+            return None
+
+    def note(self, error_code):
+        code = error_code if isinstance(error_code, str) and error_code in ERROR_CODES else "unknown_error"
+        with self._lock:
+            if self._finished or code in self._notes:
+                return
+            self._notes.add(code)
+        try:
+            self.telemetry._event(self, "stage_observation", outcome="unknown", error_code=code, span=self.span)
+        except Exception:
+            pass
 
     def __enter__(self):
         return self
@@ -210,11 +248,11 @@ class StageTelemetry(NullTelemetry):
         self.finished_count = meter.create_counter("sixnine.stage.finished")
         self.duration = meter.create_histogram("sixnine.stage.duration", unit="s")
 
-    def start(self, stage, context=None):
+    def start(self, stage, context=None, *, started_at=None):
         if self._closed:
             return NullStage()
         try:
-            return Stage(self, _choice(stage, STAGES), _context(context))
+            return Stage(self, _choice(stage, STAGES), _context(context), started_at)
         except Exception:
             # Optional observation must not fail admission, inference or cleanup.
             return NullStage()
@@ -231,7 +269,7 @@ class StageTelemetry(NullTelemetry):
                 self._labelsets.add(identity)
         return labels
 
-    def _event(self, stage, event, *, outcome=None, error_code=None, duration=None, span=None):
+    def _event(self, stage, event, *, outcome=None, error_code=None, duration=None, span=None, timing_basis=None):
         from opentelemetry.trace import set_span_in_context
         body = {"schema_version": 1, "event": event, "stage": stage.stage,
                 "stage_id": stage.stage_id, "time_unix_ns": self.timestamp(), **stage.context}
@@ -241,6 +279,9 @@ class StageTelemetry(NullTelemetry):
             body["error_code"] = error_code
         if duration is not None:
             body["duration_seconds"] = duration
+            body["timing_basis"] = timing_basis or "monotonic"
+        if stage.started_at is not None:
+            body["interval_start_unix_ns"] = int(stage.started_at * 1000000000)
         kwargs = {}
         if span is not None:
             trace = span.get_span_context()
@@ -253,8 +294,9 @@ class StageTelemetry(NullTelemetry):
         from opentelemetry.context import Context
         # Never inherit arbitrary HTTP/baggage context. Trusted job/attempt IDs
         # correlate these stage spans without automatic user-input capture.
+        kwargs = {"start_time": int(stage.started_at * 1000000000)} if stage.started_at is not None else {}
         span = self.tracer.start_span("sixnine." + stage.stage, context=Context(),
-            attributes={"stage": stage.stage, **stage.context})
+            attributes={"stage": stage.stage, **stage.context}, **kwargs)
         try:
             # Enqueue now, independently of whether the long-lived span ever ends.
             self._event(stage, "stage_started", span=span)
@@ -264,21 +306,24 @@ class StageTelemetry(NullTelemetry):
             raise
         return span
 
-    def _end(self, stage, outcome, error_code, duration):
+    def _end(self, stage, outcome, error_code, duration, timing_basis="monotonic"):
         try:
             from opentelemetry.trace import Status, StatusCode
             self._event(stage, "stage_finished", outcome=outcome, error_code=error_code,
-                        duration=duration, span=stage.span)
+                        duration=duration, span=stage.span, timing_basis=timing_basis)
             labels = self._labels(stage.stage, stage.context, outcome)
             self.finished_count.add(1, labels)
             self.duration.record(duration, labels)
+            stage.span.set_attribute("timing_basis", timing_basis)
             stage.span.set_status(Status(StatusCode.ERROR if outcome == "failure" else StatusCode.UNSET,
                 description=error_code if outcome == "failure" else None))
         except Exception:
             pass
         finally:
             try:
-                stage.span.end()
+                end_time = (int((stage.started_at + duration) * 1000000000)
+                    if stage.started_at is not None and timing_basis == "durable_cpu_interval" else None)
+                stage.span.end(end_time=end_time)
             except Exception:
                 pass
 
