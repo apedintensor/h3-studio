@@ -59,6 +59,14 @@ def register_routes(app, *, registry=None, service=None):
                                           ttl_seconds, service.repo.clock())
         return response(value)
 
+    @app.post(PREFIX+"/market-refreshes", status_code=202)
+    def market_refreshes(request: Request, body: dict):
+        service.authorize(principal(request))
+        if body:
+            raise OperatorError("operator_inventory_refresh_invalid", 422)
+        return JSONResponse(capacity_market.request_refresh(service.repo), status_code=202,
+            headers={"Cache-Control": "no-store"})
+
     @app.post(PREFIX+"/previews")
     def previews(request: Request, body: dict):
         return response(service.preview(principal(request),body))

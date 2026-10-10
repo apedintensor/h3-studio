@@ -105,6 +105,11 @@ class CandidateTests(LedgerCase):
         rows = self.project()["candidates"]
         self.assertEqual([row["offer_id"] for row in rows], ["fits"])
         self.assertEqual(rows[0]["ram_gib"], 100)
+        self.assertEqual(rows[0]["allocation_ram_gib"], 96)
+        excluded = self.project()["excluded"]
+        self.assertEqual(excluded[0]["ram_gib"], 98)
+        self.assertEqual(excluded[0]["allocation_ram_gib"], 94)
+        self.assertIn("inventory_ram_below_minimum", excluded[0]["blockers"])
         self.assertEqual(self.resolve(rows[0]["selection"])["ram_gib"], 100)
         with self.assertRaisesRegex(OperatorError, "inventory_ram_below_minimum"):
             self.resolve({**rows[0]["selection"], "offer_id":"too-small"})
@@ -114,6 +119,46 @@ class CandidateTests(LedgerCase):
         targon = offer("sku", "targon", "RTX PRO 6000 Blackwell", ram_gib=98)
         self.assertEqual(allocation_resources(targon), targon)
         self.assertIsNone(allocation_resources(offer(ram_gib=None))["ram_gib"])
+
+    def test_effective_filters_distinguish_profile_floors_guidance_and_protected_policy(self):
+        binding = self.qualify(filters={"min_ram_gib":96, "min_disk_gib":250,
+            "min_download_mbps":500, "max_price_per_gpu_hour_microusd":850000},
+            boot={"path":"PRIVATE-CONTROLLER-PATH"})
+        result = self.project()
+        profile = next(item for item in result["filters"] if item["runtime_profile_id"] == binding.runtime_profile_id)
+        self.assertEqual(profile["source"], "runtime_profile")
+        self.assertEqual(profile["hard_requirements"]["min_ram_gib"], 96)
+        self.assertEqual(profile["hard_requirements"]["min_disk_gib"], 128)
+        self.assertEqual(profile["guidance"]["min_download_mbps"], 200)
+        policy = profile["deployments"][0]
+        self.assertEqual(policy["filters"]["min_disk_gib"], 250)
+        self.assertEqual(policy["filters"]["min_download_mbps"], 500)
+        self.assertEqual(policy["source"], "protected_operator_registry")
+        self.assertTrue(policy["enabled"])
+        self.assertEqual(policy["hourly_cost_ceiling_microusd"], binding.hourly_cost_microusd)
+        self.assertNotIn("PRIVATE-CONTROLLER-PATH", str(result))
+        self.assertNotIn("owner-budget", str(result))
+        self.assertNotIn("budget_account_ids", str(result))
+        other = next(item for item in result["filters"] if item["runtime_profile_id"] != binding.runtime_profile_id)
+        self.assertEqual(other["deployments"], [])
+
+    def test_excluded_stock_is_bounded_and_model_edition_mismatch_is_explained(self):
+        self.publish("lium", [offer(str(index), ram_gib=62) for index in range(105)])
+        self.publish("targon", [offer("generic-pro", "targon", "RTX PRO 6000 Blackwell")])
+        pruned = self.project()
+        self.assertEqual(pruned["excluded_count"], 105)
+        self.assertEqual(len(pruned["excluded"]), 100)
+        self.assertTrue(all("inventory_ram_below_minimum" in row["blockers"] for row in pruned["excluded"]))
+        base = self.project(BASE)
+        self.assertEqual(base["candidates"], [])
+        self.assertEqual(base["excluded_count"], 106)
+        # A generic supplier edition cannot borrow pruned qualification for Base.
+        self.publish("lium")
+        row = self.project(BASE)["excluded"][0]
+        self.assertEqual(row["offer_id"], "generic-pro")
+        self.assertIn("operator_gpu_not_catalogued", row["blockers"])
+        self.assertIn("inventory_ram_below_minimum", row["blockers"])
+        self.assertEqual(self.project(BASE)["filters"][0]["deployments"], [])
 
     def test_topology_is_pending_and_full_host_price_is_preserved(self):
         self.qualify()

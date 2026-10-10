@@ -3,7 +3,7 @@ import {createOperatorClient} from './operator-client.js';
 const uid=()=>crypto.randomUUID();
 const keyFor=account=>'sixnine:operator:pending:'+account;
 const clone=value=>structuredClone(value);
-export function createOperatorController({client=createOperatorClient(),storage=globalThis.localStorage}={}){
+export function createOperatorController({client=createOperatorClient(),storage=globalThis.localStorage,wait=ms=>new Promise(resolve=>setTimeout(resolve,ms)),now=()=>Date.now()}={}){
   let epoch=0,loading=false,state={account:null,snapshot:null,catalog:null,pending:null,busy:false,loading:false,error:'',denied:false,unavailable:false};
   const listeners=new Set();
   const emit=patch=>{state={...state,...patch};listeners.forEach(fn=>fn());};
@@ -27,6 +27,22 @@ export function createOperatorController({client=createOperatorClient(),storage=
     refresh,poll:()=>state.busy?Promise.resolve():refresh(),
     preview:selection=>act(()=>client.preview(selection)),
     candidates:query=>act(()=>client.candidates(query)),
+    refreshCandidates:(query,onUpdate=()=>{},signal)=>act(async()=>{
+      const account=state.account,current=epoch,selection=clone(query),receipt=await client.marketRefresh();guard(account,current);
+      if(typeof receipt?.request_id!=='string'||!receipt.request_id||!Number.isFinite(receipt.requested_at)||!['lium','targon'].every(provider=>receipt.providers?.includes(provider)))throw Error('供应商库存刷新尚未确认，请稍后重新查询。');
+      const deadline=now()+60000;let last=null;
+      for(let read=0;read<31;read++){
+        if(signal?.aborted||last&&now()>=deadline)return last;
+        const result=await client.candidates(selection);guard(account,current);
+        if(signal?.aborted)return result;
+        if(result.model_id!==selection.model_id||result.mode!==selection.mode)throw Error('库存响应与当前模型或模式不一致，请重新查询。');
+        if(!['lium','targon'].every(provider=>result.providers?.some(item=>item.provider===provider&&typeof item.refresh_request_id==='string'&&Number.isFinite(item.refresh_requested_at)&&item.refresh_requested_at>=receipt.requested_at&&['pending','complete','failed','timeout'].includes(item.refresh_status))))throw Error('供应商库存刷新尚未返回本轮记录，请重新查询。');
+        last=result;
+        onUpdate(result);
+        if(!result.providers.some(item=>item.refresh_status==='pending')||read===30||now()>=deadline)return result;
+        await wait(Math.max(0,Math.min(2000,deadline-now())));guard(account,current);
+      }
+    }),
     offers:selection=>act(()=>client.offers(selection)),
     start:preview=>command('start',[],{preview_id:preview.preview_id}),
     drain:node=>command('drain',[node.id],{expected_version:node.version}),

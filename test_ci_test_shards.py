@@ -153,7 +153,8 @@ class ShardTests(unittest.TestCase):
         """.split())
         self.assertEqual(len(expected), 70)
         self.assertTrue(expected.issubset(set(ci.POSTGRES_MODULES)))
-        self.assertEqual(set(ci.POSTGRES_MODULES) - expected, {"test_operator_manual_review"})
+        self.assertEqual(set(ci.POSTGRES_MODULES) - expected,
+                         {"test_operator_manual_review", "test_capacity_market_refresh", "test_capacity_candidates"})
         self.assertEqual(len(ci.POSTGRES_MODULES), len(set(ci.POSTGRES_MODULES)))
 
     def test_postgres_loader_uses_complete_manifest(self):

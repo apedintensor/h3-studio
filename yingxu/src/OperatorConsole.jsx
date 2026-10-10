@@ -52,7 +52,7 @@ function CandidateCard({row,index,current,busy,onStart}){
   return <article className="op-candidate">
     <header><span className="op-candidate-rank">{String(index+1).padStart(2,'0')}</span><div><span className="op-candidate-provider">{providerLabel(row.provider)} · {row.offer_kind==='resource_sku'?'资源规格 SKU':'指定执行机器'}</span><h4>{row.gpu_type} <span>× {known(row.gpu_count)}</span></h4></div><span className={'op-badge '+(current&&readiness==='待启动预览'?'good':'warn')}>{current?readiness:'库存待刷新'}</span></header>
     <div className="op-candidate-price"><strong>{dollars(row.hourly_cost_microusd,{digits:3})}<small> / 小时</small></strong><span>整组 {known(row.gpu_count)} 张 GPU 的报价<br/>每卡 {dollars(row.price_per_gpu_hour_microusd,{digits:3})} / 小时</span></div>
-    <dl className="op-candidate-specs"><div><dt>系统内存</dt><dd>{roundedSpec(row.ram_gib,'GiB')}</dd></div><div><dt>可用磁盘</dt><dd>{roundedSpec(row.disk_gib,'GiB')}</dd></div><div><dt>下载带宽</dt><dd>{roundedSpec(row.download_mbps,'Mbps')}</dd></div><div><dt>当前可用</dt><dd>{known(row.available_count)} {row.offer_kind==='resource_sku'?'份配置':'台'}</dd></div></dl>
+    <dl className="op-candidate-specs"><div><dt>系统内存</dt><dd>{roundedSpec(row.ram_gib,'GiB')}{Number.isFinite(row.allocation_ram_gib)&&row.allocation_ram_gib!==row.ram_gib&&<small>可分配 {roundedSpec(row.allocation_ram_gib,'GiB')}</small>}</dd></div><div><dt>可用磁盘</dt><dd>{roundedSpec(row.disk_gib,'GiB')}</dd></div><div><dt>下载带宽</dt><dd>{roundedSpec(row.download_mbps,'Mbps')}</dd></div><div><dt>当前可用</dt><dd>{known(row.available_count)} {row.offer_kind==='resource_sku'?'份配置':'台'}</dd></div></dl>
     <p className="op-candidate-slots"><Cpu size={13}/>{operatorSlotsLabel(row)}</p>
     <div className="op-rank-reasons">{(row.rank_reasons||[]).map(operatorRankReason).filter(Boolean).map(text=><span key={text}>{text}</span>)}</div>
     <Reasons items={row.blockers||[]}/>{row.preference_hints?.length>0&&<p className="op-note">{row.preference_hints.map(reasonText).join(' ')}</p>}
@@ -60,10 +60,49 @@ function CandidateCard({row,index,current,busy,onStart}){
     <footer><span>{!current?'请刷新库存':blocked?'启动条件见上方说明':'点击后核对费用并开机'}</span><button className="op-primary" type="button" disabled={busy||!current||!stock||blocked} onClick={()=>onStart(row)}><Play size={13}/>{row.offer_kind==='resource_sku'?'按此规格启动':'启动这台'}</button></footer>
   </article>;
 }
+function FilterFacts({filters={}}){
+  const entries=[['min_ram_gib','系统内存至少',value=>roundedSpec(value,'GiB')],['min_disk_gib','可用磁盘至少',value=>roundedSpec(value,'GiB')],['min_cpu_cores','CPU 至少',value=>roundedSpec(value,'核')],['min_download_mbps','下载带宽至少',value=>roundedSpec(value,'Mbps')],['max_price_per_gpu_hour_microusd','每卡费率上限',value=>dollars(value,{digits:3})+' / 小时'],['allowed_countries','允许地区',value=>value.length?value.join('、'):'不限']];
+  return <dl className="op-filter-facts">{entries.filter(([key])=>Array.isArray(filters[key])||Number.isFinite(filters[key])&&filters[key]>0).map(([key,label,format])=><div key={key}><dt>{label}</dt><dd>{format(filters[key])}</dd></div>)}</dl>;
+}
+function MarketFilters({result,catalog}){
+  if(!result.filters?.length)return null;
+  return <details className="op-details op-market-filters">
+    <summary>当前筛选条件与排除原因{result.excluded_count>0&&` · ${result.excluded_count} 项被筛掉`}</summary>
+    <p>条件来自服务端配置。当前模型准入条件包含已配置的资源门槛，不代表每项都是实测硬件最低值。调整运行策略由服务端处理，模型与精度保持所选配置。「参考条件」中的带宽与价格用于提示和排序；「服务端部署配置」中的资源、带宽与费率上限会限制实际启动。</p>
+    <p>Lium 按可分配内存筛选，会扣除至少 4 GiB 的系统保留；Targon 按资源规格中的已分配内存筛选。</p>
+    {result.filters.map(profile=><section key={profile.runtime_profile_id}>
+      <h4>{catalog?.profiles?.find(item=>item.id===profile.runtime_profile_id)?.label||profile.runtime_profile_id}</h4>
+      <p className="op-note">当前模型准入条件</p><FilterFacts filters={profile.hard_requirements}/>
+      <p className="op-note">参考条件</p><FilterFacts filters={profile.guidance}/>
+      {profile.deployments?.length?<details className="op-details">
+        <summary>服务端部署配置 · {profile.deployments.length} 项</summary>
+        {profile.deployments.map(binding=><section key={binding.binding_id}>
+          <p><b>{providerLabel(binding.provider)} · {binding.gpu_type} × {binding.gpu_count}</b> · {binding.enabled?'已启用':'未启用'}</p>
+          <FilterFacts filters={binding.filters}/>
+          <p>整机费率上限 {dollars(binding.hourly_cost_ceiling_microusd,{digits:3})} / 小时 · 配置 <code>{binding.binding_id}</code></p>
+        </section>)}
+      </details>:<p className="op-note">尚无匹配的服务端部署配置。</p>}
+    </section>)}
+    {result.excluded?.length>0&&<details className="op-details">
+      <summary>查看被筛掉的机器 · {result.excluded_count} 项</summary>
+      <p>以下库存低于当前模型的资源准入门槛，或 GPU 型号、版本尚未纳入所选模型的验收配置。其他未满足的启动条件显示在机器卡片上。</p>
+      <div className="op-table-wrap"><table><thead><tr><th>供应商与机器</th><th>上报资源</th><th>排除原因</th></tr></thead><tbody>
+        {result.excluded.map((offer,index)=><tr key={`${offer.provider}-${offer.offer_id}-${offer.runtime_profile_id}-${index}`}>
+          <td>{providerLabel(offer.provider)} · {offer.gpu_type} × {offer.gpu_count}<small><code>{offer.offer_id}</code></small></td>
+          <td>内存 {roundedSpec(offer.ram_gib,'GiB')}{Number.isFinite(offer.allocation_ram_gib)&&offer.allocation_ram_gib!==offer.ram_gib&&<small>可分配 {roundedSpec(offer.allocation_ram_gib,'GiB')}</small>}<small>磁盘 {roundedSpec(offer.disk_gib,'GiB')}</small></td>
+          <td><Reasons items={offer.blockers}/><small>{offer.runtime_profile_id}</small></td>
+        </tr>)}
+      </tbody></table></div>
+      {result.excluded_count>result.excluded.length&&<p>已展示前 {result.excluded.length} 项，共 {result.excluded_count} 项。</p>}
+    </details>}
+  </details>;
+}
 function StartDrawer({catalog,policy,controller,busy,onClose}){
   const models=useMemo(()=>operatorModels(catalog),[catalog]),[market,dispatch]=useReducer(operatorMarketReducer,policy,initialOperatorMarket),[now,setNow]=useState(Date.now());
+  const scanSignal=useRef(new AbortController());
   const {query,result,row,selection,preview,error}=market;
   useEffect(()=>{const timer=setInterval(()=>setNow(Date.now()),1000);return()=>clearInterval(timer);},[]);
+  useEffect(()=>{const signal=new AbortController();scanSignal.current=signal;return()=>signal.abort();},[]);
   const model=models.find(item=>item.id===query.model_id),profile=model?.profiles.find(item=>item.id===selection?.runtime_profile_id);
   const ttl=runtimeDuration(policy,null,query.ttl_seconds),expired=!!preview&&preview.expires_at*1000<=now;
   const current=operatorCandidateCurrent(result,query,row,now),matches=operatorCandidatePreviewMatches(selection,preview);
@@ -71,7 +110,7 @@ function StartDrawer({catalog,policy,controller,busy,onClose}){
   function change(patch){dispatch({type:'change',patch});}
   async function scan(){
     const revision=market.revision+1;dispatch({type:'scan'});
-    try{const response=await controller.candidates(query);if(response.model_id!==query.model_id||response.mode!==query.mode)throw Error('库存响应与当前模型或模式不一致，请重新查询。');dispatch({type:'result',revision,result:response});}
+    try{const response=await controller.refreshCandidates(query,result=>dispatch({type:'refresh-progress',revision,result}),scanSignal.current.signal);dispatch({type:'result',revision,result:response});}
     catch(error){dispatch({type:'error',revision,error:error.message});}
   }
   async function choose(candidate){
@@ -103,9 +142,10 @@ function StartDrawer({catalog,policy,controller,busy,onClose}){
       </section>
       {model&&<p className="op-model-caption">{model.id} · 将比较同一模型、精度的兼容部署，不自动替换模型。</p>}
       {ttl.problem&&<p className="op-error" role="alert">{ttl.problem}</p>}
-      <div className="op-market-query"><button className="op-primary" type="button" disabled={busy||!model||!!ttl.problem} onClick={scan}><RefreshCw size={14}/>{market.loading==='candidates'?'正在查询…':result?'刷新兼容机器':'查看兼容机器'}</button><span>只查询库存，不租机、不预留预算</span><details className="op-details op-start-window"><summary>启动窗口 · {duration(query.ttl_seconds)}</summary><label>最多运行多久<div className="op-unit-input"><input type="number" min="2" max={ttl.maximumMinutes??undefined} step="1" value={query.ttl_seconds/60} onChange={e=>change({ttl_seconds:Number(e.target.value)*60})}/><span>分钟</span></div></label><p>当前策略上限 {ttl.maximumMinutes??'尚未确认'} 分钟。窗口包含下载、准备和运行，是本次安全停止上限，不是机器保活保证；修改后重新查询与预览。</p></details></div>
+      <div className="op-market-query"><button className="op-primary" type="button" disabled={busy||!model||!!ttl.problem} onClick={scan}><RefreshCw size={14}/>{market.loading==='candidates'?'正在查询两家供应商…':result?'刷新兼容机器':'查看兼容机器'}</button><span>同时查询 Lium 和 Targon，不租机、不预留预算</span><details className="op-details op-start-window"><summary>启动窗口 · {duration(query.ttl_seconds)}</summary><label>最多运行多久<div className="op-unit-input"><input type="number" min="2" max={ttl.maximumMinutes??undefined} step="1" value={query.ttl_seconds/60} onChange={e=>change({ttl_seconds:Number(e.target.value)*60})}/><span>分钟</span></div></label><p>当前策略上限 {ttl.maximumMinutes??'尚未确认'} 分钟。窗口包含下载、准备和运行，是本次安全停止上限，不是机器保活保证；修改后重新查询与预览。</p></details></div>
       {result?<section className="op-candidates" aria-label="兼容机器列表"><div className="op-candidates-heading"><h3>选一个适合本次任务的配置</h3><small>{age(result.observed_at,now)}更新</small></div><p className="op-note" role="status">{operatorMarketSummary(result,now)}</p>
-        <div className="op-market-providers">{['lium','targon'].map(provider=>{const observation=operatorMarketProvider(result,provider,now);return <details className="op-details" key={provider}><summary><b>{providerLabel(provider)}</b><span className={'op-badge '+(observation.fresh?'neutral':'warn')}>{observation.label}</span><small>{age(observation.observed_at,now)}</small></summary><p>观测于 {date(observation.observed_at)}{observation.reason_code&&<> · {reasonText(observation.reason_code)}</>}</p></details>;})}</div>
+        <div className="op-market-providers" aria-live="polite">{['lium','targon'].map(provider=>{const observation=operatorMarketProvider(result,provider,now);return <details className="op-details" key={provider}><summary><b>{providerLabel(provider)}</b><span className={'op-badge '+(observation.fresh||observation.refreshing?'neutral':'warn')}>{observation.label}</span><small>{age(observation.observed_at,now)}</small></summary>{Number.isFinite(observation.refresh_requested_at)&&<p>本轮查询请求于 {date(observation.refresh_requested_at)}</p>}<p>最近库存观测于 {date(observation.observed_at)}{(observation.refresh_reason_code||observation.reason_code)&&<> · {reasonText(observation.refresh_reason_code||observation.reason_code)}</>}</p></details>;})}</div>
+        <MarketFilters result={result} catalog={catalog}/>
         {result.candidates?.length?<div className="op-candidate-grid">{result.candidates.map((candidate,index)=><CandidateCard key={operatorCandidateKey(candidate)} row={candidate} index={index} current={operatorCandidateCurrent(result,query,candidate,now)} busy={busy||!operatorCandidateSelection(catalog,query,candidate)} onStart={choose}/>)}</div>:<div className="op-market-empty"><Server size={25}/><p>暂无可展示的兼容配置</p><small>保留所选模型与模式，稍后刷新库存。</small></div>}
       </section>:<div className="op-market-empty"><Server size={27}/><p>{market.loading==='candidates'?'正在核对兼容机器…':model?'查看该模型的兼容机器':'先选想运行的模型'}</p><small>GPU 型号、供应商和数量将在查询结果中一起比较。</small></div>}
     </fieldset>{error&&<p className="op-error" role="alert">{error}</p>}

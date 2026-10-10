@@ -556,7 +556,8 @@ def create_controller(path, *, repository=None, settings=None, boot_factory=None
     # All Lium bindings use the same explicit service/profile and validated
     # loader. Do not copy credentials or give provider egress to the API.
     lium=next((provider for provider in providers.values() if isinstance(provider,_BoundLiumProvider)),None)
-    market=LiumMarketRefresh(repo,lium._loader) if lium is not None else None
+    from .capacity_scan import ProviderMarketRefresh
+    market=ProviderMarketRefresh(repo,lium._loader if lium is not None else None)
     return OperatorController(service,provider_factory=lambda binding:providers[binding.binding_id],
         boot_factory=boot,enabled=True,inventory_refresh=InventoryRefresh(repo,registry,providers,market_refresh=market),
         status_writer=_status_writer(config,clock=repo.clock))
