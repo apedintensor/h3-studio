@@ -1,4 +1,5 @@
 """Offline prepared-profile/source-bundle checks; no GPU, cloud, or network."""
+import ast
 import copy
 import hashlib
 import importlib.util
@@ -105,6 +106,31 @@ class ProfileBootstrapTests(unittest.TestCase):
                 self.root/'state',{},lambda phase:None)
         download.assert_not_called()
 
+    def test_private_bundle_contains_its_internal_import_dependencies(self):
+        spec = importlib.util.spec_from_file_location('profile_package_closure_test',ROOT/'deploy/wangp/package_tool.py')
+        package = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(package)
+        members = set(package.PRIVATE_FILES)
+        for name in sorted(members):
+            if not name.endswith('.py'):
+                continue
+            module = name[:-3].replace('/','.')
+            parent = module.removesuffix('.__init__') if name.endswith('/__init__.py') else module.rpartition('.')[0]
+            for node in ast.walk(ast.parse((ROOT/name).read_text(encoding='utf-8'))):
+                targets = []
+                if isinstance(node,ast.ImportFrom):
+                    base = importlib.util.resolve_name('.'*node.level+(node.module or ''),parent) if node.level else node.module
+                    if base:
+                        targets = [base]+[base+'.'+item.name for item in node.names]
+                elif isinstance(node,ast.Import):
+                    targets = [item.name for item in node.names]
+                for target in targets:
+                    paths = [target.replace('.','/')+suffix for suffix in ('.py','/__init__.py')]
+                    existing = [path for path in paths if (ROOT/path).is_file()]
+                    with self.subTest(source=name,dependency=target):
+                        self.assertFalse(existing and members.isdisjoint(existing),
+                            'Private runtime dependency missing: '+target)
+
     def test_extracted_private_bundle_compiles_all_profiles_without_workspace_imports(self):
         spec = importlib.util.spec_from_file_location('profile_package_test',ROOT/'deploy/wangp/package_tool.py')
         package = importlib.util.module_from_spec(spec)
@@ -122,7 +148,7 @@ root=Path(sys.argv[1]).resolve()
 sys.path.insert(0,str(root))
 class NoRuntimeImports:
     def find_spec(self,name,path=None,target=None):
-        if name.split('.')[0] in {'torch','transformers','huggingface_hub','requests','boto3'}:
+        if name.split('.')[0] in {'torch','transformers','huggingface_hub','requests','boto3','sqlalchemy'}:
             raise AssertionError('runtime or network dependency imported')
 sys.meta_path.insert(0,NoRuntimeImports())
 from studio_platform.runtime_catalog import PROFILE_IDS,get_profile,engine_manifest
@@ -130,28 +156,32 @@ from studio_platform.inference.wangp_profile_compiler import H3ProfileCompiler,v
 from comfy_workflow import native_output_spec
 import comfy_workflow
 assert Path(comfy_workflow.__file__).resolve().is_relative_to(root)
+from studio_platform.h3_profile_support import MAX_STEPS
+assert MAX_STEPS==100
 for identity in PROFILE_IDS:
-    profile=get_profile(identity)
-    request={'model':profile['model_id'],'mode':'fl','prompt':'Synthetic offline fixture','steps':20,
-        'duration':5,'resolution':'480P','seed':'42','inputs':{'first_frame':'a','last_frame':'b'}}
-    manifest=engine_manifest(identity,'fl')
-    assets={key:{'metadata':{'kind':'image'},'model':{'key':'owners/owner/assets/'+key+'/file',
-        'sha256':'a'*64,'size_bytes':4}} for key in ('a','b')}
-    job={'id':'job','owner_id':'owner','request_hash':'b'*64,
-        'execution_plan':{'deployment_profile_id':identity,'engine_manifest_digest':manifest.digest},
-        'request':{'request':request,'assets':assets,'output_spec':native_output_spec(request),
-            'deployment_profile_id':identity,'recipe_id':'h3-base-fl2va-v1'}}
-    import io
-    class Store:
-        def open(self,key): return io.BytesIO(b'data')
-    prepared=H3ProfileCompiler(manifest,lambda item,*a,**k:item)(job,'attempt',Store(),lambda:None)
-    validate_prepared(prepared,manifest)
-print('three profile bundles verified without external modules')
+    for mode in ('fl','ref'):
+        profile=get_profile(identity)
+        inputs={'first_frame':'a','last_frame':'b'} if mode=='fl' else {'images':['a','b']}
+        request={'model':profile['model_id'],'mode':mode,'prompt':'Synthetic offline fixture','steps':MAX_STEPS,
+            'duration':5,'resolution':'480P','seed':'42','inputs':inputs}
+        manifest=engine_manifest(identity,mode)
+        assets={key:{'metadata':{'kind':'image','model_ready':True,'width':832,'height':480},
+            'model':{'key':'owners/owner/assets/'+key+'/file','sha256':'a'*64,'size_bytes':4}} for key in ('a','b')}
+        job={'id':'job','owner_id':'owner','request_hash':'b'*64,
+            'execution_plan':{'deployment_profile_id':identity,'engine_manifest_digest':manifest.digest},
+            'request':{'request':request,'assets':assets,'output_spec':native_output_spec(request),
+                'deployment_profile_id':identity,'recipe_id':manifest.document['generation_recipe_id']}}
+        import io
+        class Store:
+            def open(self,key): return io.BytesIO(b'data')
+        prepared=H3ProfileCompiler(manifest,lambda item,*a,**k:item)(job,'attempt',Store(),lambda:None)
+        validate_prepared(prepared,manifest)
+print('all FL/REF profile bundles verified without external modules')
 '''
         checked = subprocess.run([sys.executable,'-I','-S','-c',script,str(extracted)],
             cwd=self.root,check=False,capture_output=True,text=True,timeout=20)
         self.assertEqual(checked.returncode,0,checked.stderr)
-        self.assertEqual(checked.stdout.strip(),'three profile bundles verified without external modules')
+        self.assertEqual(checked.stdout.strip(),'all FL/REF profile bundles verified without external modules')
 
 
 if __name__=='__main__':
