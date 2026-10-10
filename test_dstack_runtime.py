@@ -15,6 +15,7 @@ from studio_platform.inference.wangp_contract import HostReadiness
 from studio_platform.repository import registered_workers, scaler_receipts
 from studio_platform.runtime_catalog import engine_manifest
 from studio_platform.runtime_hosts.wangp_http import private_token_file
+from studio_platform.wangp_bootstrap import BootError
 from test_dstack_operator import Client, PROFILE, PUB
 from test_platform_repository import LedgerCase
 from tools.build_operator_sources import _runtime
@@ -70,15 +71,22 @@ class NativeRuntimeTests(LedgerCase):
             "state": "runtime_unconfirmed", "observed_at": self.repo.clock()})
         return self.store.load(binding["intent_id"]), run
 
-    def bridge(self):
+    def bridge(self, *, coordinates_for_run=None, ssh_factory=None):
         outer = self
         def host_factory(config, coordinates):
             remote = outer.remotes.setdefault(config.mode, {"starts": 0, "uploads": 0,
                 "incarnation": "c" * 32, "gpu": GPU, "idle": True, "identity": None})
             class Host:
+                def ensure_connected(self):
+                    if remote.get("ssh_unavailable"):
+                        raise RuntimeError("SECRET SSH connection diagnostic")
                 def upload(self, files):
                     remote["uploads"] += 1
                     assert set(files) == set(config.source_sha256)
+                    if remote.pop("fail_upload_once", False):
+                        raise RuntimeError("SECRET SSH upload diagnostic")
+                    if remote.get("source_mismatch"):
+                        raise BootError("bootstrap_existing_source_mismatch")
                 def start(self, identity):
                     # Real transactional boot intent and protected token are
                     # present BEFORE anything resembling a remote launch.
@@ -105,10 +113,72 @@ class NativeRuntimeTests(LedgerCase):
             assert len(token) >= 32
             return SimpleNamespace(readiness=lambda: HostReadiness(config.engine_manifest_digest,
                 remote["identity"]["intent_id"], remote["incarnation"], remote["idle"]), close=lambda: None)
+        coordinates_for_run = coordinates_for_run or (lambda binding, _run: {
+            "host": "offline.invalid", "port": 22, "username": "root",
+            "instance_id": binding["provider_instance_id"]})
         return DstackNativeRuntime(self.store, lambda binding: self.configs[binding["mode"]],
-            lambda binding, _run: {"host": "offline.invalid", "port": 22, "username": "root",
-                "instance_id": binding["provider_instance_id"]},
-            ssh_factory=host_factory, transport_factory=transport_factory)
+            coordinates_for_run, ssh_factory=ssh_factory or host_factory,
+            transport_factory=transport_factory)
+
+    def test_missing_ssh_metadata_then_available_does_not_consume_bootstrap(self):
+        binding, run = self.allocation()
+        coordinates = {"host": None, "port": None, "username": "root", "instance_id": "gpu-fl"}
+        bridge = self.bridge(coordinates_for_run=lambda _binding, _run: dict(coordinates))
+        directory = self.configs["fl"].work_dir / binding["intent_id"]
+        with self.assertRaisesRegex(DstackError, "^dstack_runtime_ssh_coordinates_unavailable$"):
+            bridge.readiness(binding, run)
+        self.assertFalse(self.store.load(binding["intent_id"]).get("bootstrap_started"))
+        self.assertFalse((directory / "bootstrap-state.json").exists())
+        self.assertFalse((directory / "wangp-token").exists())
+        self.assertEqual(self.remotes, {})
+        coordinates.update(host="offline.invalid", port=22345)
+        self.assertTrue(bridge.readiness(self.store.load(binding["intent_id"]), run).idle)
+        self.assertEqual((self.remotes["fl"]["starts"], self.remotes["fl"]["uploads"]), (1, 1))
+
+    def test_ssh_connection_failure_does_not_consume_bootstrap(self):
+        binding, run = self.allocation()
+        def unavailable(_config, _coordinates):
+            raise RuntimeError("SECRET host-key/SSH diagnostic")
+        with self.assertRaisesRegex(DstackError, "^dstack_runtime_ssh_unavailable_or_host_key_untrusted$"):
+            self.bridge(ssh_factory=unavailable).readiness(binding, run)
+        directory = self.configs["fl"].work_dir / binding["intent_id"]
+        self.assertFalse(self.store.load(binding["intent_id"]).get("bootstrap_started"))
+        self.assertFalse((directory / "bootstrap-state.json").exists())
+        self.assertFalse((directory / "wangp-token").exists())
+        self.assertTrue(self.bridge().readiness(self.store.load(binding["intent_id"]), run).idle)
+        self.assertEqual(self.remotes["fl"]["starts"], 1)
+
+    def test_upload_failure_resumes_original_journal_and_token_without_replaying_start(self):
+        binding, run = self.allocation()
+        self.remotes["fl"] = {"starts": 0, "uploads": 0, "incarnation": "c" * 32,
+            "gpu": GPU, "idle": True, "identity": None, "fail_upload_once": True}
+        bridge = self.bridge()
+        with self.assertRaisesRegex(DstackError, "^dstack_runtime_upload_unconfirmed$"):
+            bridge.readiness(binding, run)
+        directory = self.configs["fl"].work_dir / binding["intent_id"]
+        self.assertTrue(self.store.load(binding["intent_id"])["bootstrap_started"])
+        self.assertEqual(json.loads((directory / "bootstrap-state.json").read_text())["phase"], "journaled")
+        self.assertEqual(self.remotes["fl"]["starts"], 0)
+        token = private_token_file(directory / "wangp-token")
+        bridge.close()
+        recovered = self.bridge()
+        self.assertTrue(recovered.readiness(self.store.load(binding["intent_id"]), run).idle)
+        recovered.readiness(self.store.load(binding["intent_id"]), run)
+        self.assertEqual(token, private_token_file(directory / "wangp-token"))
+        self.assertEqual((self.remotes["fl"]["starts"], self.remotes["fl"]["uploads"]), (1, 2))
+
+    def test_partial_remote_source_is_explicitly_blocked_without_overwrite_or_launch(self):
+        binding, run = self.allocation()
+        self.remotes["fl"] = {"starts": 0, "uploads": 0, "incarnation": "c" * 32,
+            "gpu": GPU, "idle": True, "identity": None, "source_mismatch": True}
+        bridge = self.bridge()
+        for _ in range(2):
+            with self.assertRaisesRegex(DstackError, "^dstack_runtime_upload_reconciliation_required$"):
+                bridge.readiness(self.store.load(binding["intent_id"]), run)
+        directory = self.configs["fl"].work_dir / binding["intent_id"]
+        self.assertEqual(json.loads((directory / "bootstrap-state.json").read_text())["phase"], "journaled")
+        self.assertEqual(self.remotes["fl"]["starts"], 0)
+        self.assertTrue(self.store.load(binding["intent_id"])["bootstrap_started"])
 
     def test_owned_ledger_journals_once_and_original_native_factory_creates_hatchet_slot(self):
         binding, run = self.allocation()
