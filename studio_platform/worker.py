@@ -27,7 +27,7 @@ from .inference.comfy import ComfyBackend
 from .inference.outputs import _request, _shape, delivery_spec
 from .inference.protocol import (BackendError, InferenceBackend, NotReady, Outcome,
                                  RenderCacheCapacityExceeded, SubmissionRejected,
-                                 SubmissionUncertain, TAG, TASK)
+                                 SubmissionUncertain, TAG, TASK, safe_failure_code)
 
 
 class DisabledBackend:
@@ -277,7 +277,12 @@ class WorkerRunner:
                 cost = self._cost(job, task_id, outcome)
                 if job["status"] == "cancel_requested":
                     return self._summary(self.queue.confirm_cancel(lease, upstream_stopped=True, actual_cost_microusd=cost))
-                return self._summary(self.queue.fail(lease, "upstream_generation_failed", actual_cost_microusd=cost, upstream_stopped=True))
+                # Only a closed diagnostic vocabulary may cross from an adapter
+                # into public/durable error fields. It cannot authorize retry.
+                code = (safe_failure_code(getattr(outcome, "error_code", None))
+                    if self.backend.kind == "wangp-worker" and outcome.state == "failed" else None)
+                return self._summary(self.queue.fail(lease, code or "upstream_generation_failed",
+                    actual_cost_microusd=cost, upstream_stopped=True))
             return self._summary(self.queue.release(lease, retry_after_s=self.retry_after_s,
                 error_code="upstream_status_unknown" if outcome.state == "unknown" else None))
         except LeaseLost:

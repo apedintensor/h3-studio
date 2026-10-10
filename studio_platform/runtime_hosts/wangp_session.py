@@ -322,6 +322,40 @@ def _audit_profile_runtime(session, manifest, requested, *, loaded=False):
                 raise ValueError('wangp_profile_loaded_unpruned_mismatch')
 
 
+def _failure_code(errors):
+    """Reduce the first upstream error to a static stage/signature label.
+
+Pinned GenerationError exposes message/stage, not the original exception class.
+Messages are examined only in memory, with a bounded prefix, and never returned
+or persisted. Unknown shapes/text keep an explicit unclassified diagnostic.
+"""
+    stage, message = "unknown", ""
+    try:
+        if type(errors) in (list, tuple) and errors:
+            error = errors[0]
+            candidate = getattr(error, "stage", None)
+            if type(candidate) is str and candidate in {"validation", "generation", "runtime"}:
+                stage = candidate
+            candidate = getattr(error, "message", None)
+            if type(candidate) is str:
+                message = candidate[:4096].lower()
+    except Exception:
+        pass  # Malformed diagnostics cannot change a positively stopped result.
+    category = "unclassified"
+    if "cuda out of memory" in message or "cuda error: out of memory" in message:
+        category = "cuda_out_of_memory"
+    elif any(signature in message for signature in (
+            "sizes of tensors must match", "the size of tensor a", "mat1 and mat2 shapes cannot be multiplied")):
+        category = "tensor_shape_mismatch"
+    elif "invalid data found when processing input" in message:
+        category = "media_decode_failed"
+    elif "no module named" in message:
+        category = "dependency_missing"
+    elif "seed must be between 0 and 2**32 - 1" in message:
+        category = "seed_out_of_range"
+    return f"wangp_{stage}_{category}"
+
+
 class _SessionHandle:
     def __init__(self, job, output_root, audio_writer, worker_alive, quiesce, result_audit=None):
         self.job, self.root, self.audio_writer = job, output_root, audio_writer
@@ -354,7 +388,8 @@ class _SessionHandle:
                 self._observation = RuntimeObservation("cancelled", stopped=True)
                 return self._observation
             if result.success is not True:
-                self._observation = RuntimeObservation("failed", stopped=True)
+                self._observation = RuntimeObservation("failed", stopped=True,
+                    error_code=_failure_code(getattr(result, "errors", None)))
                 return self._observation
             if (result.total_tasks != 1 or result.successful_tasks != 1 or result.failed_tasks != 0
                     or result.errors or len(result.generated_files) != 1):
