@@ -188,7 +188,7 @@ and requires both checks. Ordinary users and Agent credentials cannot mark it.
 The existing global lock protects the audit and capacity exclusion. Only an
 exact Targon intent already `destroying`, with its existing stop operation,
 deletion-start receipt and stopped desired state, is eligible. Fresh bound
-workers, current jobs, unreleased devices, unfinished/unsafe attempts and
+workers, current jobs, unknown/orphan device ownership, unfinished/unsafe attempts and
 unconfirmed upstream stops reject the mark. Creation-unknown and active nodes
 cannot use this exception. Identical replay returns the same operation;
 conflicting replay rejects. Actor, time, exact instance, original intent,
@@ -197,6 +197,17 @@ receipt authority, without a new schema or rental ledger.
 The mark also requires a fresh `operator-offers-v1-review-v1-` controller
 heartbeat. An earlier controller cannot accept the new command through an
 app-only rollout; activate the updated controller before enabling review.
+
+For the exact stopped node only, the same human-review transaction may retire
+an expired unbound worker and release its remaining local devices. This requires
+the original protected deployment binding and worker-spec hash to match, all
+worker attempt/job history to be safely terminal, and exact device ownership
+to match the worker spec. Capacity, worker/device and job/attempt locks prevent
+concurrent revival; retirement increments the worker fence. Fresh/current
+workers, inconsistent/cross-node ownership and unknown upstream stops remain
+blocked. The durable `local_execution_release` audit records prior states,
+fences, devices and terminal attempt IDs. It releases local ownership only;
+it does not assert physical provider removal or settle any reservation.
 
 The public removal observation becomes `manually_reviewed`, its next check is
 null, and the node no longer counts toward operating capacity/hourly estimates.

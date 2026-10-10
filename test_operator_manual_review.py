@@ -1,5 +1,6 @@
 """Exact human review authority, capacity and guardian boundaries; offline only."""
 from contextlib import redirect_stdout
+from dataclasses import replace
 import io
 import json
 from pathlib import Path
@@ -19,7 +20,8 @@ import test_operator_capacity as operator_fixtures
 import test_targon_cleanup as guardian_fixtures
 from tools.targon_cleanup_guard import OperatorManualReviewReader, ProtectedManualReviewReader
 from tools import targon_cleanup_guard as review_guard
-from studio_platform.scaler import ProviderFact
+from studio_platform.scaler import LaunchSpec, ProviderFact
+from studio_platform.control import WorkerControl,WorkerSpec
 from studio_platform.targon_cleanup import _hash
 
 
@@ -48,6 +50,22 @@ class ManualReviewTests(operator_fixtures.OperatorTests):
         node=self.service.state(self.actor)['nodes'][0]
         return {'expected_version':node['version'],'provider_instance_id':self.uid,
             'account_absent':True,'no_continuing_charge':True}
+
+    def known_expired_worker(self, *, state='draining', worker_id='expired-bound', gpu_id='GPU-old'):
+        self.binding=replace(self.binding,launch=LaunchSpec('targon',self.binding.configuration_id,self.binding.model_id))
+        self.registry.bindings[self.binding.binding_id]=self.binding
+        with self.repo.transaction() as connection:
+            connection.execute(update(operator_nodes).where(operator_nodes.c.intent_id==self.node_id).values(
+                binding_hash=self.binding.fingerprint))
+        spec=WorkerSpec(worker_id,self.binding.pool,'targon',self.uid,(gpu_id,),self.binding.recipe_ids,
+            self.binding.model_id,self.binding.configuration_id,backend='wangp-worker',
+            engine_manifest_digest=self.binding.engine_manifest_digest)
+        control=WorkerControl(self.repo)
+        worker=control.register(spec)
+        with self.repo.transaction() as connection:
+            connection.execute(update(registered_workers).where(registered_workers.c.id==worker_id).values(
+                state=state,expires_at=self.now-30,drain_requested=1))
+        return worker
 
     def test_exact_review_preserves_reservation_deadline_and_provider_state(self):
         before=self.repo.list_instance_intents()[0]
@@ -151,8 +169,95 @@ class ManualReviewTests(operator_fixtures.OperatorTests):
             connection.execute(update(registered_workers).values(state='retired',expires_at=self.now-1))
             connection.execute(insert(registered_devices).values(provider='targon',instance_id=self.uid,
                 gpu_id='GPU-old',worker_id='bound-worker',state='reserved'))
-        with self.assertRaisesRegex(OperatorError,'device_unreleased'):
+        with self.assertRaisesRegex(OperatorError,'binding_unconfirmed'):
             self.service.manual_review(self.actor,self.node_id,self.body,'device-held')
+
+    def assert_expired_local_release(self,state):
+        worker=self.known_expired_worker(state=state,worker_id='expired-'+state,gpu_id='GPU-'+state)
+        self.assertTrue(self.service.state(self.actor)['nodes'][0]['actions']['manual_review']['allowed'])
+        before=self.repo.list_instance_intents()[0]
+        budget=self.repo.get_budget('owner-budget')
+        body=self.body_now();key='review-expired-'+state
+        result=self.service.manual_review(self.actor,self.node_id,body,key)
+        with self.repo.engine.connect() as connection:
+            after=connection.execute(select(registered_workers).where(
+                registered_workers.c.id==worker['id'])).mappings().one()
+            device=connection.execute(select(registered_devices).where(
+                registered_devices.c.worker_id==worker['id'])).mappings().one()
+            review=connection.execute(select(scaler_receipts.c.facts).where(
+                scaler_receipts.c.operation=='manual_review')).scalar_one()
+        self.assertEqual((after['state'],after['fence'],device['state']),('retired',worker['fence']+1,'released'))
+        audit=review['local_execution_release']
+        self.assertFalse(audit['provider_removal_confirmed']);self.assertFalse(audit['billing_settled'])
+        self.assertEqual(audit['workers'][0]['worker_id'],worker['id'])
+        self.assertEqual(audit['workers'][0]['devices'][0]['gpu_id'],'GPU-'+state)
+        self.assertEqual(self.repo.get_budget('owner-budget'),budget)
+        after_intent=self.repo.list_instance_intents()[0]
+        for field in ('state','hard_deadline','provider_instance_id','reserved_cost_microusd','actual_cost_microusd','billing_status'):
+            self.assertEqual(after_intent[field],before[field])
+        self.assertEqual(self.service.manual_review(self.actor,self.node_id,body,key),result)
+        self.assertEqual(WorkerControl(self.repo).get(worker['id'])['fence'],after['fence'])
+        with self.assertRaisesRegex(Exception,'lease_lost'):
+            WorkerControl(self.repo).heartbeat(worker['id'],worker['fence'])
+
+    def test_known_expired_draining_worker_release_is_atomic_audited_and_replay_safe(self):
+        self.assert_expired_local_release('draining')
+
+    def test_known_expired_retired_worker_device_can_be_locally_released(self):
+        self.assert_expired_local_release('retired')
+
+    def test_expired_local_release_rejects_unknown_binding_or_orphan_cross_node_device(self):
+        worker=self.known_expired_worker()
+        with self.repo.transaction() as connection:
+            connection.execute(update(registered_workers).where(registered_workers.c.id==worker['id']).values(spec_hash='f'*64))
+        with self.assertRaisesRegex(OperatorError,'binding_unconfirmed'):
+            self.service.manual_review(self.actor,self.node_id,self.body_now(),'unknown-spec')
+        with self.repo.transaction() as connection:
+            connection.execute(update(registered_workers).where(registered_workers.c.id==worker['id']).values(spec_hash=worker['spec_hash']))
+            connection.execute(insert(registered_devices).values(provider='targon',instance_id='wrk-other',
+                gpu_id='GPU-cross',worker_id=worker['id'],state='owned'))
+        with self.assertRaisesRegex(OperatorError,'device_unreleased'):
+            self.service.manual_review(self.actor,self.node_id,self.body_now(),'cross-node')
+        with self.repo.transaction() as connection:
+            connection.execute(update(registered_devices).where(registered_devices.c.gpu_id=='GPU-cross').values(state='released'))
+            connection.execute(insert(registered_workers).values({**worker,'id':'foreign-worker','instance_id':'wrk-other'}))
+            connection.execute(insert(registered_devices).values(provider='targon',instance_id=self.uid,
+                gpu_id='GPU-orphan',worker_id='foreign-worker',state='owned'))
+        with self.assertRaisesRegex(OperatorError,'device_unreleased'):
+            self.service.manual_review(self.actor,self.node_id,self.body_now(),'orphan-owner')
+        self.assertEqual(WorkerControl(self.repo).get(worker['id'])['state'],'draining')
+        self.assertEqual(WorkerControl(self.repo).get(worker['id'])['fence'],worker['fence'])
+
+    def test_expired_local_release_requires_safe_all_attempt_history_and_preserves_jobs(self):
+        worker=self.known_expired_worker()
+        job=self.job(status='queued')
+        with self.repo.transaction() as connection:
+            connection.execute(update(jobs).where(jobs.c.id==job['id']).values(status='failed'))
+            connection.execute(insert(attempts).values(id='terminal-but-unknown',job_id=job['id'],number=1,
+                status='failed',fence=1,worker_id=worker['id'],created_at=self.now,updated_at=self.now,
+                submission_started_at=self.now-1,upstream_task_id='original-upstream',upstream_stopped=0))
+        with self.assertRaisesRegex(OperatorError,'attempt_unsafe'):
+            self.service.manual_review(self.actor,self.node_id,self.body_now(),'unsafe-local-review')
+        with self.repo.engine.connect() as connection:
+            self.assertEqual(connection.execute(select(registered_devices.c.state).where(
+                registered_devices.c.worker_id==worker['id'])).scalar_one(),'owned')
+            self.assertEqual(list(connection.execute(select(scaler_receipts).where(
+                scaler_receipts.c.operation=='manual_review'))),[])
+        self.assertEqual(WorkerControl(self.repo).get(worker['id'])['fence'],worker['fence'])
+        with self.repo.transaction() as connection:
+            connection.execute(update(attempts).where(attempts.c.id=='terminal-but-unknown').values(upstream_stopped=1))
+        original_job=self.repo.get_job(self.scope,job['id'])
+        with self.repo.engine.connect() as connection:
+            original_attempt=dict(connection.execute(select(attempts).where(
+                attempts.c.id=='terminal-but-unknown')).mappings().one())
+        self.service.manual_review(self.actor,self.node_id,self.body_now(),'proven-local-review')
+        self.assertEqual(self.repo.get_job(self.scope,job['id']),original_job)
+        with self.repo.engine.connect() as connection:
+            after=dict(connection.execute(select(attempts).where(attempts.c.id=='terminal-but-unknown')).mappings().one())
+            review=connection.execute(select(scaler_receipts.c.facts).where(
+                scaler_receipts.c.operation=='manual_review')).scalar_one()
+        self.assertEqual(after,original_attempt)
+        self.assertEqual(review['local_execution_release']['workers'][0]['terminal_attempt_ids'],['terminal-but-unknown'])
 
     def test_unsafe_attempt_blocks_and_late_provider_cost_cannot_settle_manual_review(self):
         job=self.job(status='queued')
@@ -192,7 +297,8 @@ class ManualReviewTests(operator_fixtures.OperatorTests):
     def test_postgres_guardian_reader_executes_exact_audit_query(self):
         if self.repo.engine.dialect.name != 'postgresql':
             self.skipTest('requires explicitly configured local test PostgreSQL')
-        self.service.manual_review(self.actor,self.node_id,self.body,'pg-reader-review')
+        self.known_expired_worker()
+        self.service.manual_review(self.actor,self.node_id,self.body_now(),'pg-reader-review')
         container='a'*64
         queries=[]
         def run(arguments,**options):

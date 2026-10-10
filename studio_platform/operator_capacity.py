@@ -13,7 +13,7 @@ from pathlib import Path
 import re
 import uuid
 
-from sqlalchemy import Column, Float, ForeignKey, Integer, JSON, String, Table, UniqueConstraint, func, insert, select, update
+from sqlalchemy import Column, Float, ForeignKey, Integer, JSON, String, Table, UniqueConstraint, func, insert, or_, select, update
 
 from .repository import (Scope, metadata, canonical, request_hash, capacity_gate, instance_intents,
                          jobs, attempts, registered_workers, registered_devices, scaler_actions, scaler_receipts,
@@ -625,8 +625,7 @@ class OperatorCapacity:
             self.repo._emit(connection,"operator.capacity."+kind+"_requested",command["id"],{"actor":actor,"node_id":node_id})
         return {"operation":{**command_public(command),"node_ids":[node_id]}}
 
-    @staticmethod
-    def _review_blocker(connection, intent, node, now, *, lock=False):
+    def _review_blocker(self, connection, intent, node, now, *, lock=False, local_releases=None):
         if intent["provider"]!="targon": return "operator_manual_review_targon_only"
         if (intent["state"]!="destroying" or not intent["provider_instance_id"]
                 or node["desired_state"]!="stopped"):
@@ -649,21 +648,76 @@ class OperatorCapacity:
         workers=list(connection.execute(worker_query).mappings())
         if any(w["current_job_id"] or w["state"]!="retired" and w["expires_at"]>now for w in workers):
             return "operator_manual_review_worker_active"
-        if connection.execute(select(registered_devices.c.worker_id).where(
-                registered_devices.c.provider==intent["provider"],
-                registered_devices.c.instance_id==intent["provider_instance_id"],
-                registered_devices.c.state!="released").limit(1)).first():
+        worker_ids=[w["id"] for w in workers]
+        exact_device=(registered_devices.c.provider==intent["provider"]) & \
+            (registered_devices.c.instance_id==intent["provider_instance_id"])
+        # Include devices owned by these workers outside the exact node too:
+        # inconsistent/cross-node ownership must block, never be released.
+        device_query=select(registered_devices).where(or_(exact_device,
+            registered_devices.c.worker_id.in_(worker_ids))).order_by(
+                registered_devices.c.provider,registered_devices.c.instance_id,registered_devices.c.gpu_id)
+        if lock: device_query=device_query.with_for_update()
+        devices=list(connection.execute(device_query).mappings())
+        if any(d["state"]!="released" and (d["worker_id"] not in worker_ids
+                or d["provider"]!=intent["provider"] or d["instance_id"]!=intent["provider_instance_id"])
+                for d in devices):
             return "operator_manual_review_device_unreleased"
+        history=[]
         if workers:
-            history=list(connection.execute(select(attempts.c.status,attempts.c.submission_started_at,
-                attempts.c.upstream_task_id,attempts.c.upstream_stopped,jobs.c.status.label("job_status"))
-                .join(jobs,jobs.c.id==attempts.c.job_id).where(
-                    attempts.c.worker_id.in_([w["id"] for w in workers]))).mappings())
-            if any(h["job_status"] not in {"succeeded","failed","cancelled"}
+            attempt_query=select(attempts).where(attempts.c.worker_id.in_(worker_ids)).order_by(attempts.c.id)
+            history=list(connection.execute(attempt_query).mappings())
+            job_ids=[h["job_id"] for h in history]
+            job_query=select(jobs.c.id,jobs.c.status,jobs.c.lease_worker_id).where(or_(
+                jobs.c.id.in_(job_ids),jobs.c.lease_worker_id.in_(worker_ids))).order_by(jobs.c.id)
+            if lock: job_query=job_query.with_for_update()
+            job_rows={j["id"]:j for j in connection.execute(job_query).mappings()}
+            if lock:
+                # Follow worker -> job -> attempt locking used by WorkerControl.
+                history=list(connection.execute(attempt_query.with_for_update()).mappings())
+            if any(j["lease_worker_id"] in worker_ids and j["status"] not in {"succeeded","failed","cancelled"}
+                    for j in job_rows.values()):
+                return "operator_manual_review_worker_active"
+            if any(h["job_id"] not in job_rows or job_rows[h["job_id"]]["status"] not in {"succeeded","failed","cancelled"}
                     or h["status"] not in {"succeeded","failed","cancelled"}
                     or (h["submission_started_at"] is not None or h["upstream_task_id"] is not None)
-                    and not h["upstream_stopped"] for h in history):
+                    and h["upstream_stopped"]!=1 for h in history):
                 return "operator_manual_review_attempt_unsafe"
+        release_candidates=[w for w in workers if w["state"]!="retired"
+            or any(d["worker_id"]==w["id"] and d["state"]!="released" for d in devices)]
+        if release_candidates:
+            from .control import WorkerSpec,worker_spec_payload
+            try:
+                binding=self.registry.get(node["binding_id"])
+                if (binding.fingerprint!=node["binding_hash"] or binding.pool!=intent["pool"]
+                        or binding.launch.provider!=intent["provider"]):
+                    return "operator_manual_review_worker_binding_unconfirmed"
+                for worker in release_candidates:
+                    raw=worker["spec"]
+                    spec=WorkerSpec(**{**raw,"physical_gpu_ids":tuple(raw["physical_gpu_ids"]),
+                        "recipe_ids":tuple(raw["recipe_ids"])})
+                    if (request_hash(worker_spec_payload(spec))!=worker["spec_hash"]
+                            or spec.worker_id!=worker["id"] or spec.provider!=intent["provider"]
+                            or spec.instance_id!=intent["provider_instance_id"] or spec.pool!=binding.pool
+                            or worker["pool"]!=binding.pool or spec.backend!="wangp-worker"
+                            or spec.model_id!=binding.model_id or spec.configuration_id!=binding.configuration_id
+                            or spec.engine_manifest_digest!=binding.engine_manifest_digest
+                            or set(spec.recipe_ids)!=set(binding.recipe_ids)
+                            or worker["state"] not in {"registered","ready","busy","draining","unknown","retired"}
+                            or not math.isfinite(worker["expires_at"]) or worker["expires_at"]>now
+                            or type(worker["fence"]) is not int or worker["fence"]<0):
+                        return "operator_manual_review_worker_binding_unconfirmed"
+                    held=[d for d in devices if d["worker_id"]==worker["id"] and d["state"]!="released"]
+                    if any(d["gpu_id"] not in spec.physical_gpu_ids or d["state"] not in {"owned","reserved"}
+                            for d in held):
+                        return "operator_manual_review_device_unreleased"
+                    if local_releases is not None:
+                        local_releases.append({"worker_id":worker["id"],"previous_state":worker["state"],
+                            "previous_fence":worker["fence"],"next_fence":worker["fence"]+1,
+                            "expires_at":worker["expires_at"],"spec_hash":worker["spec_hash"],
+                            "devices":[{"gpu_id":d["gpu_id"],"previous_state":d["state"]} for d in held],
+                            "terminal_attempt_ids":[h["id"] for h in history if h["worker_id"]==worker["id"]]})
+            except (OperatorError,KeyError,TypeError,ValueError):
+                return "operator_manual_review_worker_binding_unconfirmed"
         return None
 
     def manual_review(self, principal, node_id, body, key):
@@ -685,7 +739,8 @@ class OperatorCapacity:
             require(body["provider_instance_id"]==intent["provider_instance_id"],"operator_manual_review_identity_mismatch")
             require(not manually_reviewed_inactive(connection,intent),"operator_node_manually_reviewed")
             now=self.repo.clock()
-            blocker=self._review_blocker(connection,intent,node,now,lock=True)
+            local_releases=[]
+            blocker=self._review_blocker(connection,intent,node,now,lock=True,local_releases=local_releases)
             require(blocker is None,blocker or "operator_manual_review_blocked")
             stop=next(command for command in connection.execute(select(operator_commands).where(
                 operator_commands.c.kind=="stop").order_by(operator_commands.c.created_at.desc())).mappings()
@@ -697,6 +752,20 @@ class OperatorCapacity:
                 "instance_id":intent["provider_instance_id"],"operation_id":command["id"],"actor":actor,
                 "account_absent":True,"no_continuing_charge":True,"deadline":intent["hard_deadline"],
                 "stop_operation_id":stop["id"]}
+            if local_releases:
+                review["local_execution_release"]={"state":"local_ownership_released",
+                    "provider_removal_confirmed":False,"billing_settled":False,"workers":local_releases}
+                for released in local_releases:
+                    connection.execute(update(registered_workers).where(registered_workers.c.id==released["worker_id"]).values(
+                        state="retired",current_job_id=None,drain_requested=1,fence=released["next_fence"],updated_at=now))
+                    for device in released["devices"]:
+                        connection.execute(update(registered_devices).where(registered_devices.c.provider==intent["provider"],
+                            registered_devices.c.instance_id==intent["provider_instance_id"],
+                            registered_devices.c.worker_id==released["worker_id"],
+                            registered_devices.c.gpu_id==device["gpu_id"]).values(state="released"))
+                    self.repo._emit(connection,"operator.capacity.local_worker_retired",released["worker_id"],
+                        {"actor":actor,"operation_id":command["id"],"intent_id":node_id,
+                         "instance_id":intent["provider_instance_id"],**released})
             connection.execute(insert(operator_commands).values(**command))
             connection.execute(insert(scaler_receipts).values(id=str(uuid.uuid4()),intent_id=node_id,
                 operation="manual_review",observed_at=now,facts=canonical(review)))
