@@ -91,6 +91,15 @@ class BrokerReadinessTests(unittest.TestCase):
                 self.client.list.return_value.rows=[self.worker(labels=entries)]
                 self.assertFalse(probe.probe(self.slot))
 
+    def test_exact_physical_worker_label_required_in_addition_to_worker_name(self):
+        _, expected, _ = _expectation(self.config, self.slot)
+        self.assertEqual(expected["sixnine_worker"], self.spec.worker_id)
+        entries = [SimpleNamespace(key=label.key,
+            value="another-physical-slot" if label.key == "sixnine_worker" else label.value)
+            for label in self.worker().labels]
+        self.client.list.return_value.rows = [self.worker(labels=entries)]
+        self.assertEqual(self.readiness.projection(self.slot)["reason_code"], "hatchet_consumer_labels_mismatch")
+
     def test_stale_future_naive_and_missing_heartbeats_are_rejected(self):
         stamps=[None,datetime.fromtimestamp(self.now-61,timezone.utc),
             datetime.fromtimestamp(self.now+1,timezone.utc),datetime.fromtimestamp(self.now)]

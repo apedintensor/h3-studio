@@ -14,7 +14,7 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-from .hatchet_dispatch import ROUTE, create_client, labels
+from .hatchet_dispatch import ROUTE, create_client, worker_labels
 from .inference.wangp_contract import EngineManifest
 from .inference.wangp_factory import read_document
 from .repository import request_hash
@@ -103,7 +103,7 @@ def _expectation(config, slot):
         "engine_manifest_digest": manifest.digest,
         "deployment_profile_id": manifest.document["deployment_profile_id"],
         "mode": manifest.document["mode"], "backend": spec.backend}
-    expected = labels(value)
+    expected = worker_labels(value, spec.worker_id)
     name = _namespace(config, spec.worker_id)
     workflow = _namespace(config, "sixnine-generation-" + request_hash(value)[:24])
     return name, expected, workflow

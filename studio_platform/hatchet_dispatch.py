@@ -28,8 +28,8 @@ from sqlalchemy import and_, or_, select, update
 from .control import WorkerControl
 from .drain_safe_runner import collection_slot
 from .queue import TaskQueue
-from .repository import (Repository, canonical, dispatch_receipts,
-                         identifier, jobs, outbox, request_hash)
+from .repository import (Repository, attempts, canonical, dispatch_receipts,
+                         identifier, jobs, outbox, registered_workers, request_hash)
 from .telemetry import configured_telemetry
 from .worker import WorkerRunner
 
@@ -77,6 +77,31 @@ def labels(value):
         "sixnine_binding": request_hash(value),
         "sixnine_mode": value["mode"],
         "sixnine_profile": value["deployment_profile_id"]}
+
+
+def worker_labels(value, worker_id):
+    """Registered identity is immutable to its physical slot and manifest."""
+    identifier(worker_id)
+    return {**labels(value), "sixnine_worker": worker_id}
+
+
+def _original_worker(connection, job):
+    """Recover from the authoritative attempt, even after its job lease clears."""
+    if not job["current_attempt_id"]:
+        if job["status"] == "queued" and job["lease_worker_id"] is None:
+            return None
+        raise ValueError("hatchet_original_attempt_unconfirmed")
+    attempt = connection.execute(select(attempts).where(
+        attempts.c.id == job["current_attempt_id"], attempts.c.job_id == job["id"])).mappings().first()
+    if attempt is None:
+        raise ValueError("hatchet_original_attempt_unconfirmed")
+    worker = connection.execute(select(registered_workers).where(
+        registered_workers.c.id == attempt["worker_id"])).mappings().first()
+    if (worker is None or worker["current_job_id"] != job["id"]
+            or worker["state"] == "retired" or not WorkerControl.matches(worker, job)
+            or job["lease_worker_id"] not in (None, worker["id"])):
+        raise ValueError("hatchet_original_worker_unconfirmed")
+    return worker["id"]
 
 
 def _input_matches(job, message):
@@ -319,16 +344,25 @@ def create_client(config):
 
 
 class SDKPublisher:
-    def __init__(self, client):
-        self.client = client
+    def __init__(self, client, repository):
+        self.client, self.repo = client, repository
 
     def publish(self, message, job):
         from hatchet_sdk import DesiredWorkerLabel, IdempotencyCollisionError
-        stub = self.client.stubs.task(name=workflow_name(job), input_validator=DispatchInput)
+        # A dispatch snapshot or lease field cannot establish recovery affinity.
+        # Read the original attempt and still-bound physical worker immediately
+        # before publication. The callback rechecks it before a fenced claim.
+        with self.repo.engine.connect() as connection:
+            current = self.repo._job(connection, message.job_id)
+            if not _input_matches(current, message):
+                raise ValueError("hatchet_dispatch_identity_mismatch")
+            original_worker = _original_worker(connection, current)
+        desired = worker_labels(binding(current), original_worker) if original_worker else labels(binding(current))
+        stub = self.client.stubs.task(name=workflow_name(current), input_validator=DispatchInput)
         try:
             result = stub.run_no_wait(input=message,
                 desired_worker_labels=[DesiredWorkerLabel(key=key, value=value, required=True)
-                    for key, value in labels(binding(job)).items()],
+                    for key, value in desired.items()],
                 additional_metadata={"sixnine_event_id": message.event_id, "sixnine_job_id": message.job_id})
         except IdempotencyCollisionError as collision:
             # A lost successful publish response is reconciled against the
@@ -367,6 +401,7 @@ class HatchetSlotRunner(WorkerRunner):
             "mode": document.get("mode", ""), "backend": spec["backend"]}
         sdk = self.client_factory(self.broker_config)
         task_labels = labels(value)
+        registration_labels = worker_labels(value, worker_id)
         task_name = "sixnine-generation-"+request_hash(value)[:24]
         stop = threading.Event()
 
@@ -394,19 +429,42 @@ class HatchetSlotRunner(WorkerRunner):
             while not stop.is_set() and not context.is_cancelled and time.monotonic() < deadline:
                 with self.repo.engine.connect() as connection:
                     job = self.repo._job(connection, message.job_id)
-                if not _input_matches(job, message) or binding(job) != value:
+                if not _input_matches(job, message):
                     raise ValueError("hatchet_dispatch_identity_mismatch")
                 if job["status"] in TERMINAL:
                     return {"job_id": message.job_id, "state": job["status"]}
+                if binding(job) != value:
+                    return {"job_id": message.job_id, "state": "reconciliation_required",
+                        "reason_code": "hatchet_worker_incompatible"}
+                with self.repo.engine.connect() as connection:
+                    current_worker = self.control._worker(connection, worker_id)
+                    try:
+                        original_worker = _original_worker(connection, job)
+                    except ValueError:
+                        return {"job_id": message.job_id, "state": "reconciliation_required",
+                            "reason_code": "hatchet_original_binding_unconfirmed"}
+                if (not self.control.matches(current_worker, job)
+                        or original_worker not in (None, worker_id)):
+                    return {"job_id": message.job_id, "state": "reconciliation_required",
+                        "reason_code": "hatchet_worker_incompatible"}
+                if current_worker["current_job_id"] not in (None, message.job_id):
+                    return {"job_id": message.job_id, "state": "reconciliation_required",
+                        "reason_code": "hatchet_worker_busy"}
                 result = runner.run_once(worker_id, pool)
-                if result.get("state") == "draining":
-                    break
+                if result.get("state") in TERMINAL:
+                    return {"job_id": message.job_id, "state": result["state"]}
+                if result.get("state") in {"idle", "draining"}:
+                    # Another replica, busy slot, admission or higher-priority
+                    # candidate may win. Yield this broker slot now; its original
+                    # ledger/outbox wakeup can retry later without inference.
+                    return {"job_id": message.job_id, "state": "reconciliation_required",
+                        "reason_code": "hatchet_claim_unavailable"}
                 time.sleep(self.broker_config.poll_interval_s)
             # Broker interruption is not business cancellation. The durable
             # attempt/slot survives and the dispatch recovery scan reconciles.
             return {"job_id": message.job_id, "state": "reconciliation_required"}
 
-        worker = sdk.worker(name=worker_id, slots=1, labels=task_labels, workflows=[execute])
+        worker = sdk.worker(name=worker_id, slots=1, labels=registration_labels, workflows=[execute])
 
         def maintain_registration():
             while not stop.wait(30):
@@ -464,7 +522,7 @@ def main(argv=None):
     repo = Repository(settings.database_url)
     try:
         repo.create_schema()
-        dispatcher = OutboxDispatcher(repo, SDKPublisher(create_client(config)), publisher_id="dispatcher-"+uuid.uuid4().hex)
+        dispatcher = OutboxDispatcher(repo, SDKPublisher(create_client(config), repo), publisher_id="dispatcher-"+uuid.uuid4().hex)
         stop = threading.Event()
         if threading.current_thread() is threading.main_thread():
             for signum in (signal.SIGINT, signal.SIGTERM):
