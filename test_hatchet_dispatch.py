@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest.mock import Mock, patch
 
-from sqlalchemy import select
+from sqlalchemy import event, select, update
 
 from studio_platform.control import WorkerControl, WorkerSpec, worker_spec_payload
 from studio_platform.hatchet_dispatch import (BrokerConfig, DispatchInput, EVENT,
@@ -93,12 +93,14 @@ class HatchetDispatchTests(LedgerCase):
         self.directory = Path(self.temp.name)
         self.store = LocalObjectStore(self.directory/"objects")
 
-    def make_job(self, key="job", *, dispatch=ROUTE, status="queued", audio=False, scope=None):
+    def make_job(self, key="job", *, dispatch=ROUTE, status="queued", audio=False, scope=None, source_bytes=0):
         scope = scope or self.scope
         request = {"recipe_id": "test-recipe", "request": {"model": "SIMULATION", "prompt": "test only",
             "duration": 4, "resolution": "custom", "width": 256, "height": 256,
             "generate_audio": audio, "export_crf": 18},
             "output_spec": {"width": 256, "height": 256}, "assets": {}}
+        if source_bytes:
+            request["hidden_sources"] = "x" * source_bytes
         execution = {"pool": "hatchet-test", "backend": "mock", "enabled": True,
             "configuration_id": "test-config", "expected_runtime_s": 1}
         if dispatch is not None:
@@ -304,6 +306,49 @@ class HatchetDispatchTests(LedgerCase):
         with self.assertRaises(Conflict):
             queue.record_submitted(claim.lease, "task-original")
         self.assertIsNone(self.control.claim("worker", "hatchet-test", purpose="generate"))
+
+    def test_mixed_lease_expiry_wakeup_reads_only_hatchet_plan_and_preserves_original_attempt(self):
+        legacy = self.make_job("large-legacy", dispatch=None, source_bytes=256*1024)
+        modern = self.make_job("large-modern", source_bytes=256*1024)
+        self.ready("legacy", "legacy")
+        self.ready("modern")
+        legacy_claim = self.control.claim("legacy", "hatchet-test", lease_seconds=60)
+        modern_claim = self.control.claim("modern", "hatchet-test", lease_seconds=60)
+        queue = TaskQueue(self.repo)
+        queue.begin_submission(modern_claim.lease)
+        initial = self.message(modern)
+        # Positive broker terminal evidence has already closed this delivery;
+        # the expired original inference may now receive a recovery wakeup.
+        with self.repo.transaction() as connection:
+            connection.execute(update(outbox).where(outbox.c.id == initial.event_id).values(delivered_at=self.now))
+            connection.execute(update(dispatch_receipts).where(dispatch_receipts.c.event_id == initial.event_id)
+                .values(state="finished"))
+        self.now += 61
+        selected_columns = []
+        def capture(_connection, _cursor, _statement, _parameters, context, _executemany):
+            sql = context.compiled.statement if context.compiled is not None else None
+            if sql is not None and getattr(sql, "is_select", False):
+                selected_columns.extend(sql.selected_columns.keys())
+        event.listen(self.repo.engine, "before_cursor_execute", capture)
+        try:
+            recovered = queue.recover_expired(summary=True)
+        finally:
+            event.remove(self.repo.engine, "before_cursor_execute", capture)
+        states = {row["id"]: row["status"] for row in recovered}
+        self.assertEqual(states, {legacy["id"]: "queued", modern["id"]: "submission_unknown"})
+        self.assertNotIn("request", selected_columns)
+        self.assertNotIn("result", selected_columns)
+        self.assertEqual(selected_columns.count("execution_plan"), 1)
+        with self.repo.engine.connect() as connection:
+            wakeups = list(connection.execute(select(outbox).where(outbox.c.event_type == EVENT,
+                outbox.c.delivered_at.is_(None))).mappings())
+        self.assertEqual(len(wakeups), 1)
+        self.assertEqual(wakeups[0]["aggregate_id"], modern["id"])
+        self.assertEqual(wakeups[0]["payload"], {"version": 1, "job_id": modern["id"],
+            "request_hash": modern["request_hash"], "plan_hash": request_hash(modern["execution_plan"])})
+        self.assertEqual(self.repo.get_job(self.scope, modern["id"])["current_attempt_id"], modern_claim.lease.attempt_id)
+        self.assertEqual(self.repo.get_job(self.scope, legacy["id"])["current_attempt_id"], legacy_claim.lease.attempt_id)
+        self.assertEqual(self.repo.get_job(self.scope, modern["id"])["attempt_no"], 1)
 
     def test_broker_failure_reawakens_original_job_but_unknown_broker_status_does_not(self):
         job = self.make_job()
