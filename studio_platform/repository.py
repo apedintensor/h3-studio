@@ -388,8 +388,16 @@ class Repository:
     def _dispatch_wakeup(self, connection, job_id):
         # This outbox notification is committed with the existing business
         # transition. It contains identity only, never prompts or media URLs.
-        job = self._job(connection, job_id)
-        if (job["execution_plan"].get("dispatch_backend", "legacy") != "hatchet-v1"
+        # Legacy expiry recovery promises scalar-only reads. Inspect the route
+        # as a JSON scalar before touching an immutable plan; prompts, source
+        # snapshots and results are never needed to create a wakeup.
+        job = connection.execute(select(jobs.c.status, jobs.c.lease_worker_id,
+            jobs.c.not_before, jobs.c.request_hash,
+            jobs.c.execution_plan["dispatch_backend"].as_string().label("dispatch_backend"))
+            .where(jobs.c.id == job_id)).mappings().first()
+        if job is None:
+            raise NotFound("job_not_found")
+        if (job["dispatch_backend"] != "hatchet-v1"
                 or job["status"] not in {"queued", "running", "submission_unknown", "collecting", "cancel_requested"}
                 or job["lease_worker_id"] is not None):
             return
@@ -406,9 +414,11 @@ class Repository:
                 dispatch_receipts.c.job_id == job_id, dispatch_receipts.c.state == "published")).first():
             return
         event_id = str(uuid.uuid4())
+        execution_plan = connection.execute(select(jobs.c.execution_plan)
+            .where(jobs.c.id == job_id)).scalar_one()
         connection.execute(insert(outbox).values(id=event_id, event_type="job.dispatch_requested",
             aggregate_id=job_id, payload={"version": 1, "job_id": job_id,
-                "request_hash": job["request_hash"], "plan_hash": request_hash(job["execution_plan"])},
+                "request_hash": job["request_hash"], "plan_hash": request_hash(execution_plan)},
             created_at=self.clock()))
         sequence = connection.execute(select(func.max(dispatch_receipts.c.sequence))
             .where(dispatch_receipts.c.job_id == job_id)).scalar() or 0
