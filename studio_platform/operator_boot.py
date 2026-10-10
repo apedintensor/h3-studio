@@ -19,6 +19,7 @@ from sqlalchemy import or_, select
 from .control import TERMINAL, WorkerControl, worker_spec_payload
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
 from .inference.wangp import WanGPBackend
+from .instance_host_keys import HostKeyError, known_hosts_for
 from .lium_bootstrap import BootConfig, BootController, BootError, idle_proof_type
 from .lium_provider import _uuid
 from .operator_capacity import operator_nodes, public_bootstrap
@@ -90,6 +91,11 @@ class OperatorBoot:
         self.slots = []
         root = Path(runtime_config['work_dir'])
         ports = ports_for(root,self.intent_id,binding.execution_slots,runtime_config['port_start'])
+        try:
+            hosts, host_identity = known_hosts_for(root,
+                (self.provider_id,self.intent_id,self.instance_id),runtime_config['known_hosts_file'])
+        except HostKeyError as error:
+            raise BootError(error.code) from None
         profile = get_profile(binding.runtime_profile_id)
         sources, hashes = binding.boot['source_dirs'],binding.boot['source_sha256']
         if len(sources) != binding.execution_slots or len(hashes) != binding.execution_slots:
@@ -98,7 +104,7 @@ class OperatorBoot:
             if source_hashes(sources[index]) != hashes[index]:
                 raise BootError('operator_slot_source_changed')
             config = BootConfig(root/'boot'/self.intent_id/str(index),Path(sources[index]),
-                Path(runtime_config['ssh_key_file']),Path(runtime_config['known_hosts_file']),ports[index],
+                Path(runtime_config['ssh_key_file']),hosts,ports[index],
                 binding.configuration_id,model_id=binding.model_id,
                 min_gpu_bytes=profile.get('hardware_admission', {}).get('minimum_total_vram_bytes',
                     (30 if 'Pruned' in profile['model_id'] else 90)*1024**3),
@@ -108,7 +114,7 @@ class OperatorBoot:
                 execution_backend='wangp-worker',engine_manifest_digest=binding.engine_manifest_digest,
                 output_delivery='native-frames-v1',deployment_profile_id=binding.runtime_profile_id,
                 runtime_python='/venv/main/bin/python',profile_slot_index=index,expected_host_gpus=binding.gpu_count,
-                provider=self.provider_id)
+                provider=self.provider_id,host_key_identity=host_identity)
             boot = boot_class(repo,provider,config,ssh_factory=WanGPSSHHost,fleet_factory=self._fleet)
             boot.start_guard = self._start_allowed
             boot.enable_pollable_upload()
