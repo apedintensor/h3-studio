@@ -3,6 +3,8 @@
 The original ledger journals setup once. Local files are protected transport
 receipts/credentials, never a second business ledger. Reconnect observes the
 same remote marker/incarnation; it cannot reinstall, restart or mint a token.
+An original journal known not to have dispatched setup can resume its immutable
+source upload, then make the single initial launch.
 Provider endpoint extraction and worker lifecycle stay with the controller.
 """
 from __future__ import annotations
@@ -26,7 +28,7 @@ from .inference.wangp_factory import create_backend, read_document
 from .inference.wangp_http import HTTPWanGPTransport
 from .runtime_catalog import engine_manifest, get_profile
 from .runtime_hosts.wangp_http import private_token_file
-from .wangp_bootstrap import (SOURCE_NAMES, WanGPSSHHost, _write_immutable,
+from .wangp_bootstrap import (SOURCE_NAMES, BootError, WanGPSSHHost, _write_immutable,
                              read_sources, validate_report)
 from .worker import _slot_lock
 
@@ -117,6 +119,7 @@ class RuntimeStore(Protocol):
 
 class RuntimeHost(Protocol):
     """Existing verified SSH transport; no provider credential methods."""
+    def ensure_connected(self) -> None: ...
     def upload(self, files: dict) -> None: ...
     def start(self, identity: dict) -> dict: ...
     def report(self) -> dict: ...
@@ -137,7 +140,8 @@ class DstackNativeRuntime:
 
     config_for_binding(binding) chooses immutable prepared sources/settings.
     coordinates_for_run(binding, run) extracts trusted dstack SSH coordinates;
-    the controller owns that pinned API contract, including any proxy hop.
+    the controller owns that pinned API contract. Only direct root SSH is
+    supported; proxy/dockerized topology must be rejected by the extractor.
     This bridge does not discover, rent, stop, register or execute business jobs.
     """
     def __init__(self, store: RuntimeStore, config_for_binding, coordinates_for_run, *,
@@ -184,6 +188,20 @@ class DstackNativeRuntime:
             "dstack_runtime_prepared_source_required")
         return files, manifest, hashes
 
+    def _coordinates(self, binding, run):
+        coordinates = self.coordinates_for_run(dict(binding), run)
+        _require(type(coordinates) is dict and set(coordinates) ==
+            {"host", "port", "username", "instance_id"}, "dstack_runtime_ssh_coordinates_invalid")
+        _require(coordinates.get("host") is not None and coordinates.get("port") is not None,
+            "dstack_runtime_ssh_coordinates_unavailable")
+        _require(isinstance(coordinates["host"], str)
+            and re.fullmatch(r"[A-Za-z0-9.:_-]{1,253}", coordinates["host"])
+            and type(coordinates["port"]) is int and 1 <= coordinates["port"] <= 65535
+            and coordinates["username"] == "root"
+            and coordinates["instance_id"] == binding["provider_instance_id"],
+            "dstack_runtime_ssh_coordinates_invalid")
+        return dict(coordinates)
+
     @staticmethod
     def _save(path, state):
         _absolute(path)
@@ -220,6 +238,30 @@ class DstackNativeRuntime:
                 if state is not None:
                     _require(state.get("identity") == identity and state.get("local_port") == config.local_port,
                         "dstack_runtime_receipt_changed")
+                    _require(state.get("phase") in {"journaled", "start_unknown", "booting", "runtime_ready"},
+                        "dstack_runtime_receipt_phase_invalid")
+                _require(current.get("bootstrap_started") is True
+                    or state is None and not (directory / "wangp-token").exists(),
+                    "dstack_runtime_existing_receipt_requires_reconciliation")
+                # dstack RUNNING can precede SSH metadata/availability. Only
+                # read-only connection work belongs before the nonreplayable
+                # journal; do not consume the initial bootstrap while waiting
+                # for an endpoint or its verified host key.
+                coordinates = self._coordinates(binding, run)
+                if intent_id not in self._hosts:
+                    _require(len(self._hosts) < self.max_hosts, "dstack_runtime_host_limit_reached")
+                    try:
+                        host = self.ssh_factory(config, coordinates)
+                    except Exception:
+                        raise DstackError("dstack_runtime_ssh_unavailable_or_host_key_untrusted") from None
+                    self._hosts[intent_id] = (identity, coordinates, host)
+                cached_identity, cached_coordinates, host = self._hosts[intent_id]
+                _require(cached_identity == identity and cached_coordinates == coordinates,
+                    "dstack_runtime_host_identity_changed")
+                try:
+                    host.ensure_connected()
+                except Exception:
+                    raise DstackError("dstack_runtime_ssh_unavailable_or_host_key_untrusted") from None
                 first = self.store.begin_bootstrap(intent_id, binding["run_id"], binding["provider_instance_id"])
                 if first:
                     _require(state is None, "dstack_runtime_existing_receipt_requires_reconciliation")
@@ -235,13 +277,22 @@ class DstackNativeRuntime:
                     _require(state is not None and (directory / "wangp-token").is_file(),
                         "dstack_runtime_recovery_material_missing")
                     private_token_file(directory / "wangp-token")  # Verify, never recreate.
-                if intent_id not in self._hosts:
-                    _require(len(self._hosts) < self.max_hosts, "dstack_runtime_host_limit_reached")
-                    self._hosts[intent_id] = (identity, self.ssh_factory(config, self.coordinates_for_run(dict(binding), run)))
-                cached_identity, host = self._hosts[intent_id]
-                _require(cached_identity == identity, "dstack_runtime_host_identity_changed")
-                if first:
-                    host.upload(files)
+                if state["phase"] == "journaled":
+                    # Source upload is immutable and has no setup launch. A
+                    # failed upload can retry the same bytes/token; an existing
+                    # partial file instead requires reconciliation below. No
+                    # phase after start_unknown can replay upload or setup.
+                    try:
+                        host.upload(files)
+                    except BootError as error:
+                        if error.args == ("bootstrap_existing_source_mismatch",):
+                            # A partial file is not silently overwritten by
+                            # the original transport. Preserve the journal,
+                            # explain the reconciliation hold, never launch.
+                            raise DstackError("dstack_runtime_upload_reconciliation_required") from None
+                        raise DstackError("dstack_runtime_upload_unconfirmed") from None
+                    except Exception:
+                        raise DstackError("dstack_runtime_upload_unconfirmed") from None
                     state["phase"] = "start_unknown"
                     self._save(receipt, state)  # Before the non-replayable launch.
                     try:
@@ -312,4 +363,4 @@ class DstackNativeRuntime:
             pair = self._hosts.pop(identity, None)
             self._slots.pop(identity, None)
             if pair is not None:
-                pair[1].close()
+                pair[2].close()
