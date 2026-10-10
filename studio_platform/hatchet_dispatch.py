@@ -231,9 +231,9 @@ class ExactJobRunner(WorkerRunner):
 
     def _claim(self, worker_id, pool, *, purpose):
         return self.control.claim(worker_id, pool, lease_seconds=900, purpose=purpose,
-            job_filter=and_(jobs.c.id == self.message.job_id,
-                jobs.c.execution_plan["dispatch_backend"].as_string() == ROUTE),
-            job_allowed=lambda job: _input_matches(job, self.message))
+            job_filter=jobs.c.execution_plan["dispatch_backend"].as_string() == ROUTE,
+            selected_job_id=self.message.job_id,
+            selected_job_allowed=lambda job: _input_matches(job, self.message))
 
     def _collect(self, job, lease, tag, task_id, heartbeat):
         with collection_slot(self.collection_lock_dir, heartbeat):

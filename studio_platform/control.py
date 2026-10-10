@@ -332,7 +332,8 @@ class WorkerControl:
         return (effective.get("model") == spec["model_id"]
                 and execution.get("configuration_id") == spec["configuration_id"])
 
-    def claim(self, worker_id, pool, *, purpose="generate", lease_seconds=90, job_filter=None, job_allowed=None):
+    def claim(self, worker_id, pool, *, purpose="generate", lease_seconds=90, job_filter=None, job_allowed=None,
+              selected_job_id=None, selected_job_allowed=None):
         """Claim and bind slot atomically in the same ledger transaction."""
         with self.repo.transaction() as connection:
             worker = self._worker(connection, worker_id, lock=True)
@@ -401,6 +402,7 @@ class WorkerControl:
             from .worker_admission import worker_window_reason
             claim = self.queue.claim(worker_id, pool, purpose=purpose, lease_seconds=lease_seconds,
                 dispatch_backend=spec.get("dispatch_backend", "legacy"),
+                selected_job_id=selected_job_id, selected_validator=selected_job_allowed,
                 connection=connection, job_filter=and_(*bindings), validator=lambda job: self.matches(worker, job)
                     and (purpose != "generate" or capacity_member_claim_allowed(self.repo, connection, job, worker))
                     and (purpose != "generate" or worker_window_reason(connection, worker, self.repo.clock(),
