@@ -1,0 +1,270 @@
+"""Safe observation must not change work, leak inputs or grow without bound."""
+import base64
+import json
+import os
+from pathlib import Path
+import tempfile
+import time
+import unittest
+from unittest.mock import patch
+
+from studio_platform.telemetry import (CloudTelemetryConfig, NullTelemetry, StageTelemetry,
+    configured_telemetry, create_cloud_telemetry, read_config)
+from studio_platform.runtime_catalog import PROFILE_IDS
+
+
+def config():
+    return CloudTelemetryConfig("https://otlp-gateway-prod-us-east-0.grafana.net/otlp",
+        "Basic " + base64.b64encode(b"12345:PRIVATE_WRITE_TOKEN").decode())
+
+
+class RecordingLogger:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, **kwargs):
+        self.events.append(json.loads(kwargs["body"]))
+
+
+class Instrument:
+    def __init__(self):
+        self.points = []
+
+    def add(self, value, attrs):
+        self.points.append((value, attrs))
+
+    record = add
+
+
+class RecordingMeter:
+    def create_counter(self, *_args, **_kwargs):
+        return Instrument()
+
+    create_histogram = create_counter
+
+
+class TelemetryTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            from opentelemetry.trace import NonRecordingSpan, SpanContext
+        except ImportError:
+            self.skipTest("Optional SDK API dependency not installed")
+        self.logger = RecordingLogger()
+        self.clock = [100.0]
+        self.tracer = type("Tracer", (), {"start_span": lambda _self, *_args, **_kwargs:
+            NonRecordingSpan(SpanContext(1, 2, False))})()
+        self.telemetry = StageTelemetry(logger=self.logger, tracer=self.tracer, meter=RecordingMeter(),
+            monotonic=lambda: self.clock[0], timestamp=lambda: 1770000000000000000)
+
+    def test_start_is_visible_before_finish_and_duration_is_monotonic(self):
+        stage = self.telemetry.start("model_load", {"profile_id": PROFILE_IDS[0],
+            "provider": "vast", "mode": "fl", "gpu_type": "rtx5090", "warmth": "cold",
+            "job_id": "11111111-1111-1111-1111-111111111111", "gpu_index": 0})
+        self.assertEqual([e["event"] for e in self.logger.events], ["stage_started"])
+        self.assertEqual(self.logger.events[0]["job_id"], "11111111-1111-1111-1111-111111111111")
+        self.clock[0] = 107.25
+        self.assertEqual(stage.finish(), 7.25)
+        self.assertIsNone(stage.finish())
+        self.assertEqual(len(self.logger.events), 2)
+        self.assertEqual(self.logger.events[1]["duration_seconds"], 7.25)
+        for _, labels in self.telemetry.duration.points:
+            self.assertNotIn("job_id", labels)
+            self.assertNotIn("stage_id", labels)
+
+    def test_payload_projection_discards_private_context_and_free_form_errors(self):
+        secret = "SECRET /private/media.mp4 https://x/?signature=SECRET"
+        stage = self.telemetry.start(secret, {"prompt": secret, "media": secret, "url": secret,
+            "provider": secret, "profile_id": secret, "job_id": secret, "dstack_run": secret,
+            "owner_id": secret, "memory": secret, "listed_memory_gib": float("nan"),
+            "width": 832, "steps": 50, "gpu_index": True})
+        stage.finish("failure", error_code=secret)
+        raw = json.dumps(self.logger.events)
+        self.assertNotIn("SECRET", raw)
+        self.assertEqual(self.logger.events[-1]["error_code"], "unknown_error")
+        self.assertEqual(self.logger.events[-1]["stage"], "unknown")
+        self.assertEqual(self.logger.events[-1]["width"], 832)
+        self.assertNotIn("gpu_index", self.logger.events[-1])
+        self.assertNotIn("listed_memory_gib", self.logger.events[-1])
+
+    def test_telemetry_failure_preserves_operation_result_and_original_exception(self):
+        with patch.object(self.logger, "emit", side_effect=RuntimeError("SECRET")):
+            self.assertEqual(self.telemetry.call("generate", {}, lambda: "original result"), "original result")
+        with self.assertRaisesRegex(RuntimeError, "PRIVATE original error"):
+            self.telemetry.call("generate", {}, lambda: (_ for _ in ()).throw(RuntimeError("PRIVATE original error")))
+        self.assertEqual(self.logger.events[-1]["error_code"], "stage_failed")
+        self.assertNotIn("PRIVATE", json.dumps(self.logger.events))
+
+    def test_metric_labelsets_are_capped_across_many_safe_dimensions(self):
+        from studio_platform.telemetry import STAGES, GPU_TYPES
+        for stage in STAGES:
+            for gpu in GPU_TYPES:
+                for mode in ("fl", "ref"):
+                    self.telemetry.start(stage, {"mode": mode, "gpu_type": gpu}).finish()
+        self.assertLessEqual(self.telemetry.status()["metric_labelsets"], 128)
+        self.assertTrue(any(attrs.get("stage") == "unknown" for _, attrs in self.telemetry.duration.points))
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_https_cloud_destination_and_authorization_are_required_and_not_represented(self):
+        self.assertNotIn("PRIVATE_WRITE_TOKEN", repr(config()))
+        for endpoint in ("http://otlp-gateway-prod-us-east-0.grafana.net/otlp",
+                "https://user:SECRET@otlp-gateway-prod-us-east-0.grafana.net/otlp",
+                "https://otlp-gateway-prod-us-east-0.grafana.net/otlp?token=SECRET",
+                "https://otlp-gateway-evil.grafana.net.example.com/otlp", "https://127.0.0.1/otlp"):
+            with self.assertRaisesRegex(ValueError, "^telemetry_config_invalid$"):
+                CloudTelemetryConfig(endpoint, config().authorization)
+        with self.assertRaisesRegex(ValueError, "^telemetry_config_invalid$"):
+            CloudTelemetryConfig(config().endpoint, "Bearer SECRET")
+
+    def test_explicit_protected_file_and_disabled_defaults_do_not_mutate_environment(self):
+        before = dict(os.environ)
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "telemetry.json"
+            content = {"schema_version": 1, "enabled": True, **vars(config())}
+            path.write_text(json.dumps(content), encoding="utf-8")
+            if os.name != "nt":
+                path.chmod(0o600)
+            self.assertEqual(read_config(path), config())
+            with self.assertRaisesRegex(ValueError, "^telemetry_config_invalid$"):
+                read_config("relative.json")
+            content["extra_secret"] = "SECRET"
+            path.write_text(json.dumps(content), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "^telemetry_config_invalid$"):
+                read_config(path)
+            self.assertEqual(configured_telemetry(path).status(),
+                             {"enabled": False, "code": "telemetry_config_unavailable"})
+        self.assertEqual(before, dict(os.environ))
+        self.assertEqual(NullTelemetry().call("generate", {}, lambda: 7), 7)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(configured_telemetry().enabled)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permission assertion")
+    def test_group_readable_credentials_are_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "telemetry.json"
+            path.write_text(json.dumps({"schema_version": 1, "enabled": True, **vars(config())}))
+            path.chmod(0o640)
+            with self.assertRaisesRegex(ValueError, "^telemetry_config_invalid$"):
+                read_config(path)
+
+
+class SDKTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            from opentelemetry.sdk._logs import LoggerProvider
+        except ImportError:
+            self.skipTest("Install the optional hashed telemetry lock for SDK tests")
+
+    def test_real_otlp_encodings_emit_start_before_span_ends_and_never_expose_http_failure(self):
+        from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+        from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import ExportMetricsServiceRequest
+        from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+
+        requests = []
+        class Response:
+            status = 204
+            reason = "SECRET response text"
+            def close(self):
+                pass
+
+        class Pool:
+            def __init__(self, **_kwargs):
+                pass
+            def request(self, method, url, **kwargs):
+                requests.append((method, url, kwargs["body"]))
+                return Response()
+            def clear(self):
+                pass
+
+        with patch("urllib3.PoolManager", Pool):
+            telemetry = create_cloud_telemetry(config())
+            try:
+                stage = telemetry.start("generate", {"provider": "vast", "mode": "fl",
+                    "job_id": "11111111-1111-1111-1111-111111111111", "prompt": "SECRET prompt"})
+                self.assertTrue(telemetry.force_flush())
+                logs = [ExportLogsServiceRequest.FromString(body) for _, url, body in requests if url.endswith("logs")]
+                self.assertTrue(logs)
+                self.assertIn("stage_started", str(logs[0]))
+                self.assertNotIn("SECRET prompt", str(logs[0]))
+                self.assertFalse(any(url.endswith("traces") for _, url, _ in requests))
+                stage.finish("success")
+                self.assertTrue(telemetry.force_flush())
+                traces = [ExportTraceServiceRequest.FromString(body) for _, url, body in requests if url.endswith("traces")]
+                metrics = [ExportMetricsServiceRequest.FromString(body) for _, url, body in requests if url.endswith("metrics")]
+                self.assertTrue(traces)
+                self.assertTrue(metrics)
+                self.assertNotIn("job_id", str(metrics))
+                self.assertNotIn("SECRET", str(logs + traces + metrics))
+                Response.status = 302
+                telemetry.start("collect", {}).finish()
+                with self.assertLogs("opentelemetry.exporter", level="ERROR") as captured:
+                    telemetry.force_flush()
+                self.assertNotIn("SECRET", " ".join(captured.output))
+                self.assertGreater(telemetry.status()["export_failures"], 0)
+            finally:
+                telemetry.close()
+
+    def test_start_exports_asynchronously_without_waiting_for_span_completion(self):
+        import threading
+        from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+        emitted = threading.Event()
+        bodies = []
+        class Response:
+            status = 204
+            def close(self):
+                pass
+        class Pool:
+            def __init__(self, **_kwargs):
+                pass
+            def request(self, _method, url, **kwargs):
+                if url.endswith("logs"):
+                    bodies.append(ExportLogsServiceRequest.FromString(kwargs["body"]))
+                    emitted.set()
+                return Response()
+            def clear(self):
+                pass
+        with patch("urllib3.PoolManager", Pool):
+            telemetry = create_cloud_telemetry(config())
+            try:
+                telemetry.start("model_load", {"provider": "vast", "mode": "fl"})
+                # No finish, force_flush or span end: a later crash cannot hide a
+                # start already delivered by the independent background log path.
+                self.assertTrue(emitted.wait(2))
+                self.assertIn("stage_started", str(bodies))
+                self.assertNotIn("stage_finished", str(bodies))
+            finally:
+                telemetry.close()
+
+    def test_actual_sdk_queues_stay_bounded_when_cloud_is_unavailable(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        class Pool:
+            def __init__(self, **_kwargs):
+                pass
+            def request(self, *_args, **_kwargs):
+                entered.set()
+                release.wait(2)
+                raise RuntimeError("SECRET private upstream exception")
+            def clear(self):
+                release.set()
+
+        with patch("urllib3.PoolManager", Pool):
+            telemetry = create_cloud_telemetry(config())
+            try:
+                started = time.monotonic()
+                for _ in range(600):
+                    telemetry.start("generate", {}).finish()
+                self.assertLess(time.monotonic() - started, 2)
+                logs, traces, _ = telemetry.providers
+                log_processor = logs._multi_log_record_processor._log_record_processors[0]
+                span_processor = traces._active_span_processor._span_processors[0]
+                self.assertLessEqual(len(log_processor._batch_processor._queue), 256)
+                self.assertLessEqual(len(span_processor._batch_processor._queue), 256)
+                self.assertTrue(entered.wait(1))
+            finally:
+                release.set()
+                telemetry.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

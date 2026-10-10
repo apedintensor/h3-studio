@@ -1,0 +1,5 @@
+# Match the existing platform API pin. This optional layer is never imported for
+# disabled telemetry; no automatic instrumentation or local telemetry server.
+opentelemetry-api==1.45.0
+opentelemetry-sdk==1.45.0
+opentelemetry-exporter-otlp-proto-http==1.45.0
