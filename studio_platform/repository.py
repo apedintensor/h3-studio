@@ -170,6 +170,19 @@ outbox = Table(
     Column("payload", JSON, nullable=False), Column("created_at", Float, nullable=False),
     Column("delivered_at", Float),
 )
+dispatch_receipts = Table(
+    "platform_dispatch_receipts", metadata,
+    Column("event_id", String(36), ForeignKey("platform_outbox.id"), primary_key=True),
+    Column("job_id", String(36), ForeignKey("platform_jobs.id"), nullable=False),
+    Column("state", String(30), nullable=False),
+    Column("publisher_id", String(200)), Column("lease_expires_at", Float),
+    Column("external_run_id", String(200)),
+    Column("publish_attempts", Integer, nullable=False, default=0),
+    Column("sequence", Integer, nullable=False),
+    Column("not_before", Float, nullable=False, default=0),
+    Column("updated_at", Float, nullable=False), Column("error_code", String(100)),
+    UniqueConstraint("job_id", "sequence"),
+)
 scheduler_state = Table(
     "platform_scheduler_state", metadata, Column("pool", String(200), primary_key=True),
     Column("last_owner", String(500)),
@@ -369,6 +382,39 @@ class Repository:
     def _emit(self, connection, event_type, aggregate_id, payload):
         connection.execute(insert(outbox).values(id=str(uuid.uuid4()), event_type=event_type,
             aggregate_id=aggregate_id, payload=canonical(payload), created_at=self.clock()))
+        if event_type in {"job.created", "job.queued", "job.lease_expired", "job.submission_unknown"}:
+            self._dispatch_wakeup(connection, aggregate_id)
+
+    def _dispatch_wakeup(self, connection, job_id):
+        # This outbox notification is committed with the existing business
+        # transition. It contains identity only, never prompts or media URLs.
+        job = self._job(connection, job_id)
+        if (job["execution_plan"].get("dispatch_backend", "legacy") != "hatchet-v1"
+                or job["status"] not in {"queued", "running", "submission_unknown", "collecting", "cancel_requested"}
+                or job["lease_worker_id"] is not None):
+            return
+        # Keep one undelivered wakeup per job. Published wakeups may be followed
+        # by recovery wakeups, which always reuse the original attempt.
+        if connection.execute(select(outbox.c.id).where(outbox.c.event_type == "job.dispatch_requested",
+                outbox.c.aggregate_id == job_id, outbox.c.delivered_at.is_(None))).first():
+            return
+        # An accepted Hatchet run may still be executing/pending while its
+        # original worker yields a poll lease. Do not enqueue a new broker run
+        # per poll. The broker recovery scan closes this delivery only after a
+        # positive terminal observation, while preserving the GPU attempt.
+        if connection.execute(select(dispatch_receipts.c.event_id).where(
+                dispatch_receipts.c.job_id == job_id, dispatch_receipts.c.state == "published")).first():
+            return
+        event_id = str(uuid.uuid4())
+        connection.execute(insert(outbox).values(id=event_id, event_type="job.dispatch_requested",
+            aggregate_id=job_id, payload={"version": 1, "job_id": job_id,
+                "request_hash": job["request_hash"], "plan_hash": request_hash(job["execution_plan"])},
+            created_at=self.clock()))
+        sequence = connection.execute(select(func.max(dispatch_receipts.c.sequence))
+            .where(dispatch_receipts.c.job_id == job_id)).scalar() or 0
+        connection.execute(insert(dispatch_receipts).values(event_id=event_id, job_id=job_id,
+            state="pending", publish_attempts=0, sequence=sequence+1,
+            not_before=job["not_before"], updated_at=self.clock()))
 
     def put_document(self, scope, kind, document_id, payload, *, expected_version=None):
         kind, document_id, payload = identifier(kind), identifier(document_id), canonical(payload)
@@ -437,6 +483,8 @@ class Repository:
         if expires_at <= self.clock():
             raise Conflict("plan_expired")
         request, execution_plan = canonical(request), canonical(execution_plan)
+        if execution_plan.get("dispatch_backend", "legacy") not in {"legacy", "hatchet-v1"}:
+            raise ValueError("invalid_dispatch_backend")
         row = dict(id=str(uuid.uuid4()), tenant_id=scope.tenant_id, owner_id=scope.owner_id,
             project_id=scope.project_id, request=request, request_hash=request_hash(request),
             execution_plan=execution_plan, plan_hash=request_hash(execution_plan),

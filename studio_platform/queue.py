@@ -13,7 +13,7 @@ import json
 import hashlib
 import uuid
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
@@ -49,7 +49,7 @@ class TaskQueue:
         return self.repository._locked(connection, select(scheduler_state).where(scheduler_state.c.pool == pool))
 
     def claim(self, worker_id, pool, *, lease_seconds=90, purpose="generate", connection=None, job_ids=None,
-              job_filter=None, validator=None):
+              job_filter=None, validator=None, dispatch_backend="legacy"):
         """Claim one task; returns Claim or None. Collection reuses its original attempt.
 
         Per-pool row locking serializes short scheduling transactions on PostgreSQL.
@@ -60,6 +60,8 @@ class TaskQueue:
         """
         identifier(worker_id)
         identifier(pool)
+        if dispatch_backend not in {"legacy", "hatchet-v1"}:
+            raise ValueError("invalid_dispatch_backend")
         if not math.isfinite(lease_seconds) or not 0 < lease_seconds <= 3600:
             raise ValueError("invalid_lease_duration")
         states = {"generate": ("queued",), "collect": ("collecting",),
@@ -74,6 +76,8 @@ class TaskQueue:
             statement = select(jobs.c.id, jobs.c.tenant_id, jobs.c.owner_id, jobs.c.created_at).where(
                 jobs.c.pool == pool, jobs.c.status.in_(states[purpose]),
                 jobs.c.not_before <= repo.clock(), jobs.c.lease_worker_id.is_(None))
+            statement = statement.where(func.coalesce(
+                jobs.c.execution_plan["dispatch_backend"].as_string(), "legacy") == dispatch_backend)
             if job_ids is not None:
                 statement = statement.where(jobs.c.id.in_(job_ids))
             if job_filter is not None:
@@ -195,6 +199,7 @@ class TaskQueue:
             connection.execute(update(jobs).where(jobs.c.id == lease.job_id).values(
                 fence=job["fence"] + 1, lease_worker_id=None, lease_expires_at=None,
                 not_before=repo.clock() + retry_after_s, error_code=error_code, updated_at=repo.clock()))
+            repo._dispatch_wakeup(connection, lease.job_id)
             return repo._job(connection, lease.job_id)
 
     def defer_unsubmitted(self, lease, *, retry_after_s=30, error_code="worker_not_ready"):
@@ -212,6 +217,7 @@ class TaskQueue:
                 not_before=repo.clock() + retry_after_s, error_code=error_code, updated_at=repo.clock()))
             connection.execute(update(attempts).where(attempts.c.id == lease.attempt_id)
                 .values(status="deferred", error_code=error_code, updated_at=repo.clock()))
+            repo._dispatch_wakeup(connection, lease.job_id)
             return repo._job(connection, lease.job_id)
 
     def _transition(self, lease, allowed, status, *, attempt_values=None, job_values=None):
@@ -299,6 +305,7 @@ class TaskQueue:
                 fence=job["fence"] + 1, lease_worker_id=None, lease_expires_at=None, updated_at=repo.clock()))
             connection.execute(update(attempts).where(attempts.c.id == lease.attempt_id).values(
                 collection_failures=attempts.c.collection_failures + 1, error_code=error_code, updated_at=repo.clock()))
+            repo._dispatch_wakeup(connection, lease.job_id)
             return repo._job(connection, lease.job_id)
 
     def complete(self, lease, artifact_specs, *, actual_cost_microusd, settlement=None):
