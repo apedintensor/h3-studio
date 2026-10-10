@@ -81,7 +81,7 @@ class StagedInputs:
             pass
         self.resolve(descriptor)
 
-    def image_path(self, descriptor, *, reference=False):
+    def image_path(self, descriptor, *, reference=False, deployment_profile_id=None):
         """Expose inspected normalized PNG bytes under a runtime-safe extension.
 
         WanGP rejects extensionless inputs. The public asset service supplies
@@ -97,15 +97,20 @@ class StagedInputs:
                     or not 256 <= picture.width <= 5760 or not 256 <= picture.height <= 5760):
                 raise ValueError("wangp_normalized_png_required")
             if reference:
-                self._reference_dimensions(picture.width, picture.height)
+                self._reference_dimensions(picture.width, picture.height, deployment_profile_id)
             picture.verify()
         return self._typed_copy(descriptor, "images", ".png")
 
     @staticmethod
-    def _reference_dimensions(width, height):
+    def _reference_dimensions(width, height, deployment_profile_id=None):
+        maximum, pixels = 832,832*480
+        if deployment_profile_id is not None:
+            from ..runtime_catalog import get_profile
+            get_profile(deployment_profile_id)
+            maximum,pixels = 5760,5760**2
         if (type(width) is not int or type(height) is not int or min(width, height) < 256
-                or max(width, height) > 832 or width * height > 832*480 or not .4 <= width/height <= 2.5):
-            raise ValueError("wangp_ref_qualification_pixels_exceeded")
+                or max(width, height) > maximum or width * height > pixels or not .4 <= width/height <= 2.5):
+            raise ValueError("wangp_ref_invalid_dimensions")
 
     def _probe_reference(self, descriptor, kind):
         if descriptor.kind != kind:
@@ -138,10 +143,10 @@ class StagedInputs:
         if deployment_profile_id is not None:
             from ..runtime_catalog import get_profile
             get_profile(deployment_profile_id)  # Unknown IDs never widen admission.
-            counts = (56,)
+            counts = tuple(range(56,363,17))
         stream, _ = self._probe_reference(descriptor, "video")
         try:
-            self._reference_dimensions(stream["width"], stream["height"])
+            self._reference_dimensions(stream["width"], stream["height"], deployment_profile_id)
             count = int(stream["nb_read_frames"])
             duration = float(stream["duration"])
             if (stream["codec_name"] != "h264" or count not in counts
@@ -157,7 +162,7 @@ class StagedInputs:
         if deployment_profile_id is not None:
             from ..runtime_catalog import get_profile
             get_profile(deployment_profile_id)
-            maximum = 5.2
+            maximum = 15
         stream, info = self._probe_reference(descriptor, "audio")
         try:
             if (stream["codec_name"] != "pcm_s16le" or int(stream["sample_rate"]) != 32000
@@ -166,6 +171,29 @@ class StagedInputs:
         except (ValueError, KeyError, TypeError, OverflowError):
             raise ValueError("wangp_ref_normalized_audio_required") from None
         return self._typed_copy(descriptor, "audios", ".wav")
+
+    def validate_reference_totals(self, descriptors, *, deployment_profile_id):
+        """Recheck aggregate actual bytes before upstream can trim multiple refs."""
+        from ..runtime_catalog import get_profile
+        get_profile(deployment_profile_id)
+        video_frames,audio_seconds = 0,0
+        try:
+            for descriptor in descriptors:
+                if descriptor.kind=='video':
+                    stream,_ = self._probe_reference(descriptor,'video')
+                    video_frames += int(stream['nb_read_frames'])
+                elif descriptor.kind=='audio':
+                    _,info = self._probe_reference(descriptor,'audio')
+                    duration = float(info['duration'])
+                    if not math.isfinite(duration) or duration<2:
+                        raise ValueError()
+                    audio_seconds += duration
+        except (ValueError,KeyError,TypeError,OverflowError):
+            raise ValueError('wangp_ref_media_probe_rejected') from None
+        if video_frames>362:
+            raise ValueError('wangp_ref_total_video_duration_exceeded')
+        if audio_seconds>15:
+            raise ValueError('wangp_ref_total_audio_duration_exceeded')
 
     def _typed_copy(self, descriptor, plural, extension):
         from .wangp_receipts import checked_directory, checked_reader, sync_directory

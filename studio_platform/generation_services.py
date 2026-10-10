@@ -100,7 +100,12 @@ class GenerationRead:
         return visible
 
     def job(self, principal, job_id):
-        return self.public_job(self.access.job(principal, job_id))
+        job = self.access.job(principal, job_id)
+        value = self.public_job(job)
+        if job["status"] == "queued":
+            from .control import WorkerControl
+            value["wait_diagnostic"] = WorkerControl(self.repo).queued_diagnostic(job)
+        return value
 
     def list_jobs(self, principal, *, project_id=None, limit=100, offset=0):
         if project_id:

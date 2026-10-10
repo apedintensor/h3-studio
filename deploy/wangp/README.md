@@ -393,8 +393,50 @@ Worker's existing responsibility.
 Before enabling this recipe publicly: verify the installed runtime and files,
 qualify a real accepted job through the complete API-to-download path, record the
 actual native/delivered media specs and audio stream, then reconcile cost/lease
-evidence. Adding further controls or variants requires a distinct declared and
-tested recipe; it must not weaken the immutable manifest binding of existing jobs.
+evidence. Different weights/runtime configurations require an explicit declared
+binding. Supported input combinations do not require a separate qualification
+run merely because they were not measured; retain the immutable manifest and
+request binding of existing jobs.
+
+### Native deployment-profile support (current API)
+
+The native `deployment_profile_id` compiler separates implemented model/API
+support from historical measurements. `verified_cases` / `qualification_cases`
+and public `joint_cases` are evidence/examples, not admission allowlists. Timing
+hints remain exact-case-only and absent for unmeasured combinations. No extra
+qualification confirmation is required for a supported request.
+
+FL accepts text-only, first-image-only, last-image-only, or both. REF maps ordered
+image lists (up to nine), up to three silent video references through
+`video_guide` / `video_guide2` / `video_guide3` (`V-U`, `V+-U`, `V+*-U`), and up to
+three independent audio references (`A`, `AB`, `ABD`). It requires references,
+visual reference count at least audio count, at most twelve files, and explicit
+aggregate bounds that prevent upstream trimming. Audio is 2–15 seconds per clip
+with at most 15 seconds combined. Video uses the asset service's 24 fps native
+17k+5 grid, at most 362 frames combined, and explicit 2–15 second source
+selections. Host staging rechecks actual typed bytes and aggregate lengths.
+
+These profiles map 1–100 integer steps (the existing public API range), Euler,
+RES Multistep or Ralston 2S, and integer output duration 4–15 seconds. Output
+canvases use the shared native presets or custom 32-pixel grid, side/area/aspect
+validation; frame snapping and original controls stay visible in preflight.
+Decoder/encoder configuration, precision, memory profile, attention and weight
+identity remain pinned. Unmapped controls receive a specific diagnostic instead
+of being silently ignored or described as untested model limitations.
+
+Sixnine's current FL/REF mode contract remains separate. Upstream offers other
+controls, including Ref2VA timeline anchors, soundtrack extraction and injected
+frames; those are concrete adapter gaps rather than universal H3 exclusions.
+The [pinned upstream handler](https://github.com/deepbeepmeep/Wan2GP/blob/0e58385fbde7ff102d276e4a9e490845de76b4ea/models/minimax_h3/minimax_h3_handler.py)
+documents optional FL start/end images, the reference counts/audio-visual
+relationship, multi-guide selectors and parity of pruned inputs/settings.
+
+Current protected execution policy still imposes its explicit resource limits,
+serving window, budget, exact model/manifest and capacity checks. A source change
+does not rewrite that policy, extend a rental, enable a worker or authorize paid
+inference. Public `generation_support` distinguishes `supported_constraints`
+from `execution_policy_constraints`; always inspect the actual preflight. The
+legacy BF16 candidate below remains its own frozen compiler/manifest contract.
 
 ### Offline Ref2VA candidate
 

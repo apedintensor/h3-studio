@@ -10,23 +10,20 @@ import re
 from .protocol import BackendError
 from .wangp_contract import InputDescriptor, PreparedRequest, canonical_json
 from .wangp_compiler import FIXED_CONTROLS, MAX_SEED, control_schema as legacy_schema
-from ..runtime_catalog import get_profile, model_for, supported_cases, validate_manifest
+from ..runtime_catalog import get_profile, model_for, validate_manifest
+from ..h3_profile_support import MAX_FRAMES, MAX_STEPS, SAMPLERS
 from ..storage import key_belongs_to, validate_key
 
 
 def control_schema(profile_id, mode):
     model_for(profile_id, mode)
-    cases = [c for c in supported_cases(profile_id) if c['mode'] == mode]
     schema = legacy_schema()
-    schema['steps'].update(default=20, enum=sorted({c['steps'] for c in cases}))
-    schema['duration'].update(default=5, minimum=5, maximum=5, enum=[5])
-    schema['resolution'].update(default='480P', enum=sorted({str(c['height'])+'P' for c in cases}))
-    schema['aspect_ratio'].update(default='16:9', enum=['16:9'])
-    for key in ('width', 'height'):
-        values = sorted({c[key] for c in cases})
-        schema[key].update(minimum=min(values), maximum=max(values), enum=values)
-    # Marginal enums describe controls, not an unrestricted Cartesian product.
-    # normalize_request also enforces the exact joint case including input roles.
+    schema['steps'] = {'type':'integer','default':20,'minimum':1,'maximum':MAX_STEPS}
+    schema['sampler_name'].update(enum=list(SAMPLERS))
+    schema['duration'].update(default=5)
+    schema['resolution'].update(default='480P')
+    # The native canvas validator and protected resource policy constrain shapes.
+    # Historical joint cases only supply exact timing hints, never admission.
     return schema
 
 
@@ -49,7 +46,7 @@ def normalize_request(request, metadata, output_spec, profile_id):
     if not isinstance(value.get('prompt'), str) or not value['prompt'].strip() or len(value['prompt']) > 12000:
         raise ValueError('wangp_invalid_prompt')
     for key, expected in FIXED_CONTROLS.items():
-        if key == 'steps':
+        if key in {'steps', 'sampler_name'}:
             continue
         actual = value.get(key, expected)
         if key in {'shift_video','shift_audio'} and actual is None:
@@ -58,21 +55,22 @@ def normalize_request(request, metadata, output_spec, profile_id):
             raise ValueError('wangp_unsupported_' + key)
         value[key] = expected
     steps = value.setdefault('steps', 20)
-    if type(steps) is not int or steps not in (20, 50):
-        raise ValueError('wangp_unsupported_steps')
+    if type(steps) is not int or not 1 <= steps <= MAX_STEPS:
+        raise ValueError('wangp_invalid_steps')
+    if value.setdefault('sampler_name','euler') not in SAMPLERS:
+        raise ValueError('wangp_unsupported_sampler_name')
     seed = value.get('seed', '0')
     if (isinstance(seed, bool) or not isinstance(seed, (str,int))
             or not re.fullmatch(r'[0-9]{1,20}', str(seed)) or int(seed) > MAX_SEED):
         raise ValueError('wangp_invalid_seed')
     value['seed'] = str(int(seed))
-    if type(value.setdefault('duration', 5)) is not int or value['duration'] != 5:
-        raise ValueError('wangp_profile_native_duration_required')
+    if type(value.setdefault('duration', 5)) is not int or not 4 <= value['duration'] <= 15:
+        raise ValueError('wangp_invalid_duration')
     value.setdefault('resolution', '480P')
     value.setdefault('aspect_ratio', '16:9')
-    if value['resolution'] not in ('480P','768P') or value['aspect_ratio'] != '16:9':
-        raise ValueError('wangp_profile_output_exceeded')
     from comfy_workflow import native_output_spec
-    if (native_output_spec(value) != output_spec or output_spec.get('frames') != 124
+    if (native_output_spec(value) != output_spec
+            or not 107 <= output_spec.get('frames',0) <= MAX_FRAMES or output_spec['frames']%17 != 5
             or any(type(output_spec.get(k)) is not int for k in ('width','height','frames'))):
         raise ValueError('wangp_output_spec_mismatch')
     for key in ('width','height'):
@@ -82,19 +80,20 @@ def normalize_request(request, metadata, output_spec, profile_id):
     if not isinstance(inputs, dict) or set(inputs)-{'images','videos','audios','first_frame','last_frame'}:
         raise ValueError('wangp_invalid_inputs')
     inputs = {**{'images':[], 'videos':[], 'audios':[], 'first_frame':None, 'last_frame':None}, **inputs}
-    ids, roles = [], []
+    ids = []
     if mode == 'fl':
         if any(inputs[k] != [] for k in ('images','videos','audios')) or value.get('video_audio', {}) != {}:
-            raise ValueError('wangp_first_last_images_only')
+            raise ValueError('wangp_adapter_fl_reference_inputs_unmapped')
         pairs = [(role, 'image', [inputs[role]] if inputs[role] is not None else [])
                  for role in ('first_frame','last_frame')]
     else:
         if inputs['first_frame'] is not None or inputs['last_frame'] is not None:
-            raise ValueError('wangp_ref_first_last_or_guides_unsupported')
+            raise ValueError('wangp_adapter_ref_first_last_unmapped')
         pairs = [(kind, kind, inputs[plural]) for plural,kind in
                  (('images','image'),('videos','video'),('audios','audio'))]
     for role, kind, values in pairs:
-        if not isinstance(values, list) or len(values) > 1:
+        maximum = {'image':9,'video':3,'audio':3}.get(role,1)
+        if not isinstance(values, list) or len(values) > maximum:
             raise ValueError('wangp_profile_reference_count_exceeded')
         for identity in values:
             if not isinstance(identity, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,200}', identity):
@@ -108,28 +107,35 @@ def normalize_request(request, metadata, output_spec, profile_id):
                 if kind in ('image','video'):
                     w,h = meta.get('width'),meta.get('height')
                     if (type(w) is not int or type(h) is not int or min(w,h)<256
-                            or max(w,h)>832 or w*h>832*480 or not .4 <= w/h <= 2.5):
-                        raise ValueError('wangp_ref_qualification_pixels_exceeded')
+                            or max(w,h)>5760 or not .4 <= w/h <= 2.5):
+                        raise ValueError('wangp_ref_invalid_dimensions')
                 if kind == 'video' and (meta.get('has_audio') is not False or meta.get('fps') != 24
-                        or type(meta.get('frame_count')) is not int or meta['frame_count'] != 56
-                        or not _number(meta.get('duration')) or abs(meta['duration']-56/24)>1e-6
-                        or not _number(meta.get('source_duration')) or not 2 <= meta['source_duration'] <= 3.1):
+                        or type(meta.get('frame_count')) is not int or not 56 <= meta['frame_count'] <= MAX_FRAMES
+                        or meta['frame_count']%17 != 5 or not _number(meta.get('duration'))
+                        or abs(meta['duration']-meta['frame_count']/24)>1e-6
+                        or not _number(meta.get('source_duration')) or not 2 <= meta['source_duration'] <= 15):
                     raise ValueError('wangp_ref_aligned_video_required')
-                if kind == 'audio' and (not _number(meta.get('duration')) or not 2 <= meta['duration'] <= 5.2
+                if kind == 'audio' and (not _number(meta.get('duration')) or not 2 <= meta['duration'] <= 15
                         or meta.get('sample_rate') != 32000 or meta.get('channels') != 2):
                     raise ValueError('wangp_ref_selected_audio_required')
             ids.append(identity)
-            roles.append(role)
     if len(set(ids)) != len(ids) or set(ids) != set(metadata):
         raise ValueError('wangp_input_snapshot_mismatch')
+    if mode == 'ref':
+        if not ids:
+            raise ValueError('wangp_ref_reference_required')
+        if len(ids)>12:
+            raise ValueError('wangp_profile_reference_count_exceeded')
+        if len(inputs['audios'])>len(inputs['images'])+len(inputs['videos']):
+            raise ValueError('wangp_ref_audio_requires_visual_reference')
+        if sum(metadata[i]['frame_count'] for i in inputs['videos'])>MAX_FRAMES:
+            raise ValueError('wangp_ref_total_video_duration_exceeded')
+        if sum(metadata[i]['duration'] for i in inputs['audios'])>15:
+            raise ValueError('wangp_ref_total_audio_duration_exceeded')
     expected_audio = {identity:False for identity in inputs['videos']}
     if (value.get('video_audio', {}) != expected_audio
             or any(type(v) is not bool for v in value.get('video_audio', {}).values())):
-        raise ValueError('wangp_ref_soundtrack_unsupported')
-    wanted = (mode, output_spec['width'], output_spec['height'], 124, 24, steps, sorted(roles))
-    if not any((case['mode'], case['width'], case['height'], case['frames'], case['fps'],
-                case['steps'], sorted(case['input_roles'])) == wanted for case in supported_cases(profile_id)):
-        raise ValueError('wangp_profile_joint_envelope_unverified')
+        raise ValueError('wangp_adapter_reference_video_soundtrack_unmapped')
     value.update(inputs=inputs, video_audio=expected_audio)
     return value
 
@@ -145,18 +151,21 @@ def compile_settings(request, metadata, output_spec, handles, profile_id):
     return {
         'model_type':model_for(profile_id, value['mode'])['model_type'], 'config':runtime['task_config'], 'image_mode':0,
         'prompt':value['prompt'], 'negative_prompt':'', 'alt_prompt':'',
-        'resolution':f"{output_spec['width']}x{output_spec['height']}", 'video_length':124, 'force_fps':'24',
+        'resolution':f"{output_spec['width']}x{output_spec['height']}", 'video_length':output_spec['frames'], 'force_fps':'24',
         'num_inference_steps':value['steps'], 'seed':int(value['seed']), 'guidance_scale':1.0,
-        'guidance_phases':1, 'flow_shift':12.0, 'sample_solver':'euler', 'denoising_strength':1.0,
+        'guidance_phases':1, 'flow_shift':12.0, 'sample_solver':value['sampler_name'], 'denoising_strength':1.0,
         'image_prompt_type':('S' if first else 'T')+('E' if last else ''),
         'image_start':handles.get(first), 'image_end':handles.get(last),
-        'video_prompt_type':('I' if images else '')+('V-U' if videos else ''),
+        'video_prompt_type':('I' if images else '')+({0:'',1:'V-U',2:'V+-U',3:'V+*-U'}[len(videos)]),
         'image_refs':[handles[i] for i in images] or None,
         'video_guide':handles[videos[0]] if videos else None,
         'audio_guide':handles[audios[0]] if audios else None,
-        'audio_prompt_type':'A' if audios else '', 'image_refs_relative_size':100,
+        'audio_prompt_type':{0:'',1:'A',2:'AB',3:'ABD'}[len(audios)], 'image_refs_relative_size':100,
         'remove_background_images_ref':0, 'video_source':None, 'audio_source':None,
-        'video_guide2':None, 'video_guide3':None, 'audio_guide2':None, 'audio_guide3':None,
+        'video_guide2':handles[videos[1]] if len(videos)>1 else None,
+        'video_guide3':handles[videos[2]] if len(videos)>2 else None,
+        'audio_guide2':handles[audios[1]] if len(audios)>1 else None,
+        'audio_guide3':handles[audios[2]] if len(audios)>2 else None,
         'repeat_generation':1, 'batch_size':1, 'multi_prompts_gen_type':'FG', 'multi_images_gen_type':0,
         'prompt_enhancer':'', 'activated_loras':[], 'skip_steps_cache_type':'',
         'override_attention':'sdpa', 'override_profile':runtime['memory_profile'],
@@ -246,18 +255,42 @@ def validate_prepared(prepared, manifest):
             inputs[role] = take(handle,'image')
     refs = settings.get('image_refs')
     if refs is not None:
-        if not isinstance(refs,list) or len(refs)!=1:
+        if not isinstance(refs,list) or not 1 <= len(refs)<=9:
             raise ValueError('wangp_profile_reference_count_exceeded')
-        inputs['images'] = [take(refs[0],'image')]
-    for field,plural,kind in (('video_guide','videos','video'),('audio_guide','audios','audio')):
-        if settings.get(field) is not None:
-            inputs[plural] = [take(settings[field],kind)]
+        inputs['images'] = [take(handle,'image') for handle in refs]
+    for plural,kind in (('videos','video'),('audios','audio')):
+        for suffix in ('','2','3'):
+            handle = settings.get(kind+'_guide'+suffix)
+            if handle is not None:
+                inputs[plural].append(take(handle,kind))
     if len(handles) != len(descriptors):
         raise ValueError('wangp_unused_input_handle')
     output = json.loads(prepared.output_spec_json)
+    from comfy_workflow import native_output_spec
+    if not isinstance(output,dict):
+        raise ValueError('wangp_output_spec_mismatch')
+    canvas = None
+    schema = control_schema(profile['id'],doc['mode'])
+    for resolution in schema['resolution']['enum']:
+        for aspect in schema['aspect_ratio']['enum']:
+            for duration in range(4,16):
+                candidate = {'resolution':resolution,'aspect_ratio':aspect,'duration':duration}
+                if resolution=='custom':
+                    candidate.update(width=output.get('width'),height=output.get('height'))
+                try:
+                    matches = native_output_spec(candidate)==output
+                except ValueError:
+                    matches = False
+                if matches:
+                    canvas=candidate
+                    break
+            if canvas is not None: break
+        if canvas is not None: break
+    if canvas is None:
+        raise ValueError('wangp_output_spec_mismatch')
     request = {'model':profile['model_id'],'mode':doc['mode'],'prompt':settings.get('prompt'),
         'seed':settings.get('seed'),'steps':settings.get('num_inference_steps'),
-        'resolution':str(output.get('height'))+'P','duration':5,'aspect_ratio':'16:9','inputs':inputs,
+        **canvas,'inputs':inputs,'sampler_name':settings.get('sample_solver'),
         'video_audio':{identity:False for identity in inputs['videos']}}
     expected = compile_settings(request,metadata,output,handles,profile['id'])
     expected['output_filename'] = 'sixnine-'+prepared.attempt_tag

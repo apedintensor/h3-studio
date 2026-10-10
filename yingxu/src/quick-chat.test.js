@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {createQuickChatClient} from './quick-chat-client.js';
 import {createQuickChatController,saveMaterialSelection} from './quick-chat-controller.js';
+import {saveDraft,readDraft,draftSnapshot,rememberDraftOrigin,clearAcceptedDraft,carryDraft} from './quick-chat-draft.js';
 import {defaultsFor,nextSettingsFor,effectiveControlSchema,effectiveLimits,settingsProblems,bindingProblems,bindingPayload,bindingsToInputs,mergeTimelineTurns,isInternalDerivedInventory} from './quick-chat-model.js';
 const memory=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(key,value)=>data.set(key,value),removeItem:key=>data.delete(key)};};
 const capability={recipes:[{id:'fl',mode:'fl',controls:{duration:{type:'integer',minimum:4,maximum:15,default:5},resolution:{type:'string',enum:['480P','768P'],default:'768P'},seed:{type:['string','null'],default:null},steps:{type:'integer',minimum:1,maximum:100,default:50},video_decode:{type:'string',enum:['normal','tiled'],default:'normal'}},limits:{max_images:9,max_videos:3,max_audios:3,max_total_files:12,max_guides:8,min_clip_duration:2,max_clip_duration:15,max_total_video_duration:15,max_total_audio_duration:15},execution_support:{constraints:{max_steps:50,max_duration_seconds:124/24,max_reference_files:3,max_guides:1,controls:{video_decode:['tiled']},input_limits:{max_images:1,max_videos:1,max_audios:1,max_video_duration_seconds:10,max_audio_duration_seconds:10,guide_kinds:['image'],guide_recipe_ids:['ref']}}},deployment_preset:{controls:{video_decode:'tiled'}}}]};
@@ -12,6 +13,42 @@ test('guides use their independent current recipe allowance',()=>{const binding=
 test('assistant lifecycle updates one durable turn, not duplicate history messages',()=>{const initial={id:'t',seq:1,text:'我的想法',status:'running'};const turns=mergeTimelineTurns([{id:'e1',seq:1,type:'turn.created',record:initial},{id:'e2',seq:2,type:'assistant.completed',record:{...initial,status:'completed',reply:'持久结果'}}]);assert.equal(turns.length,1);assert.equal(turns[0].reply,'持久结果');});
 test('client uses same-origin account fence, original idempotency and exact creative paths',async()=>{const calls=[],client=createQuickChatClient({fetcher:async(path,options)=>{calls.push({path,options});return new Response('{"session":{"id":"s"}}');}});client.setAccount('superdan');await client.createSession({model_id:'gemini-3.8-flash'},'logical-create');await client.preflight('s','r',{item_ids:['i'],retry_of_execution_id:'old'},'logical-pref');assert.equal(calls[0].path,'/v1/quick-chat/sessions');assert.equal(calls[0].options.credentials,'same-origin');assert.equal(calls[0].options.headers['X-Expected-Account'],'superdan');assert.equal(calls[1].options.headers['Idempotency-Key'],'logical-pref');assert.deepEqual(JSON.parse(calls[1].options.body).item_ids,['i']);});
 function fakeClient(overrides={}){let account;return {setAccount:value=>account=value,reset(){},schema:async()=>({models:[]}),capabilities:async()=>capability,sessions:async()=>({sessions:[{id:'s',title:'测试',version:1}]}),createSession:async()=>({session:{id:'s',title:'测试',version:1}}),session:async id=>({session:{id,version:1}}),materials:async()=>({bindings:[]}),timeline:async()=>({events:[]}),...overrides};}
+test('a durable generation receipt clears only the submitted draft, preserving settings and history on reload',async()=>{
+  const storage=memory();saveDraft('owner','s','original prompt',{storage,edit:true});
+  const draft=draftSnapshot(storage,'owner','s');let accepted=false;
+  const receipt={status:'accepted',turn_id:'turn',revision_id:'revision',submission_id:'submission'},settings={recipe_id:'fl',controls:{resolution:'768P'},copies:2};
+  const client=fakeClient({session:async()=>({session:{id:'s',version:accepted?2:1,next_settings:settings,composer_reset:accepted?receipt:null}}),turn:async()=>({id:'turn'}),timeline:async()=>({events:[{id:'old',seq:1,type:'turn.created',record:{id:'old-turn',text:'history',status:'recorded'}}]})});
+  const controller=createQuickChatController({client,storage});await controller.setAccount('owner');await controller.open('s');
+  await controller.turn('original prompt','gemini-3.8-flash','none',{draft});
+  assert.equal(readDraft('owner','s',storage),'original prompt');assert.equal(controller.getState().draftReset,null);
+  accepted=true;await controller.poll();assert.equal(readDraft('owner','s',storage),'');assert.equal(controller.getState().draftReset.submissionId,'submission');
+  assert.deepEqual(controller.getState().session.next_settings,settings);assert.equal(controller.getState().timeline.length,1);
+  const fresh=createQuickChatController({client,storage});await fresh.setAccount('owner');await fresh.open('s');assert.equal(readDraft('owner','s',storage),'');assert.equal(fresh.getState().timeline.length,1);
+});
+test('newer draft edits including ABA survive late accepted submission and account isolation is retained',()=>{
+  const storage=memory();saveDraft('a','s','same',{storage,edit:true});const original=draftSnapshot(storage,'a','s');
+  saveDraft('a','s','newer',{storage,edit:true});saveDraft('a','s','same',{storage,edit:true});rememberDraftOrigin(storage,'a','s',original,'turn');
+  const receipt={status:'accepted',turn_id:'turn'};assert.equal(clearAcceptedDraft(storage,'a','s',receipt),false);assert.equal(readDraft('a','s',storage),'same');
+  saveDraft('b','s','other account',{storage,edit:true});assert.equal(clearAcceptedDraft(storage,'b','s',receipt),false);assert.equal(readDraft('b','s',storage),'other account');
+  const current=draftSnapshot(storage,'a','s');rememberDraftOrigin(storage,'a','s',current,'next');assert.equal(clearAcceptedDraft(storage,'a','s',{status:'admission_blocked',turn_id:'next'}),false);
+  assert.equal(clearAcceptedDraft(storage,'a','s',{status:'accepted',turn_id:'next'}),true);assert.equal(clearAcceptedDraft(storage,'a','s',{status:'accepted',turn_id:'next'}),false);
+});
+test('first-session carry preserves draft identity and recovery links the original turn without resubmission',async()=>{
+  const storage=memory();saveDraft('owner',null,'first prompt',{storage,edit:true});const draft=draftSnapshot(storage,'owner',null);carryDraft(storage,'owner',null,'owner','s');
+  let committed=false;const calls=[];const client=fakeClient({session:async()=>({session:{id:'s',version:1,composer_reset:committed?{status:'accepted',turn_id:'turn',submission_id:'original-submission'}:null}}),turn:async(_id,body,key)=>{calls.push({body,key});committed=true;if(calls.length===1)throw Error('lost response');return {id:'turn'};}});
+  const first=createQuickChatController({client,storage});await first.setAccount('owner');await first.open('s');await assert.rejects(first.turn('first prompt','gemini-3.8-flash','none',{draft,createCard:true}));
+  assert.equal(readDraft('owner','s',storage),'first prompt');assert.deepEqual(first.getState().pending.draft,draft);
+  const restored=createQuickChatController({client,storage});await restored.setAccount('owner');await restored.open('s');assert.equal(readDraft('owner','s',storage),'first prompt');
+  await restored.recover();assert.deepEqual(calls[0],calls[1]);assert.equal(restored.getState().pending,null);assert.equal(readDraft('owner','s',storage),'');
+});
+test('late accepted receipt from a former account cannot clear either account draft',async()=>{
+  const storage=memory();for(const account of ['old','new'])saveDraft(account,'s',account+' draft',{storage,edit:true});
+  rememberDraftOrigin(storage,'old','s',draftSnapshot(storage,'old','s'),'old-turn');let defer=false,finish;
+  const client=fakeClient({session:async()=>defer?new Promise(resolve=>{finish=resolve;}):{session:{id:'s',version:1}}});
+  const controller=createQuickChatController({client,storage});await controller.setAccount('old');await controller.open('s');defer=true;const poll=controller.poll();await Promise.resolve();await controller.setAccount('new');
+  finish({session:{id:'s',version:2,composer_reset:{status:'accepted',turn_id:'old-turn'}}});await assert.rejects(poll);
+  assert.equal(readDraft('old','s',storage),'old draft');assert.equal(readDraft('new','s',storage),'new draft');assert.equal(controller.getState().draftReset,null);
+});
 test('a completed automatic title refreshes loaded history without replacing paged sessions or timeline',async()=>{
   let title='新的创作',listReads=0;
   const client=fakeClient({

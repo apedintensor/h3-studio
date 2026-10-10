@@ -25,7 +25,7 @@ from studio_platform.runtime_hosts.wangp_environment import (
 PRIVATE_FILES = (
     "comfy_workflow.py",
     "studio_platform/__init__.py", "studio_platform/storage.py", "studio_platform/storage_config.py",
-    "studio_platform/media_process.py",
+    "studio_platform/media_process.py", "studio_platform/h3_profile_support.py",
     "studio_platform/inference/__init__.py", "studio_platform/inference/protocol.py",
     "studio_platform/inference/wangp.py", "studio_platform/inference/wangp_contract.py",
     "studio_platform/inference/wangp_compiler.py", "studio_platform/inference/wangp_http.py",

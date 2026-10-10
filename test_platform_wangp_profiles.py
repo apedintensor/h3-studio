@@ -51,6 +51,91 @@ def job_for(profile_id, case):
 
 
 class ProfileCompilerTests(unittest.TestCase):
+    def test_advertised_native_canvas_shapes_survive_host_template_validation(self):
+        identity=PROFILE_IDS[0]
+        schema=control_schema(identity,'fl')
+        for resolution in schema['resolution']['enum']:
+            for aspect in schema['aspect_ratio']['enum']:
+                job,manifest=job_for(identity,{'mode':'fl','height':480,'steps':20,'input_roles':[]})
+                job['request']['request'].update(resolution=resolution,aspect_ratio=aspect)
+                if resolution=='custom': job['request']['request'].update(width=768,height=1024)
+                job['request']['output_spec']=native_output_spec(job['request']['request'])
+                with self.subTest(resolution=resolution,aspect=aspect):
+                    prepared=H3ProfileCompiler(manifest,lambda *a:self.fail('no assets'))(
+                        job,'canvas',None,lambda:None)
+                    validate_prepared(prepared,manifest)
+
+    def test_unmeasured_first_only_last_only_and_changed_controls_keep_exact_profile(self):
+        for identity in PROFILE_IDS:
+            for roles in ([],['first_frame'],['last_frame'],['first_frame','last_frame']):
+                for controls in ({'steps':30,'duration':6,'resolution':'576P','aspect_ratio':'1:1'},
+                        {'steps':50,'duration':15,'resolution':'custom','width':512,'height':512,
+                         'sampler_name':'res_multistep'}):
+                    case={'mode':'fl','height':480,'steps':20,'input_roles':roles}
+                    job,manifest=job_for(identity,case)
+                    job['request']['request'].update(controls)
+                    job['request']['output_spec']=native_output_spec(job['request']['request'])
+                    staged=[]
+                    compiler=H3ProfileCompiler(manifest,lambda item,*a,**k:staged.append(item) or item)
+                    with self.subTest(profile=identity,roles=roles,controls=controls):
+                        prepared=compiler(job,'unmeasured',NS(open=lambda _:io.BytesIO(b'data')),lambda:None)
+                        validate_prepared(prepared,manifest)
+                        settings=prepared.settings
+                        self.assertEqual(settings['config'],get_profile(identity)['runtime']['task_config'])
+                        self.assertEqual(settings['num_inference_steps'],controls['steps'])
+                        self.assertEqual(settings['video_length'],job['request']['output_spec']['frames'])
+                        self.assertEqual(settings['image_prompt_type'],('S' if 'first_frame' in roles else 'T')+
+                            ('E' if 'last_frame' in roles else ''))
+                        self.assertEqual(len(staged),len(roles))
+
+    def test_multiple_reference_handles_map_in_order_and_host_consumes_every_input_once(self):
+        identity=PROFILE_IDS[0]
+        job,manifest=job_for(identity,{'mode':'ref','height':480,'steps':20,'input_roles':['image','video','audio']})
+        request=job['request']['request']; assets=job['request']['assets']
+        for plural,kind in (('images','image'),('videos','video'),('audios','audio')):
+            request['inputs'][plural]=[]
+            for index in range(3):
+                key=kind+str(index); request['inputs'][plural].append(key)
+                assets[key]=copy.deepcopy(assets[kind])
+                assets[key]['model']['key']=f'owners/owner/assets/{key}/file'
+                if kind=='audio': assets[key]['metadata']['duration']=4
+            del assets[kind]
+        request['video_audio']={key:False for key in request['inputs']['videos']}
+        request.update(steps=30,duration=8)
+        job['request']['output_spec']=native_output_spec(request)
+        prepared=H3ProfileCompiler(manifest,lambda item,*a,**k:item)(job,'multiple',
+            NS(open=lambda _:io.BytesIO(b'data')),lambda:None)
+        consumed=[]
+        def resolve(item,**kwargs): consumed.append(item.asset_id); return '/private/'+item.asset_id
+        aggregate=[]
+        resolved=resolve_inputs(prepared,NS(image_path=resolve,video_path=resolve,audio_path=resolve,
+            validate_reference_totals=lambda values,**kw:aggregate.append(values)),manifest)
+        self.assertEqual(resolved['video_prompt_type'],'IV+*-U')
+        self.assertEqual(resolved['audio_prompt_type'],'ABD')
+        self.assertEqual(resolved['video_guide3'],'/private/video2')
+        self.assertEqual(resolved['audio_guide2'],'/private/audio1')
+        self.assertEqual(resolved['image_refs'],['/private/image0','/private/image1','/private/image2'])
+        self.assertCountEqual(consumed,assets)
+        self.assertEqual(len(consumed),len(set(consumed)))
+        self.assertEqual(len(aggregate),1)
+        self.assertCountEqual([d.asset_id for d in aggregate[0]],assets)
+        for change in ('aggregate_audio','aggregate_video','missing_visual','mixed_mode'):
+            bad=copy.deepcopy(job); req=bad['request']['request']; meta=bad['request']['assets']
+            if change=='aggregate_audio':
+                for a in req['inputs']['audios']: meta[a]['metadata']['duration']=6
+            elif change=='aggregate_video':
+                for v in req['inputs']['videos']: meta[v]['metadata'].update(frame_count=124,duration=124/24)
+            elif change=='missing_visual':
+                for plural in ('images','videos'):
+                    for key in req['inputs'][plural]: del meta[key]
+                    req['inputs'][plural]=[]
+                req['video_audio']={}
+            else:
+                req['inputs']['first_frame']='image0'
+            with self.subTest(change=change),self.assertRaises(BackendError):
+                H3ProfileCompiler(manifest,lambda *a,**k:self.fail('invalid request transferred'))(
+                    bad,'invalid',None,lambda:None)
+
     def test_all_22_verified_joint_cases_compile_without_precision_or_role_substitution(self):
         for identity in PROFILE_IDS:
             profile = get_profile(identity)
@@ -73,17 +158,17 @@ class ProfileCompilerTests(unittest.TestCase):
                         self.assertEqual(settings['audio_prompt_type'],'A')
                         self.assertIsNone(settings['audio_source'])
 
-    def test_untested_controls_roles_and_frame_trimming_fail_before_staging(self):
+    def test_invalid_or_unmapped_controls_and_frame_trimming_fail_before_staging(self):
         identity = PROFILE_IDS[1]
         case = get_profile(identity)['verified_cases'][3]
         request, metadata = example(identity,case)
-        for changes in ({'steps':30},{'steps':True},{'resolution':'768P','steps':50},
-                {'model':'MiniMax-H3-Base-BF16'},{'duration':6},{'generate_audio':False},
+        for changes in ({'steps':101},{'steps':True},
+                {'model':'MiniMax-H3-Base-BF16'},{'duration':16},{'generate_audio':False},
                 {'shift_audio':4},{'guides':[]},{'video_audio':{'video':True}}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 value = {**request,**changes}
                 normalize_request(value,metadata,native_output_spec(value),identity)
-        for frame_count in (39,48,73):
+        for frame_count in (39,48,74):
             changed = copy.deepcopy(metadata)
             changed['video'].update(frame_count=frame_count,duration=frame_count/24)
             with self.assertRaisesRegex(ValueError,'aligned_video_required'):
@@ -91,8 +176,8 @@ class ProfileCompilerTests(unittest.TestCase):
         request['inputs']['videos'] = []
         request['video_audio'] = {}
         metadata.pop('video')
-        with self.assertRaisesRegex(ValueError,'joint_envelope_unverified'):
-            normalize_request(request,metadata,native_output_spec(request),identity)
+        normalized = normalize_request(request,metadata,native_output_spec(request),identity)
+        self.assertEqual(normalized['inputs']['images'],['image'])
 
     def test_compiler_binds_both_profile_identities_and_owner_before_any_upload(self):
         identity = PROFILE_IDS[2]
@@ -126,7 +211,7 @@ class ProfileCompilerTests(unittest.TestCase):
             audio_path=lambda *a,**kw:paths.append(kw['deployment_profile_id']) or '/private/audio.wav')
         resolved = resolve_inputs(prepared,inputs,manifest)
         self.assertEqual(resolved['video_guide'],'/private/video.mp4')
-        for changes in ({'config':'bf16,bf16'},{'num_inference_steps':50},{'repeat_generation':2},
+        for changes in ({'config':'bf16,bf16'},{'num_inference_steps':101},{'repeat_generation':2},
                 {'video_prompt_type':'VP'},{'audio_source':'secret'},{'prompt_enhancer':'anything'},
                 {'sliding_window_trim_first_frames':1},{'unknown':1}):
             altered = replace(prepared,settings_json=canonical_json({**prepared.settings,**changes}))
@@ -171,7 +256,7 @@ class ProfileCompilerTests(unittest.TestCase):
                 self.assertEqual(host.submit(prepared).state,'running')
                 self.assertEqual(host.submit(prepared).state,'running')
                 self.assertEqual(len(calls),1)
-                changed = {**prepared.settings,'num_inference_steps':50}
+                changed = {**prepared.settings,'num_inference_steps':101}
                 wrong = replace(prepared,attempt_tag='attempt-2',settings_json=canonical_json(changed))
                 with self.assertRaisesRegex(BackendError,'settings_resolution_failed'):
                     host.submit(wrong)
@@ -244,7 +329,7 @@ class ProfileSessionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'backend_changed'):
                 _audit_profile_runtime(session,manifest,config)
 
-    def test_staged_media_profile_extends_audio_only_and_rejects_unaligned_video(self):
+    def test_staged_media_profile_uses_native_reference_bounds_and_rejects_unaligned_video(self):
         with tempfile.TemporaryDirectory() as directory:
             inputs = StagedInputs(directory)
             audio = InputDescriptor('a','ha','audio','a'*64,4)
@@ -259,9 +344,28 @@ class ProfileSessionTests(unittest.TestCase):
             with patch.object(inputs,'_probe_reference',return_value=(stream,{})), \
                  patch.object(inputs,'_typed_copy',return_value=Path(directory)/'video.mp4'):
                 inputs.video_path(video)
+                inputs.video_path(video,deployment_profile_id=PROFILE_IDS[1])
+                stream.update(nb_read_frames='74',duration=str(74/24))
                 with self.assertRaises(ValueError): inputs.video_path(video,deployment_profile_id=PROFILE_IDS[1])
                 stream.update(nb_read_frames='56',duration=str(56/24))
                 inputs.video_path(video,deployment_profile_id=PROFILE_IDS[1])
+
+    def test_host_checks_actual_aggregate_not_placeholder_metadata_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs=StagedInputs(directory)
+            descriptors=[InputDescriptor('v'+str(n),'hv'+str(n),'video',str(n)*64,4) for n in (1,2)]
+            descriptors += [InputDescriptor('a'+str(n),'ha'+str(n),'audio',str(n+2)*64,4) for n in (1,2)]
+            video_frames,audio_seconds=124,5
+            def probe(descriptor,kind):
+                return ({'nb_read_frames':str(video_frames)},{}) if kind=='video' else ({},{'duration':str(audio_seconds)})
+            with patch.object(inputs,'_probe_reference',side_effect=probe):
+                inputs.validate_reference_totals(descriptors,deployment_profile_id=PROFILE_IDS[0])
+                video_frames=192
+                with self.assertRaisesRegex(ValueError,'total_video_duration_exceeded'):
+                    inputs.validate_reference_totals(descriptors,deployment_profile_id=PROFILE_IDS[0])
+                video_frames=124;audio_seconds=8
+                with self.assertRaisesRegex(ValueError,'total_audio_duration_exceeded'):
+                    inputs.validate_reference_totals(descriptors,deployment_profile_id=PROFILE_IDS[0])
 
     def test_native_source_attestation_rejects_other_install_metadata_before_weights(self):
         from studio_platform.runtime_hosts.wangp_session import verify_runtime

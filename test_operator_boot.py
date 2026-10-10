@@ -39,7 +39,7 @@ class FakeConnection:
 class FakeRepo:
     def __init__(self,binding):
         self.intent={'id':INTENT,'provider':'lium','provider_instance_id':INSTANCE,'state':'starting','hard_deadline':5000}
-        self.node={'desired_state':'running','binding_hash':binding.fingerprint,'binding_id':'binding',
+        self.node={'desired_state':'running','runtime_state':'ready','binding_hash':binding.fingerprint,'binding_id':'binding',
             'payload':{'lifetime':{'state':'verified','instance_id':INSTANCE,'observed_at':1000,'safe_deadline':5000}}}
         self.worker=None
         self.engine=NS(connect=lambda:FakeConnection(self))
@@ -77,7 +77,7 @@ class OperatorBootTests(unittest.TestCase):
             for name in subject.SOURCE_NAMES:
                 (directory/name).write_bytes((name+str(index)).encode())
             sources.append(str(directory))
-        self.binding=NS(runtime_profile_id=profile['id'],execution_slots=2,gpu_count=2,launch=NS(provider='lium'),
+        self.binding=NS(enabled=True,runtime_profile_id=profile['id'],execution_slots=2,gpu_count=2,launch=NS(provider='lium'),
             model_id=profile['model_id'],configuration_id='native-test',recipe_ids=('h3-base-fl2va-v1',),
             engine_manifest_digest=engine_manifest(profile['id'],'fl').digest,fingerprint='f'*64,
             pool='native-test',expires_at=6000,

@@ -77,11 +77,16 @@ def _mode_result(settings, repo, registry, policy, valid, mode, recipe, now):
     else:
         counts = WorkerControl(repo).pool_status(policy["pool"], model_id=policy["model_id"],
             configuration_id=policy["configuration_id"], recipe_id=recipe, backend=policy["backend"],
-            engine_manifest_digest=policy.get("engine_manifest_digest", ""), output_delivery=policy.get("output_delivery", ""))
+            engine_manifest_digest=policy.get("engine_manifest_digest", ""), output_delivery=policy.get("output_delivery", ""),
+            expected_runtime_s=policy["reservation"]["expected_runtime_s"],
+            deployment_profile_id=policy.get("deployment_profile_id"))
         if counts["ready"]:
             state, reason = "ready", "matching_worker_ready"
         elif counts["busy"]:
             state, reason = "busy", "matching_worker_busy"
+        elif counts["reason_counts"]:
+            reason = sorted(counts["reason_counts"])[0]
+            state = "unknown" if reason == "managed_provider_lifetime_unverified" else "unavailable"
         elif counts["unknown"]:
             state, reason = "unknown", "worker_readiness_unconfirmed"
         elif counts["registered"]:

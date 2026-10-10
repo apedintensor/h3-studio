@@ -19,6 +19,7 @@ from .repository import (Scope, metadata, canonical, request_hash, capacity_gate
                          jobs, attempts, registered_workers, registered_devices, scaler_actions, scaler_receipts,
                          paused_capacity_pools, manually_reviewed_inactive)
 from .scaler import LaunchSpec, REMOVAL_CHECK_INTERVAL_SECONDS
+from .operator_extensions import OperatorExtensions
 
 operator_policy = Table("platform_operator_capacity_policy", metadata,
     Column("id", String(30), primary_key=True), Column("version", Integer, nullable=False),
@@ -347,12 +348,13 @@ class OperatorRegistry:
 def command_public(row, nodes=()):
     return {"id":row["id"],"kind":row["kind"],"state":row["state"],"reason_code":row["reason_code"],
             "created_at":row["created_at"],"updated_at":row["updated_at"],
-            "node_ids":[n["intent_id"] for n in nodes],"selection":row["payload"].get("selection")}
+            "node_ids":[n["intent_id"] for n in nodes],"selection":row["payload"].get("selection"),
+            **({"extension":row["payload"]["extension"]} if row["kind"]=="extend" else {})}
 
 
 def node_version(intent, node):
     return request_hash({"id":intent["id"],"state":intent["state"],"provider_instance_id":intent["provider_instance_id"],
-                         "updated_at":intent["updated_at"],"desired_state":node["desired_state"],
+                         "updated_at":intent["updated_at"],"desired_state":node["desired_state"],"hard_deadline":intent["hard_deadline"],
                          **({"manual_review":node["payload"]["manual_review"]} if node["payload"].get("manual_review") else {})})
 
 
@@ -382,7 +384,7 @@ def public_bootstrap(value):
     return result
 
 
-class OperatorCapacity:
+class OperatorCapacity(OperatorExtensions):
     def __init__(self, repo, settings, registry=None):
         self.repo,self.settings,self.registry=repo,settings,registry or OperatorRegistry()
 
@@ -787,14 +789,23 @@ class OperatorCapacity:
             policy=self._policy(connection)
             controller=connection.execute(select(operator_heartbeats).where(operator_heartbeats.c.id=="global")).mappings().first()
             worker_rows=list(connection.execute(select(registered_workers)).mappings())
+            from .worker_admission import worker_window_reason
+            controller_fresh=bool(controller and controller["state"]=="running"
+                and 0<=now-controller["observed_at"]<=CONTROLLER_FRESH_SECONDS)
             managed=list(connection.execute(select(operator_nodes)).mappings())
             intents={row["id"]:row for row in connection.execute(select(instance_intents)).mappings()}
+            node_profiles={(intents[node["intent_id"]]["provider"],intents[node["intent_id"]]["provider_instance_id"]):
+                node["payload"].get("selection",{}).get("runtime_profile_id") for node in managed if node["intent_id"] in intents}
+            worker_admission={worker["id"]:worker_window_reason(connection,worker,now,
+                deployment_profile_id=node_profiles.get((worker["provider"],worker["instance_id"]))) for worker in worker_rows}
             actions={row["intent_id"]:row for row in connection.execute(select(scaler_actions)).mappings()}
             commands=list(connection.execute(select(operator_commands).order_by(operator_commands.c.created_at.desc()).limit(100)).mappings())
             removal_checks=dict(connection.execute(select(scaler_receipts.c.intent_id,
                 func.max(scaler_receipts.c.observed_at)).where(scaler_receipts.c.operation=="removal_check_started")
                 .group_by(scaler_receipts.c.intent_id)).all())
             manual_reviews={row["id"]:manually_reviewed_inactive(connection,row) for row in intents.values()}
+            extension_values={row["intent_id"]:self._extension_value(connection,intents[row["intent_id"]],row,60)
+                for row in managed if row["intent_id"] in intents}
             review_blockers={row["intent_id"]:self._review_blocker(connection,intents[row["intent_id"]],row,now)
                 for row in managed if row["intent_id"] in intents}
             stop_requests={}
@@ -820,6 +831,11 @@ class OperatorCapacity:
                 spec=worker["spec"]
                 slots.append({"id":worker["id"],"gpu_ids":spec["physical_gpu_ids"],"state":worker["state"],
                     "stale":worker["expires_at"]<=now,"current_job_id":worker["current_job_id"],
+                    "admission_allowed":bool(controller_fresh and policy["enabled"] and worker["state"]=="ready"
+                        and not worker["drain_requested"] and worker["current_job_id"] is None
+                        and worker["expires_at"]>now and worker["updated_at"]<=now
+                        and worker["spec_hash"]==request_hash(spec) and worker_admission[worker["id"]] is None),
+                    "admission_reason_code":worker_admission[worker["id"]],
                     "configuration_id":spec["configuration_id"],"recipe_ids":spec["recipe_ids"],
                     "engine_manifest_digest":spec.get("engine_manifest_digest")})
             review=manual_reviews.get(intent["id"])
@@ -827,11 +843,18 @@ class OperatorCapacity:
             availability={"allowed":allowed,"blockers":[] if allowed else [{"code":"operator_node_manually_reviewed" if review else "operator_node_already_destroyed"}]}
             review_blocker="operator_node_manually_reviewed" if review else review_blockers.get(intent["id"])
             bootstrap=public_bootstrap(payload.get("bootstrap"))
+            extension=extension_values[intent["id"]]
+            removal=removal_confirmation(intent,action,removal_checks.get(intent["id"]),requested_at,now,review)
+            record_group=("history" if review or intent["state"]=="destroyed" else
+                "pending_review" if intent["state"]=="creation_unknown" or row["runtime_state"] in
+                {"blocked","failed","observation_failed","bootstrap_unconfigured"}
+                or removal and removal["state"]=="overdue" else "current")
             nodes.append({"id":intent["id"],"version":node_version(intent,row),"provider":intent["provider"],
                 "provider_instance_id":intent["provider_instance_id"],"state":intent["state"],
                 "runtime_state":row["runtime_state"],"desired_state":row["desired_state"],
+                "record_group":record_group,"review_required":record_group=="pending_review",
                 "bootstrap":bootstrap,
-                "removal_confirmation":removal_confirmation(intent,action,removal_checks.get(intent["id"]),requested_at,now,review),
+                "removal_confirmation":removal,
                 "reason_code":bootstrap.get("reason_code") if bootstrap and row["runtime_state"] in {"blocked","failed"} else None,
                 "gpu_count":intent["physical_gpus"],"gpu_model":payload["selection"]["gpu_type"],
                 "runtime_profile_id":payload["selection"]["runtime_profile_id"],"observed_at":observed,"stale":stale,
@@ -841,16 +864,18 @@ class OperatorCapacity:
                 "provider_safe_deadline":payload.get("lifetime",{}).get("safe_deadline"),
                 "provider_lifetime_state":payload.get("lifetime",{}).get("state","unverified"),
                 "provider_lifetime_observed_at":payload.get("lifetime",{}).get("observed_at"),
+                "last_extension":payload.get("last_extension"),
                 "slots":slots,"actions":{"drain":availability,"stop":availability,
+                    "extend":{"allowed":extension["can_extend"],"blockers":extension["blockers"]},
                     "manual_review":{"allowed":review_blocker is None,"blockers":[{"code":review_blocker}] if review_blocker else []}}})
         age=None if controller is None else now-controller["observed_at"]
         return {"schema_version":1,"observed_at":now,"operator":{"account":actor,"permissions":{
-            key:True for key in ("view","start","drain","stop","manual_review","update_policy")}},"policy":policy,
+            key:True for key in ("view","start","drain","stop","extend","manual_review","update_policy")}},"policy":policy,
             "controller":{"state":controller["state"] if controller else "offline",
                           "last_heartbeat_at":controller["observed_at"] if controller else None,"stale":age is None or not 0<=age<=60},
             "summary":{"nodes_active":usage["allocated_instances"],
                 "gpus_allocated":usage["allocated_physical_gpus"],
-                "slots_ready":sum(slot["state"]=="ready" and not slot["stale"] for node in nodes for slot in node["slots"]),
+                "slots_ready":sum(slot["admission_allowed"] for node in nodes for slot in node["slots"]),
                 "jobs_running":running,"jobs_waiting":waiting,"hourly_cost_microusd":None if usage["unpriced"] else usage["hourly"],
                 "hourly_cost_basis":"approved_ceiling_including_pending_commands"},
             "nodes":nodes,"operations":[command_public(row,[node for node in managed if node["command_id"]==row["id"]])

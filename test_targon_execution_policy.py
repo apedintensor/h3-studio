@@ -39,15 +39,39 @@ class TargonExecutionPolicyTests(unittest.TestCase):
                 self.assertIsNone(timing_hint(profile['id'],mode,case['width'],case['height'],
                     case['frames'],case['fps'],case['steps'],case['input_roles']))
 
-    def test_candidate_cannot_broaden_envelope_or_claim_completed_qualification(self):
+    def test_supported_steps_are_not_limited_by_historical_measurements(self):
         for original in self.policies:
-            for field, value in (('max_steps',51), ('max_pixels',1032193)):
+            with self.subTest(recipe=original['recipe_ids'][0]):
+                self.assertEqual(original['envelope']['max_steps'], 50)
+                candidate = copy.deepcopy(original)
+                candidate['envelope']['max_steps'] = 100
+                self.assertIs(validate_policy(candidate), candidate)
+                # Support is not permission to rewrite the protected saved
+                # resource policy, invent timings or claim qualification.
+                self.assertEqual(original['envelope']['max_steps'], 50)
+                for field in ('qualification', 'reservation', 'budget_accounts',
+                              'engine_manifest_digest', 'configuration_id'):
+                    self.assertEqual(candidate[field], original[field])
+
+    def test_candidate_cannot_exceed_implemented_limits_or_claim_completed_qualification(self):
+        for original in self.policies:
+            for field, value, diagnostic in (
+                    ('max_steps', 101, 'policy exceeds implemented model support'),
+                    ('max_pixels', 1032193, 'Invalid execution envelope limit'),
+                    ('max_duration_seconds', 16, 'policy exceeds implemented model support')):
                 broken = copy.deepcopy(original)
                 broken['envelope'][field] = value
-                with self.assertRaises(ValueError): validate_policy(broken)
+                with self.subTest(recipe=original['recipe_ids'][0], field=field):
+                    with self.assertRaisesRegex(ValueError, diagnostic):
+                        validate_policy(broken)
+            broken = copy.deepcopy(original)
+            broken['envelope']['controls']['audio_decode'] = ['chunked']
+            with self.assertRaisesRegex(ValueError, 'policy includes unmapped controls'):
+                validate_policy(broken)
             broken = copy.deepcopy(original)
             broken['qualification']['status'] = 'accepted'
-            with self.assertRaises(ValueError): validate_policy(broken)
+            with self.assertRaisesRegex(ValueError, '^Invalid execution qualification$'):
+                validate_policy(broken)
 
     def test_candidate_requires_explicit_pending_metadata_without_measurements(self):
         value = self.policies[0]
@@ -60,14 +84,30 @@ class TargonExecutionPolicyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'candidate qualification is not pending'):
                     validate_policy(value)
 
-    def test_missing_mode_cases_fail_closed_without_empty_maximum(self):
-        value = self.policies[0]
-        profile = get_profile(value['deployment_profile_id'])
-        profile['qualification_cases'] = [c for c in profile['qualification_cases'] if c['mode']=='ref']
-        profile['verified_cases'] = [c for c in profile['verified_cases'] if c['mode']=='ref']
-        with patch('studio_platform.runtime_catalog.get_profile', return_value=profile):
-            with self.assertRaisesRegex(ValueError, '^Deployment profile envelope exceeds tested scope$'):
-                validate_policy(value)
+    def test_missing_historical_mode_cases_do_not_hide_implemented_support(self):
+        for mode, value in zip(('fl', 'ref'), self.policies):
+            with self.subTest(mode=mode):
+                profile = get_profile(value['deployment_profile_id'])
+                case = next(c for c in profile['verified_cases'] if c['mode'] == mode)
+                profile['qualification_cases'] = [c for c in profile['qualification_cases']
+                    if c['mode'] != mode]
+                profile['verified_cases'] = [c for c in profile['verified_cases'] if c['mode'] != mode]
+                with patch('studio_platform.runtime_catalog.get_profile', return_value=profile):
+                    self.assertIs(validate_policy(value), value)
+                    manifest = engine_manifest(profile['id'], mode)
+                    self.assertEqual(value['engine_manifest_digest'], manifest.digest)
+                    self.assertIs(manifest.document['production_adapter_verified'], False)
+                    self.assertIsNone(timing_hint(profile['id'], mode, case['width'], case['height'],
+                        case['frames'], case['fps'], case['steps'], case['input_roles']))
+
+    def test_missing_implemented_mode_mapping_still_fails_closed(self):
+        for mode, value in zip(('fl', 'ref'), self.policies):
+            with self.subTest(mode=mode):
+                profile = get_profile(value['deployment_profile_id'])
+                profile['models'] = [model for model in profile['models'] if model['mode'] != mode]
+                with patch('studio_platform.runtime_catalog.get_profile', return_value=profile):
+                    with self.assertRaisesRegex(ValueError, '^wangp_profile_mode_unsupported$'):
+                        validate_policy(value)
 
 
 if __name__ == '__main__':

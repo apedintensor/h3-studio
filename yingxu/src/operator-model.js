@@ -38,6 +38,11 @@ export const stateTone=value=>['ready','healthy','complete','completed','succeed
 const reasons={operator_manual_review_controller_unavailable:"人工审核控制器尚未更新或心跳过期，请等待管理员完成启用。",operator_removal_manually_reviewed:'已人工核对账户无机器且未继续扣费，暂停自动核对。',operator_node_manually_reviewed:'此记录已人工审核，保留历史与未结账单。',operator_manual_review_worker_active:'仍有活跃执行槽或任务，暂不能人工审核。',operator_manual_review_device_unreleased:'执行槽设备义务尚未释放，暂不能人工审核。',operator_manual_review_attempt_unsafe:'原任务执行或结果收集未确认安全结束。',operator_manual_review_identity_mismatch:'供应商实例身份发生变化，请刷新后重新核对。',operator_manual_review_requires_requested_removal:'必须先提交这台机器的停止请求。',bootstrap_reconciliation_required:'启动结果需要核对，尚不能确认已准备好。',operator_bootstrap_failed:'启动检查未通过，请先处理已记录的原因。',wangp_configuration_permissions:'运行配置文件权限不符合要求，需要修复后核对原启动。',runtime_process_exited:'模型服务进程提前退出，需要核对原启动。',runtime_readiness_timeout:'模型服务未在规定时间内就绪，需要核对原启动。',wangp_runtime_dependency_missing:'运行环境缺少依赖，需要修复后核对原启动。',UnclassifiedBootstrapFailure:'启动检查异常，具体原因尚未确认。',operator_inventory_stale:'库存信息尚未更新，请等待控制器检查后刷新。',provider_inventory_unavailable:'目前无法核对供应商库存，请稍后刷新。',provider_inventory_unconfirmed:'供应商库存尚未确认，请等待控制器核对。',operator_ttl_below_provider_minimum:'所选期限短于供应商允许的最短期限，请调整本次运行时间后重新预览。',operator_deployment_not_configured:'此配方、模式与硬件尚无匹配的部署配置。',operator_binding_selection_mismatch:'所选条件与已配置部署不匹配。',operator_deployment_not_qualified:'此部署尚未完成执行验收。',operator_inventory_not_configured:'当前服务尚未配置供应商库存查询。',operator_ttl_limit:'所选运行期限超过策略上限。',operator_instance_limit:'将超过机器数量上限。',operator_gpu_limit:'将超过物理 GPU 数量上限。',operator_hourly_cost_limit:'将超过每小时费用上限。',operator_unpriced_existing_capacity:'已有容量的费用尚未核对，先保留原记录。',operator_authority_expiring:'已授权租赁期限不足，请核对原授权。',operator_reservation_insufficient:'预算预留不足以覆盖本次期限。',operator_policy_changed:'启动策略已改变，请核对当前操作。',operator_policy_version_conflict:'策略已被更新，请刷新后重新修改。',operator_binding_changed:'部署配置已改变，请核对原操作。',operator_bootstrap_unconfigured:'工作机启动流程尚未配置。',operator_provider_disabled:'供应商执行尚未启用。',operator_node_observation_stale:'机器观测已过期，请先核对。',operator_active_obligations:'仍有任务或租赁义务需要完成。',operator_capacity_disabled:'手动容量服务未启用。',operator_capacity_unconfigured:'手动容量服务尚未配置。',controller_unavailable:'控制器暂不可用。',controller_stale:'控制器状态已过期。',policy_disabled:'启动策略未启用。',provider_unconfigured:'供应商尚未连接。',no_matching_offers:'没有符合条件的机器。',inventory_unavailable:'目前无法核对库存。',max_instances_exceeded:'将超过机器数量上限。',max_physical_gpus_exceeded:'将超过 GPU 数量上限。',max_hourly_cost_exceeded:'将超过每小时费用上限。',budget_exceeded:'可用预算不足。',active_jobs:'仍有任务正在执行或收集。',pending_obligations:'仍有任务、租赁或费用需要核对。',unknown_rental:'原租赁结果未知，不能重复开机。',node_stale:'机器状态已过期，需先核对。',version_conflict:'机器或策略已改变，请刷新后重新预览。',preview_expired:'启动预览已过期，请重新预览。',profile_unavailable:'此部署配方尚未开放启动。',runtime_profile_unavailable:'此部署配方尚未开放启动。',capacity_not_configured:'容量控制尚未配置。'};
 export function reasonText(value){const code=typeof value==='string'?value:value?.code;return reasons[code]||'条件尚未满足，请核对状态后重试。';}
 Object.assign(reasons,{
+  operator_provider_extension_unsupported:'供应商已安排停止时间，当前接口不能推迟。请保留原机器期限。',
+  operator_provider_deadline_limit:'所选延期超过已核对的供应商安全期限，请缩短窗口或保留原期限。',
+  operator_extension_unavailable:'当前机器没有可延长的已授权窗口。',
+  operator_extension_preview_expired:'延期预览已过期，请重新核对期限与费用。',
+  operator_extension_node_changed:'机器状态或停止上限已改变，请重新预览。',
   operator_gpu_not_catalogued:'此 GPU 型号或版本尚未纳入所选模型的验收配置。',
   inventory_refresh_timeout:'本轮库存查询超时，请检查控制器状态后重新查询。',
   operator_pool_paused:'该执行池已暂停启动，请联系管理员核对运行配置。',
@@ -70,9 +75,9 @@ export function operatorMarketProvider(market,provider,now=Date.now()){
   const timedOut=observation?.refresh_status==='pending'&&refreshDeadline!==null&&now-refreshDeadline>=60000;
   const refreshStatus=timedOut?'timeout':observation?.refresh_status,refreshing=refreshStatus==='pending';
   const refreshProblem={failed:'本轮查询失败',timeout:'本轮查询超时'}[refreshStatus];
-  const fresh=observation?.status==='ok'&&observed!==null&&observed<=now&&now-observed<=seconds*1000&&!refreshing&&!refreshProblem;
+  const fresh=observation?.status==='ok'&&observed!==null&&observed<=now&&now-observed<=seconds*1000&&!refreshProblem;
   const status=observation?.status==='ok'&&!fresh?'stale':observation?.status||'unconfirmed';
-  return {...observation,provider,fresh,status,refreshing,refresh_status:refreshStatus,refresh_reason_code:timedOut?'inventory_refresh_timeout':observation?.refresh_reason_code,label:refreshing?'正在查询库存':refreshProblem||({ok:'库存已核对',error:'库存查询失败',unconfigured:'尚未配置库存查询',stale:'库存已过期，需重新查询',unconfirmed:'库存尚未核对'}[status]||'库存尚未核对')};
+  return {...observation,provider,fresh,status,refreshing,refresh_status:refreshStatus,refresh_reason_code:timedOut?'inventory_refresh_timeout':observation?.refresh_reason_code,label:refreshing?(fresh?'上次库存仍有效 · 刷新中':'正在查询库存'):refreshProblem||({ok:'库存已核对',error:'库存查询失败',unconfigured:'尚未配置库存查询',stale:'库存已过期，需重新查询',unconfirmed:'库存尚未核对'}[status]||'库存尚未核对')};
 }
 export function operatorRecommendationsCurrent(market,selection,now=Date.now()){
   return ['ok','partial'].includes(market?.status)&&market.reason_code==='inventory_no_matching_stock'&&operatorMarketProvider(market,selection.provider||'lium',now).fresh;
@@ -181,7 +186,7 @@ export function initialOperatorMarket(policy){
 export function operatorMarketReducer(state,action){
   if(action.type==='back')return {...state,revision:state.revision+1,row:null,selection:null,preview:null,confirmed:false,loading:null,error:''};
   if(action.type==='change')return {...initialOperatorMarket(),query:{...state.query,...action.patch},revision:state.revision+1};
-  if(action.type==='scan')return {...state,revision:state.revision+1,result:null,row:null,selection:null,preview:null,confirmed:false,loading:'candidates',error:''};
+  if(action.type==='scan')return {...state,revision:state.revision+1,row:null,selection:null,preview:null,confirmed:false,loading:'candidates',error:''};
   if(action.type==='select')return {...state,revision:state.revision+1,row:action.row,selection:action.selection,preview:null,confirmed:false,loading:'preview',error:''};
   if(action.type==='confirm')return {...state,confirmed:action.value};
   if(action.revision!==state.revision)return state;
@@ -193,7 +198,7 @@ export function operatorMarketReducer(state,action){
 }
 export function operatorMarketSummary(result,now=Date.now()){
   if(!result)return '查询后将显示 Lium 与 Targon 的兼容机器。';
-  if(result.providers?.some(item=>operatorMarketProvider(result,item.provider,now).refreshing))return '正在查询 Lium 与 Targon；已完成的一方先显示，另一方保留独立查询状态。';
+  if(result.providers?.some(item=>operatorMarketProvider(result,item.provider,now).refreshing))return '正在查询 Lium 与 Targon；已核对的一方可以先预览启动，另一方继续查询。';
   const fresh=(result.providers||[]).some(item=>operatorMarketProvider(result,item.provider,now).fresh);
   if(!fresh)return '库存尚未确认，请刷新查询；当前不能判断有无合适机器。';
   if(result.candidates?.length)return `${result.candidates.length} 项兼容配置 · 已验收且满足条件的优先，再按整组价格与下载带宽排序。`;

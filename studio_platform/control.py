@@ -135,7 +135,8 @@ class WorkerControl:
                 and previous.upstream_task_id is None)
 
     def pool_status(self, pool, *, model_id, configuration_id, recipe_id=None,
-                    backend="comfy-worker", engine_manifest_digest=None, output_delivery=""):
+                    backend="comfy-worker", engine_manifest_digest=None, output_delivery="",
+                    expected_runtime_s=None, deployment_profile_id=None):
         """Read-only readiness of exact operator-bound slots, not a GPU probe.
 
         An expired registration is reported as unknown without modifying its
@@ -155,6 +156,7 @@ class WorkerControl:
         now = self.repo.clock()
         counts = {state: 0 for state in ("ready", "busy", "unknown", "registered", "draining", "retired")}
         matched = 0
+        reasons = {}
         with self.repo.engine.connect() as connection:
             from .operator_capacity import operator_nodes
             stopping = set(connection.execute(select(instance_intents.c.provider, instance_intents.c.provider_instance_id)
@@ -191,10 +193,17 @@ class WorkerControl:
                     observed = state
                 else:
                     observed = "busy"
+                if observed in {"ready", "busy"}:
+                    from .worker_admission import worker_window_reason
+                    reason = worker_window_reason(connection, row, now,
+                        expected_runtime_s=expected_runtime_s, deployment_profile_id=deployment_profile_id)
+                    if reason:
+                        observed = "unknown" if reason == "managed_provider_lifetime_unverified" else "draining"
+                        reasons[reason] = reasons.get(reason, 0) + 1
                 counts[observed] += 1
         return {"pool": pool, "model_id": model_id, "configuration_id": configuration_id,
                 "backend": backend, "recipe_id": recipe_id, "observed_at": now,
-                "matched_slots": matched, **counts}
+                "matched_slots": matched, "reason_counts": reasons, **counts}
 
     def register(self, spec: WorkerSpec):
         """Operator assigns concrete provider/instance/device identities, not users."""
@@ -371,14 +380,19 @@ class WorkerControl:
                     # A shorter job may fit even when a long queued job does
                     # not. Existing attempts still reconcile/collect past this
                     # gate; this must never cause another paid submission.
-                    remaining = min(deadlines)-self.repo.clock()-120
+                    from .worker_admission import COMPLETION_MARGIN_SECONDS
+                    remaining = min(deadlines)-self.repo.clock()-COMPLETION_MARGIN_SECONDS
                     bindings.append(jobs.c.expected_runtime_s < remaining)
             if job_filter is not None:
                 bindings.append(job_filter)
             from .capacity import capacity_member_claim_allowed
+            from .worker_admission import worker_window_reason
             claim = self.queue.claim(worker_id, pool, purpose=purpose, lease_seconds=lease_seconds,
                 connection=connection, job_filter=and_(*bindings), validator=lambda job: self.matches(worker, job)
                     and (purpose != "generate" or capacity_member_claim_allowed(self.repo, connection, job, worker))
+                    and (purpose != "generate" or worker_window_reason(connection, worker, self.repo.clock(),
+                        expected_runtime_s=job["expected_runtime_s"],
+                        deployment_profile_id=job["request"].get("deployment_profile_id")) is None)
                     and (job_allowed is None or job_allowed(job) is True))
             if claim is None:
                 return None
@@ -433,11 +447,48 @@ class WorkerControl:
             if (worker["current_job_id"] != job["id"] or worker["drain_requested"]
                     or worker["expires_at"] <= now or worker["state"] not in {"leased", "busy"}):
                 return False
-            intents = connection.execute(select(instance_intents.c.hard_deadline, instance_intents.c.state).where(
-                instance_intents.c.provider == worker["provider"],
-                instance_intents.c.provider_instance_id == worker["instance_id"])).mappings()
-            return all(row["state"] in {"starting", "ready", "busy"}
-                and row["hard_deadline"] > now+job["expected_runtime_s"]+120 for row in intents)
+            from .worker_admission import worker_window_reason
+            return worker_window_reason(connection, worker, now, expected_runtime_s=job["expected_runtime_s"],
+                deployment_profile_id=job["request"].get("deployment_profile_id")) is None
+
+    def queued_diagnostic(self, job):
+        """Owner-facing advisory of this accepted job, with no scheduler writes."""
+        now = self.repo.clock()
+        result = {"advisory_only": True, "observed_at": now, "reason_code": "awaiting_worker_claim"}
+        if job.get("lease_worker_id") or job.get("current_attempt_id"):
+            result["reason_code"] = "original_attempt_requires_reconciliation"
+            return result
+        if job.get("not_before", 0) > now:
+            result.update(reason_code="queue_backoff", retry_after_seconds=math.ceil(job["not_before"]-now))
+            return result
+        plan, stored = job["execution_plan"], job["request"]
+        if not plan.get("enabled"):
+            result["reason_code"] = "generation_disabled"
+            return result
+        request = stored.get("request", stored)
+        try:
+            counts = self.pool_status(job["pool"], model_id=request["model"],
+                configuration_id=plan["configuration_id"], backend=plan["backend"], recipe_id=stored.get("recipe_id"),
+                engine_manifest_digest=plan.get("engine_manifest_digest"), output_delivery=plan.get("output_delivery", ""),
+                expected_runtime_s=job.get("expected_runtime_s"), deployment_profile_id=stored.get("deployment_profile_id"))
+        except (KeyError, ValueError):
+            result["reason_code"] = "queue_configuration_unconfirmed"
+            return result
+        result["capacity"] = {key: counts[key] for key in ("ready", "busy", "unknown", "registered", "draining", "matched_slots", "reason_counts")}
+        if counts["ready"]:
+            # A read cannot prove controller liveness or reserve the next claim.
+            result["reason_code"] = "awaiting_worker_claim"
+        elif counts["busy"]:
+            result["reason_code"] = "matching_worker_busy"
+        elif counts["reason_counts"]:
+            result["reason_code"] = sorted(counts["reason_counts"])[0]
+        elif counts["unknown"]:
+            result["reason_code"] = "worker_readiness_unconfirmed"
+        elif counts["registered"]:
+            result["reason_code"] = "matching_worker_starting"
+        else:
+            result["reason_code"] = "matching_capacity_unavailable"
+        return result
 
     def heartbeat(self, worker_id, fence, *, lease_seconds=None):
         seconds = self.registration_seconds if lease_seconds is None else lease_seconds

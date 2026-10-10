@@ -86,6 +86,15 @@ def register_routes(app, *, registry=None, service=None):
         return JSONResponse(service.node_command(principal(request),node_id,body,key,"stop"),
             status_code=202,headers={"Cache-Control":"no-store"})
 
+    @app.post(PREFIX+"/nodes/{node_id}/extension-previews")
+    def extension_previews(node_id: str, request: Request, body: dict):
+        return response(service.extension_preview(principal(request),node_id,body))
+
+    @app.post(PREFIX+"/nodes/{node_id}/extensions", status_code=202)
+    def extensions(node_id: str, request: Request, body: dict, key: str=Header(...,alias="Idempotency-Key")):
+        return JSONResponse(service.extend(principal(request),node_id,body,key),status_code=202,
+            headers={"Cache-Control":"no-store"})
+
     @app.put(PREFIX+"/policy")
     def policy(request: Request, body: dict):
         return response(service.update_policy(principal(request),body))

@@ -114,9 +114,10 @@ def resolve_inputs(prepared, inputs, manifest=None):
     handles = {item.handle: item for item in prepared.inputs}
     used = set()
     if settings.get("model_type") in {"minimax_h3_ref2va", "minimax_h3_ref2va_pruned"}:
-        if any(settings.get(field) is not None for field in (
-                "image_start", "image_end", "video_source", "audio_source", "video_guide2",
-                "video_guide3", "audio_guide2", "audio_guide3")):
+        blocked = ['image_start','image_end','video_source','audio_source']
+        if profile_id is None:
+            blocked += ['video_guide2','video_guide3','audio_guide2','audio_guide3']
+        if any(settings.get(field) is not None for field in blocked):
             raise ValueError("wangp_ref_unsupported_input_role")
         def resolve(handle, kind):
             if (not isinstance(handle, str) or handle not in handles or handle in used
@@ -124,20 +125,26 @@ def resolve_inputs(prepared, inputs, manifest=None):
                 raise ValueError("wangp_unbound_input_handle")
             used.add(handle)
             if kind == "image":
+                if profile_id is not None:
+                    return str(inputs.image_path(handles[handle], reference=True, deployment_profile_id=profile_id))
                 return str(inputs.image_path(handles[handle], reference=True))
             if profile_id is not None:
                 return str(getattr(inputs, kind + "_path")(handles[handle], deployment_profile_id=profile_id))
             return str(getattr(inputs, kind + "_path")(handles[handle]))
         references = settings.get("image_refs")
         if references is not None:
-            if not isinstance(references, list) or len(references) != 1:
+            if not isinstance(references, list) or not 1 <= len(references) <= (9 if profile_id else 1):
                 raise ValueError("wangp_ref_qualification_count_exceeded")
             settings["image_refs"] = [resolve(handle, "image") for handle in references]
-        for field, kind in (("video_guide", "video"), ("audio_guide", "audio")):
-            if settings.get(field) is not None:
-                settings[field] = resolve(settings[field], kind)
+        for kind in ('video','audio'):
+            for suffix in ('','2','3') if profile_id else ('',):
+                field = kind+'_guide'+suffix
+                if settings.get(field) is not None:
+                    settings[field] = resolve(settings[field], kind)
         if used != set(handles) or not used:
             raise ValueError("wangp_unused_input_handle")
+        if profile_id is not None and any(sum(d.kind==kind for d in handles.values())>1 for kind in ('video','audio')):
+            inputs.validate_reference_totals(tuple(handles.values()),deployment_profile_id=profile_id)
         return settings
     for field in ("image_start", "image_end"):
         handle = settings.get(field)
