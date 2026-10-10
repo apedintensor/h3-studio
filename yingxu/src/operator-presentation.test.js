@@ -27,6 +27,7 @@ test('ended and manually reviewed records stay in searchable non-destructive his
   assert.equal(historicalNode(reviewed),true);assert.deepEqual(filterOperatorHistory(groups.history,{search:'OLD-JOB'}),[]);
   assert.deepEqual(filterOperatorHistory(groups.history,{search:'INSTANCE-LIVE',provider:'lium'}).map(n=>n.id),['reviewed','old-node']);
   assert.deepEqual(filterOperatorHistory(groups.history,{provider:'targon'}),[]);assert.deepEqual(source,saved);
+  assert.deepEqual(filterOperatorHistory([{...ended,provider:'targon'}],{search:'TARGON'}).map(n=>n.id),['old-node']);
 });
 test('destroyed rendering makes deadlines, failures and slots historical without claiming settled bills',()=>{
   const html=render(ended);
@@ -47,21 +48,28 @@ test('stale and absent bootstrap observations remain unknown rather than invente
   assert.equal(operatorBootstrap({...active,bootstrap:{observed_at:1001,slots:[]}},now).freshness,'unknown');
 });
 test('capacity summary excludes historical ready slots and counts only observed live readiness',()=>{
-  const ready={...active,id:'ready',state:'ready',desired_state:'running',runtime_state:'ready',provider_safe_deadline:1400,provider_lifetime_state:'verified',provider_lifetime_observed_at:999,slots:[{id:'s',state:'ready',stale:false},{id:'expired',state:'ready',stale:true}]},unknown={...ready,id:'unknown',observed_at:800};
+  const ready={...active,id:'ready',state:'ready',desired_state:'running',runtime_state:'ready',hard_deadline:1400,provider_safe_deadline:1500,provider_lifetime_state:'verified',provider_lifetime_observed_at:999,slots:[{id:'s',state:'ready',stale:false},{id:'expired',state:'ready',stale:true}]},unknown={...ready,id:'unknown',observed_at:800};
   const snapshot={observed_at:999,controller:{state:'running',last_heartbeat_at:999,stale:false},nodes:[active,ended,ready,unknown]};
   const summary=operatorCapacitySummary(snapshot,now);
   assert.deepEqual(summary,{stale:false,ready_slots:1,starting_nodes:1,unknown_nodes:1,pending_review:0});
   assert.equal(operatorNodeStatus({...ready,slots:[]},now).label,'等待执行槽就绪');
-  for(const patch of [{desired_state:'draining'},{desired_state:'drained'},{desired_state:'stopped'},{state:'destroying'},{state:'destroy_unknown'},{runtime_state:'blocked'},{runtime_state:'failed'},{record_group:'pending_review'},{hard_deadline:1000},{provider_safe_deadline:1000},{provider_safe_deadline:null},{provider_safe_deadline:1299},{provider_lifetime_state:'unverified'},{provider_lifetime_observed_at:969},{provider_lifetime_observed_at:1001},{reason_code:'runtime_process_exited'}]){
+  for(const patch of [{desired_state:'draining'},{desired_state:'drained'},{desired_state:'stopped'},{state:'destroying'},{state:'destroy_unknown'},{runtime_state:'blocked'},{runtime_state:'failed'},{record_group:'pending_review'},{hard_deadline:1000},{hard_deadline:1300},{provider_safe_deadline:1000},{provider_safe_deadline:null},{provider_safe_deadline:1399},{provider_lifetime_state:'unverified'},{provider_lifetime_observed_at:969},{provider_lifetime_observed_at:1001},{reason_code:'runtime_process_exited'}]){
     assert.equal(operatorCapacitySummary({...snapshot,nodes:[{...ready,...patch}]},now).ready_slots,0,JSON.stringify(patch));
   }
-  for(const controller of [{state:'offline',last_heartbeat_at:999},{state:'running',last_heartbeat_at:800},{state:'running',last_heartbeat_at:1001},{state:'running',last_heartbeat_at:999,stale:true},null]){
+  for(const controller of [{state:'offline',last_heartbeat_at:999},{state:'running',last_heartbeat_at:800},{state:'running',last_heartbeat_at:969},{state:'running',last_heartbeat_at:1001},{state:'running',last_heartbeat_at:999,stale:true},null]){
     assert.equal(operatorCapacitySummary({...snapshot,controller,nodes:[ready]},now).ready_slots,0);
   }
   assert.equal(operatorCapacitySummary({...snapshot,observed_at:800,nodes:[ready]},now).ready_slots,0);
   assert.equal(operatorCapacitySummary({...snapshot,nodes:[{...ready,runtime_state:'busy'}]},now).ready_slots,1);
   assert.equal(operatorCapacitySummary({...snapshot,nodes:[{...ready,state:'busy',runtime_state:'busy'}]},now).ready_slots,1);
   assert.equal(operatorCapacitySummary({...snapshot,nodes:[{...ready,state:'starting'}]},now).ready_slots,1);
+  const notAdmitted={...ready,slots:[{id:'s',state:'ready',stale:false,admission_allowed:false,admission_reason_code:'job_exceeds_worker_window'}]};
+  assert.equal(operatorCapacitySummary({...snapshot,nodes:[notAdmitted]},now).ready_slots,0);
+  assert.equal(operatorNodeStatus(notAdmitted,now).label,'暂不接单');
+  assert.equal(operatorNodeStatus({...ready,hard_deadline:1300},now).label,'暂不接单');
+  assert.equal(operatorNodeStatus({...ready,hard_deadline:1301},now).label,'可接单');
+  const rejectedMarkup=render(notAdmitted);
+  assert.match(rejectedMarkup,/暂不接单/);assert.match(rejectedMarkup,/job_exceeds_worker_window/);assert.doesNotMatch(rejectedMarkup,/<span class="op-badge good"><i><\/i>可接单/);
 });
 test('compact rows expose a detail action instead of full slot history',()=>{
   const html=renderToStaticMarkup(React.createElement(MachineRow,{node:ended,profiles:[],now,onOpen:()=>{},onExtend:()=>{}}));

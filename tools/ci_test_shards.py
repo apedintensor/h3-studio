@@ -51,6 +51,7 @@ test_platform_wangp_first_last_policy test_platform_wangp_ref test_platform_wang
 test_platform_preparation_hold_recovery test_platform_quick_chat_integration
 test_platform_quick_chat_admission test_platform_quick_chat_wangp test_platform_quick_chat_titles test_platform_agent_connect
 test_platform_agent_connect_app test_operator_manual_review test_operator_owned_drain
+test_operator_extensions test_managed_worker_admission
 """.split())
 
 # CPU ffmpeg/font fixtures have additional process/codec costs. These multipliers

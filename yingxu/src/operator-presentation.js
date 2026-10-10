@@ -47,27 +47,31 @@ export function operatorNodeStatus(node,now=Date.now()){
   if(node?.stale||observed===null||observed>now||now-observed>60000||['unknown','observation_failed'].includes(node?.runtime_state))return {label:'状态待核对',tone:'warn'};
   const boot=operatorBootstrap(node,now),phase=boot.slots.find(slot=>phaseLabels[slot.phase]);
   if(phase&&boot.freshness==='fresh'&&!['ready','busy','draining','blocked','failed'].includes(node.runtime_state))return {label:phase.label,tone:'neutral'};
-  if(node.runtime_state==='ready'&&!(node.slots||[]).some(slot=>slot.state==='ready'&&!slot.stale))return {label:'等待执行槽就绪',tone:'neutral'};
+  if(node.runtime_state==='ready'){
+    const ready=(node.slots||[]).filter(slot=>slot.state==='ready'&&!slot.stale);
+    if(!ready.length)return {label:'等待执行槽就绪',tone:'neutral'};
+    if(!ready.some(slot=>slot.admission_allowed!==false)||epochMs(node.hard_deadline)<=now+300000)return {label:'暂不接单',tone:'warn'};
+  }
   return {label:stateLabel(node?.runtime_state||node?.state),tone:['ready','busy'].includes(node?.runtime_state)?'good':['blocked','failed'].includes(node?.runtime_state)?'warn':'neutral'};
 }
 export function operatorCapacitySummary(snapshot,now=Date.now()){
   const groups=operatorNodeGroups(snapshot?.nodes),current=[...groups.current,...groups.pending_review];
   const unknown=node=>operatorNodeStatus(node,now).label==='状态待核对';
   const heartbeat=epochMs(snapshot?.controller?.last_heartbeat_at);
-  const controllerCurrent=snapshot?.controller?.stale!==true&&['running','degraded'].includes(snapshot?.controller?.state)&&heartbeat!==null&&heartbeat<=now&&now-heartbeat<=60000;
-  const deadlineCurrent=value=>{const time=epochMs(value);return time!==null&&time>now;};
+  const controllerCurrent=snapshot?.controller?.stale!==true&&['running','degraded'].includes(snapshot?.controller?.state)&&heartbeat!==null&&heartbeat<=now&&now-heartbeat<=30000;
+  const deadlineCurrent=value=>{const time=epochMs(value);return time!==null&&time>now+300000;};
   const readinessCurrent=node=>controllerCurrent&&!staleSnapshot(snapshot,now)&&operatorNodeGroup(node)==='current'&&
     ['starting','ready','busy'].includes(node.state)&&node.desired_state==='running'&&['ready','busy'].includes(node.runtime_state)&&!unknown(node)&&
     !nodeRemovalConfirmation(node)&&!node.reason_code&&nodeDeadline(node,now).verified&&
     deadlineCurrent(node.hard_deadline)&&node.provider_safe_deadline>=node.hard_deadline;
   return {stale:staleSnapshot(snapshot,now),
-    ready_slots:current.reduce((n,node)=>n+(readinessCurrent(node)?(node.slots||[]).filter(slot=>slot.state==='ready'&&!slot.stale).length:0),0),
+    ready_slots:current.reduce((n,node)=>n+(readinessCurrent(node)?(node.slots||[]).filter(slot=>slot.state==='ready'&&!slot.stale&&slot.admission_allowed!==false).length:0),0),
     starting_nodes:current.filter(node=>!unknown(node)&&['reserved','creating','starting'].includes(node.state)&&!['blocked','failed','ready','busy','draining'].includes(node.runtime_state)).length,
     unknown_nodes:current.filter(unknown).length,pending_review:groups.pending_review.length};
 }
 export function filterOperatorHistory(nodes,{search='',provider='all'}={}){
   const text=search.trim().toLocaleLowerCase();return nodes.filter(node=>(provider==='all'||node.provider===provider)&&
-    (!text||[node.id,node.provider_instance_id,node.gpu_model,node.runtime_profile_id,node.mode,node.state].some(value=>String(value??'').toLocaleLowerCase().includes(text))));
+    (!text||[node.id,node.provider,node.provider_instance_id,node.gpu_model,node.runtime_profile_id,node.mode,node.state].some(value=>String(value??'').toLocaleLowerCase().includes(text))));
 }
 export function operatorExtensionCurrent(node,preview,additionalSeconds,now=Date.now()){
   const observed=epochMs(node?.observed_at);
