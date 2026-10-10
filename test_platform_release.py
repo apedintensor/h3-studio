@@ -462,6 +462,37 @@ class ApplyReleaseTests(unittest.TestCase):
             release.apply_locked(self.root, COMMIT)
         retire.assert_not_called()
 
+    def test_operator_app_release_and_rollback_retain_cleanup_and_ledger(self):
+        contracts={'version':1,'api_compatibility':'1'*64,'worker_compatibility':'2'*64,
+            'frontend_contract':'sixnine-web-v1'}
+        self.expected['contracts']={**contracts,'worker_compatibility':'3'*64}
+        old={**self.expected,'commit':self.old,'contracts':contracts}
+        context={'kind':'operator','admission':'open','contracts':contracts,'execution_manifest':old}
+        obligations=self.root/'retained-obligations.json'
+        content='{"pending_stop":1,"provider_state":"unknown","reserved":17,"original_deadline":1000}'
+        obligations.write_text(content)
+        for fail in (False,True):
+            self.calls.clear()
+            self.state({'current':self.old,'previous':self.older,'status':'app_ready'})
+            with patch.object(release,'gpu_deployment_context',return_value=context), \
+                 patch.object(release,'approved_application_configuration'), \
+                 patch.object(release,'load_approved_image',side_effect=lambda r,d,c,e:old if c==self.old else self.expected), \
+                 patch.object(release,'operator_app_compatibility') as compatible, \
+                 patch.object(release,'application_compose',side_effect=lambda d,e,*a,**kw:
+                     self.calls.append(('application',a,d))), \
+                 patch.object(release,'wait_proxy_stable',side_effect=[release.ReleaseError('synthetic'),None] if fail else None):
+                if fail:
+                    with self.assertRaisesRegex(release.ReleaseError,'release_failed'):release.apply_locked(self.root,COMMIT)
+                    compatible.assert_called_once_with(self.root,context,old,old)
+                    self.assertEqual(self.state()['status'],'rolled_back_app_only')
+                    self.assertEqual(self.calls[-1][2],self.root/'releases'/self.old)
+                else:
+                    release.apply_locked(self.root,COMMIT)
+                    self.assertEqual(self.state()['current'],COMMIT)
+            self.assertEqual(len(self.calls),2 if fail else 1)
+            self.assertTrue(all(call[1]==('up','-d','--no-deps','app') for call in self.calls))
+            self.assertEqual(obligations.read_text(),content)
+
 
 if __name__ == "__main__":
     unittest.main()

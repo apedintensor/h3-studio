@@ -235,17 +235,17 @@ def controller(image, runtime=None):
         'logging':{'driver':'json-file','options':{'max-size':'10m','max-file':'3'}}}
 
 
-def overlay(image, profile_id, runtime=None):
+def overlay(image, profile_id, runtime=None, *, owners='superdan,supervan'):
     return {'services':{'app':{'environment':{'H3_OPERATOR_RUNTIME_CONFIG':RUNTIME.as_posix(),
         'SIXNINE_EXECUTION_PROFILES_FILE':PROFILES.as_posix(),'SIXNINE_GENERATION_ENABLED':'1',
         'SIXNINE_EXECUTION_BACKEND':'wangp-worker','AWS_EC2_METADATA_DISABLED':'true',
         'SIXNINE_DEFAULT_DEPLOYMENT_PROFILE_ID':profile_id,
-        'SIXNINE_OPERATOR_CAPACITY_OWNERS':'superdan,supervan'},
+        'SIXNINE_OPERATOR_CAPACITY_OWNERS':owners},
         'volumes':shared_mounts(),'healthcheck':{'test':['CMD','python','-c',GPU_HEALTH]}},
         SERVICE:controller(image,runtime)}}
 
 
-def validate_rendered(value, directory, version, image, profile_id, runtime=None):
+def validate_rendered(value, directory, version, image, profile_id, runtime=None, *, owners='superdan,supervan'):
     config = copy.deepcopy(value)
     if version in ('2.38.2','v2.38.2'):
         for service in config['services'].values():
@@ -263,7 +263,7 @@ def validate_rendered(value, directory, version, image, profile_id, runtime=None
         if mount.get('read_only') is False: del mount['read_only']
     release.require(actual==expected,'operator_controller_configuration_invalid')
     app = config['services']['app']
-    wanted = overlay(image,profile_id,runtime)['services']['app']
+    wanted = overlay(image,profile_id,runtime,owners=owners)['services']['app']
     for key,value in wanted['environment'].items():
         release.require(app['environment'].get(key)==value,'operator_app_environment_invalid')
         del app['environment'][key]
@@ -408,14 +408,68 @@ def prepare():
 
 
 def prepared():
+    """Resolve the immutable execution release, independently of the current API."""
     runtime,files = configuration()
     value = release._protected_json(ROOT/'prepared.json',maximum=2*1024**2)
-    commit,directory,environment,image_id = approved_current()
-    release.require(value=={'schema_version':1,'commit':commit,'image_id':image_id,
+    commit=value.get('commit')
+    release.require(isinstance(commit,str) and release.SHA.fullmatch(commit),'operator_prepared_identity_changed')
+    directory=release.ROOT/'releases'/commit
+    release.approved_manifest(release.ROOT,directory,commit)
+    expected=release.manifest(directory,commit)
+    environment=release.deployment_environment(release.ROOT/'site.env',commit)
+    release.approved_configuration(directory,environment)
+    identities=release.validate_image_archive(directory/'image.tar.gz',expected)
+    images=json.loads(release.command(['image','inspect',environment['SIXNINE_IMAGE']],environment=environment))
+    release.require(isinstance(images,list) and len(images)==1 and images[0].get('Id') in identities,
+        'operator_execution_image_unapproved')
+    image_id=images[0]['Id']
+    release.require(type(value.get('schema_version')) is int and value=={'schema_version':1,'commit':commit,'image_id':image_id,
         'runtime_config_sha256':release.canonical_hash(runtime),'files':files},'operator_prepared_identity_changed')
-    release.require(release._protected_json(ROOT/'overlay.json')==overlay(environment['SIXNINE_IMAGE'],default_profile(),runtime),
+    original=release._protected_json(ROOT/'overlay.json')
+    owners=original.get('services',{}).get('app',{}).get('environment',{}).get('SIXNINE_OPERATOR_CAPACITY_OWNERS')
+    release.require(owners in ('superdan','superdan,supervan') and
+        original==overlay(environment['SIXNINE_IMAGE'],default_profile(),runtime,owners=owners),
         'operator_overlay_changed')
     return runtime,value,directory,environment
+
+
+def app_overlay(*, admission):
+    """Separately protected API permissions; never edit the execution overlay."""
+    release.require(admission in ('open','closed'),'operator_admission_invalid')
+    if admission=='closed': return {'services':{'app':{}}}
+    original=release._protected_json(ROOT/'overlay.json')
+    app=copy.deepcopy(original['services']['app'])
+    settings=ROOT/'app-settings.json'
+    if settings.exists() or settings.is_symlink():
+        value=release._protected_json(settings)
+        release.require(set(value)=={'schema_version','capacity_owners'}
+            and type(value.get('schema_version')) is int and value['schema_version']==1
+            and value['capacity_owners'] in (['superdan'],['superdan','supervan']),
+            'operator_app_settings_invalid')
+        app['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS']=','.join(value['capacity_owners'])
+    return {'services':{'app':app}}
+
+
+def validate_app_rendered(value,directory,version,image,expected):
+    """Validate only the app overlay; no controller service is rendered or changed."""
+    config=copy.deepcopy(value)
+    app=config.get('services',{}).get('app',{})
+    wanted=expected['services']['app']
+    for key,value in wanted.get('environment',{}).items():
+        release.require(app.get('environment',{}).get(key)==value,'operator_app_environment_invalid')
+        del app['environment'][key]
+    app['environment'].update(SIXNINE_GENERATION_ENABLED='0',SIXNINE_EXECUTION_BACKEND='disabled')
+    if version in ('2.38.2','v2.38.2'):
+        for mount in app.get('volumes',[]):
+            if mount.get('type')=='bind' and mount.get('bind')=={}: mount['bind']={'create_host_path':False}
+    for mount in wanted.get('volumes',[]):
+        release.require(app.get('volumes',[]).count(mount)==1,'operator_app_mount_invalid')
+        app['volumes'].remove(mount)
+    release.require(app.get('image')==image and app.get('healthcheck',{}).get('test')==
+        wanted.get('healthcheck',{'test':['CMD','python','-c',CPU_HEALTH]})['test'],
+        'operator_app_identity_invalid')
+    app['healthcheck']['test']=['CMD','python','-c',CPU_HEALTH]
+    return validate_base(config,deployment_directory=directory,compose_version=version)
 
 
 def pin_for(value):
@@ -428,7 +482,9 @@ def pin_for(value):
 def checked_pin(value):
     pin = release._protected_json(ROOT/'active.json')
     expected = pin_for(value)
-    release.require(all(pin.get(k)==v for k,v in expected.items() if k not in ('active','state','admission'))
+    release.require(type(pin.get('version')) is int
+        and set(pin) in (set(expected),set(expected)|{'controller_id'})
+        and all(pin.get(k)==v for k,v in expected.items() if k not in ('active','state','admission'))
         and type(pin.get('active')) is bool and pin.get('admission') in ('open','closed'),
         'operator_active_identity_changed')
     return pin
@@ -502,7 +558,7 @@ def launch(directory,environment,runtime,pin, *, loader_factory=None,targon_load
 
 
 def close_admission(directory,environment,pin):
-    # Restores only this pinned app, never a different release or a controller.
+    # Resolve the current approved compatible API, retaining the execution pin.
     closed = {**pin,'admission':'closed'}
     atomic(ROOT/'active.json',closed)
     release.restore_current_cpu_locked(release.ROOT,operator_pin=closed)
@@ -544,6 +600,7 @@ def start(*, clock=time.monotonic,sleep=time.sleep):
         with (release.ROOT/'release.lock').open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
             runtime,value,directory,environment = prepared()
+            release.require(approved_current()[0]==value['commit'],'operator_start_release_changed')
             no_competing_controller(environment)
             # No replay after any launch intent, including failed/unknown delivery.
             release.require(not (ROOT/'active.json').exists(),'operator_previous_launch_requires_reconciliation')

@@ -165,6 +165,42 @@ Late positive terminal receipts can be consumed without waiting. Restart and
 failed reads retain the interval, original deletion obligation and reservation.
 Elapsed time alone never confirms removal or billing settlement.
 
+The operator state response adds `node.removal_confirmation` for a requested
+deletion: `pending`, `overdue` after 300 seconds, or `confirmed` from the existing
+ledger's terminal removal evidence. It contains the original request time,
+last actual provider observation, next eligible check and only allowlisted
+observation fields. A scheduling claim and a webpage refresh are not provider
+observations. Overdue is an attention signal, not a lifecycle transition.
+Retained slots and rates on a removal card describe historical allocation;
+they do not establish current hardware activity or final billing.
+
+Compatible application publication may retain an active operator execution
+release. The protected host checks an exact execution-to-app review receipt
+bound to both manifests, the original image and preparation hash. Schema/startup
+migrations and accepted work remain unchanged; a reviewed conservative readiness
+tightening is explicitly recorded rather than described as unchanged admission.
+Operator command semantics and host Compose/configuration files remain identical.
+Publication replaces only the app with `--no-deps`, preserving controller,
+guardian, provider identities, original deadlines and accounting. Admission
+closure and recovery resolve the current approved compatible app independently
+of the immutable execution pin. Operator account additions use separate protected
+app settings, never a rewrite of execution preparation. Unknown or incompatible
+changes still require reconciliation; outstanding billing alone does not force
+a website outage. An app publication does not update a running controller's code.
+
+The explicit protected `operator_handoff.py` action can replace controller code
+while deletion remains pending only when there are no active tasks, unsafe
+attempts, live bound workers or owned child processes. Every remaining allocation
+must already be destroying under its original exact identity and stop intent.
+It rejects incomplete start commands, binds the old supervisor to the exact
+controller process, closes admission, and waits for both clean local shutdown
+and host-supervisor exit. A one-use successor intent binds configuration and
+ledger hashes before credentials are delivered. It preserves journals, original
+deadlines and accounting, uses normal leadership expiry, and reopens only after
+fresh successor health. Unknown outcomes retain the barrier and require
+inspection, never another launch. Independent guardian code activation is
+separate and must preserve its original requests, receipts and configuration.
+
 ## Historical generation hints
 
 Use `total_seconds` consistently: task submission through local output save/validation, including component loading encountered in the task, excluding machine startup, queueing, dependency setup and prior downloads. Store process/loading context separately; no controlled warm/cold comparison was performed. Match profile, mode, resolution, native frames/fps, steps and reference roles exactly. A single measured sample is not an SLA or an estimate for another configuration.
