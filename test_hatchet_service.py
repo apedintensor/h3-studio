@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -152,14 +153,22 @@ class RealHatchetTests(unittest.TestCase):
             dispatcher = OutboxDispatcher(repo, publisher, publisher_id="proof-dispatcher", retry_seconds=1)
             start = time.monotonic()
             receipt = None
+            next_recovery = 0
             try:
                 # Worker registration is asynchronous; the bridge safely holds
                 # unknown publishing outcomes on this same original event.
                 deadline = start+delay+180
                 while time.monotonic() < deadline:
                     self.assertIsNone(process.poll(), "worker exited; inspect protected local diagnostic")
-                    if receipt is None or receipt["state"] != "published":
-                        receipt = dispatcher.publish_once()
+                    # Match the production dispatcher: an ended callback may
+                    # yield during the original attempt's collection backoff.
+                    # Its recovery wakeup must resume that same business job.
+                    if time.monotonic() >= next_recovery:
+                        dispatcher.recover_wakeups()
+                        next_recovery = time.monotonic()+config.recovery_interval_s
+                    publication = dispatcher.publish_once()
+                    if publication["state"] != "idle":
+                        receipt = publication
                     current = repo.get_job(scope, job["id"])
                     if current["status"] == "succeeded" and receipt and receipt["state"] == "published":
                         break
@@ -167,15 +176,22 @@ class RealHatchetTests(unittest.TestCase):
                 self.assertEqual(current["status"], "succeeded")
                 self.assertEqual(repo.get_job(scope, older["id"])["status"], "planned")
                 self.assertGreaterEqual(len(publisher.calls), 2)
-                self.assertEqual(len({event for event, run in publisher.calls}), 1)
+                # The lost acceptance response retries the original event.
+                # Later recovery may emit another event for this same job.
+                self.assertEqual(len({event for event, run in publisher.calls[:2]}), 1)
                 # At-least-once broker deliveries may have different run IDs.
                 # Business execution, not a broker TTL/cache, owns deduplication.
                 unique_broker_runs = len({run for event, run in publisher.calls})
-                # Redelivery after success is a harmless same-run acknowledgement.
                 with repo.engine.connect() as connection:
-                    delivery = connection.execute(select(dispatch_receipts).where(
-                        dispatch_receipts.c.job_id == job["id"])).mappings().one()
+                    deliveries = list(connection.execute(select(dispatch_receipts).where(
+                        dispatch_receipts.c.job_id == job["id"])
+                        .order_by(dispatch_receipts.c.sequence)).mappings())
                     attempt_rows = list(connection.execute(select(attempts)).mappings())
+                self.assertTrue(deliveries)
+                event_ids = {item["event_id"] for item in deliveries}
+                self.assertTrue(all(event in event_ids for event, run in publisher.calls))
+                self.assertTrue(all(item["job_id"] == job["id"] for item in deliveries))
+                delivery = deliveries[-1]
                 operations = [json.loads(s) for s in (root/"operations.jsonl").read_text().splitlines()]
                 self.assertEqual(len(attempt_rows), 1)
                 self.assertEqual(sum(x["operation"] == "submit" for x in operations), 1)
@@ -189,6 +205,9 @@ class RealHatchetTests(unittest.TestCase):
                     "elapsed_s": round(elapsed, 3), "broker_delivery_calls": len(publisher.calls),
                     "broker_unique_run_ids": unique_broker_runs,
                     "broker_same_run_id": unique_broker_runs == 1,
+                    "broker_event_ids": sorted(event_ids),
+                    "broker_call_run_ids": sorted({run for event, run in publisher.calls}),
+                    "lost_response_same_event": True,
                     "original_attempts": 1, "remote_submissions": 1, "artifact_fetches": 1,
                     "video_and_audio": True, "older_job_untouched": True,
                     "event_id": delivery["event_id"], "run_id": delivery["external_run_id"],
@@ -201,6 +220,22 @@ class RealHatchetTests(unittest.TestCase):
                 # SDK validation may include the protected token as a value.
                 diagnostic = diagnostic.replace(Path(config.token_file).read_text().strip(), "[REDACTED_TOKEN]")
                 (config_path.parent/"protected-proof-worker-diagnostic.log").write_text(diagnostic, encoding="utf-8")
+                # Freeze CPU-only ledger evidence before TemporaryDirectory
+                # cleanup. This is a private diagnostic snapshot, never an
+                # execution ledger or a resumable replacement for the original.
+                try:
+                    snapshot = config_path.parent/('protected-proof-ledger-'+job['id']+'.sqlite3')
+                    with snapshot.open('xb') as stream:
+                        os.chmod(stream.name, 0o600)
+                    source = sqlite3.connect('file:'+(root/'ledger.sqlite3').as_posix()+'?mode=ro', uri=True)
+                    target = sqlite3.connect(snapshot)
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
+                        source.close()
+                except Exception:
+                    print("proof_ledger_snapshot_unavailable", flush=True)
                 print("proof_worker_failed; sanitized diagnostic retained beside protected configuration", flush=True)
                 raise
             finally:
