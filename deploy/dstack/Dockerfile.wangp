@@ -1,0 +1,17 @@
+# A derivative of an already captured native-profile environment. The supplied
+# digest must retain Python3.12.14, the exact profile's core dependency versions,
+# pinned upstream source and usable FFmpeg. Never resolve packages at cold boot.
+# A source-only or BF16 Python3.11 candidate is not a compatible replacement.
+ARG PROFILE_RUNTIME_IMAGE
+FROM ${PROFILE_RUNTIME_IMAGE}
+ARG SOURCE_REVISION=0e58385fbde7ff102d276e4a9e490845de76b4ea
+RUN test "$(/venv/main/bin/python -c 'import platform; print(platform.python_version())')" = "3.12.14" \
+    && test "$(git -C /opt/workspace-internal/Wan2GP rev-parse HEAD)" = "$SOURCE_REVISION" \
+    && /venv/main/bin/python -m pip check
+# Only these public source files enter the image. Per-run manifest/config/private
+# listener token and source bundle are staged by the CPU controller after its
+# bootstrap intent commits. Model bytes reuse the verified cache when available.
+COPY deploy/wangp/bootstrap.py /opt/sixnine/wangp-bootstrap.py
+ENV PYTHONDONTWRITEBYTECODE=1 TOKENIZERS_PARALLELISM=false
+WORKDIR /workspace
+CMD ["sleep", "infinity"]
