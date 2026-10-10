@@ -25,6 +25,7 @@ from studio_platform.hatchet_dispatch import (HatchetSlotRunner, OutboxDispatche
     SDKPublisher, create_client, read_broker_config)
 from studio_platform.repository import Repository, Scope, attempts, dispatch_receipts
 from studio_platform.storage import LocalObjectStore
+from studio_platform.telemetry import configured_telemetry
 from studio_platform.worker import MockBackend, Outcome, SubmissionUncertain
 
 
@@ -60,11 +61,37 @@ class ProofBackend(MockBackend):
 
 def worker(config_path, root, delay):
     repo = Repository("sqlite:///"+(root/"ledger.sqlite3").as_posix())
-    control = WorkerControl(repo)
-    runner = HatchetSlotRunner(repo, LocalObjectStore(root/"objects"), root/"worker",
-        backend=ProofBackend(root, delay), control=control,
-        broker_config=read_broker_config(config_path), collection_lock_dir=root/"collection-lock")
-    runner.run_forever("hatchet-service-proof", "proof-pool")
+    telemetry = configured_telemetry()
+    configured = telemetry.enabled is True
+    try:
+        control = WorkerControl(repo)
+        runner = HatchetSlotRunner(repo, LocalObjectStore(root/"objects"), root/"worker",
+            backend=ProofBackend(root, delay), control=control, telemetry=telemetry,
+            telemetry_context={"provider": "local", "simulation": True},
+            broker_config=read_broker_config(config_path), collection_lock_dir=root/"collection-lock")
+        runner.run_forever("hatchet-service-proof", "proof-pool")
+    finally:
+        flush_ok = False
+        try:
+            flush_ok = telemetry.force_flush(timeout_millis=1000) is True
+        except Exception:
+            pass
+        try:
+            telemetry.close()
+        except Exception:
+            pass
+        # Bounded exporter counts only; never configuration, credentials,
+        # endpoint/response bodies or arbitrary SDK diagnostics.
+        status = telemetry.status()
+        report = {"configured": configured, "flush_ok": flush_ok}
+        for key in ("export_attempts", "export_failures", "metric_labelsets"):
+            value = status.get(key)
+            if type(value) is int and 0 <= value <= 100000:
+                report[key] = value
+        with (root/"telemetry-status.json").open("x", encoding="utf-8") as stream:
+            os.chmod(stream.name, 0o600)
+            stream.write(json.dumps(report))
+        repo.close()
 
 
 class LoseAcceptedResponse:
@@ -168,10 +195,6 @@ class RealHatchetTests(unittest.TestCase):
                     "video_and_audio": True, "older_job_untouched": True,
                     "event_id": delivery["event_id"], "run_id": delivery["external_run_id"],
                     "job_id": job["id"], "paid_gpu_operations": 0}
-                destination = os.environ.get("HATCHET_PROOF_RECEIPT")
-                if destination:
-                    Path(destination).write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
-                print(json.dumps(result), flush=True)
             except Exception:
                 print(json.dumps({"safe_broker_call_identities": publisher.calls}), flush=True)
                 worker_log.flush()
@@ -193,6 +216,19 @@ class RealHatchetTests(unittest.TestCase):
                     process.wait(timeout=20)
                 worker_log.close()
                 repo.close()
+            if os.environ.get("SIXNINE_TELEMETRY_CONFIG_FILE"):
+                exporter_status = root/"telemetry-status.json"
+                self.assertTrue(exporter_status.is_file(), "bounded worker exporter status missing")
+                status = json.loads(exporter_status.read_text())
+                self.assertTrue(status["configured"], "protected optional exporter was unavailable")
+                self.assertTrue(status["flush_ok"], "bounded exporter flush did not complete")
+                self.assertGreater(status["export_attempts"], 0)
+                self.assertEqual(status["export_failures"], 0)
+                result["telemetry"] = status
+            destination = os.environ.get("HATCHET_PROOF_RECEIPT")
+            if destination:
+                Path(destination).write_text(json.dumps(result, indent=2)+"\n", encoding="utf-8")
+            print(json.dumps(result), flush=True)
 
 
 if __name__ == "__main__":
