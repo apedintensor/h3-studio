@@ -51,7 +51,10 @@ export function createQuickChatController({client=createQuickChatClient(),storag
     if(!initial)for(let page=0;page<5&&timelineData.has_more&&timelineData.next_cursor;page++){
       timelineData=await client.timeline(id,{after_cursor:timelineData.next_cursor});guard(ctx);events=merge(events,timelineData.events||[]);
     }
-    emit({session,materials:materialsData.materials||materialsData.bindings||[],timeline:initial?events:merge(state.timeline,events),historyCursor:initial?(timelineData.before_cursor||timelineData.next_cursor||null):state.historyCursor,forwardCursor:timelineData.after_cursor||timelineData.latest_cursor||state.forwardCursor,lastUpdated:Date.now(),error:''});
+    // Automatic naming may finish without an authoring-version change. Merge
+    // the current summary rather than reloading or discarding paged history.
+    const sessions=state.sessions.map(item=>item.id===session.id?{...item,title:session.title??item.title,updated_at:session.updated_at??item.updated_at,version:session.version}:item);
+    emit({session,sessions,materials:materialsData.materials||materialsData.bindings||[],timeline:initial?events:merge(state.timeline,events),historyCursor:initial?(timelineData.before_cursor||timelineData.next_cursor||null):state.historyCursor,forwardCursor:timelineData.after_cursor||timelineData.latest_cursor||state.forwardCursor,lastUpdated:Date.now(),error:''});
     // Timeline holds durable creation references; current job state is read
     // separately even when its sequence has not changed.
     const cardIds=new Set(events.map(event=>event.record?.card_id||event.card_id).filter(Boolean));

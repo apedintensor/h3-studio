@@ -72,6 +72,20 @@ class DeploymentPolicyTests(unittest.TestCase):
     def test_rendered_compose_has_strict_production_policy(self):
         self.assertTrue(policy.validate(self.rendered, compose_version=self.compose_version))
 
+    def test_title_secret_path_and_egress_are_a_complete_reviewed_pair(self):
+        legacy=copy.deepcopy(self.rendered)
+        app=legacy['services']['app']
+        app['environment'].pop('SIXNINE_TITLE_CONFIG_FILE')
+        app['networks'].pop('edge')
+        app['secrets']=[item for item in app['secrets'] if item['source']!='google_titles']
+        legacy['secrets'].pop('google_titles')
+        self.assertTrue(policy.validate(legacy,compose_version=self.compose_version))
+        for mutate in (lambda c:c['services']['app']['environment'].update(SIXNINE_TITLE_CONFIG_FILE='/data/key'),
+                       lambda c:c['services']['app']['networks'].pop('edge'),
+                       lambda c:c['services']['db'].setdefault('secrets',[]).append({'source':'google_titles','target':'/run/secrets/google_titles'})):
+            broken=copy.deepcopy(self.rendered);mutate(broken)
+            with self.assertRaises(policy.ConfigurationError): policy.validate(broken,compose_version=self.compose_version)
+
     def test_initial_four_gib_host_has_explicit_two_account_container_envelope(self):
         services = self.rendered["services"]
         expected = {"app": 2*1024**3, "db": 512*1024**2, "caddy": 128*1024**2,
@@ -108,7 +122,7 @@ class DeploymentPolicyTests(unittest.TestCase):
         for value in services.values():
             self.assertNotIn("/root/.aws", json.dumps(value))
             self.assertNotIn("docker.sock", json.dumps(value))
-        self.assertEqual(set(self.rendered["secrets"]), {"db_admin_password", "app_database_url"})
+        self.assertEqual(set(self.rendered["secrets"]), {"db_admin_password", "app_database_url", "google_titles"})
 
     def test_mount_and_resource_policy_rejects_unreviewed_sources_or_privileges(self):
         changes = {

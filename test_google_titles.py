@@ -11,6 +11,7 @@ import httpx
 
 from studio_platform.google_chat import ChatError, GoogleChatClient, ORIGIN, PROFILE
 from studio_platform.google_titles import GoogleTitleGenerator, TITLE_MODEL, validate_config, runtime_config, configured_generator
+from studio_platform.google_title_config import GoogleTitleConfigError
 from studio_platform.settings import Settings
 
 FAKE = {"enabled": True, "service": "gemini", "profile": PROFILE, "base_url": ORIGIN,
@@ -54,9 +55,10 @@ class GoogleTitleTests(unittest.TestCase):
 
     def test_exact_profile_and_disabled_source(self):
         self.assertIsNone(validate_config({'enabled':False}))
+        with self.assertRaises(GoogleTitleConfigError): validate_config({'enabled':0})
         for key, bad in [('service','other'),('profile','default'),('base_url','https://example.test'),
                          ('enabled',1),('api_key','bad\nsecret')]:
-            with self.subTest(key=key), self.assertRaises(ChatError) as error:
+            with self.subTest(key=key), self.assertRaises(GoogleTitleConfigError) as error:
                 validate_config({**FAKE,key:bad})
             self.assertNotIn(FAKE['api_key'],str(error.exception))
 
@@ -68,13 +70,13 @@ class GoogleTitleTests(unittest.TestCase):
             def root_metadata(fd):
                 values=list(original(fd)); values[4]=0
                 return os.stat_result(values)
-            with patch('studio_platform.google_titles.os.fstat', side_effect=root_metadata):
+            with patch('studio_platform.google_title_config.os.fstat', side_effect=root_metadata):
                 path.write_text(json.dumps(FAKE), encoding='utf-8')
                 path.chmod(0o640)
                 self.assertEqual(runtime_config(path).base_url,ORIGIN)
                 for raw in ('{"enabled":false,"enabled":false}', 'x'*4097, '{}'):
                     path.write_text(raw,encoding='utf-8')
-                    with self.assertRaises(ChatError): runtime_config(path)
+                    with self.assertRaises(GoogleTitleConfigError): runtime_config(path)
                     with self.assertRaises(ChatError): configured_generator(settings).generate('ignored')
                 path.write_text('{"enabled":false}',encoding='utf-8')
                 self.assertIsNone(configured_generator(settings))

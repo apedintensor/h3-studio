@@ -350,6 +350,7 @@ inventory.json
 !studio_platform/generation_availability.py
 !studio_platform/google_chat.py
 !studio_platform/google_titles.py
+!studio_platform/google_title_config.py
 
 # Preserved public Agent connection source; credentials/runtime data stay ignored.
 !studio_platform/agent_connect.py

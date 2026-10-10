@@ -35,6 +35,18 @@ def valid_host():
 
 
 class PreflightTests(unittest.TestCase):
+    def test_optional_title_file_requires_same_private_tmpfs_and_app_group(self):
+        snapshot=valid_host()
+        snapshot['secrets']['google_titles']=info(gid=10001,mode=0o440,regular=True)
+        snapshot['secret_filesystems']['google_titles']='tmpfs'
+        self.assertEqual(preflight.validate_snapshot(snapshot)['state'],'host_metadata_ready')
+        for mutate in (lambda s:s['secret_filesystems'].update(google_titles='ext4'),
+                       lambda s:s['secrets']['google_titles'].update(gid=0),
+                       lambda s:s['secrets']['google_titles'].update(mode=stat.S_IFLNK|0o440),
+                       lambda s:s['secrets']['google_titles'].update(mode=stat.S_IFREG|0o644)):
+            bad=copy.deepcopy(snapshot);mutate(bad)
+            with self.assertRaises(preflight.PreflightError): preflight.validate_snapshot(bad)
+
     def test_reviewed_two_core_host_is_accepted_without_process_or_secret_reads(self):
         with patch.object(preflight.subprocess, "run", side_effect=AssertionError("No process in pure validation")), \
              patch("builtins.open", side_effect=AssertionError("No content read")):

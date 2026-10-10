@@ -76,6 +76,43 @@ claims after at least 180 seconds. A pending claim becomes failed with
 `title_call_unknown`, because the original call may have executed. Neither
 case sends another provider request, and late responses stay fenced.
 
+## Credential configuration and deployment
+
+The local opt-in is `SIXNINE_TITLE_USE_CENTRAL=1`; it uses the existing
+`api_registry.load_api('gemini', profile='gemini--user-supplied')` adapter with
+the original `https://generativelanguage.googleapis.com` endpoint. It is not
+permitted for a public deployment. Default local previews remain disabled.
+
+Production uses `SIXNINE_TITLE_CONFIG_FILE=/run/secrets/google_titles`.
+The protected host loader reads `/sixnine/platform/google-titles` in AWS Secrets
+Manager and hydrates a root-owned, group-10001, mode-0440 file in `/run` tmpfs;
+only the app mounts it. No API key enters an environment variable, frontend
+bundle, connection instruction, repository or public guide. The host installs
+the dependency-free `studio_platform/google_title_config.py` beside the existing
+`runtime_secrets_aws.py`; hydration needs no model SDK or HTTP dependency.
+
+The optional source has a disabled sentinel `{"enabled":false}`. Missing,
+denied or malformed upstream configuration disables naming for the next app
+start, without changing database/account secrets or blocking their hydration.
+Google file replacement is atomic: a running app retains its already-bound
+inode until restart. Rotation therefore takes effect at an app restart; it is
+distinct from the existing database credential policy that forbids implicit
+rotation. Protected host preflight validates file ownership, mode and tmpfs.
+
+The reviewed Compose configuration gives the app outbound connectivity for the
+fixed Google HTTPS endpoint; ingress stays behind Caddy, and provider/GPU
+credentials, controller paths and SSH keys remain outside the app. Legacy
+two-secret/no-egress Compose bundles remain accepted for rollback. This source
+change participates in the conservative worker compatibility fingerprint and
+must follow the existing protected release gate; it is not permission to stop,
+restart or extend a user's GPU rental.
+
+The request is limited to 64 output tokens, 20-second HTTP timeout (5 seconds to
+connect), no retries, and `thinkingConfig.thinkingLevel=minimal`, as supported
+by the [official Gemma API documentation](https://ai.google.dev/gemma/docs/core/gemma_on_gemini_api).
+Automatic naming is one request per eligible session, independent of the
+selected conversational model. It does not enable the conversation assistant.
+
 ## Verification boundary
 
 `test_platform_quick_chat_titles.py` checks owner/reader isolation, first-input

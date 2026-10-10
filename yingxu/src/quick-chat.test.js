@@ -12,6 +12,36 @@ test('guides use their independent current recipe allowance',()=>{const binding=
 test('assistant lifecycle updates one durable turn, not duplicate history messages',()=>{const initial={id:'t',seq:1,text:'我的想法',status:'running'};const turns=mergeTimelineTurns([{id:'e1',seq:1,type:'turn.created',record:initial},{id:'e2',seq:2,type:'assistant.completed',record:{...initial,status:'completed',reply:'持久结果'}}]);assert.equal(turns.length,1);assert.equal(turns[0].reply,'持久结果');});
 test('client uses same-origin account fence, original idempotency and exact creative paths',async()=>{const calls=[],client=createQuickChatClient({fetcher:async(path,options)=>{calls.push({path,options});return new Response('{"session":{"id":"s"}}');}});client.setAccount('superdan');await client.createSession({model_id:'gemini-3.8-flash'},'logical-create');await client.preflight('s','r',{item_ids:['i'],retry_of_execution_id:'old'},'logical-pref');assert.equal(calls[0].path,'/v1/quick-chat/sessions');assert.equal(calls[0].options.credentials,'same-origin');assert.equal(calls[0].options.headers['X-Expected-Account'],'superdan');assert.equal(calls[1].options.headers['Idempotency-Key'],'logical-pref');assert.deepEqual(JSON.parse(calls[1].options.body).item_ids,['i']);});
 function fakeClient(overrides={}){let account;return {setAccount:value=>account=value,reset(){},schema:async()=>({models:[]}),capabilities:async()=>capability,sessions:async()=>({sessions:[{id:'s',title:'测试',version:1}]}),createSession:async()=>({session:{id:'s',title:'测试',version:1}}),session:async id=>({session:{id,version:1}}),materials:async()=>({bindings:[]}),timeline:async()=>({events:[]}),...overrides};}
+test('a completed automatic title refreshes loaded history without replacing paged sessions or timeline',async()=>{
+  let title='新的创作',listReads=0;
+  const client=fakeClient({
+    sessions:async({cursor})=>{listReads++;return cursor?{sessions:[{id:'older',title:'早期作品',version:1}],next_cursor:'third-page'}:{sessions:[{id:'s',title,version:4,project_id:'compatibility-project'},{id:'other',title:'另一份创作',version:2}],next_cursor:'second-page'};},
+    session:async()=>({session:{id:'s',title,version:4,updated_at:100}}),
+    timeline:async(_id,{before_cursor,after_cursor}={})=>before_cursor?{events:[{id:'old-event',seq:1,type:'turn.created',record:{id:'old-turn',status:'recorded'}}],before_cursor:'older-history'}:after_cursor?{events:[],after_cursor:'forward'}:{events:[{id:'event',seq:2,type:'turn.created',record:{id:'turn',status:'recorded'}}],before_cursor:'previous-history',after_cursor:'forward'},
+  }),controller=createQuickChatController({client,storage:memory()});
+  await controller.setAccount('supervan');await controller.open('s');await controller.list({more:true});await controller.history();
+  title='月下剑舞';await controller.poll();
+  const state=controller.getState();assert.equal(state.session.title,title);assert.equal(state.session.version,4);
+  assert.deepEqual(state.sessions.map(item=>[item.id,item.title]),[['s',title],['other','另一份创作'],['older','早期作品']]);
+  assert.equal(state.sessions[0].project_id,'compatibility-project');assert.equal(state.sessions[0].version,4);assert.equal(state.sessions[0].updated_at,100);
+  assert.equal(listReads,2);assert.equal(state.sessionsCursor,'third-page');assert.equal(state.historyCursor,'older-history');assert.equal(state.forwardCursor,'forward');
+  assert.deepEqual(state.timeline.map(event=>event.id),['old-event','event']);
+});
+test('late title reads cannot return another account name into history',async()=>{
+  let account,hold=false,finish;
+  const client=fakeClient({setAccount:value=>account=value,sessions:async()=>({sessions:[{id:account,title:account+'作品',version:1}]}),session:async id=>{const value={session:{id,title:id+'标题',version:1}};if(hold){hold=false;return new Promise(resolve=>finish=()=>resolve(value));}return value;}}),controller=createQuickChatController({client,storage:memory()});
+  await controller.setAccount('owner-one');await controller.open('owner-one');hold=true;
+  const oldPoll=controller.poll().catch(error=>error);await controller.setAccount('owner-two');finish();await oldPoll;
+  assert.equal(controller.getState().account,'owner-two');assert.equal(controller.getState().session,null);
+  assert.deepEqual(controller.getState().sessions.map(item=>[item.id,item.title]),[['owner-two','owner-two作品']]);assert.equal(controller.getState().error,'');
+});
+test('a late poll cannot undo a manual history rename',async()=>{
+  let session={id:'s',title:'新的创作',version:1},hold=false,finish;
+  const client=fakeClient({sessions:async()=>({sessions:[structuredClone(session)]}),session:async()=>{const value={session:structuredClone(session)};if(hold){hold=false;return new Promise(resolve=>finish=()=>resolve(value));}return value;},patchSession:async(_id,body)=>{assert.equal(body.expected_version,1);session={...session,title:body.title,version:2};return {session};}}),controller=createQuickChatController({client,storage:memory()});
+  await controller.setAccount('supervan');await controller.open('s');hold=true;
+  const oldPoll=controller.poll().catch(error=>error);await controller.patch({title:'我选的作品名'});finish();await oldPoll;
+  assert.equal(controller.getState().session.title,'我选的作品名');assert.equal(controller.getState().sessions[0].title,'我选的作品名');assert.equal(controller.getState().sessions[0].version,2);
+});
 test('lost creation is retained and recovered with exactly the same operation key/body',async()=>{const calls=[],client=fakeClient({createSession:async(body,key)=>{calls.push({body,key});if(calls.length===1)throw Error('transport interrupted');return {session:{id:'s',version:1}};}}),controller=createQuickChatController({client,storage:memory()});await controller.setAccount('superdan');await assert.rejects(controller.create({model_id:'gemini-3.8-flash'}));assert.ok(controller.getState().pending);await assert.rejects(controller.create({model_id:'gemma-4-31b-it'}));assert.equal(calls.length,1);await controller.recover();assert.equal(calls.length,2);assert.deepEqual(calls[0],calls[1]);assert.equal(controller.getState().pending,null);});
 test('switching accounts drops late resources and keeps old unknown operations in their own bucket',async()=>{let finish;const client=fakeClient({schema:()=>new Promise(resolve=>finish=resolve)}),storage=memory(),controller=createQuickChatController({client,storage});const old=controller.setAccount('superdan');await controller.setAccount(null);finish({models:[{id:'old-account-model'}]});await old;assert.equal(controller.getState().account,null);assert.equal(controller.getState().schema,null);assert.deepEqual(controller.getState().sessions,[]);});
 test('no storage means no mutation sent and no false success',async()=>{let calls=0;const client=fakeClient({createSession:async()=>{calls++;return {session:{id:'s'}};}}),controller=createQuickChatController({client,storage:{getItem:()=>null,setItem:()=>{throw Error('quota');},removeItem(){}}});await controller.setAccount('superdan');await assert.rejects(controller.create({model_id:'gemini-3.8-flash'}));assert.equal(calls,0);});

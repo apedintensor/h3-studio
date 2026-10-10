@@ -19,6 +19,8 @@ test('handoff links point to the saved cloud scope and never carry page query or
   assert.equal(value.workUrl,'https://www.sixnine.art/?project=story-1&entity=shot-2');
   for(const excluded of ['api_key=','do-not-copy','#private','Private title','Private script','synthetic-secret'])assert.ok(!value.brief.includes(excluded));
   assert.equal(value.ready,true);assert.match(value.brief,/for-agents\/SKILL\.md/);assert.match(value.brief,/不自动替换已采用/);
+  assert.ok(value.brief.includes('完整纯文本指南（无需登录）：https://www.sixnine.art/for-agents/guide.md'));
+  assert.ok(value.brief.includes('离线说明与工具包：https://www.sixnine.art/for-agents/skill.zip'));
 });
 
 test('an unsaved draft, another account, or a local workspace cannot leak a handoff to inaccessible or unpublished contents',()=>{

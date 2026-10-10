@@ -94,6 +94,43 @@ def write_runtime(name, content):
         os.close(fd)
 
 
+def hydrate_titles(api):
+    # The host installs this dependency-free validator alongside this helper.
+    # Unlike DB credentials, optional title config may be disabled/rotated at an
+    # app restart. Atomic replacement preserves any existing mounted inode.
+    from studio_platform.google_title_config import validate_config, unique_pairs
+    try:
+        response = api.get_secret_value(SecretId=GOOGLE_TITLES)
+        payload = json.loads(response["SecretString"], object_pairs_hook=unique_pairs)
+        validate_config(payload)
+    except Exception:
+        payload = {"enabled": False}
+        print("Google title configuration unavailable; naming disabled for the next app start")
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    info = ROOT.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or (info.st_uid, info.st_gid) != (0, 0)
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise RuntimeError("Runtime secret directory is not protected")
+    path = ROOT / "google_titles"
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != 0:
+            raise RuntimeError("Title runtime file is invalid")
+    temporary = ROOT / (".google-titles-" + uuid.uuid4().hex)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o400)
+    try:
+        os.fchown(fd, 0, 10001)
+        os.fchmod(fd, 0o440)
+        with os.fdopen(fd, "w", closefd=False) as handle:
+            json.dump(payload, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(fd)
+        os.replace(temporary, path)
+    finally:
+        os.close(fd)
+        temporary.unlink(missing_ok=True)
+
+
 def hydrate(initialize=False):
     if os.geteuid() != 0:
         raise RuntimeError("Host operator privileges required")
@@ -107,17 +144,7 @@ def hydrate(initialize=False):
             value(api, ACCOUNTS, True)
         for name, content in database.items():
             write_runtime(name, content)
-        # This optional provider is unrelated to database/account initialization.
-        # Absent configuration disables naming; malformed/denied access fails hydration.
-        try:
-            result = api.get_secret_value(SecretId=GOOGLE_TITLES)
-        except api.exceptions.ResourceNotFoundException:
-            payload = {"enabled": False}
-        else:
-            payload = json.loads(result["SecretString"])
-        from studio_platform.google_titles import validate_config
-        validate_config(payload)
-        write_runtime("google_titles", json.dumps(payload, separators=(",", ":")))
+        hydrate_titles(api)
 
 
 if __name__ == "__main__":

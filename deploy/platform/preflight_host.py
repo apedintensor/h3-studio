@@ -70,7 +70,9 @@ def validate_snapshot(snapshot):
     for name in ("secret-root", "docker-config"):
         _directory(dirs[name], "preflight_private_root_directory_required", group=0, mode=0o700)
     require(snapshot["docker_config_empty"] is True, "preflight_docker_config_must_be_empty")
-    require(set(snapshot["secrets"]) == {"db_admin_password", "app_database_url"}, "preflight_secret_set_invalid")
+    names = set(snapshot["secrets"])
+    require(names in ({"db_admin_password", "app_database_url"},
+                      {"db_admin_password", "app_database_url", "google_titles"}), "preflight_secret_set_invalid")
     for name, info in snapshot["secrets"].items():
         require(stat.S_ISREG(info["mode"]) and info["uid"] == 0 and info["links"] == 1
                 and 1 <= info["bytes"] <= 16384, "preflight_secret_file_not_protected_regular")
@@ -80,8 +82,8 @@ def validate_snapshot(snapshot):
             allowed, group = {0o440, 0o640}, 10001
         require(stat.S_IMODE(info["mode"]) in allowed and info["gid"] == group,
                 "preflight_secret_owner_or_mode")
-    require(snapshot["secret_filesystems"] == {"secret-root": "tmpfs", "db_admin_password": "tmpfs",
-                                               "app_database_url": "tmpfs"}, "preflight_runtime_secrets_require_tmpfs")
+    require(snapshot["secret_filesystems"] == {name: "tmpfs" for name in names | {"secret-root"}},
+            "preflight_runtime_secrets_require_tmpfs")
     docker = snapshot["docker"]
     require(docker.get("os") == "linux" and type(docker.get("cpus")) is int and docker["cpus"] >= 2,
             "preflight_docker_requires_two_linux_cpus")
@@ -135,13 +137,15 @@ def check_host(*, root=ROOT, secret_root=SECRETS, docker_config=DOCKER_CONFIG):
             _directory(snapshot["directories"][name], "preflight_private_root_directory_required", group=0, mode=0o700)
         with os.scandir(docker_config) as entries:
             snapshot["docker_config_empty"] = next(entries, None) is None
-        snapshot["secrets"] = {name: metadata(secret_root/name) for name in ("db_admin_password", "app_database_url")}
+        names = ["db_admin_password", "app_database_url"]
+        if (secret_root/"google_titles").exists() or (secret_root/"google_titles").is_symlink():
+            names.append("google_titles")
+        snapshot["secrets"] = {name: metadata(secret_root/name) for name in names}
         with Path("/proc/self/mountinfo").open("r", encoding="utf-8") as source:
             mounts = source.read(1024*1024+1)
         require(len(mounts) <= 1024*1024, "preflight_mountinfo_too_large")
         snapshot["secret_filesystems"] = {name: filesystem_for(path, mounts) for name, path in {
-            "secret-root": secret_root, "db_admin_password": secret_root/"db_admin_password",
-            "app_database_url": secret_root/"app_database_url"}.items()}
+            "secret-root": secret_root, **{name: secret_root/name for name in names}}.items()}
         # Empty config disables accidental use of root's registry/login/context
         # files. Only the local daemon is queried; no network command is issued.
         info = subprocess.run(["/usr/bin/docker", "--host", "unix:///var/run/docker.sock", "info",
