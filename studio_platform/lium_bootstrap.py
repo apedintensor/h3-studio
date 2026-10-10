@@ -823,6 +823,8 @@ class BootController:
                     value["slots"][0].update(comfy_revision="", runtime_config_file=slot.runtime_config_file)
                 if not spec.output_delivery:
                     value["slots"][0].pop("output_delivery")
+                if spec.dispatch_backend == "legacy":
+                    value["slots"][0].pop("dispatch_backend")
                 cfg_path.write_text(json.dumps(value), encoding="utf-8")
                 self.fleet = self.fleet_factory(config, self.repo, cfg_path)
                 state["fleet_recipe_ids"] = list(self.config.recipe_ids)

@@ -1,0 +1,29 @@
+# CPU services only. Provider/API/DB secrets are supplied by the existing
+# protected host loader, never checked into this file or forwarded to GPU runs.
+# DSTACK_CONFIG_DIR must contain a protected server/config.yml populated with
+# the explicit Vast/RunPod profiles; DSTACK_DATA_DIR preserves SSH/server state.
+name: sixnine-capacity
+services:
+  dstack:
+    image: dstackai/dstack:0.22.3@sha256:ce0e567675360ba91a6867a0399dccc1682dc2169075c6210d2ec873146f1ad8
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      DSTACK_SERVER_ADMIN_TOKEN: ${DSTACK_SERVER_ADMIN_TOKEN:?Use protected CPU host injection}
+      DSTACK_DATABASE_URL: ${DSTACK_DATABASE_URL:?Use an isolated dstack database/user}
+      DSTACK_SERVER_LOG_FORMAT: json
+      # Upstream tests presence, not value: even "0" enables OTel. Omit
+      # DSTACK_OTEL_*_ENABLED entirely; send only allowlisted CPU events.
+      DSTACK_DEFAULT_CREDS_DISABLED: "1"
+      DSTACK_DB_POOL_SIZE: "5"
+      DSTACK_DB_MAX_OVERFLOW: "5"
+    volumes:
+      - ${DSTACK_DATA_DIR:?Persistent protected dstack state}:/root/.dstack
+      - ${DSTACK_CONFIG_FILE:?Protected dstack server config}:/root/.dstack/server/config.yml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    init: true

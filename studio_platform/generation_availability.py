@@ -79,7 +79,8 @@ def _mode_result(settings, repo, registry, policy, valid, mode, recipe, now):
             configuration_id=policy["configuration_id"], recipe_id=recipe, backend=policy["backend"],
             engine_manifest_digest=policy.get("engine_manifest_digest", ""), output_delivery=policy.get("output_delivery", ""),
             expected_runtime_s=policy["reservation"]["expected_runtime_s"],
-            deployment_profile_id=policy.get("deployment_profile_id"))
+            deployment_profile_id=policy.get("deployment_profile_id"),
+            dispatch_backend=policy.get("dispatch_backend", "legacy"))
         if counts["ready"]:
             state, reason = "ready", "matching_worker_ready"
         elif counts["busy"]:

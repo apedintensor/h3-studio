@@ -1,0 +1,410 @@
+{
+  "uid": "sixnine-generation-pipeline",
+  "title": "Sixnine generation pipeline",
+  "description": "Cloud telemetry is diagnostic evidence. PostgreSQL remains job, attempt, output and billing authority. Missing telemetry does not mean no running GPU.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "browser",
+  "tags": [
+    "sixnine",
+    "dstack",
+    "hatchet",
+    "generation"
+  ],
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "annotations": {
+    "list": []
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "label": "Cloud metrics",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "DS_LOKI",
+        "label": "Cloud logs",
+        "type": "datasource",
+        "query": "loki",
+        "current": {}
+      },
+      {
+        "name": "provider",
+        "label": "Provider",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(sixnine_stage_duration_seconds_count, provider)",
+        "query": {
+          "query": "label_values(sixnine_stage_duration_seconds_count, provider)",
+          "refId": "VariableQuery"
+        },
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "profile",
+        "label": "Model profile",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(sixnine_stage_duration_seconds_count, profile_id)",
+        "query": {
+          "query": "label_values(sixnine_stage_duration_seconds_count, profile_id)",
+          "refId": "VariableQuery"
+        },
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "mode",
+        "label": "FL / REF",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(sixnine_stage_duration_seconds_count, mode)",
+        "query": {
+          "query": "label_values(sixnine_stage_duration_seconds_count, mode)",
+          "refId": "VariableQuery"
+        },
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "gpu",
+        "label": "GPU",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(sixnine_stage_duration_seconds_count, gpu_type)",
+        "query": {
+          "query": "label_values(sixnine_stage_duration_seconds_count, gpu_type)",
+          "refId": "VariableQuery"
+        },
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "warmth",
+        "label": "Cold / warm",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "definition": "label_values(sixnine_stage_duration_seconds_count, warmth)",
+        "query": {
+          "query": "label_values(sixnine_stage_duration_seconds_count, warmth)",
+          "refId": "VariableQuery"
+        },
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "job_id",
+        "label": "Job or attempt ID (optional)",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": [
+          {
+            "text": "",
+            "value": "",
+            "selected": true
+          }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "How to read this dashboard",
+      "type": "text",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Stage start events are exported before completion; inspect logs for starts without matching finishes. Telemetry is bounded and best effort: absence or a missing finish is **not** permission to rerun or rent again. Check the original business job/attempt and provider run. Compare GPU/model/steps/resolution/reference count and cold/warm state before interpreting timings. This dashboard has no access to the business database, user media or prompts. Costs and live machine authority remain in the operator console."
+      }
+    },
+    {
+      "id": 2,
+      "title": "Completed stage median",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, stage, provider, mode, warmth) (rate(sixnine_stage_duration_seconds_bucket{provider=~\"$provider\",profile_id=~\"$profile\",mode=~\"$mode\",gpu_type=~\"$gpu\",warmth=~\"$warmth\",outcome=\"success\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}} {{provider}} {{mode}} {{warmth}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "Completed stage p95",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, stage, provider, mode, warmth) (rate(sixnine_stage_duration_seconds_bucket{provider=~\"$provider\",profile_id=~\"$profile\",mode=~\"$mode\",gpu_type=~\"$gpu\",warmth=~\"$warmth\",outcome=\"success\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}} {{provider}} {{mode}} {{warmth}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "Cold preparation vs warm model work",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.5, sum by (le, stage, provider, mode, warmth) (rate(sixnine_stage_duration_seconds_bucket{provider=~\"$provider\",profile_id=~\"$profile\",mode=~\"$mode\",gpu_type=~\"$gpu\",warmth=~\"$warmth\",stage=~\"image_pull|weights_download|model_load|mode_switch\"}[$__rate_interval])))",
+          "legendFormat": "{{stage}} {{provider}} {{mode}} {{warmth}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "Failure / unknown stage observations",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 12,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (stage, provider, mode, outcome) (increase(sixnine_stage_finished_total{provider=~\"$provider\",profile_id=~\"$profile\",mode=~\"$mode\",gpu_type=~\"$gpu\",warmth=~\"$warmth\",outcome=~\"failure|unknown\"}[$__rate_interval]))",
+          "legendFormat": "{{stage}} {{provider}} {{mode}} {{warmth}}"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Per-attempt stage timeline (starts and finishes)",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 20,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_namespace=\"sixnine\",service_name=~\"sixnine-.*\"} |~ \"${job_id:regex}\" | json | provider=~\"$provider\" | profile_id=~\"$profile\" | mode=~\"$mode\" | gpu_type=~\"$gpu\" | warmth=~\"$warmth\"",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true
+      }
+    },
+    {
+      "id": 7,
+      "title": "Safe diagnostic failures and uncertainty",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "${DS_LOKI}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 24,
+        "h": 10
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_namespace=\"sixnine\",service_name=~\"sixnine-.*\"} |~ \"${job_id:regex}\" | json | provider=~\"$provider\" | profile_id=~\"$profile\" | mode=~\"$mode\" | gpu_type=~\"$gpu\" | warmth=~\"$warmth\" | outcome=~\"failure|unknown\"",
+          "queryType": "range"
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true
+      }
+    },
+    {
+      "id": 8,
+      "title": "Recovery and comparison",
+      "type": "text",
+      "gridPos": {
+        "x": 0,
+        "y": 40,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "Expand a log to inspect `stage_id`, `job_id`, `attempt_id`, `dstack_run`, `hatchet_run`, `trace_id`, `gpu_index`, dimensions, steps and reference counts. IDs are log fields, never metric labels. Search a trace ID in the existing Cloud Tempo data source. `listed_memory_gib` is not a cgroup memory ceiling; compare `cgroup_memory_gib` separately. A recorded `end_to_end` ends only after validated output has committed and is downloadable. Exact claim, cancellation, billing and retry decisions belong to the original ledger."
+      }
+    }
+  ]
+}

@@ -76,7 +76,11 @@
       "url": "https://github.com/inkseq/h3-studio/issues/71",
       "title": "[E3] Deliver operator-managed GPU capacity and tested H3 profiles",
       "project_item_id": "PVTI_lADOFEnp9c4Bmayezg_ypa4",
-      "depends_on": ["D2", "D4", "G1"]
+      "depends_on": [
+        "D2",
+        "D4",
+        "G1"
+      ]
     },
     "A0": {
       "number": 9,
@@ -280,6 +284,12 @@
       "title": "[C4] Enforce the actual AWS release caller account",
       "project_item_id": "PVTI_lADOFEnp9c4Bmayezg_ypZc",
       "depends_on": []
+    },
+    "MIGRATION": {
+      "number": 132,
+      "url": "https://github.com/inkseq/h3-studio/issues/132",
+      "title": "[E/C] Migrate capacity and dispatch to dstack and Hatchet with Grafana Cloud",
+      "specification": "DSTACK-MIGRATION.md"
     }
   },
   "views": {

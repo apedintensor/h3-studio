@@ -35,8 +35,11 @@ class WorkerSpec:
     backend: str = "comfy-worker"
     engine_manifest_digest: str = ""
     output_delivery: str = ""
+    dispatch_backend: str = "legacy"
 
     def __post_init__(self):
+        if self.dispatch_backend not in {"legacy", "hatchet-v1"}:
+            raise ValueError("invalid_dispatch_backend")
         validate_delivery_policy(self.backend, self.output_delivery)
         for value in (self.worker_id, self.pool, self.provider, self.instance_id, self.model_id, self.configuration_id):
             identifier(value)
@@ -77,6 +80,9 @@ def worker_spec_payload(spec):
         value.pop("engine_manifest_digest")
     if not spec.output_delivery:
         value.pop("output_delivery")
+    # Preserve all historical registration hashes for the original route.
+    if spec.dispatch_backend == "legacy":
+        value.pop("dispatch_backend")
     return canonical(value)
 
 
@@ -136,7 +142,7 @@ class WorkerControl:
 
     def pool_status(self, pool, *, model_id, configuration_id, recipe_id=None,
                     backend="comfy-worker", engine_manifest_digest=None, output_delivery="",
-                    expected_runtime_s=None, deployment_profile_id=None):
+                    expected_runtime_s=None, deployment_profile_id=None, dispatch_backend="legacy"):
         """Read-only readiness of exact operator-bound slots, not a GPU probe.
 
         An expired registration is reported as unknown without modifying its
@@ -145,6 +151,8 @@ class WorkerControl:
         """
         for value in (pool, model_id, configuration_id):
             identifier(value)
+        if dispatch_backend not in {"legacy", "hatchet-v1"}:
+            raise ValueError("invalid_dispatch_backend")
         validate_delivery_policy(backend, output_delivery)
         if recipe_id is not None:
             identifier(recipe_id)
@@ -174,6 +182,7 @@ class WorkerControl:
             for row in rows:
                 spec = row["spec"]
                 if (spec["backend"] != backend or spec["model_id"] != model_id
+                    or spec.get("dispatch_backend", "legacy") != dispatch_backend
                     or spec["configuration_id"] != configuration_id
                     or backend == "wangp-worker" and spec.get("engine_manifest_digest") != engine_manifest_digest
                     or spec.get("output_delivery", "") != output_delivery
@@ -310,6 +319,7 @@ class WorkerControl:
         if not isinstance(effective, dict):
             return False
         if (job["pool"] != spec["pool"] or execution.get("backend") != spec["backend"]
+            or execution.get("dispatch_backend", "legacy") != spec.get("dispatch_backend", "legacy")
             or execution.get("enabled") is not True
             or execution.get("output_delivery", "") != spec.get("output_delivery", "")):
             return False
@@ -322,7 +332,8 @@ class WorkerControl:
         return (effective.get("model") == spec["model_id"]
                 and execution.get("configuration_id") == spec["configuration_id"])
 
-    def claim(self, worker_id, pool, *, purpose="generate", lease_seconds=90, job_filter=None, job_allowed=None):
+    def claim(self, worker_id, pool, *, purpose="generate", lease_seconds=90, job_filter=None, job_allowed=None,
+              selected_job_id=None, selected_job_allowed=None):
         """Claim and bind slot atomically in the same ledger transaction."""
         with self.repo.transaction() as connection:
             worker = self._worker(connection, worker_id, lock=True)
@@ -349,6 +360,8 @@ class WorkerControl:
                 return None
             spec = worker["spec"]
             bindings = [jobs.c.pool == pool,
+                func.coalesce(jobs.c.execution_plan["dispatch_backend"].as_string(), "legacy")
+                    == spec.get("dispatch_backend", "legacy"),
                 jobs.c.execution_plan["backend"].as_string() == spec["backend"],
                 # JSON boolean extraction is text on PG and integer on SQLite.
                 # Avoid casting arbitrary legacy strings to PG BOOLEAN, which
@@ -388,6 +401,8 @@ class WorkerControl:
             from .capacity import capacity_member_claim_allowed
             from .worker_admission import worker_window_reason
             claim = self.queue.claim(worker_id, pool, purpose=purpose, lease_seconds=lease_seconds,
+                dispatch_backend=spec.get("dispatch_backend", "legacy"),
+                selected_job_id=selected_job_id, selected_validator=selected_job_allowed,
                 connection=connection, job_filter=and_(*bindings), validator=lambda job: self.matches(worker, job)
                     and (purpose != "generate" or capacity_member_claim_allowed(self.repo, connection, job, worker))
                     and (purpose != "generate" or worker_window_reason(connection, worker, self.repo.clock(),
@@ -470,7 +485,8 @@ class WorkerControl:
             counts = self.pool_status(job["pool"], model_id=request["model"],
                 configuration_id=plan["configuration_id"], backend=plan["backend"], recipe_id=stored.get("recipe_id"),
                 engine_manifest_digest=plan.get("engine_manifest_digest"), output_delivery=plan.get("output_delivery", ""),
-                expected_runtime_s=job.get("expected_runtime_s"), deployment_profile_id=stored.get("deployment_profile_id"))
+                expected_runtime_s=job.get("expected_runtime_s"), deployment_profile_id=stored.get("deployment_profile_id"),
+                dispatch_backend=plan.get("dispatch_backend", "legacy"))
         except (KeyError, ValueError):
             result["reason_code"] = "queue_configuration_unconfirmed"
             return result

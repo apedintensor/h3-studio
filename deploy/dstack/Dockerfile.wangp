@@ -1,0 +1,25 @@
+# A derivative of an already captured native-profile environment. The supplied
+# digest must retain Python3.12.14, the exact profile's core dependency versions,
+# pinned upstream source and usable FFmpeg. Never resolve packages at cold boot.
+# A source-only or BF16 Python3.11 candidate is not a compatible replacement.
+ARG PROFILE_RUNTIME_IMAGE=vastai/wan2gp@sha256:27ef0628d6b4ea24d7263efd8bdb13eb8033de62aa06dfe342e82b8c434ae14c
+FROM ${PROFILE_RUNTIME_IMAGE}
+ARG SOURCE_REVISION=0e58385fbde7ff102d276e4a9e490845de76b4ea
+COPY deploy/dstack/repair_decord_metadata.py /opt/sixnine/repair-decord-metadata.py
+# The vendor base carries a CPython3.6-tagged decord wheel under Python3.12.
+# Replace only that packaging artifact with PyPI's same-version py3 wheel;
+# retain every native profile core version and enforce pip check afterwards.
+ADD --checksum=sha256:51997f20be8958e23b7c4061ba45d0efcd86bffd5fe81c695d0befee0d442976 https://files.pythonhosted.org/packages/11/79/936af42edf90a7bd4e41a6cac89c913d4b47fa48a26b042d5129a9242ee3/decord-0.6.0-py3-none-manylinux2010_x86_64.whl /tmp/decord-0.6.0-py3-none-manylinux2010_x86_64.whl
+RUN /venv/main/bin/python -m pip install --no-deps --no-index --force-reinstall /tmp/decord-0.6.0-py3-none-manylinux2010_x86_64.whl \
+    && /venv/main/bin/python /opt/sixnine/repair-decord-metadata.py \
+    && rm /tmp/decord-0.6.0-py3-none-manylinux2010_x86_64.whl
+RUN test "$(/venv/main/bin/python -c 'import platform; print(platform.python_version())')" = "3.12.14" \
+    && test "$(git -C /opt/workspace-internal/Wan2GP rev-parse HEAD)" = "$SOURCE_REVISION" \
+    && /venv/main/bin/python -m pip check
+# Only these public source files enter the image. Per-run manifest/config/private
+# listener token and source bundle are staged by the CPU controller after its
+# bootstrap intent commits. Model bytes reuse the verified cache when available.
+COPY deploy/wangp/bootstrap.py /opt/sixnine/wangp-bootstrap.py
+ENV PYTHONDONTWRITEBYTECODE=1 TOKENIZERS_PARALLELISM=false
+WORKDIR /workspace
+CMD ["sleep", "infinity"]

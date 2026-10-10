@@ -1,0 +1,12 @@
+# Render outside the repository with permissions 0600 via the CPU secret loader.
+# Placeholders deliberately cannot authenticate. Do not copy Windows DPAPI files
+# or project/provider keys to a GPU. dstack owns provider credentials on CPU.
+projects:
+  - name: sixnine
+    backends:
+      - type: vastai
+        creds:
+          api_key: REPLACE_VIA_PROTECTED_LOADER
+      - type: runpod
+        creds:
+          api_key: REPLACE_VIA_PROTECTED_LOADER

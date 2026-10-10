@@ -1,0 +1,291 @@
+# Merge after deploy/platform/compose.yaml. No service is started by this file.
+# All variable values are exact image identities, protected paths or existing
+# authorization/configuration, never credentials. Do not use a project .env.
+x-migration-logs: &migration-logs
+  driver: json-file
+  options: {max-size: 5m, max-file: "2"}
+
+x-business-environment: &business-environment
+  SIXNINE_DATA: /data
+  SIXNINE_DATABASE_URL_FILE: /run/secrets/app_database_url
+  SIXNINE_AUTH_MODE: password
+  SIXNINE_EXECUTION_PROFILES_FILE: /run/secrets/execution_profiles
+  SIXNINE_OPERATOR_CAPACITY_OWNERS: ${SIXNINE_OPERATOR_CAPACITY_OWNERS:?Existing authorized operator owners required}
+  SIXNINE_TELEMETRY_CONFIG_FILE: /run/secrets/grafana_cloud
+
+x-cpu-service: &cpu-service
+  image: ${SIXNINE_DISPATCH_IMAGE:?Exact tested CPU dispatch image digest required}
+  pull_policy: never
+  user: "10001:10001"
+  init: true
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  network_mode: service:app
+  stop_grace_period: 210s
+  logging: *migration-logs
+
+services:
+  db:
+    mem_limit: 384m
+  db-init:
+    mem_limit: 128m
+  caddy:
+    mem_limit: 96m
+  app:
+    mem_limit: 512m
+    environment:
+      <<: *business-environment
+      DSTACK_OPERATOR_CONFIG: /run/secrets/dstack_operator_config
+      SIXNINE_GENERATION_ENABLED: ${SIXNINE_MIGRATION_GENERATION_ENABLED:-0}
+      SIXNINE_EXECUTION_BACKEND: ${SIXNINE_MIGRATION_EXECUTION_BACKEND:-disabled}
+    secrets: [execution_profiles, grafana_cloud, dstack_operator_config, dstack_api_token, dstack_ssh_public_key]
+    healthcheck:
+      test: [CMD, python, -c, "import json,urllib.request; h=json.load(urllib.request.urlopen('http://127.0.0.1:8845/healthz',timeout=5)); assert h['auth_ready'] and not h['render_enabled'] and not h['cloud_creation_enabled']"]
+
+  dstack:
+    image: dstackai/dstack:0.22.3@sha256:ce0e567675360ba91a6867a0399dccc1682dc2169075c6210d2ec873146f1ad8
+    pull_policy: never
+    user: "0:0"
+    init: true
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    network_mode: service:app
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 60s
+    depends_on:
+      app: {condition: service_started}
+      db: {condition: service_healthy}
+    # Official image installs its dstack executable using uv tool; preserve
+    # image PATH. Override the entrypoint only to hydrate protected files.
+    entrypoint: [python, -c]
+    command:
+      - |
+        import os, pathlib, stat, sys
+        from urllib.parse import urlsplit
+        def read(path):
+            with pathlib.Path(path).open('rb') as stream:
+                info=os.fstat(stream.fileno()); raw=stream.read(16385)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_mode & 0o027:
+                raise ValueError()
+            text=raw.decode('utf-8').removesuffix('\n')
+            if not text or len(raw)>16384 or text!=text.strip() or any(c in text for c in '\r\n\x00'):
+                raise ValueError()
+            return text
+        try:
+            token=read('/run/secrets/dstack_api_token')
+            dsn=read('/run/secrets/dstack_database_url'); parsed=urlsplit(dsn)
+            if len(token)<32 or any(c.isspace() for c in token) or parsed.scheme!='postgresql+asyncpg':
+                raise ValueError()
+            if (parsed.hostname,parsed.username,parsed.path)!=('db','dstack_control','/sixnine_dstack') or not parsed.password:
+                raise ValueError()
+            os.environ['DSTACK_SERVER_ADMIN_TOKEN']=token
+            os.environ['DSTACK_DATABASE_URL']=dsn
+        except Exception:
+            sys.exit('dstack_protected_configuration_invalid')
+        # Pinned CLI 0.22.3 writes this marker and phones home on a fresh cache.
+        # Seed its nonsecret daily marker in tmpfs; immutable deployments do not
+        # need an upstream CLI update probe at each server restart.
+        update_marker=pathlib.Path('/root/.cache/.dstack/cli/last_check')
+        update_marker.parent.mkdir(parents=True,exist_ok=True)
+        update_marker.touch()
+        os.execvp('dstack',['dstack','server','--host','127.0.0.1','--port','3000','--log-level','WARNING','--no'])
+    environment:
+      DSTACK_SERVER_HOST: 127.0.0.1
+      DSTACK_SERVER_PORT: "3000"
+      DSTACK_SERVER_URL: http://127.0.0.1:3000
+      DSTACK_SERVER_LOG_LEVEL: WARNING
+      DSTACK_SERVER_ROOT_LOG_LEVEL: ERROR
+      DSTACK_SERVER_UVICORN_LOG_LEVEL: ERROR
+      DSTACK_SERVER_LOG_FORMAT: json
+      DSTACK_DEFAULT_CREDS_DISABLED: "1"
+      DSTACK_DB_POOL_SIZE: "5"
+      DSTACK_DB_MAX_OVERFLOW: "5"
+      DSTACK_SERVER_EXECUTOR_MAX_WORKERS: "16"
+      # Presence enables DSTACK_OTEL_*_ENABLED, even when the value is "0".
+      # None of these switches or raw request instrumentation are configured.
+    secrets: [dstack_api_token, dstack_database_url]
+    volumes:
+      - type: bind
+        source: ${SIXNINE_DSTACK_STATE_DIR:?Existing protected persistent dstack state required}
+        target: /root/.dstack
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${SIXNINE_DSTACK_SERVER_CONFIG_FILE:?Protected explicit Vast/RunPod config required}
+        target: /root/.dstack/server/config.yml
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:size=67108864,mode=1777", "/root/.cache:size=1048576,mode=0700"]
+    healthcheck:
+      test: [CMD, python, -c, "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:3000/healthcheck',timeout=4))['status']=='running'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 45s
+    logging: *migration-logs
+
+  hatchet-db:
+    image: postgres:15@sha256:c961aa287d8698297cb26cdfadfbe9fd2cbaf77e53cfffe9636e8d8a1e4d842c
+    pull_policy: never
+    restart: unless-stopped
+    mem_limit: 256m
+    shm_size: 64m
+    pids_limit: 128
+    security_opt: [no-new-privileges:true]
+    command: [postgres, -c, max_connections=80, -c, shared_buffers=32MB, -c, work_mem=2MB]
+    environment:
+      POSTGRES_USER: hatchet
+      POSTGRES_DB: hatchet
+      POSTGRES_PASSWORD_FILE: /run/secrets/database_password
+    secrets: [database_password]
+    volumes: [hatchet-postgres:/var/lib/postgresql/data]
+    networks: [database]
+    healthcheck:
+      test: [CMD, pg_isready, -d, hatchet, -U, hatchet]
+      interval: 5s
+      timeout: 4s
+      retries: 24
+    logging: *migration-logs
+
+  hatchet:
+    image: ghcr.io/hatchet-dev/hatchet/hatchet-lite:v0.110.5@sha256:cc81f078a5285d7d2051ec4a4fa459d033e1face4ca5983d82612b00da6e3fa3
+    pull_policy: never
+    restart: unless-stopped
+    entrypoint: [/bin/sh, /sixnine/entrypoint.sh]
+    network_mode: service:app
+    mem_limit: 640m
+    pids_limit: 256
+    stop_grace_period: 60s
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      app: {condition: service_started}
+      hatchet-db: {condition: service_healthy}
+    environment:
+      DATABASE_POSTGRES_HOST: hatchet-db
+      DATABASE_POSTGRES_PORT: "5432"
+      DATABASE_POSTGRES_USERNAME: hatchet
+      DATABASE_POSTGRES_DB_NAME: hatchet
+      DATABASE_POSTGRES_SSL_MODE: disable
+      DATABASE_MAX_CONNS: "10"
+      DATABASE_MIN_CONNS: "1"
+      DATABASE_LOG_QUERIES: "false"
+      SERVER_MSGQUEUE_KIND: postgres
+      SERVER_AUTH_COOKIE_DOMAIN: 127.0.0.1
+      SERVER_AUTH_COOKIE_INSECURE: "true"
+      SERVER_GRPC_BIND_ADDRESS: 127.0.0.1
+      SERVER_GRPC_INSECURE: "true"
+      SERVER_GRPC_BROADCAST_ADDRESS: 127.0.0.1:7077
+      SERVER_GRPC_PORT: "7077"
+      SERVER_URL: http://127.0.0.1:8888
+      SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS: 127.0.0.1:7077
+      SERVER_AUTH_SET_EMAIL_VERIFIED: "true"
+      SERVER_ALLOW_SIGNUP: "false"
+      SERVER_ALLOW_INVITES: "false"
+      SERVER_LOGGER_LEVEL: warn
+      DATABASE_LOGGER_LEVEL: warn
+      ADMIN_EMAIL: sixnine-operator@localhost.invalid
+      ADMIN_NAME: Sixnine operator
+      DEFAULT_TENANT_NAME: Sixnine dispatch
+      DEFAULT_TENANT_SLUG: sixnine
+      SERVER_LIMITS_DEFAULT_TENANT_RETENTION_PERIOD: 168h
+    secrets: [database_password, administrator_password]
+    volumes:
+      - hatchet-config:/config
+      - type: bind
+        source: ../hatchet/entrypoint.sh
+        target: /sixnine/entrypoint.sh
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8888/api/ready]
+      interval: 10s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+    logging: *migration-logs
+
+  dispatch:
+    <<: *cpu-service
+    mem_limit: 128m
+    pids_limit: 64
+    command: [python, -m, studio_platform.hatchet_dispatch, dispatcher, --broker-config, /run/secrets/hatchet_broker]
+    environment: *business-environment
+    secrets: [app_database_url, execution_profiles, grafana_cloud, hatchet_broker, hatchet_api_token]
+    volumes:
+      - type: bind
+        source: /srv/sixnine/platform-data
+        target: /data
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:size=16777216,mode=1777"]
+    depends_on:
+      app: {condition: service_healthy}
+      hatchet: {condition: service_healthy}
+
+  controller:
+    <<: *cpu-service
+    mem_limit: 640m
+    pids_limit: 192
+    command: [python, -m, studio_platform.dstack_controller]
+    environment:
+      <<: *business-environment
+      DSTACK_OPERATOR_CONFIG: /run/secrets/dstack_operator_config
+      DSTACK_RUNTIME_CONFIG: /run/secrets/dstack_runtime_config
+    secrets: [app_database_url, execution_profiles, grafana_cloud, hatchet_broker, hatchet_api_token, dstack_operator_config, dstack_runtime_config, dstack_api_token, dstack_ssh_public_key, gpu_ssh_key]
+    volumes:
+      - type: bind
+        source: /srv/sixnine/platform-data
+        target: /data
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${SIXNINE_DSTACK_RUNTIME_DIR:?Original durable runtime transport state required}
+        target: /dstack-runtime
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${SIXNINE_DSTACK_SOURCE_DIR:?Exact selected source bundle directory required}
+        target: /dstack-sources
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:size=67108864,mode=1777"]
+    depends_on:
+      app: {condition: service_healthy}
+      dstack: {condition: service_healthy}
+      hatchet: {condition: service_healthy}
+
+secrets:
+  execution_profiles:
+    file: ${SIXNINE_EXECUTION_PROFILES_SECRET_FILE:?Protected original admission profiles required}
+  grafana_cloud:
+    file: ${SIXNINE_GRAFANA_CONFIG_FILE:?Protected existing Grafana Cloud config required}
+  dstack_operator_config:
+    file: ${SIXNINE_DSTACK_OPERATOR_CONFIG_FILE:?Protected dstack operator config required}
+  dstack_runtime_config:
+    file: ${SIXNINE_DSTACK_RUNTIME_CONFIG_FILE:?Protected native runtime config required}
+  dstack_api_token:
+    file: ${SIXNINE_DSTACK_TOKEN_FILE:?Protected existing dstack API token required}
+  dstack_database_url:
+    file: ${SIXNINE_DSTACK_DSN_FILE:?Dedicated infrastructure database credential required}
+  dstack_ssh_public_key:
+    file: ${SIXNINE_DSTACK_SSH_PUBLIC_KEY_FILE:?Existing selected SSH public key file required}
+  gpu_ssh_key:
+    file: ${SIXNINE_GPU_SSH_KEY_FILE:?Existing CPU-only SSH private key file required}
+  hatchet_broker:
+    file: ${SIXNINE_HATCHET_BROKER_CONFIG_FILE:?Protected authenticated broker config required}
+  hatchet_api_token:
+    file: ${SIXNINE_HATCHET_TOKEN_FILE:?Protected existing Hatchet API token required}
+  database_password:
+    file: ${SIXNINE_HATCHET_SECRET_DIR:?Existing protected Hatchet secret directory required}/database-password
+  administrator_password:
+    file: ${SIXNINE_HATCHET_SECRET_DIR:?Existing protected Hatchet secret directory required}/administrator-password
+
+volumes:
+  # Existing volumes must be selected; missing names must not start a blank DB.
+  hatchet-postgres:
+    external: true
+    name: ${SIXNINE_HATCHET_POSTGRES_VOLUME:?Existing Hatchet PostgreSQL volume required}
+  hatchet-config:
+    external: true
+    name: ${SIXNINE_HATCHET_CONFIG_VOLUME:?Existing Hatchet signing/config volume required}

@@ -439,9 +439,11 @@ class OperatorController:
     def _summarize_commands(self):
         with self.repo.engine.connect() as connection:
             commands=list(connection.execute(select(operator_commands).where(operator_commands.c.state.in_(ACTIVE_COMMANDS))).mappings())
-            nodes=list(connection.execute(select(operator_nodes)).mappings())
+            nodes=[n for n in connection.execute(select(operator_nodes)).mappings()
+                if n["payload"].get("capacity_backend") != "dstack-v1"]
             intents={row["id"]:row for row in connection.execute(select(instance_intents)).mappings()}
             workers=list(connection.execute(select(registered_workers)).mappings())
+        commands = [c for c in commands if not c["kind"].startswith("dstack_")]
         for command in commands if not self.shutting_down else ():
             if command["kind"]=="start":
                 owned=[row for row in nodes if row["command_id"]==command["id"]]
@@ -495,7 +497,8 @@ class OperatorController:
         with self.repo.engine.connect() as connection:
             # Includes completed/blocked commands: rentals still need lifecycle
             # reconciliation, pending invoice settlement and conservative cleanup.
-            nodes=list(connection.execute(select(operator_nodes)).mappings())
+            nodes=[n for n in connection.execute(select(operator_nodes)).mappings()
+                if n["payload"].get("capacity_backend") != "dstack-v1"]
         if self.shutting_down:
             self._drain_for_shutdown(nodes)
         errors=0

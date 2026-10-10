@@ -156,7 +156,10 @@ class ShardTests(unittest.TestCase):
         self.assertEqual(set(ci.POSTGRES_MODULES) - expected,
                          {"test_operator_manual_review", "test_capacity_market_refresh", "test_capacity_candidates",
                           "test_platform_wangp_failure_diagnostics", "test_platform_wangp_seed_domain", "test_operator_owned_drain", "test_platform_quick_chat_titles",
-                          "test_operator_extensions", "test_managed_worker_admission"})
+                          "test_operator_extensions", "test_managed_worker_admission",
+                          "test_dstack_operator", "test_dstack_controller", "test_dstack_runtime",
+                          "test_dstack_factory", "test_hatchet_dispatch", "test_hatchet_dispatch_telemetry",
+                          "test_hatchet_affinity"})
         self.assertEqual(len(ci.POSTGRES_MODULES), len(set(ci.POSTGRES_MODULES)))
 
     def test_postgres_loader_uses_complete_manifest(self):
