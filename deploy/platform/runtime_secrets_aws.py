@@ -17,6 +17,7 @@ from botocore.exceptions import ClientError
 REGION = "ap-southeast-1"
 DATABASE = "/sixnine/platform/database"
 ACCOUNTS = "/sixnine/platform/bootstrap-accounts"
+GOOGLE_TITLES = "/sixnine/platform/google-titles"
 ROOT = Path("/run/sixnine-secrets")
 
 
@@ -61,7 +62,7 @@ def value(api, name, initialize=False):
 
 
 def write_runtime(name, content):
-    if name not in {"db_admin_password", "app_database_url"}:
+    if name not in {"db_admin_password", "app_database_url", "google_titles"}:
         raise RuntimeError("Unexpected runtime secret")
     ROOT.mkdir(mode=0o700, exist_ok=True)
     info = ROOT.lstat()
@@ -106,6 +107,17 @@ def hydrate(initialize=False):
             value(api, ACCOUNTS, True)
         for name, content in database.items():
             write_runtime(name, content)
+        # This optional provider is unrelated to database/account initialization.
+        # Absent configuration disables naming; malformed/denied access fails hydration.
+        try:
+            result = api.get_secret_value(SecretId=GOOGLE_TITLES)
+        except api.exceptions.ResourceNotFoundException:
+            payload = {"enabled": False}
+        else:
+            payload = json.loads(result["SecretString"])
+        from studio_platform.google_titles import validate_config
+        validate_config(payload)
+        write_runtime("google_titles", json.dumps(payload, separators=(",", ":")))
 
 
 if __name__ == "__main__":

@@ -62,8 +62,9 @@ def payload(model, messages, instruction=DEFAULT_INSTRUCTION, max_tokens=2048):
 
 
 class GoogleChatClient:
-    def __init__(self, loader=central_config, transport=None):
+    def __init__(self, loader=central_config, transport=None, *, timeout=None):
         self.loader, self.transport = loader, transport
+        self.timeout = timeout or httpx.Timeout(120, connect=15)
 
     def _request(self, method, path, body=None):
         try:
@@ -71,7 +72,7 @@ class GoogleChatClient:
             if config.base_url != ORIGIN or not config.api_key:
                 raise ChatError("profile_mismatch", "中央Google配置端点或凭据不匹配。", 503)
             with httpx.Client(base_url=ORIGIN, headers={"x-goog-api-key": config.api_key},
-                              timeout=httpx.Timeout(120, connect=15), follow_redirects=False,
+                              timeout=self.timeout, follow_redirects=False,
                               transport=self.transport) as client:
                 response = client.request(method, path, json=body)
         except ChatError:

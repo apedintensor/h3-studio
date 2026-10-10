@@ -31,7 +31,7 @@ def validate(config, *, deployment_directory=None, compose_version=None):
     allowed_env = {
         "app": {"SIXNINE_DATA", "SIXNINE_DATABASE_URL_FILE", "SIXNINE_PUBLIC_ORIGIN", "SIXNINE_AUTH_MODE",
                 "SIXNINE_GENERATION_ENABLED", "SIXNINE_RENDER_ENABLED", "SIXNINE_EXECUTION_BACKEND", "SIXNINE_CLOUD_CREATION_ENABLED",
-                "SIXNINE_STORAGE_PROVIDER", "SIXNINE_FRONTEND_DIR", "SIXNINE_FRONTEND_RELEASE_DIR"},
+                "SIXNINE_STORAGE_PROVIDER", "SIXNINE_FRONTEND_DIR", "SIXNINE_FRONTEND_RELEASE_DIR", "SIXNINE_TITLE_CONFIG_FILE"},
         "db": {"POSTGRES_USER", "POSTGRES_DB", "POSTGRES_PASSWORD_FILE", "POSTGRES_INITDB_ARGS",
                "POSTGRES_HOST_AUTH_METHOD", "PGDATA"}, "db-init": set(), "caddy": set()}
     allowed_caps = {"app": set(), "db-init": set(), "caddy": {"NET_BIND_SERVICE"},
@@ -86,6 +86,9 @@ def validate(config, *, deployment_directory=None, compose_version=None):
     independent_frontend = "SIXNINE_FRONTEND_RELEASE_DIR" in app.get("environment", {})
     if independent_frontend:
         required["SIXNINE_FRONTEND_RELEASE_DIR"] = "/frontend"
+    titles = "SIXNINE_TITLE_CONFIG_FILE" in app.get("environment", {})
+    if titles:
+        required["SIXNINE_TITLE_CONFIG_FILE"] = "/run/secrets/google_titles"
     require(app.get("environment") == required, "App production safety settings differ")
     networks = config.get("networks", {})
     require(set(networks) == {"web", "database", "edge"}, "Unexpected network definition")
@@ -94,7 +97,8 @@ def validate(config, *, deployment_directory=None, compose_version=None):
                 "Network driver/external configuration differs")
     require(networks.get("web", {}).get("internal") is True and networks.get("database", {}).get("internal") is True,
             "App/database networks must be private")
-    require(set(app.get("networks", {})) == {"web", "database"}, "App must not have internet egress")
+    require(set(app.get("networks", {})) == ({"web", "database", "edge"} if titles else {"web", "database"}),
+            "App egress must match the reviewed Google title credential configuration")
     require(set(db.get("networks", {})) == {"database"} and set(init.get("networks", {})) == {"database"},
             "DB/bootstrap must only reach the private database network")
     require(set(caddy.get("networks", {})) == {"web", "edge"}, "Proxy network separation differs")
@@ -126,10 +130,10 @@ def validate(config, *, deployment_directory=None, compose_version=None):
     require(db.get("command") == expected_db_command, "PostgreSQL security/logging/connection arguments differ")
     def secret_names(service):
         return {item["source"] if isinstance(item, dict) else item for item in service.get("secrets", [])}
-    require(secret_names(app) == {"app_database_url"} and secret_names(db) == {"db_admin_password"}
+    require(secret_names(app) == ({"app_database_url", "google_titles"} if titles else {"app_database_url"}) and secret_names(db) == {"db_admin_password"}
             and secret_names(init) == {"db_admin_password", "app_database_url"} and not secret_names(caddy),
             "Secret access is broader than required")
-    require(set(config.get("secrets", {})) == {"db_admin_password", "app_database_url"}, "Unexpected secret references")
+    require(set(config.get("secrets", {})) == ({"db_admin_password", "app_database_url", "google_titles"} if titles else {"db_admin_password", "app_database_url"}), "Unexpected secret references")
     for name, item in config.get("secrets", {}).items():
         require(set(item) == {"name", "file"} and item.get("name") == "sixnine-platform_"+name
                 and item.get("file") == "/run/sixnine-secrets/" + name,

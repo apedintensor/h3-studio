@@ -65,11 +65,19 @@ class Settings:
     operator_capacity_owners: tuple[str, ...] = ()
     render_enabled: bool = False
     recovery_backends: tuple[str, ...] = ()
+    title_config_file: Path | None = None
+    title_use_central: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "data_dir", Path(self.data_dir).resolve())
         if self.frontend_dir is not None:
             object.__setattr__(self, "frontend_dir", Path(self.frontend_dir).resolve())
+        if self.title_config_file is not None and not Path(self.title_config_file).is_absolute():
+            raise ValueError("Title credential path must be absolute")
+        if type(self.title_use_central) is not bool or (self.title_config_file is not None and self.title_use_central):
+            raise ValueError("Configure only one explicit title credential source")
+        if self.public_origin and self.title_use_central:
+            raise ValueError("Public title generation requires the protected runtime credential source")
         if self.frontend_release_dir is not None:
             from .frontend import validate_release_directory
             object.__setattr__(self, "frontend_release_dir", validate_release_directory(self.frontend_release_dir))
@@ -144,4 +152,6 @@ class Settings:
             operator_capacity_owners=tuple(x.strip() for x in os.environ.get("SIXNINE_OPERATOR_CAPACITY_OWNERS", "").split(",") if x.strip()),
             render_enabled=os.environ.get("SIXNINE_RENDER_ENABLED", "0") == "1",
             recovery_backends=tuple(x.strip() for x in os.environ.get("SIXNINE_RECOVERY_BACKENDS", "").split(",") if x.strip()),
+            title_config_file=Path(os.environ["SIXNINE_TITLE_CONFIG_FILE"]) if os.environ.get("SIXNINE_TITLE_CONFIG_FILE") else None,
+            title_use_central=os.environ.get("SIXNINE_TITLE_USE_CENTRAL", "0") == "1",
         )
