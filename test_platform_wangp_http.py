@@ -179,7 +179,7 @@ class HTTPTests(unittest.TestCase):
         raw = data.getvalue()
         item = InputDescriptor("asset-one", "input-one", "image", hashlib.sha256(raw).hexdigest(), len(raw))
         self.transport.stage_input(item, io.BytesIO(raw))
-        request = replace(prepared(), settings_json=canonical_json({"image_start": item.handle, "image_end": None}),
+        request = replace(prepared(), settings_json=canonical_json({"seed": 42, "image_start": item.handle, "image_end": None}),
                           inputs=(item,))
         actual = Path(resolve_inputs(request, self.inputs)["image_start"])
         self.assertEqual(actual.suffix, ".png")

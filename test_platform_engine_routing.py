@@ -138,7 +138,9 @@ class EngineRoutingTests(LedgerCase):
             self.repo.configure_budget(ident, tenant_id=self.scope.tenant_id, limit_microusd=1000000)
         from studio_platform.capabilities import compile_request
         from test_platform_api import generation_request
-        compiled, fingerprint = compile_request(generation_request(), lambda _: None, backend="wangp-worker")
+        request = generation_request()
+        request["controls"]["seed"] = "424242"
+        compiled, fingerprint = compile_request(request, lambda _: None, backend="wangp-worker")
         self.assertNotIn("ref_image_size", compiled["request"])
         self.assertNotIn("guides", compiled["request"])
         evaluator = ExecutionPolicies(settings, self.repo)

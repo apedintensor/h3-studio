@@ -14,15 +14,17 @@ from pathlib import Path
 import subprocess
 import sys
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
-from .control import WorkerControl
+from .control import TERMINAL, WorkerControl, worker_spec_payload
 from .fleet import FleetSupervisor, read_config as read_fleet, run_slot
+from .inference.wangp import WanGPBackend
 from .lium_bootstrap import BootConfig, BootController, BootError, idle_proof_type
 from .lium_provider import _uuid
 from .operator_capacity import operator_nodes, public_bootstrap
 from .qualification_profiles import QUEUED_TASK_PROFILE
-from .repository import Repository, instance_intents, registered_workers
+from .repository import (Repository, attempts, instance_intents, jobs,
+    registered_devices, registered_workers, request_hash)
 from .runtime_catalog import engine_manifest, get_profile
 from .wangp_bootstrap import SOURCE_NAMES, WanGPSSHHost
 from .worker import _slot_lock
@@ -160,6 +162,8 @@ class OperatorBoot:
                 reports.append({'state':'draining'})
             else:
                 reports.append(boot.tick(intent_id))
+        if self.stopping:
+            self._retire_stopped_workers()
         states = {r['state'] for r in reports}
         if states == {'fleet_running'}: state='ready'
         elif states <= {'draining'}: state='draining'
@@ -170,6 +174,148 @@ class OperatorBoot:
         reason=('bootstrap_reconciliation_required' if states & {'bootstrap_start_unknown',
             'bootstrap_reconciliation_required'} else 'operator_bootstrap_failed' if state in {'failed','blocked'} else None)
         return public_bootstrap({'state':state,'reason_code':reason,'slots':reports})
+
+    def _retire_stopped_workers(self):
+        """Release only this parent's exited children, never an unowned crash.
+
+        All configured slots must agree. The original provider stop still needs
+        its own fresh idle observation and removal receipt on the next tick.
+        """
+        if not self.stopping or len(self.slots) != self.binding.execution_slots:
+            return False
+        # Fake/absent or restarted fleets cannot establish process ownership.
+        if any(boot.fleet is None or getattr(boot.fleet, 'config', None) is None
+                for boot in self.slots):
+            return False
+        control = WorkerControl(self.repo)
+        with self.repo.transaction() as connection:
+            self.repo._lock_capacity(connection)
+            intent = self.repo._locked(connection, select(instance_intents).where(
+                instance_intents.c.id == self.intent_id))
+            node = self.repo._locked(connection, select(operator_nodes).where(
+                operator_nodes.c.intent_id == self.intent_id))
+            if (intent is None or node is None or intent['state'] != 'draining'
+                    or node['desired_state'] not in {'drained', 'stopped'}
+                    or node['binding_hash'] != self.binding.fingerprint
+                    or node['binding_id'] != self.binding.binding_id
+                    or intent['provider'] != self.provider_id
+                    or intent['provider_instance_id'] != self.instance_id
+                    or intent['pool'] != self.binding.pool
+                    or intent['physical_gpus'] != self.binding.gpu_count
+                    or intent['slots'] != self.binding.execution_slots):
+                return False
+            configured, physical = {}, set()
+            for index, boot in enumerate(self.slots):
+                pending = getattr(boot, 'preparation_pending', None)
+                fleet = boot.fleet
+                active = [slot for slot in fleet.config.slots if slot.enabled]
+                worker_id = self.provider_id+'-'+self.intent_id.replace('-', '')+'-gpu'+str(index)
+                if (not callable(pending) or pending() or len(active) != 1
+                        or set(fleet.children) != {worker_id}
+                        or active[0].spec.worker_id != worker_id
+                        or fleet.children[worker_id].poll() is None
+                        or getattr(boot, 'bound_intent', None) != self.intent_id
+                        or getattr(boot, 'bound_instance', None) != self.instance_id):
+                    return False
+                spec, backend = active[0].spec, getattr(boot, 'backend', None)
+                if (spec.provider != self.provider_id or spec.instance_id != self.instance_id
+                        or spec.pool != self.binding.pool or spec.backend != 'wangp-worker'
+                        or spec.model_id != self.binding.model_id
+                        or spec.configuration_id != self.binding.configuration_id
+                        or spec.recipe_ids != self.binding.recipe_ids
+                        or spec.engine_manifest_digest != self.binding.engine_manifest_digest
+                        or spec.output_delivery != boot.config.output_delivery
+                        or physical.intersection(spec.physical_gpu_ids)
+                        or not isinstance(backend, WanGPBackend) or backend.enabled is not True
+                        or backend.manifest.digest != self.binding.engine_manifest_digest
+                        or backend.slot_key != self.intent_id or not backend.expected_incarnation):
+                    return False
+                configured[worker_id] = (spec, backend)
+                physical.update(spec.physical_gpu_ids)
+            if len(physical) != self.binding.gpu_count:
+                return False
+            workers = list(connection.execute(select(registered_workers).where(
+                registered_workers.c.provider == self.provider_id,
+                registered_workers.c.instance_id == self.instance_id)
+                .order_by(registered_workers.c.id).with_for_update()).mappings())
+            by_id = {worker['id']: worker for worker in workers}
+            if (not set(configured) <= set(by_id)
+                    or any(worker['state'] != 'retired' and worker['id'] not in configured
+                        for worker in workers)):
+                return False
+            for worker_id, (spec, _) in configured.items():
+                worker = by_id[worker_id]
+                if (worker['current_job_id'] is not None or worker['state'] not in {'draining', 'unknown', 'retired'}
+                        or worker['state'] != 'retired' and worker['drain_requested'] != 1
+                        or worker['pool'] != spec.pool
+                        or worker['spec_hash'] != request_hash(worker_spec_payload(spec))
+                        or worker['spec'] != worker_spec_payload(spec)):
+                    return False
+            worker_ids = list(by_id)
+            devices = list(connection.execute(select(registered_devices).where(or_(
+                (registered_devices.c.provider == self.provider_id) &
+                    (registered_devices.c.instance_id == self.instance_id),
+                registered_devices.c.worker_id.in_(worker_ids))).order_by(
+                    registered_devices.c.provider, registered_devices.c.instance_id, registered_devices.c.gpu_id)
+                .with_for_update()).mappings())
+            for worker_id, (spec, _) in configured.items():
+                held = [device for device in devices if device['worker_id'] == worker_id
+                    and device['state'] != 'released']
+                if by_id[worker_id]['state'] == 'retired':
+                    if held:
+                        return False
+                elif ({device['gpu_id'] for device in held} != set(spec.physical_gpu_ids)
+                        or any(device['provider'] != self.provider_id or device['instance_id'] != self.instance_id
+                            or device['state'] != 'owned' for device in held)):
+                    return False
+            if any(device['state'] != 'released' and device['worker_id'] not in configured for device in devices):
+                return False
+            # Lock workers -> jobs -> attempts, matching claim/observe ordering.
+            history_query = select(attempts).where(attempts.c.worker_id.in_(worker_ids)).order_by(attempts.c.id)
+            history = list(connection.execute(history_query).mappings())
+            job_rows = {job['id']: job for job in connection.execute(select(
+                jobs.c.id, jobs.c.status, jobs.c.lease_worker_id, jobs.c.lease_expires_at).where(or_(
+                    jobs.c.id.in_([attempt['job_id'] for attempt in history]),
+                    jobs.c.lease_worker_id.in_(worker_ids))).order_by(jobs.c.id).with_for_update()).mappings()}
+            history = list(connection.execute(history_query.with_for_update()).mappings())
+            if (any(job['status'] not in TERMINAL or job['lease_worker_id'] is not None
+                    or job['lease_expires_at'] is not None for job in job_rows.values())
+                    or any(attempt['job_id'] not in job_rows or attempt['status'] not in TERMINAL
+                        or (attempt['submission_started_at'] is not None or attempt['upstream_task_id'] is not None)
+                            and attempt['upstream_stopped'] != 1 for attempt in history)):
+                return False
+            from .artifact_writer import write_receipts
+            receipts = connection.execute(select(write_receipts.c.record).where(
+                write_receipts.c.job_id.in_(job_rows)).with_for_update()).scalars()
+            try:
+                if any(json.loads(record).get('phase') != 'settled' for record in receipts):
+                    return False
+            except (TypeError, ValueError, AttributeError):
+                return False
+            # The pinned adapter authenticates manifest, slot and incarnation.
+            # Probe while the ledger locks exclude new work; do not reuse a prior
+            # provider fact or infer remote idle from the exited local process.
+            proofs = []
+            for _, backend in configured.values():
+                observed_at = self.repo.clock()
+                if backend.is_idle() is not True:
+                    return False
+                proofs.append(observed_at)
+            if any(not 0 <= self.repo.clock()-at <= 30 for at in proofs):
+                return False
+            for worker_id, (_, backend) in configured.items():
+                worker = by_id[worker_id]
+                if worker['state'] == 'retired':
+                    continue
+                retired = control._retire_locked(connection, worker)
+                self.repo._emit(connection, 'worker.owned_drain_retired', worker_id, {
+                    'intent_id': self.intent_id, 'worker_id': worker_id,
+                    'reason_code': 'owned_child_exited_runtime_idle',
+                    'spec_hash': worker['spec_hash'], 'previous_fence': worker['fence'],
+                    'next_fence': retired['fence'], 'manifest_digest': self.binding.engine_manifest_digest,
+                    'slot_key': backend.slot_key, 'runtime_incarnation': backend.expected_incarnation,
+                    'observed_at': min(proofs)})
+            return True
 
     def idle_probe(self, tag, instance_id):
         if tag!=self.intent_id or instance_id!=self.instance_id:

@@ -97,7 +97,8 @@ class RefAPITests(LedgerCase):
             audio = ref_fixture.RefOwnedMediaTests.media(self,"ref.wav")
             inputs.update(videos=[{"asset_id":self.upload("ref.mp4",video.read_bytes()),"include_audio":False}],
                           audios=[self.upload("ref.wav",audio.read_bytes())])
-        return generation_request(recipe_id=RECIPE_ID,inputs=inputs)
+        return generation_request(recipe_id=RECIPE_ID,inputs=inputs,
+            controls={"duration":5,"resolution":"480P","seed":"4294967295"})
 
     def test_explicit_ref_api_job_keeps_native_artifacts_and_retries_never_regenerate(self):
         body = self.body(all_kinds=True)
