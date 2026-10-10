@@ -445,22 +445,50 @@ class QuickChatService(QuickChatTitleMixin):
             raise QuickChatError("invalid_title", "卡片标题须为1–160字符。", 422)
         return snapshot, sources
 
+    @staticmethod
+    def _composer_snapshot(bindings, *, inputs=None, recipe_id=None):
+        """Freeze authoring versions, optionally only inputs of a legacy card.
+
+        Legacy requests do not carry a composer origin. A new explicit edit or
+        preflight can associate currently selected references, but must not
+        claim unrelated inputs belonging to a newer round.
+        """
+        from .generation_draft import DEFAULT_ROLE
+        def comparable(slot, entry):
+            value = {k: copy.deepcopy(v) for k, v in entry.items() if v is not None}
+            if slot not in {"first_frame", "last_frame", "guides"}:
+                value.setdefault("purpose", DEFAULT_ROLE[slot])
+            return value
+        wanted = [(slot, comparable(slot, entry)) for slot, entry, _ in input_entries(inputs)] if inputs is not None else None
+        values = []
+        for binding in bindings:
+            value = {k: copy.deepcopy(v) for k, v in binding.items()
+                if k not in {"requested_enabled", "inactive_reason", "effective_enabled", "asset"}}
+            value["enabled"] = binding.get("requested_enabled", binding["enabled"])
+            if not value["enabled"]:
+                continue
+            if wanted is not None:
+                entries = input_entries(QuickChatService._inputs([value], recipe_id))
+                if not entries or not all((slot, comparable(slot, entry)) in wanted for slot, entry, _ in entries):
+                    continue
+            values.append(value)
+        return {"bindings": values}
+
     def _create_revision(self, conn, principal, session, card, snapshot, sources, source_revision=None):
         # The composer is mutable; capture its origin separately from the
         # immutable generation inputs. Delayed assistant replies must never
         # capture material edits made after the original turn.
         origin = session["payload"]["bindings"]
+        legacy = False
         if card["payload"].get("current_revision_id"):
-            origin = self._get(conn, principal, card["payload"]["current_revision_id"], session["id"], "revision")["payload"].get("composer_snapshot", {}).get("bindings", [])
+            previous = self._get(conn, principal, card["payload"]["current_revision_id"], session["id"], "revision")["payload"].get("composer_snapshot")
+            if previous is None:
+                legacy = True
+            else:
+                origin = previous["bindings"]
         elif card["payload"].get("turn_id"):
             origin = self._get(conn, principal, card["payload"]["turn_id"], session["id"], "turn")["payload"]["bindings"]
-        composer = []
-        for binding in origin:
-            value = {k: copy.deepcopy(v) for k, v in binding.items()
-                if k not in {"requested_enabled", "inactive_reason", "effective_enabled", "asset"}}
-            value["enabled"] = binding.get("requested_enabled", binding["enabled"])
-            if value["enabled"]:
-                composer.append(value)
+        composer = self._composer_snapshot(origin, **({"inputs": snapshot["inputs"], "recipe_id": snapshot["recipe_id"]} if legacy else {}))
         project_scope = Scope(self.tenant, principal.owner, "__projects")
         where = (self.repo._scope(documents, project_scope), documents.c.kind == "project",
                  documents.c.document_id == session["payload"]["project_id"])
@@ -504,7 +532,7 @@ class QuickChatService(QuickChatTitleMixin):
             actions=[{"op": "entity.create", "entity": {"id": v["shot_id"]}} for v in items], event_type="project.edited")
         revision = self._new(conn, principal, session["id"], "revision", {**snapshot, "card_id": card["id"],
             "version": version, "turn_id": card["payload"].get("turn_id"), "source_revision_id": source_revision,
-            "composer_snapshot": {"bindings": composer},
+            "composer_snapshot": composer,
             "input_hash": digest, "requested_input_hash": digest, "items": items}, ident=revision_id, parent=card["id"],
             business=card["id"]+":"+str(version))
         self._put(conn, card, {**card["payload"], "current_revision_id": revision_id, "title": snapshot["title"]},
@@ -601,6 +629,8 @@ class QuickChatService(QuickChatTitleMixin):
                 record = self._new(conn, principal, session_id, "preflight", {"revision_id": revision_id,
                     "revision_hash": revision["input_hash"], "status": "checking", "items": [{"item_id": i["id"],
                         "index": i["index"], "seed": i["seed"], "plan": None, "error_code": None} for i in revision["items"] if i["id"] in selected],
+                    **({"composer_snapshot": self._composer_snapshot(session["payload"]["bindings"],
+                        inputs=revision["inputs"], recipe_id=revision["recipe_id"])} if revision.get("composer_snapshot") is None else {}),
                     "retry_of_execution_id": body.get("retry_of_execution_id"), "expires_at": None}, parent=revision_id)
                 self._remember(conn, principal, namespace, key, body, record["id"])
         if self.hooks is None:
@@ -687,7 +717,8 @@ class QuickChatService(QuickChatTitleMixin):
             else:
                 p = self._check_preflight(conn, principal, session_id, body["preflight_id"], revision_id, [i["id"] for i in revision["items"]])
                 submission = self._new(conn, principal, session_id, "submission", {"revision_id": revision_id,
-                    "preflight_id": body["preflight_id"], "actor_id": principal.actor_id, "cancel_requested": False},
+                    "preflight_id": body["preflight_id"], "actor_id": principal.actor_id, "cancel_requested": False,
+                    **({"composer_snapshot": copy.deepcopy(p["composer_snapshot"])} if p.get("composer_snapshot") is not None else {})},
                     parent=revision_id, business=revision_id)
                 for entry in revision["items"]:
                     item = self._new(conn, principal, session_id, "item", {**entry, "revision_id": revision_id,
@@ -770,9 +801,10 @@ class QuickChatService(QuickChatTitleMixin):
             if submission["payload"].get("composer_reset"):
                 return
             revision = self._get(conn, principal, submission["payload"]["revision_id"], session_id, "revision")
-            snapshot = revision["payload"].get("composer_snapshot")
+            snapshot = submission["payload"].get("composer_snapshot", revision["payload"].get("composer_snapshot"))
             if snapshot is None:
-                # A legacy card cannot establish which later edits it owns.
+                # A submission prepared before origin snapshots cannot safely
+                # establish which later edits it owns. Never retrofit a read.
                 return
             item_ids = select(objects.c.id).where(objects.c.tenant == self.tenant,
                 objects.c.owner == principal.owner, objects.c.session_id == session_id,
