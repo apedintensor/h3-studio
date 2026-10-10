@@ -47,6 +47,21 @@ Limits are versioned; concurrent edits require `expected_version`. Tightening li
 
 Drain stops new claims and retains reconciliation/collection. Stop is drain-then-destroy only after original execution, collection and provider obligations are safe. Partial/unknown outcomes retain their operation and provider identities; do not retry creation with another identity. Controller health, observation age, preparation, runtime readiness and serving state are displayed separately. No stale green state.
 
+A stopping `OperatorBoot` may retire its own original exited CPU workers only
+after preparation has ended and every configured slot's pinned WanGP adapter
+freshly confirms the same manifest, slot and runtime incarnation idle. A single
+transaction locks capacity, workers/devices, jobs and attempts; original binding
+and device ownership must match, current jobs and leases must be absent, all
+related attempts must be terminal with any submitted upstream work stopped,
+and any output-write receipt must already be settled. All slots pass together.
+The existing retirement transition increments the fence once, releases local
+devices and emits `worker.owned_drain_retired`. It preserves jobs, requests,
+quarantine, deadlines and budget reservations. The next normal lifecycle tick
+still needs fresh provider idle/removal evidence to complete the original stop.
+Unowned, missing, replaced, busy or collecting workers retain the general
+expired-worker destruction block. This is not process resurrection, node resume,
+provider deletion proof or billing settlement.
+
 An ambiguous bootstrap is `runtime_state: blocked` with `reason_code: bootstrap_reconciliation_required`, not indefinite preparation or proof of failure/removal. The node's optional `bootstrap` observation has a controller `observed_at`, aggregate state/reason and bounded per-slot `index`, `state`, `phase`, `failure_phase`, `error_code` and `error_type`. Only allowlisted static diagnostics are public; raw logs, exception messages, credentials and file paths are excluded. The last observation may remain visible after state changes and must be labelled historical. This projection preserves the original boot/rental journals, deadlines and reservations; it neither authorizes a restart nor converts unknown execution into safe destruction.
 
 ## Model-first stock selection

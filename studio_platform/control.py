@@ -483,12 +483,23 @@ class WorkerControl:
                 job = self.repo._job(connection, worker["current_job_id"], lock=True)
                 if job["status"] not in TERMINAL and not self._proven_unsubmitted_queue(connection, job):
                     raise Conflict("current_attempt_still_unresolved")
-            connection.execute(update(registered_workers).where(registered_workers.c.id == worker_id).values(
-                state="retired", current_job_id=None, fence=worker["fence"]+1, updated_at=self.repo.clock()))
-            connection.execute(update(registered_devices).where(registered_devices.c.worker_id == worker_id)
-                .values(state="released"))
-            connection.execute(update(cpu_slots).where(cpu_slots.c.worker_id == worker_id).values(state="released"))
-            return self._worker(connection, worker_id)
+            return self._retire_locked(connection, worker)
+
+    def _retire_locked(self, connection, worker):
+        """Transition only; caller owns the capacity/worker locks and stop proof.
+
+        Keep joined retirement checks on the caller's connection: opening a
+        second Repository.transaction here can deadlock the capacity row.
+        """
+        if worker["state"] == "retired":
+            return worker
+        worker_id = worker["id"]
+        connection.execute(update(registered_workers).where(registered_workers.c.id == worker_id).values(
+            state="retired", current_job_id=None, fence=worker["fence"]+1, updated_at=self.repo.clock()))
+        connection.execute(update(registered_devices).where(registered_devices.c.worker_id == worker_id)
+            .values(state="released"))
+        connection.execute(update(cpu_slots).where(cpu_slots.c.worker_id == worker_id).values(state="released"))
+        return self._worker(connection, worker_id)
 
     def capacity(self):
         with self.repo.engine.connect() as connection:
