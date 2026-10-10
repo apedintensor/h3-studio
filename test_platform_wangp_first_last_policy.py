@@ -78,7 +78,9 @@ class WanGPFirstLastPolicyTests(LedgerCase):
         return response.json()["id"]
 
     def plan(self, inputs):
-        return self.client.post("/v1/generation-plans", json=generation_request(inputs=inputs))
+        request = generation_request(inputs=inputs)
+        request["controls"]["seed"] = "424242"
+        return self.client.post("/v1/generation-plans", json=request)
 
     def test_production_gate_allows_only_explicit_bounded_first_last_envelope(self):
         original = copy.deepcopy(self.value)
