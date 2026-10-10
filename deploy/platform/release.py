@@ -351,23 +351,74 @@ An absent marker does not authorize replacing an independently running process.
     require(not running.strip(),'operator_controller_still_running')
 
 
+def operator_google_title_configuration(root, execution, candidate):
+    """Compare trusted Compose renders, allowing only the reviewed title wiring.
+
+    The installed Docker parser and validator, not code from either bundle,
+    interpret YAML. Secret contents are never read. Image tags and the two
+    immutable release-relative binds are the only per-release normalization.
+    """
+    import copy
+    configurations=[]
+    code='operator_host_configuration_change_requires_drain'
+    for value in (execution,candidate):
+        directory=root/'releases'/value['commit']
+        protected_directory(directory)
+        for name in ('compose.yaml','check_config.py'):
+            regular(directory/name,root_owned=True,maximum=1024**2)
+            require(checksum(directory/name)==value.get('files',{}).get(name),code)
+        environment=deployment_environment(root/'site.env',value['commit'])
+        config=copy.deepcopy(approved_configuration(directory,environment))
+        services=config['services']
+        for name in ('app','db-init'):
+            require(services[name]['image']==environment['SIXNINE_IMAGE'],code)
+            services[name]['image']='reviewed-application-image'
+        for name,filename,target in (('db-init','init_database.py','/bootstrap/init_database.py'),
+                                     ('caddy','Caddyfile','/etc/caddy/Caddyfile')):
+            mounts=[item for item in services[name].get('volumes',[])
+                if item.get('target')==target]
+            require(len(mounts)==1 and mounts[0].get('source')==str(directory/filename),code)
+            mounts[0]['source']='reviewed-release-file/'+filename
+        configurations.append(config)
+    original,target=configurations
+    before,after=original['services']['app'],target['services']['app']
+    require('SIXNINE_TITLE_CONFIG_FILE' not in before.get('environment',{})
+        and after.get('environment',{}).pop('SIXNINE_TITLE_CONFIG_FILE',None)=='/run/secrets/google_titles',code)
+    require('google_titles' not in original.get('secrets',{})
+        and target.get('secrets',{}).pop('google_titles',None)=={
+            'name':'sixnine-platform_google_titles','file':'/run/sixnine-secrets/google_titles'},code)
+    title_secret={'source':'google_titles','target':'/run/secrets/google_titles'}
+    require(isinstance(after.get('secrets'),list) and after['secrets'].count(title_secret)==1
+        and all(not isinstance(item,dict) or item.get('source')!='google_titles'
+            for item in before.get('secrets',[])),code)
+    after['secrets'].remove(title_secret)
+    require('edge' not in before.get('networks',{})
+        and after.get('networks',{}).pop('edge',None)=={},code)
+    require(canonical_hash(original)==canonical_hash(target),code)
+
+
 def operator_app_compatibility(root, pin, execution, candidate):
     """Exact independent review, not a weakening of source compatibility hashes.
 
     The protected receipt attests the *complete* execution-to-app source delta,
     including create_app/create_schema startup effects. It cannot authorize an
     execution image, provider config, command protocol or schema transition.
+    V2 also attests the exact optional Google title configuration addition;
+    every other host configuration change still requires a drain.
     """
     original=validate_contracts(execution.get('contracts'))
     target=validate_contracts(candidate.get('contracts'))
     require(original['frontend_contract']==target['frontend_contract'],
         'operator_frontend_contract_changed')
-    require(all(candidate.get('files',{}).get(name)==execution.get('files',{}).get(name)
+    unchanged=all(candidate.get('files',{}).get(name)==execution.get('files',{}).get(name)
         and isinstance(execution.get('files',{}).get(name),str)
-        for name in ('compose.yaml','Caddyfile','init_database.py','check_config.py')),
+        for name in ('compose.yaml','Caddyfile','init_database.py','check_config.py'))
+    require(unchanged or all(candidate.get('files',{}).get(name)==execution.get('files',{}).get(name)
+        and isinstance(execution.get('files',{}).get(name),str)
+        for name in ('Caddyfile','init_database.py')),
         'operator_host_configuration_change_requires_drain')
     if candidate['commit']==execution['commit']:
-        require(all(candidate.get(key)==value for key,value in execution.items()),
+        require(unchanged and all(candidate.get(key)==value for key,value in execution.items()),
             'operator_execution_manifest_changed')
         return
     directory=root/'approved-app-compatibility'
@@ -382,8 +433,15 @@ def operator_app_compatibility(root, pin, execution, candidate):
         'review':{'database_schema_and_startup_migrations':'unchanged',
             'generation_admission':'reviewed_compatible_safety_tightening','operator_commands':'unchanged',
             'accepted_jobs_and_attempts':'unchanged','controller_and_guardian':'preserved'}}
+    if not unchanged:
+        require(type(value.get('schema_version')) is int and value['schema_version']==2,
+            'operator_host_configuration_change_requires_drain')
+        expected['schema_version']=2
+        expected['review']['app_configuration']='reviewed_google_titles_only'
     require(type(value.get('schema_version')) is int and value==expected,
         'operator_app_compatibility_review_mismatch')
+    if not unchanged:
+        operator_google_title_configuration(root,execution,candidate)
 
 
 def operator_execution_context(root):
