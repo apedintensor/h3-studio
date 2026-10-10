@@ -172,7 +172,7 @@ class OwnedDrainTests(ledger_tests.LedgerCase):
         self.assertTrue(all(self.control.get(worker)['state'] == 'ready' for worker in self.worker_ids))
 
     def _job(self, key='original-job'):
-        request = {'recipe_id': self.binding.recipe_ids[0], 'request': {'model': self.binding.model_id,
+        request = {'recipe_id': self.binding.recipe_ids[0], 'deployment_profile_id': self.binding.runtime_profile_id, 'request': {'model': self.binding.model_id,
             'prompt': 'synthetic offline request'}}
         execution = {'pool': self.binding.pool, 'expected_runtime_s': 120, 'backend': 'wangp-worker',
             'enabled': True, 'configuration_id': self.binding.configuration_id,
