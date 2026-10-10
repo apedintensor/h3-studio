@@ -280,6 +280,19 @@ class HatchetDispatchTests(LedgerCase):
         self.assertEqual(second["job_id"], job["id"])
         self.assertEqual(self.repo.get_job(self.scope, job["id"])["attempt_no"], 0)
 
+    def test_recovery_cursor_does_not_starve_jobs_beyond_running_prefix(self):
+        publisher = Publisher()
+        dispatcher = self.dispatcher(publisher)
+        for index in range(5):
+            self.now += 1
+            self.make_job("paged-"+str(index))
+            delivery = dispatcher.publish_once()
+            if index == 4:
+                publisher.states[delivery["external_run_id"]] = "FAILED"
+        self.assertEqual(dispatcher.recover_wakeups(limit=2)["wakeups"], 0)
+        self.assertEqual(dispatcher.recover_wakeups(limit=2)["wakeups"], 0)
+        self.assertEqual(dispatcher.recover_wakeups(limit=2)["wakeups"], 1)
+
     def test_upload_completed_database_commit_loss_reuses_artifact_receipt_and_original_generation(self):
         job = self.make_job(audio=True)
         self.ready()

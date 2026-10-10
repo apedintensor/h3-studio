@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, or_, select, update
 
 from .control import WorkerControl
 from .drain_safe_runner import collection_slot
@@ -93,6 +93,7 @@ class OutboxDispatcher:
             raise ValueError("invalid_dispatch_delivery_policy")
         self.repo, self.publisher = repository, publisher
         self.publisher_id, self.lease_seconds, self.retry_seconds = publisher_id, lease_seconds, retry_seconds
+        self._recovery_cursor = None
 
     def _claim_delivery(self):
         with self.repo.transaction() as connection:
@@ -167,12 +168,25 @@ class OutboxDispatcher:
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("invalid_dispatch_recovery_limit")
         TaskQueue(self.repo).recover_expired(limit=limit, summary=True)
+        # Cursor through the ledger rather than repeatedly scanning its oldest
+        # active deliveries. A running prefix must not starve later recovery.
+        query = select(jobs.c.id, jobs.c.updated_at).where(
+            jobs.c.status.in_(RUNNABLE), jobs.c.lease_worker_id.is_(None),
+            jobs.c.not_before <= self.repo.clock(),
+            jobs.c.execution_plan["dispatch_backend"].as_string() == ROUTE)
+        def page(connection, cursor):
+            selected = query
+            if cursor:
+                updated, job_id = cursor
+                selected = selected.where(or_(jobs.c.updated_at > updated,
+                    and_(jobs.c.updated_at == updated, jobs.c.id > job_id)))
+            return list(connection.execute(selected.order_by(jobs.c.updated_at, jobs.c.id).limit(limit)).mappings())
         with self.repo.engine.connect() as connection:
-            ids = list(connection.execute(select(jobs.c.id).where(
-                jobs.c.status.in_(RUNNABLE), jobs.c.lease_worker_id.is_(None),
-                jobs.c.not_before <= self.repo.clock(),
-                jobs.c.execution_plan["dispatch_backend"].as_string() == ROUTE)
-                .order_by(jobs.c.updated_at, jobs.c.id).limit(limit)).scalars())
+            rows = page(connection, self._recovery_cursor)
+            if not rows and self._recovery_cursor:
+                rows = page(connection, None)
+            self._recovery_cursor = (rows[-1]["updated_at"], rows[-1]["id"]) if rows else None
+            ids = [row["id"] for row in rows]
         count = 0
         for job_id in ids:
             with self.repo.engine.connect() as connection:
@@ -276,7 +290,7 @@ def read_broker_config(path):
 def create_client(config):
     """Explicit protected credential; disable SDK dotenv and broad log capture."""
     from hatchet_sdk import ClientConfig, Hatchet
-    from hatchet_sdk.config import ClientTLSConfig, HealthcheckConfig, OpenTelemetryConfig
+    from hatchet_sdk.config import ClientTLSConfig, HealthcheckConfig, OpenTelemetryConfig, OTelAttribute
     from .runtime_hosts.wangp_receipts import checked_reader
     with checked_reader(config.token_file, Path(config.token_file).parent) as source:
         info = os.fstat(source.fileno())
@@ -294,7 +308,9 @@ def create_client(config):
                 server_name=urlsplit("//"+config.host_port).hostname, cert_file=None,
                 key_file=None, root_ca_file=None),
             healthcheck=HealthcheckConfig(_env_file=None, enabled=False, bind_address="127.0.0.1"),
-            otel=OpenTelemetryConfig(_env_file=None), disable_log_capture=True,
+            otel=OpenTelemetryConfig(_env_file=None, excluded_attributes=list(OTelAttribute),
+                include_task_name_in_start_step_run_span_name=False, individual_run_spans_for_bulk_run=False),
+            disable_log_capture=True,
             enable_force_kill_sync_threads=False, force_shutdown_on_shutdown_signal=False)
         return Hatchet(config=sdk_config)
     except Exception:
@@ -335,6 +351,8 @@ class HatchetSlotRunner(WorkerRunner):
         self.client_factory = client_factory
 
     def run_forever(self, worker_id, pool, *, poll_interval_s=1):
+        if os.name == "nt":
+            raise ValueError("hatchet_worker_requires_linux_runtime")
         from hatchet_sdk import DesiredWorkerLabel, TTLBasedIdempotencyConfig
         registration = self.control.get(worker_id)
         spec = registration["spec"]
