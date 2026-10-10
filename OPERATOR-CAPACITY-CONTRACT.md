@@ -155,6 +155,16 @@ guarantee deletion through a provider outage, or establish billing settlement.
 Public inventory, adapter capability and bootstrap readiness each remain
 insufficient evidence of live inference acceptance.
 
+Pending deletion observations use a durable 60-second interval per node in the
+capacity controller. Targon's independent guardian also limits its own pending
+removal reads to once per minute; these remain separate safety observers rather
+than a combined one-request-per-minute quota. Health sweeps and observations of
+other active machines keep their existing cadence. First deadline enforcement
+is immediate. Skipped checks do not refresh provider observation timestamps.
+Late positive terminal receipts can be consumed without waiting. Restart and
+failed reads retain the interval, original deletion obligation and reservation.
+Elapsed time alone never confirms removal or billing settlement.
+
 ## Historical generation hints
 
 Use `total_seconds` consistently: task submission through local output save/validation, including component loading encountered in the task, excluding machine startup, queueing, dependency setup and prior downloads. Store process/loading context separately; no controlled warm/cold comparison was performed. Match profile, mode, resolution, native frames/fps, steps and reference roles exactly. A single measured sample is not an SLA or an estimate for another configuration.

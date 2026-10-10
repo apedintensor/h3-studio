@@ -602,6 +602,7 @@ class OperatorTests(LedgerCase):
         self.assertEqual(len(self.provider.creates),1)
         self.assertEqual(len(self.provider.destroys),1)
         self.provider.facts[intent["id"]]=ProviderFact("destroyed",intent["provider_instance_id"])
+        self.now+=60
         replacement.tick()
         current=self.service.state(self.actor)["nodes"][0]
         self.assertEqual((current["state"],current["runtime_state"]),("destroyed","destroyed"))

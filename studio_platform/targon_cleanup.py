@@ -19,6 +19,7 @@ import time
 import uuid
 
 UID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+REMOVAL_OBSERVATION_SECONDS = 60
 
 
 def _read(path):
@@ -217,7 +218,7 @@ class TargonDeadlineGuardian:
                 else:
                     path = self.root/'receipts'/name
                     request, old = _read(requests[name]), None
-                degraded = self._tick_request(request, path, now, old) is True or degraded
+                degraded = self._tick_request(request, path, self.clock(), old) is True or degraded
             except Exception:
                 # A malformed request or transient provider failure must not
                 # prevent cleanup of another already-armed workload.
@@ -241,6 +242,32 @@ class TargonDeadlineGuardian:
             return bool(old)
         if old is not None and old['workload_identity']['org_slug'] != self.org_slug:
             return True
+        next_removal_observation = None
+        stopping_hint = old is not None and old.get('removal_poll_hint') is True
+        if old is not None and (now >= deadline or stopping_hint
+                or old.get('state') in {'removal_pending', 'cleanup_blocked'}):
+            # Keep the fast heartbeat/armed checks, but persist removal polling
+            # before I/O so provider failures and guardian restarts cannot burst.
+            # Legacy pending receipts used observed_at for their last check.
+            next_removal_observation = old.get('next_removal_observation_at')
+            if next_removal_observation is None:
+                previous_observation = old.get('observed_at') if old.get('state') in {
+                    'removal_pending', 'cleanup_blocked'} else now-REMOVAL_OBSERVATION_SECONDS
+                if type(previous_observation) not in (int, float) or not math.isfinite(previous_observation):
+                    raise ValueError('targon_guard_observation_time_invalid')
+                next_removal_observation = previous_observation+REMOVAL_OBSERVATION_SECONDS
+            if (type(next_removal_observation) not in (int, float)
+                    or not math.isfinite(next_removal_observation)):
+                raise ValueError('targon_guard_observation_time_invalid')
+            if now < next_removal_observation and not (stopping_hint and now >= deadline):
+                return True
+            next_removal_observation = now+REMOVAL_OBSERVATION_SECONDS
+            old = {**old, 'next_removal_observation_at': next_removal_observation}
+            if now >= deadline:
+                # An earlier stopping hint must not postpone the first deadline
+                # check; consume it before I/O so a failure cannot bypass cadence.
+                old.pop('removal_poll_hint', None)
+            _write(receipt_path, old)
         response = self._workload(uid)
         # Disappearance alone is never stop proof. A known exact DELETE
         # acknowledgement plus its subsequent 404 can confirm teardown.
@@ -279,6 +306,13 @@ class TargonDeadlineGuardian:
                  'request': dict(request), 'workload_identity': identity,
                  'guardian_id': self.identity, 'identity_verified': True, 'observed_at': now,
                  'state': 'removed' if status == 'deleted' else 'armed'}
+        if next_removal_observation is not None and now >= deadline:
+            value['next_removal_observation_at'] = next_removal_observation
+        if now < deadline and any(isinstance(state.get(key), str) and state[key].lower() == 'stopping'
+                                  for key in ('status', 'message')):
+            # Provider Stopping is only a polling hint, never removal evidence.
+            value.update(removal_poll_hint=True,
+                         next_removal_observation_at=now+REMOVAL_OBSERVATION_SECONDS)
         if status == 'deleted':
             value['removal_evidence'] = 'exact_uid_deleted'
         elif now >= deadline:
@@ -296,7 +330,8 @@ class TargonDeadlineGuardian:
                 return True
             value.update(state='removal_pending', delete_started_at=previous.get('delete_started_at',now),
                 delete_attempts=count+1, delete_acknowledged=previous.get('delete_acknowledged') is True,
-                next_retry_at=now+min(300,30*(2**count)), delete_status=None)
+                next_retry_at=now+min(300,30*(2**count)), delete_status=None,
+                next_removal_observation_at=now+REMOVAL_OBSERVATION_SECONDS)
             _write(receipt_path, value)
             try:
                 deleted = self.client.delete('/tha/v3/orgs/'+self.org_slug+'/workloads/'+uid)
