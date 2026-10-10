@@ -48,6 +48,8 @@ def public_title_state(payload):
 def title_error_code(error):
     # Exception messages/codes are untrusted and may contain prompts or keys.
     code = getattr(error, "code", None)
+    if not isinstance(code, str):
+        code = None
     if isinstance(error, TimeoutError) or code in {"upstream_timeout", "connection_failed"}:
         return "title_call_unknown"
     if code in {"profile_mismatch", "google_http_401", "google_http_403"}:

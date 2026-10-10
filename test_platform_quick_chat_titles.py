@@ -213,6 +213,8 @@ class QuickChatTitleTests(LedgerCase):
         error = RuntimeError("private")
         error.code = "PRIVATE KEY"
         self.assertEqual(title_error_code(error), "title_generation_failed")
+        error.code = {"private": "untrusted"}
+        self.assertEqual(title_error_code(error), "title_generation_failed")
         with self.assertRaises(ValueError):
             self.service.recover_title_runs(older_than_s=1)
 
