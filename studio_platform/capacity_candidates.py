@@ -11,7 +11,8 @@ import math
 from sqlalchemy import select
 
 from .capacity_inventory import allocation_resources
-from .capacity_market import FRESH_SECONDS, PROVIDERS, ROW_FIELDS, _constraints, market_inventory
+from .capacity_market import (FRESH_SECONDS, PROVIDERS, ROW_FIELDS, _constraints,
+                              market_inventory, refresh_projection)
 from .repository import paused_capacity_pools
 
 
@@ -57,7 +58,8 @@ def _observations(connection, now):
                     else:
                         rows.extend(({key: copy.deepcopy(value) for key, value in offer.items()
                                       if key in ROW_FIELDS}, observed) for offer in offers)
-        providers.append(dict(provider=provider, status=status, observed_at=observed, reason_code=reason))
+        providers.append(dict(provider=provider, status=status, observed_at=observed, reason_code=reason,
+                              **refresh_projection(record, now)))
     return providers, rows
 
 
@@ -65,6 +67,26 @@ def _physical_limits(profile):
     return {"min_ram_gib": math.ceil(profile["minimum_ram_bytes"] / 1024**3),
             "min_disk_gib": math.ceil(profile["minimum_disk_bytes"] / 1024**3),
             "min_cpu_cores": profile["hardware_filters"]["minimum_cpu_cores"]}
+
+
+def _filter_projection(registry, profile, mode):
+    """Safe effective policy, distinct from secrets or runtime qualification."""
+    deployments = []
+    for binding in registry.bindings.values():
+        if (binding.runtime_profile_id != profile["id"] or binding.mode != mode
+                or binding.model_id != profile["model_id"]):
+            continue
+        deployments.append({"provider": binding.launch.provider, "gpu_type": binding.gpu_type,
+            "gpu_count": binding.gpu_count, "binding_id": binding.binding_id, "enabled": binding.enabled,
+            "source": "protected_operator_registry", "filters": copy.deepcopy(binding.filters),
+            "hourly_cost_ceiling_microusd": binding.hourly_cost_microusd})
+    deployments.sort(key=lambda item: (item["provider"], item["gpu_type"], item["gpu_count"], item["binding_id"]))
+    hardware = profile["hardware_filters"]
+    return {"runtime_profile_id": profile["id"], "model_id": profile["model_id"], "mode": mode,
+            "source": "runtime_profile", "hard_requirements": _physical_limits(profile),
+            "guidance": {"min_download_mbps": hardware["minimum_download_mbps"],
+                         "max_price_per_gpu_hour_microusd": hardware["maximum_price_per_gpu_hour_microusd"]},
+            "deployments": deployments}
 
 
 def _verified_constraints(row, filters):
@@ -148,6 +170,7 @@ def _candidate(registry, profile, row, observed, mode, ttl_seconds, now, paused_
         hints.append("inventory_bandwidth_below_guidance")
     qualified = not blockers
     return {**copy.deepcopy(row), "observed_at": observed, "selection": choice,
+            "allocation_ram_gib": allocation_resources(row).get("ram_gib"),
             "offer_kind": "executor" if row["provider"] == "lium" else "resource_sku",
             "execution_slots": slots, "blockers": blockers,
             "deployment_qualified": not deployment_blockers,
@@ -163,14 +186,30 @@ def candidates_projection(connection, registry, model_id, mode, ttl_seconds, now
     profiles = _profiles(registry, model_id, mode, ttl_seconds)
     providers, rows = _observations(connection, now)
     paused_pools = paused_capacity_pools(connection)
-    candidates, uncertain_allocation = [], False
+    known_gpus = {gpu for profile in registry.catalog().get("profiles", []) for gpu in profile["gpu_models"]}
+    candidates, excluded, excluded_count, uncertain_allocation = [], [], 0, False
+    def exclude(profile, row, observed, blockers):
+        nonlocal excluded_count
+        excluded_count += 1
+        if len(excluded) < 100:
+            excluded.append({**copy.deepcopy(row), "observed_at": observed,
+                "runtime_profile_id": profile["id"], "blockers": list(dict.fromkeys(blockers)),
+                "allocation_ram_gib": allocation_resources(row).get("ram_gib")})
     for row, observed in rows:
         compatible = [profile for profile in profiles if row["gpu_type"] in profile["gpu_models"]]
-        if not compatible or not 1 <= row["gpu_count"] <= 8:
+        if not compatible:
+            # A supplier's generic PRO label is not an approved GPU edition for
+            # another model. Explain known H3 hardware instead of hiding stock.
+            if row["gpu_type"] in known_gpus and row["available_count"] > 0:
+                for profile in profiles:
+                    exclude(profile, row, observed, ["operator_gpu_not_catalogued"] + _spec_blockers(profile, row))
+            continue
+        if not 1 <= row["gpu_count"] <= 8:
             continue
         for profile in compatible:
             physical = _spec_blockers(profile, row)
             if any(code in physical for code in ("inventory_ram_below_minimum", "inventory_disk_below_minimum")):
+                exclude(profile, row, observed, physical)
                 continue
             if row["available_count"] <= 0:
                 # A partial executor is not an available whole allocation. Its
@@ -190,6 +229,8 @@ def candidates_projection(connection, registry, model_id, mode, ttl_seconds, now
         status = "unconfirmed"
     return {"model_id": model_id, "mode": mode, "observed_at": now, "fresh_seconds": FRESH_SECONDS,
             "providers": providers, "candidates": candidates, "status": status,
+            "filters": [_filter_projection(registry, profile, mode) for profile in profiles],
+            "excluded": excluded, "excluded_count": excluded_count,
             "reason_code": reason, "advisory_only": True}
 
 

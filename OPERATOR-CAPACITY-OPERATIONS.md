@@ -110,13 +110,47 @@ It does not run the rental controller, alter budgets/policies, or initialize
 capacity. The API/worker remains a cache reader without provider egress or keys.
 The normal application schema migration creates the additive table first.
 
-The configured operator controller refreshes Lium's provider-wide market cache
-asynchronously, using its existing approved in-memory Lium loader and one bounded
-GET at a time, no more often than every 30 seconds. This full-stock observation is
-separate from its per-binding admission probes; failed reads replace availability
-with an unknown/error observation, and drain stops new reads and late publication.
-Targon public stock uses the separate keyless host sampler below. Neither path
-gives provider credentials or egress to the API or changes rental/budget authority.
+The configured operator controller refreshes both provider-wide market caches
+asynchronously every 30 seconds, with at most one bounded read per supplier in
+flight. Lium uses its existing approved in-memory loader; Targon stock uses the
+public keyless endpoint. Each result is published independently, so a supplier
+timeout cannot hide the other result or hold the controller lifecycle loop. These
+full-stock observations remain separate from per-binding admission probes.
+Failed reads replace availability with a safe error; controller stopping stops
+new reads and late publication. Neither path gives provider credentials or egress
+to the API or changes rental/budget authority. A Targon-only controller still
+refreshes Targon; without an approved Lium identity, Lium reports an error rather
+than loading another account implicitly.
+
+The console's single refresh action POSTs `{}` to
+`/v1/operator/capacity/market-refreshes`. It writes a coalesced wake-up marker for
+both suppliers to the existing cache payload, preserving each previous observation
+and timestamp. The controller handles it on the next tick; the console polls the
+cache for up to 60 seconds and displays each supplier's pending/completed/failed
+state separately. A controller that is absent or cannot publish produces
+`inventory_refresh_timeout`. Refreshing does not create a capacity command,
+reservation, lease, schema migration, GPU start or provider credential copy.
+
+Expand the console's current filters to inspect their sources: profile RAM/disk/
+CPU admission floors, catalogue bandwidth/price guidance, and protected binding
+limits for the exact model/mode/provider/GPU count. The `excluded` projection keeps
+bounded known-small or GPU-edition-mismatched offers instead of making filtered
+stock look like a failed supplier API. Lium advertised 94 GiB is not 94 GiB usable:
+the existing max(4 GiB, 1%) host reserve yields 90 GiB, below the current 96 GiB
+admission floor. A generic Targon PRO 6000 can be pruned-compatible while its
+edition and Base-model deployment remain unqualified. No field editor in the
+browser can override these server-owned conditions.
+
+Runtime profile metadata lives in `deploy/wangp/profiles/*.json`; protected
+deployment filters come from the runtime file selected by
+`H3_OPERATOR_RUNTIME_CONFIG`, its `registry_file`, and the paired provider
+manifests. Inspect safe projected values before changing policy. Filter-only
+successors within the enforced profile floors use the existing replacement
+configuration process above and retain immutable prior bindings/receipts. They
+do not require another model generation merely to change bandwidth, price or
+permitted disk policy. Changing the model, mode, weights, engine identity,
+admission envelope or GPU topology still requires its own qualification. Do not
+silently lower RAM or reinterpret catalogue guidance as protected acceptance.
 
 For an already configured service environment, the explicit sampler command is:
 
@@ -141,10 +175,12 @@ python tools/run_operator_preview.py --frontend <absolute-canonical-series-direc
 ```
 
 Without `--scan-inventory`, the preview still performs no provider requests.
-This change does not install a production sampler, publish the frontend or
-restart an active capacity controller. Track activation and lifecycle in
-[#86](https://github.com/inkseq/h3-studio/issues/86). Deploy the reviewed API/cache schema,
-sampler and frontend through the existing exact-version release process. Do not
+Source changes do not install a production sampler, publish the frontend or
+restart an active capacity controller. Track unified-controller activation in
+[#110](https://github.com/inkseq/h3-studio/issues/110); historical beta lifecycle
+follow-up remains [#86](https://github.com/inkseq/h3-studio/issues/86). Deploy the
+reviewed controller, API and frontend through the existing exact-version release
+process; this refresh path uses the existing table without a schema change. Do not
 replace an active controller just to refresh stock. Preserve old ledgers and
 the pending controller recovery work in #60. A scanner error leaves a visible
 failed/stale observation, never fake zero stock or a second rental intent.
@@ -157,6 +193,12 @@ generation and final billing are separate evidence. Keep dated live receipts
 on the delivery issue rather than using this guide as a deployment status log.
 
 ### Protected AWS Targon stock sampler
+
+This separately managed helper remains an optional standalone stock path. After
+the unified controller is accepted, its own recurring Targon scan supplies the
+same market projection and this separate timer is normally unnecessary. Preserve
+old helper receipts and manage any installed timer explicitly through its scoped
+commands; an application merge alone does not install, stop or replace it.
 
 The reviewed host helper is `deploy/platform/targon_market.py`. Its separately
 approved, root-owned installation path is `/opt/sixnine-release/targon_market.py`,

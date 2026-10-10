@@ -315,7 +315,7 @@ class RuntimeTests(LedgerCase):
         self.assertEqual(before,self.repo.get_budget("owner-budget"))
         self.assertEqual(list((self.root/"work").iterdir()),[])
 
-    def test_market_refresh_reuses_exact_controller_loader_and_is_absent_for_targon_only(self):
+    def test_market_refresh_reuses_exact_controller_loader_and_keeps_targon_only_stock(self):
         loader=Mock(side_effect=AssertionError("no_credentials_during_construction"))
         controller=create_controller(self.path,repository=self.repo,settings=SimpleNamespace(),credential_loader=loader)
         self.assertIs(controller.inventory_refresh.market_refresh.loader,loader)
@@ -323,7 +323,10 @@ class RuntimeTests(LedgerCase):
         loader.assert_not_called()
         self.use_targon()
         controller=create_controller(self.path,repository=self.repo,settings=SimpleNamespace(),credential_loader=loader)
-        self.assertIsNone(controller.inventory_refresh.market_refresh)
+        market = controller.inventory_refresh.market_refresh
+        self.assertEqual(set(market.readers), {"lium", "targon"})
+        self.assertIsNone(market.loader)
+        self.assertIsNone(market.executor)
         loader.assert_not_called()
 
     def test_config_paths_and_credential_fields_are_explicit(self):

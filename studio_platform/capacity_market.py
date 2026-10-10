@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import math
 import re
+import uuid
 
 from sqlalchemy import Column, Float, JSON, String, Table, insert, select, update
 
@@ -16,6 +17,7 @@ from .runtime_catalog import get_profile
 
 PROVIDERS = ("lium", "targon")
 FRESH_SECONDS = 120
+REFRESH_TIMEOUT_SECONDS = 60
 market_inventory = Table("platform_capacity_market_observations", metadata,
     Column("provider", String(30), primary_key=True),
     Column("observed_at", Float, nullable=False),
@@ -28,6 +30,76 @@ ROW_FIELDS = {"offer_id", "provider", "gpu_type", "gpu_count", "available_count"
 
 def _number(value):
     return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def _cache_lock(connection, provider):
+    # Stock request/observation writes never acquire the paid capacity gate.
+    if connection.dialect.name == "postgresql":
+        lock_id = 685939796868749730 + PROVIDERS.index(provider)
+        connection.exec_driver_sql("SELECT pg_advisory_xact_lock(" + str(lock_id) + ")")
+
+
+def refresh_projection(record, now):
+    """Request metadata does not make an old observation fresh."""
+    payload = record["payload"] if record else {}
+    requested = payload.get("refresh_requested_at")
+    identity = payload.get("refresh_request_id")
+    status, reason = "idle", None
+    if _number(requested) and isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{32}", identity):
+        observed = record["observed_at"]
+        previous = payload.get("refresh_previous_observed_at", -1)
+        advanced = previous == -1 or _number(previous) and observed > previous
+        if requested <= observed <= now and advanced:
+            status = "complete" if payload.get("status") == "ok" else "failed"
+            reason = None if status == "complete" else "inventory_scan_failed"
+        elif not 0 <= now - requested < REFRESH_TIMEOUT_SECONDS:
+            status, reason = "timeout", "inventory_refresh_timeout"
+        else:
+            status = "pending"
+    else:
+        requested, identity = None, None
+    return {"refresh_request_id": identity, "refresh_requested_at": requested,
+            "refresh_status": status, "refresh_reason_code": reason}
+
+
+def request_refresh(repo):
+    """Coalesce an advisory refresh in the existing cache, without new schema.
+
+    The API writes only a wake-up marker. The controller owns both supplier GETs.
+    No paid command, lease, budget, observation time or authorization changes.
+    """
+    now = repo.clock()
+    if not _number(now):
+        raise ValueError("inventory_invalid_clock")
+    with repo.transaction() as connection:
+        for provider in PROVIDERS:
+            _cache_lock(connection, provider)
+        stored = {row["provider"]: row for row in connection.execute(select(market_inventory)).mappings()}
+        previous = [refresh_projection(stored.get(provider), now) for provider in PROVIDERS]
+        same_request = (previous[0]["refresh_request_id"] is not None and
+                        previous[0]["refresh_request_id"] == previous[1]["refresh_request_id"] and
+                        previous[0]["refresh_requested_at"] == previous[1]["refresh_requested_at"])
+        recent = same_request and 0 <= now - previous[0]["refresh_requested_at"] < 2
+        pending = same_request and any(value["refresh_status"] == "pending" for value in previous)
+        if recent or pending:
+            return {"request_id": previous[0]["refresh_request_id"],
+                    "requested_at": previous[0]["refresh_requested_at"],
+                    "providers": list(PROVIDERS), "coalesced": True}
+        identity = uuid.uuid4().hex
+        for provider in PROVIDERS:
+            record = stored.get(provider)
+            payload = copy.deepcopy(record["payload"]) if record else {
+                "provider": provider, "status": "error", "observed_at": 0,
+                "reason_code": "inventory_scanner_not_configured", "offers": []}
+            payload.update(refresh_request_id=identity, refresh_requested_at=now,
+                           refresh_previous_observed_at=record["observed_at"] if record else -1)
+            if record:
+                connection.execute(update(market_inventory).where(
+                    market_inventory.c.provider == provider).values(payload=payload))
+            else:
+                connection.execute(insert(market_inventory).values(provider=provider, observed_at=0, payload=payload))
+    return {"request_id": identity, "requested_at": now,
+            "providers": list(PROVIDERS), "coalesced": False}
 
 
 def publish_observation(repo, observation):
@@ -80,13 +152,15 @@ def publish_observation(repo, observation):
         # Read-only stock must work even before paid capacity is configured.
         # SQLite transaction() already uses BEGIN IMMEDIATE. PostgreSQL uses a
         # distinct per-provider cache lock, never the rental authority lock.
-        if repo.engine.dialect.name == "postgresql":
-            lock_id = 685939796868749730 + PROVIDERS.index(provider)
-            connection.exec_driver_sql("SELECT pg_advisory_xact_lock(" + str(lock_id) + ")")
+        _cache_lock(connection, provider)
         previous = connection.execute(select(market_inventory).where(
             market_inventory.c.provider == provider)).mappings().first()
         if previous and previous["observed_at"] > observed:
             return False
+        if previous:
+            for key in ("refresh_request_id", "refresh_requested_at", "refresh_previous_observed_at"):
+                if key in previous["payload"]:
+                    payload[key] = previous["payload"][key]
         values = dict(observed_at=observed, payload=payload)
         if previous:
             connection.execute(update(market_inventory).where(market_inventory.c.provider == provider).values(**values))
@@ -193,7 +267,8 @@ def market_projection(connection, registry, chosen, now):
                 reason = record["payload"]["reason_code"]
                 if status == "ok":
                     rows[provider] = record["payload"]["offers"]
-        providers.append(dict(provider=provider, status=status, reason_code=reason, observed_at=observed))
+        providers.append(dict(provider=provider, status=status, reason_code=reason, observed_at=observed,
+                              **refresh_projection(record, now)))
     filters, basis = _filters(registry, chosen)
     selected = chosen.get("provider", "lium")
     selected_rows = [row for row in rows.get(selected, []) if row["gpu_type"] == chosen["gpu_type"]

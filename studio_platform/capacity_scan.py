@@ -7,10 +7,88 @@ initialize budgets, refresh authorization or mark execution capacity ready.
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Event, Thread
 
-from .capacity_market import PROVIDERS, publish_observation
+from sqlalchemy import select
+
+from .capacity_market import (PROVIDERS, REFRESH_TIMEOUT_SECONDS, market_inventory,
+                              publish_observation, refresh_projection)
+
+
+class ProviderMarketRefresh:
+    """Nonblocking controller-wide stock reads with independent supplier futures.
+
+    Only normalized cache observations are written. No provider bindings, rental
+    commands, readiness state, or credentials are changed. Missing Lium identity
+    becomes a safe supplier error rather than an implicit credential fallback.
+    """
+    def __init__(self, repo, loader=None, *, readers=None, interval=30):
+        if type(interval) is not int or not 30 <= interval <= 90:
+            raise ValueError("inventory_interval_invalid")
+        self.repo, self.loader, self.interval = repo, loader, interval
+        if readers is None:
+            from .capacity_inventory import scan_lium, scan_targon
+            def lium():
+                if loader is None:
+                    raise ValueError("inventory_profile_unavailable")
+                return scan_lium(loader, clock=repo.clock)
+            readers = {"lium": lium, "targon": lambda: scan_targon(clock=repo.clock)}
+        if set(readers) != set(PROVIDERS):
+            raise ValueError("inventory_provider_invalid")
+        self.readers = readers
+        self.executor, self.closed = None, False
+        self.pending = {}
+        self.last = {provider: float("-inf") for provider in PROVIDERS}
+        self.started_request = {provider: None for provider in PROVIDERS}
+
+    def _read(self, provider, started):
+        try:
+            value = self.readers[provider]()
+            if value.get("provider") != provider:
+                raise ValueError("inventory_provider_mismatch")
+            return value
+        except Exception:
+            return {"provider": provider, "status": "error", "observed_at": started, "offers": []}
+
+    def __call__(self, *, stopping=False):
+        if stopping:
+            self.closed = True
+            if self.executor:
+                self.executor.shutdown(wait=False, cancel_futures=True)
+                self.executor = None
+            return
+        if self.closed:
+            return
+        for provider, future in tuple(self.pending.items()):
+            if not future.done():
+                continue
+            del self.pending[provider]
+            try:
+                publish_observation(self.repo, future.result())
+            except Exception:
+                # Use request-start time; failure must not satisfy a newer
+                # refresh marker or disguise an old observation as fresh.
+                publish_observation(self.repo, {"provider": provider, "status": "error",
+                    "observed_at": self.last[provider], "offers": []})
+        now = self.repo.clock()
+        with self.repo.engine.connect() as connection:
+            requested = {row["provider"]: refresh_projection(row, now)
+                         for row in connection.execute(select(market_inventory)).mappings()}
+        for provider in PROVIDERS:
+            request = requested.get(provider, {})
+            marker = request.get("refresh_requested_at")
+            forced = (type(marker) in (int, float) and
+                      0 <= now - marker < REFRESH_TIMEOUT_SECONDS
+                      and request.get("refresh_request_id") != self.started_request[provider]
+                      and request.get("refresh_status") == "pending")
+            if provider in self.pending or not forced and now - self.last[provider] < self.interval:
+                continue
+            if self.executor is None:
+                self.executor = ThreadPoolExecutor(max_workers=len(PROVIDERS), thread_name_prefix="provider-market")
+            self.last[provider] = now
+            self.started_request[provider] = request.get("refresh_request_id")
+            self.pending[provider] = self.executor.submit(self._read, provider, now)
 
 
 class MarketScanner:
@@ -39,8 +117,9 @@ class MarketScanner:
     def once(self):
         # Parallel suppliers: one timeout must not keep another result hidden.
         with ThreadPoolExecutor(max_workers=len(self.providers), thread_name_prefix="stock-read") as executor:
-            futures = {provider: executor.submit(self._read, provider) for provider in self.providers}
-            for provider, future in futures.items():
+            futures = {executor.submit(self._read, provider): provider for provider in self.providers}
+            for future in as_completed(futures):
+                provider = futures[future]
                 observation = future.result()
                 try:
                     publish_observation(self.repo, observation)

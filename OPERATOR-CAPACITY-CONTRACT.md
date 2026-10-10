@@ -62,13 +62,59 @@ One exact executor choice authorizes at most one allocation; additional machines
 require separate choices and confirmations.
 
 Only hardware explicitly catalogued for the selected model is considered.
-Known insufficient RAM/disk is excluded. Unknown specifications and unqualified
+Known insufficient RAM/disk is excluded from candidate cards, with the observed
+offer and its safe blockers retained in `excluded` (first 100 entries;
+`excluded_count` records the total). Other known H3 hardware absent from the
+selected model's exact GPU catalogue is also explained there with
+`operator_gpu_not_catalogued`; a generic supplier PRO 6000 label cannot inherit
+another model's GPU-edition qualification. Unknown specifications and unqualified
 topologies remain visibly blocked. Qualified deployments sort first, then
 whole-allocation hourly price, then known/higher download bandwidth. Multi-card
 hosts retain their full price and require one execution slot per GPU. There is
 no provider priority, automatic rental, weight/precision or mode substitution.
 Catalog bandwidth/price guidance produces hints; protected binding limits remain
 hard requirements. Historical timing applies only to its measured configuration.
+
+The response's `filters` entries identify each exact profile/mode and separate
+its enforced `hard_requirements` (RAM, disk, CPU admission floors) from bandwidth
+and per-GPU price `guidance`. Matching protected `deployments` show only provider,
+GPU/count, binding ID, enabled flag, allowlisted filters and the whole-allocation
+hourly ceiling. Empty deployment coverage means configuration is missing; it is
+not evidence of empty provider stock. These metadata floors are current policy,
+not a claim that every value was independently measured. A protected limit can
+be stricter than catalogue guidance. Boot paths, credentials, scope and budget
+identities are not exposed. `allocation_ram_gib` gives the RAM actually evaluated
+alongside the unchanged vendor's `ram_gib` quote.
+
+`POST /v1/operator/capacity/market-refreshes` with `{}` requests both providers in
+one operator-only browser action. It inherits same-origin and expected-account
+protection, accepts no supplier URL, profile or rental options, and returns 202
+with `request_id`, `requested_at`, `providers: ["lium", "targon"]` and `coalesced`.
+The request is advisory metadata in the existing market cache, not a paid
+command, lease, budget reservation or new schema. Pending requests coalesce for
+up to 60 seconds; a just-completed request also coalesces repeated clicks for
+two seconds. API handlers do not load provider credentials or perform GETs.
+
+The configured controller starts bounded Lium and keyless Targon reads
+independently, periodically every 30 seconds or on the next lifecycle tick for
+a pending refresh. Results are published on its lifecycle loop without waiting
+for the other supplier. An in-flight observation that predates the request
+cannot fulfill it. Accepting a request does not change either observation's
+timestamp or available offers. Failed reads produce safe unknown/error stock,
+not a successful empty inventory. Stopping prevents late publications.
+
+Each candidate response's provider entry retains `status`, `observed_at` and
+`reason_code`, and adds `refresh_request_id`, `refresh_requested_at`,
+`refresh_status` (`idle`, `pending`, `complete`, `failed`, `timeout`) and
+`refresh_reason_code` (`inventory_scan_failed` or `inventory_refresh_timeout`,
+otherwise null). Completion requires a new observation at/after the request
+and an advance beyond the previous cache watermark. Freshness is evaluated
+separately: a completed refresh can later become stale, and pending/failed
+refreshes never prove current availability. Clients poll for at most 60 seconds,
+show independent supplier progress and preserve original timestamps. Another
+operator may begin a newer coalesced request; accept observations newer than the
+original receipt rather than requiring its ID forever. A missing controller
+eventually yields a visible refresh timeout without another rental.
 
 Lium eligibility uses allocatable RAM: host telemetry minus the larger of 4 GiB
 or 1% host reserve; displayed host RAM stays unchanged. Targon SKU RAM is already
