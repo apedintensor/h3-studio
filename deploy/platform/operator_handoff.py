@@ -6,6 +6,11 @@ app-only release. After the old supervisor exits, run ``start`` under a NEW
 root-owned systemd unit with Restart=no, KillMode=process, TimeoutStopSec=infinity
 and SendSIGKILL=no. Never repoint the old unit while it is still running.
 
+For a later rollover, use ``prepare ... --journal-id TOKEN`` and bind the new
+unit's ExecStart to ``start --journal-id TOKEN --successor-unit NEW.service``.
+The original consumed journals remain untouched; a named rollover cannot be
+resumed by an arbitrary process or replayed after launch intent is recorded.
+
 This helper does not install/restart the independent guardian. Its separately
 approved source installation must preserve the original guard config, requests
 and receipts. Normal operator start/restore barriers remain unchanged.
@@ -15,6 +20,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import inspect
 import json
+import os
 from pathlib import Path
 import re
 import signal
@@ -26,8 +32,37 @@ import release
 import operator_capacity as host
 
 
-def record_path():
-    return host.ROOT/'handoff.json'
+JOURNAL_ID = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
+
+
+def record_path(journal_id=None):
+    if journal_id is None:
+        return host.ROOT/'handoff.json'
+    release.require(isinstance(journal_id, str) and JOURNAL_ID.fullmatch(journal_id),
+                    'operator_handoff_journal_id_invalid')
+    # This is a sibling in the existing root-protected directory, never a
+    # caller-controlled path. Historical consumed journals are not overwritten.
+    return host.ROOT/('handoff-'+journal_id+'.json')
+
+
+def supervisor_arguments(argv, unit):
+    """Allow only the installed helpers' exact supported foreground commands."""
+    fixed = [
+        ['/usr/bin/python3', '/opt/sixnine-release/operator_capacity.py', 'start'],
+        ['/usr/bin/python3', '/opt/sixnine-release/operator_handoff.py', 'start'],
+        ['/usr/bin/python3', '/opt/sixnine-release/operator_handoff_continuation.py', 'resume'],
+    ]
+    arguments = argv.split() if isinstance(argv, str) else []
+    release.require(isinstance(argv, str) and argv == ' '.join(arguments),
+                    'operator_handoff_supervisor_command_changed')
+    if arguments in fixed:
+        return arguments
+    release.require(len(arguments) == 7
+        and arguments[:4] == ['/usr/bin/python3', '/opt/sixnine-release/operator_handoff.py', 'start', '--journal-id']
+        and JOURNAL_ID.fullmatch(arguments[4])
+        and arguments[5:] == ['--successor-unit', unit],
+        'operator_handoff_supervisor_command_changed')
+    return arguments
 
 
 @contextmanager
@@ -43,22 +78,23 @@ def supervisor(unit):
                     'operator_handoff_unit_invalid')
     try:
         raw = subprocess.run(['/usr/bin/systemctl', 'show', unit,
-            '--property=MainPID,ExecMainPID,Restart,KillMode,ActiveState,ExecStart,User,FragmentPath,DropInPaths'],
+            '--property=MainPID,ExecMainPID,Restart,KillMode,ActiveState,ExecStart,User,FragmentPath,DropInPaths,TimeoutStopUSec,SendSIGKILL'],
             env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin'}, check=True,
             capture_output=True, timeout=20).stdout.decode()
         value = dict(line.split('=', 1) for line in raw.splitlines() if '=' in line)
     except (OSError, subprocess.SubprocessError, ValueError):
         raise release.ReleaseError('operator_handoff_supervisor_unknown') from None
     release.require(value.get('Restart') == 'no' and value.get('KillMode') == 'process'
+        and value.get('TimeoutStopUSec') == 'infinity' and value.get('SendSIGKILL') == 'no'
         and value.get('User') in ('', 'root') and value.get('MainPID', '').isdigit()
         and value.get('ExecMainPID', '').isdigit() and value.get('ExecStart'),
         'operator_handoff_supervisor_unsafe')
     # systemd appends mutable pid/start/stop/result fields to ExecStart. Bind
     # only the executable/argv and the exact protected unit + drop-in bytes.
     match = re.fullmatch(r'\{ path=([^;]+) ; argv\[\]=([^;]+) ; ignore_errors=no ;.*\}', value['ExecStart'])
-    release.require(match is not None and match[1].strip() == '/usr/bin/python3'
-        and match[2].strip() == '/usr/bin/python3 /opt/sixnine-release/operator_capacity.py start',
+    release.require(match is not None and match[1].strip() == '/usr/bin/python3',
         'operator_handoff_supervisor_command_changed')
+    supervisor_arguments(match[2].strip(), unit)
     value['ExecStart'] = {'path':match[1].strip(), 'argv':match[2].strip()}
     paths = [value.get('FragmentPath', ''), *value.get('DropInPaths', '').split()]
     release.require(all(path.startswith(('/etc/systemd/system/', '/run/systemd/system/',
@@ -104,7 +140,11 @@ def supervisor_client(unit, pin, directory, *, proc_root=Path('/proc')):
         argv = (root/str(current)/'cmdline').read_bytes().split(b'\0')
         args = [arg.decode() for arg in argv if arg]
         if current == pid:
-            release.require(args == ['/usr/bin/python3', '/opt/sixnine-release/operator_capacity.py', 'start'],
+            # supervisor() already validates the exact protected unit command;
+            # bind the live ownership tree to that same command, not merely to
+            # another permitted helper with an unrelated journal identity.
+            expected_args = unit['ExecStart']['argv'].split()
+            release.require(args == expected_args,
                             'operator_handoff_supervisor_process_changed')
         if any(args[i:i+2] == expected for i in range(len(args)-1)):
             release.require('compose' in args and 'run' in args and host.SERVICE in args
@@ -117,6 +157,23 @@ def supervisor_client(unit, pin, directory, *, proc_root=Path('/proc')):
         todo.extend(int(child) for child in children)
     release.require(bool(matches), 'operator_handoff_supervisor_does_not_own_controller')
     return {'supervisor_pid':pid, 'docker_client_pids':sorted(matches)}
+
+
+def successor_supervisor(unit, journal_id, *, proc_root=Path('/proc'), pid=None):
+    """A new journal must be started by its exact one-shot root supervisor."""
+    record_path(journal_id)
+    release.require(journal_id is not None, 'operator_handoff_explicit_journal_required')
+    value = supervisor(unit)
+    expected = ['/usr/bin/python3', '/opt/sixnine-release/operator_handoff.py', 'start',
+                '--journal-id', journal_id, '--successor-unit', unit]
+    process_id = os.getpid() if pid is None else pid
+    release.require(value['MainPID'] == str(process_id) and value['ActiveState'] == 'active'
+        and value['ExecStart'] == {'path':'/usr/bin/python3', 'argv':' '.join(expected)},
+        'operator_handoff_successor_supervisor_mismatch')
+    arguments = (proc_root/str(process_id)/'cmdline').read_bytes().split(b'\0')
+    release.require([argument.decode() for argument in arguments if argument] == expected,
+                    'operator_handoff_successor_process_mismatch')
+    return value
 
 
 def ledger_summary(rows, binding_hashes):
@@ -231,9 +288,10 @@ def current_target(commit):
     return value
 
 
-def prepare(commit, unit):
+def prepare(commit, unit, *, journal_id=None):
     with locked():
-        release.require(not record_path().exists() and not record_path().is_symlink(),
+        path = record_path(journal_id)
+        release.require(not path.exists() and not path.is_symlink(),
                         'operator_handoff_already_recorded')
         runtime, old, directory, environment = host.prepared()
         pin = host.checked_pin(old)
@@ -254,16 +312,20 @@ def prepare(commit, unit):
             'old_prepared':old, 'old_pin':pin, 'old_overlay':release._protected_json(host.ROOT/'overlay.json'),
             'supervisor_unit':unit, 'supervisor':unit_state, 'supervisor_client':client,
             'ledger':ledger, 'prepared_at':time.time()}
+        if journal_id is not None:
+            value['journal_id'] = journal_id
         # Intent precedes admission/TERM side effects. Any ambiguous outcome is
         # retained for inspection; prepare never retries by removing this file.
-        host.atomic(record_path(), value)
+        host.atomic(path, value)
         host.request_drain(directory, environment, pin)
         return {'state':'drain_requested', 'target_commit':target, 'pending_deletions':len(ledger['pending_ids'])}
 
 
-def successor():
+def successor(*, journal_id=None):
     """Called under release.lock; preserve all old evidence before replacing pins."""
-    value = release._protected_json(record_path(), maximum=2*1024**2)
+    path = record_path(journal_id)
+    value = release._protected_json(path, maximum=2*1024**2)
+    release.require(value.get('journal_id') == journal_id, 'operator_handoff_journal_identity_changed')
     release.require(value.get('schema_version') == 1 and value.get('phase') == 'drain_requested',
                     'operator_handoff_not_ready_or_already_launched')
     runtime, old, old_directory, old_environment = host.prepared()
@@ -288,6 +350,9 @@ def successor():
     ledger = ledger_probe(old_directory, old_environment)
     release.require(ledger['immutable_hash'] == value['ledger']['immutable_hash']
         and set(ledger['pending_ids']) <= set(value['ledger']['pending_ids']), 'operator_handoff_ledger_changed')
+    if journal_id is not None:
+        release.require(ledger['accounting_hash'] == value['ledger']['accounting_hash'],
+                        'operator_handoff_accounting_changed')
     commit, directory, environment, image = current_target(value['target_commit'])
     release.require(image == value['target_image_id'], 'operator_handoff_target_image_changed')
     prepared = {**old, 'commit':commit, 'image_id':image}
@@ -295,7 +360,7 @@ def successor():
     # A launch intent is one-use even after a crash or unknown stdin delivery.
     value.update(phase='launch_intent', retired_proof=proof, retired_ledger=ledger, successor_pin=next_pin,
                  launch_intent_at=time.time())
-    host.atomic(record_path(), value)
+    host.atomic(path, value)
     owners = value['old_overlay']['services']['app']['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS']
     host.atomic(host.ROOT/'overlay.json', host.overlay(environment['SIXNINE_IMAGE'], host.default_profile(), runtime, owners=owners))
     host.atomic(host.ROOT/'prepared.json', prepared)
@@ -310,7 +375,7 @@ def successor():
     return runtime, prepared, directory, environment, next_pin
 
 
-def start(*, clock=time.monotonic, sleep=time.sleep, successor_factory=None):
+def start(*, clock=time.monotonic, sleep=time.sleep, successor_factory=None, journal_id=None, successor_unit=None):
     stopping = [False]
     previous = {}
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -320,7 +385,18 @@ def start(*, clock=time.monotonic, sleep=time.sleep, successor_factory=None):
     try:
         with locked():
             release.require(not stopping[0], 'operator_handoff_interrupted')
-            runtime, prepared, directory, environment, pin = (successor_factory or successor)()
+            journal_path = record_path(journal_id)
+            if journal_id is not None:
+                release.require(successor_factory is None, 'operator_handoff_custom_factory_forbidden')
+                identity = successor_supervisor(successor_unit, journal_id)
+                value = release._protected_json(journal_path, maximum=2*1024**2)
+                release.require(value.get('journal_id') == journal_id and value.get('phase') == 'drain_requested',
+                                'operator_handoff_not_ready_or_already_launched')
+                host.atomic(journal_path, {**value, 'successor_supervisor_unit':successor_unit, 'successor_supervisor':identity})
+                runtime, prepared, directory, environment, pin = successor(journal_id=journal_id)
+            else:
+                release.require(successor_unit is None, 'operator_handoff_successor_unit_without_journal')
+                runtime, prepared, directory, environment, pin = (successor_factory or successor)()
             process = host.launch(directory, environment, runtime, pin)
             deadline = clock()+120
             while True:
@@ -341,7 +417,7 @@ def start(*, clock=time.monotonic, sleep=time.sleep, successor_factory=None):
                     proof = {}
                 if (state.get('Running') is True and state.get('Restarting') is False
                         and state.get('OOMKilled') is False and proof.get('state') == 'running'
-                        and proof.get('controller_id') != release._protected_json(record_path())['old_pin'].get('controller_id')):
+                        and proof.get('controller_id') != release._protected_json(journal_path)['old_pin'].get('controller_id')):
                     pin = {**pin, 'state':'running', 'controller_id':proof['controller_id']}
                     host.atomic(host.ROOT/'active.json', pin)
                     # Existing app-only activation verifies the current release.
@@ -358,8 +434,8 @@ def start(*, clock=time.monotonic, sleep=time.sleep, successor_factory=None):
                     release.wait_ready(directory, environment)
                     pin = {**pin, 'admission':'open'}
                     host.atomic(host.ROOT/'active.json', pin)
-                    value = release._protected_json(record_path(), maximum=2*1024**2)
-                    host.atomic(record_path(), {**value, 'phase':'running', 'controller_id':proof['controller_id']})
+                    value = release._protected_json(journal_path, maximum=2*1024**2)
+                    host.atomic(journal_path, {**value, 'phase':'running', 'controller_id':proof['controller_id']})
                     break
                 release.require(clock() < deadline, 'operator_handoff_startup_timeout')
                 sleep(2)
@@ -391,14 +467,17 @@ def main(argv=None):
     parser.add_argument('action', choices=('prepare', 'start'))
     parser.add_argument('--target-commit')
     parser.add_argument('--unit')
+    parser.add_argument('--journal-id')
+    parser.add_argument('--successor-unit')
     args = parser.parse_args(argv)
     try:
         release.check_host(release.ROOT)
         if args.action == 'prepare':
-            result = prepare(args.target_commit, args.unit)
+            release.require(args.successor_unit is None, 'operator_handoff_successor_unit_start_only')
+            result = prepare(args.target_commit, args.unit, journal_id=args.journal_id)
         else:
             release.require(args.target_commit is None and args.unit is None, 'operator_handoff_record_required')
-            result = start()
+            result = start(journal_id=args.journal_id, successor_unit=args.successor_unit)
         print(json.dumps(result, sort_keys=True))
         return 0
     except Exception as error:

@@ -1,6 +1,6 @@
 # Operator capacity and deployment profiles
 
-Accepted direction: 2026-10-09. Delivery and acceptance: [E3 #71](https://github.com/apedintensor/h3-studio/issues/71). This extends the [generation contract](GENERATION-CONTRACT.md); it does not renew a budget or certify a deployed runtime.
+Accepted direction: 2026-10-09. Delivery and acceptance: [E3 #71](https://github.com/inkseq/h3-studio/issues/71). This extends the [generation contract](GENERATION-CONTRACT.md); it does not renew a budget or certify a deployed runtime.
 
 ## One authority
 
@@ -53,7 +53,7 @@ An ambiguous bootstrap is `runtime_state: blocked` with `reason_code: bootstrap_
 
 The console first selects the exact model ID and FL2VA/Ref2VA mode, then reads
 `GET /v1/operator/capacity/candidates?model_id=...&mode=...&ttl_seconds=...`.
-[Issue #89](https://github.com/apedintensor/h3-studio/issues/89) replaces upfront
+[Issue #89](https://github.com/inkseq/h3-studio/issues/89) replaces upfront
 provider/GPU/count selection with ranked Lium/Targon allocations. Each row is a
 complete Lium executor or a Targon resource SKU, not a promised physical host.
 It contains provider/offer identity, GPU type/count, whole-allocation quote,
@@ -97,7 +97,7 @@ observation/preview clears consent. Stock is not a reservation or runtime proof.
 
 ## Legacy stock and next-tier API compatibility
 
-[Issue #85](https://github.com/apedintensor/h3-studio/issues/85) adds advisory
+[Issue #85](https://github.com/inkseq/h3-studio/issues/85) adds advisory
 Lium/Targon stock, independently of the existing binding-based start admission.
 `provider` is optional in a selection; omission still means Lium and remains
 absent in historical canonical selections/hashes. Explicit Targon cannot resolve
@@ -129,7 +129,7 @@ not quoted as cheap one-GPU slices. An available resource count does not prove
 independent physical hosts. Price/metadata and runtime qualification blockers
 are visible even when a larger-GPU suggestion is useful.
 
-The Targon VM adapter under [#86](https://github.com/apedintensor/h3-studio/issues/86)
+The Targon VM adapter under [#86](https://github.com/inkseq/h3-studio/issues/86)
 requires an explicit immutable manifest and protected deployment binding. A
 generic registry still admits only Lium. Targon admission binds the provider,
 organization, resource/image, SSH-key IDs, topology, RAM/disk floors, whole-node
@@ -173,6 +173,78 @@ observation fields. A scheduling claim and a webpage refresh are not provider
 observations. Overdue is an attention signal, not a lifecycle transition.
 Retained slots and rates on a removal card describe historical allocation;
 they do not establish current hardware activity or final billing.
+
+### Explicit manual Targon removal review
+
+For the beta VM API's stale exact-UID `Stopping` records, an authorized browser
+operator may acknowledge an already requested teardown using
+`POST /v1/operator/capacity/nodes/{node_id}/manual-review` with the original
+`provider_instance_id`, current `expected_version`, both `account_absent: true`
+and `no_continuing_charge: true`, and `Idempotency-Key`. These fields are explicit
+human account/billing attestations; list absence or unchanged credit alone does
+not trigger the action automatically. The browser first shows a review reminder
+and requires both checks. Ordinary users and Agent credentials cannot mark it.
+
+The existing global lock protects the audit and capacity exclusion. Only an
+exact Targon intent already `destroying`, with its existing stop operation,
+deletion-start receipt and stopped desired state, is eligible. Fresh bound
+workers, current jobs, unknown/orphan device ownership, unfinished/unsafe attempts and
+unconfirmed upstream stops reject the mark. Creation-unknown and active nodes
+cannot use this exception. Identical replay returns the same operation;
+conflicting replay rejects. Actor, time, exact instance, original intent,
+deadline and stop operation are durably bound in the existing command/scaler
+receipt authority, without a new schema or rental ledger.
+The mark also requires a fresh `operator-offers-v1-review-v1-` controller
+heartbeat. An earlier controller cannot accept the new command through an
+app-only rollout; activate the updated controller before enabling review.
+
+For the exact stopped node only, the same human-review transaction may retire
+an expired unbound worker and release its remaining local devices. This requires
+the original protected deployment binding and worker-spec hash to match, all
+worker attempt/job history to be safely terminal, and exact device ownership
+to match the worker spec. Capacity, worker/device and job/attempt locks prevent
+concurrent revival; retirement increments the worker fence. Fresh/current
+workers, inconsistent/cross-node ownership and unknown upstream stops remain
+blocked. The durable `local_execution_release` audit records prior states,
+fences, devices and terminal attempt IDs. It releases local ownership only;
+it does not assert physical provider removal or settle any reservation.
+
+The public removal observation becomes `manually_reviewed`, its next check is
+null, and the node no longer counts toward operating capacity/hourly estimates.
+Controller reconciliation skips the reviewed UID. The underlying instance
+remains `destroying`: manual review is neither `destroyed`, provider stop proof,
+nor a final bill. Original jobs, IDs, requests, deadlines and reservations remain.
+Existing replacement/invoice gates requiring positive provider removal and
+settlement are not waived. The final provider API/billing defect remains #86 in
+backlog; no approximate charge is settled automatically.
+
+The independent root guardian consumes the same committed audit through an
+optional fixed read-only PostgreSQL bridge. Its service pins the verified full
+database container ID with `--manual-review-database-container`; Docker labels
+must still identify the Sixnine `db` service. Set the independently verified
+application database with `--manual-review-database-name`; `postgres` remains
+the compatibility default and may be only a maintenance database. The short
+nonsecret database name is validated and passed as a separate `psql -d`
+argument. The bridge retains the `postgres` OS/database role and read-only
+transaction; it never reads or forwards application credentials.
+It checks the audit/stop/node/UID
+relations and absence of active execution obligations, then records its own
+protected `manually_reviewed` receipt and stops polling that UID. DB failure or
+invalid review never disables ordinary deadline enforcement. Persisted review
+survives restart, and `removal_proof` still rejects it.
+
+Standalone historical test UIDs without a business node use a separate explicit
+root-only exception audit, enabled by `--manual-review-directory`. Each
+root-owned single-link `{exact_uid}.json` must bind the retained request hash,
+workload-identity hash and original deadline; it records a human auditor, review
+operation/time, both account attestations, and `accepted_delete: true`. The
+`intent_id` is null when no business intent exists; do not invent a ledger ID.
+The
+retained guardian must already have a deletion-start receipt. Writable/symlinked
+paths, wrong UID/identity/deadline and invalid audits fail closed. This narrowly
+authorizes stopping that historical polling obligation, never runtime, rental,
+budget release, positive physical removal or invoice settlement. The service
+config/window and retained request/receipt are not rewritten.
 
 Compatible application publication may retain an active operator execution
 release. The protected host checks an exact execution-to-app review receipt

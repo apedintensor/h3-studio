@@ -31,8 +31,9 @@ export function createOperatorController({client=createOperatorClient(),storage=
     start:preview=>command('start',[],{preview_id:preview.preview_id}),
     drain:node=>command('drain',[node.id],{expected_version:node.version}),
     stop:node=>command('stop',[node.id],{expected_version:node.version}),
+    manualReview:(node,attestation)=>command('manualReview',[node.id],{expected_version:node.version,provider_instance_id:node.provider_instance_id,...attestation}),
     updatePolicy:body=>act(async()=>{if(state.pending)throw Error('请先核对原管理操作。');const result=await client.updatePolicy(body);await refresh();return result;}),
-    recover:()=>act(async()=>{const op=state.pending;if(!op||op.corrupt||op.account!==state.account||!['start','drain','stop'].includes(op.method)||!Array.isArray(op.args)||typeof op.key!=='string')throw Error('原操作记录无法核对，请保留记录并联系管理员。');return send(op);}),
+    recover:()=>act(async()=>{const op=state.pending;if(!op||op.corrupt||op.account!==state.account||!['start','drain','stop','manualReview'].includes(op.method)||!Array.isArray(op.args)||typeof op.key!=='string')throw Error('原操作记录无法核对，请保留记录并联系管理员。');return send(op);}),
     destroy(){epoch++;client.reset();listeners.clear();},
   };
 }

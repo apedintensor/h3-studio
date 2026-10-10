@@ -2,7 +2,7 @@ name: Work item
 description: Define a bounded change with an owner, a contract, and acceptance evidence.
 title: "[Work item] "
 labels: ["type:task"]
-projects: ["apedintensor/2"]
+projects: ["inkseq/1"]
 body:
   - type: markdown
     attributes:

@@ -17,7 +17,7 @@ Updated: 2026-10-08 (Australia/Sydney). This is the GitHub workflow entry point.
 
 Read **applicable AGENTS → PROJECT-PLAN → DECISIONS → this workflow → the assigned issue, its parent work package, and relevant specification**. Expand only the contracts, code, and evidence needed for that task. Local sessions may also consult `PLANNING-INDEX.zh-CN.md` for detailed historical research. Do not load every historical report as current guidance.
 
-Use `workflow/project.json` to locate the actual remote work items. Read the latest claim, comments, PRs, dependencies, and status before proceeding. A screenshot or a past chat saying “done” does not replace these records. Reconcile discrepancies rather than assuming the current production state.
+The public repositories are `inkseq/h3-studio` and `inkseq/sixnine-design`. The active Delivery Project is the private `inkseq` organization project. Use its verified identifiers in `workflow/project.json` to locate the actual remote work items; the former personal project is retained as closed migration evidence after cutover. Historical receipt URLs, immutable source IDs and signed release manifests retain their recorded provenance. Read the latest claim, comments, PRs, dependencies, and status before proceeding. A screenshot or a past chat saying “done” does not replace these records. Reconcile discrepancies rather than assuming the current production state.
 
 Check the latest remote main revision and compare relevant guidance with the active branch before relying on it. Read newer documents through the remote or another worktree if needed; do not switch, reset or overwrite a preserved checkout to make its documents look current. Record the revisions compared and any unresolved difference in the claim/handoff. If the remote is unavailable, state that freshness is unverified and follow the bounded-work rule below.
 
@@ -26,7 +26,7 @@ This entry point depends on project context. **A completely new session outside 
 For a session without project context, paste:
 
 ```text
-Continue work in https://github.com/apedintensor/h3-studio.
+Continue work in https://github.com/inkseq/h3-studio.
 Read AGENTS.md, PROJECT-PLAN.md, DECISIONS.md, WORKFLOW.md, and workflow/project.json.
 Check the Project, current claims, and dependencies; pick the highest-priority Ready task
 unless I assign a specific issue. Claim a bounded scope before editing and leave a handoff.
@@ -83,13 +83,15 @@ The same PR updates the decision record and affected plan/contract in place. Rem
 
 The user does not perform routine manual PR work. Agents create the PR, inspect its complete diff, run the selected checks and merge the authorized batch when ready. Use independent agent review for material authentication, persistence, generation or billing changes. Required checks are not bypassed; a human approval count is not a substitute for that review. The stable backend CI check is `test`.
 
+Backend CI partitions the complete Python and PostgreSQL inventories into six deterministic shards per suite. Each PostgreSQL shard uses its own isolated service; the single required `test` gate waits for every selected shard and rejects failed, cancelled or accidentally skipped checks. Preserve full inventory coverage when adding tests. Use the uploaded per-shard timings to rebalance measured slow groups; an under-three-minute target is not evidence of achieved duration. Public repositories use hosted runners, without production credentials in pull-request tests. Complete a related batch before its integrated CI pass; publication of the exact main revision and protected deployment remain separate release phases.
+
 Leave an independent review receipt in the PR or linked issue: reviewer/session, reviewed revision and boundaries, exclusions or authoring overlap, findings, fix commits and re-review result. An agent must not describe review of its own changes as independent. A technical review is not automatically full acceptance of every issue criterion; state whether acceptance was also assessed and which criteria remain unverified. An agent review receipt is sufficient; a mandatory human PR review is not required.
 
 Keep incomplete or unapproved work in a clearly labelled draft/source branch; do not merge it just to back it up. Push reviewed source at meaningful checkpoints and before handoff, excluding secrets, media, runtime data, environments and dependencies. Unpublished does not mean uncommitted. Git protects source; database/media recovery remains a separate F obligation.
 
 A handoff or merged PR does not require switching an existing shared feature checkout to `main`. Preserve its branch, unpublished work and preview dependencies; use an isolated worktree for the next task. Cleanup or retirement is a separate authorized action, not a completion ritual.
 
-Canonical frontend and approved mock are in the private `apedintensor/sixnine-design` repository at the existing `../video-studio-design` path. Its `test` workflow checks source without deploying it. The generated backend `yingxu/` snapshot remains on the existing release path. An approved source merge does not remove the user's existing frontend publication gate.
+Canonical frontend and approved mock are in the public `inkseq/sixnine-design` repository at the existing `../video-studio-design` path. Its `test` workflow checks source without deploying it. The generated backend `yingxu/` snapshot remains on the existing release path. An approved source merge does not remove the user's existing frontend publication gate.
 
 Main protection should require PRs and the stable `test` result, disallow force-push/deletion, and require zero human approvals. If GitHub's account plan prevents enforcement, record that limitation and follow the same agent-managed workflow; do not make the repository public or buy an upgrade automatically.
 

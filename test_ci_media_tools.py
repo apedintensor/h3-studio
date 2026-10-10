@@ -1,13 +1,13 @@
 """CI dependency policy with fake processes; never installs host packages."""
 import os
 from pathlib import Path
-import shlex
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from tools import ci_media_tools as media
+from tools import ci_test_shards
 
 
 class MediaToolTests(unittest.TestCase):
@@ -90,15 +90,14 @@ class MediaToolTests(unittest.TestCase):
         self.assertEqual(source.count("python tools/ci_media_tools.py install"), 2)
         self.assertEqual(source.count("Install media test tools from signed Ubuntu repositories\n        timeout-minutes: 10"), 2)
         postgres = source.split("\n  postgres:\n", 1)[1].split("\n  frontend:\n", 1)[0]
-        commands = [shlex.split(line.strip()[5:]) for line in postgres.splitlines()
-                    if line.startswith("        run: python -m unittest ")]
         required = {"test_platform_quick_chat_integration", "test_platform_quick_chat_admission",
                     "test_platform_quick_chat_wangp", "test_platform_agent_connect",
                     "test_platform_agent_connect_app", "test_platform_pool_members",
                     "test_platform_wangp_first_last_policy"}
-        self.assertTrue(any(required <= set(command) for command in commands),
+        self.assertTrue(required <= set(ci_test_shards.POSTGRES_MODULES),
                         "PostgreSQL must retain the Quick Chat, connection and pool/first-last contract checks")
-        self.assertIn("python -m unittest discover -s . -p 'test_*.py' -v", source)
+        self.assertIn("python tools/ci_test_shards.py --suite postgres", postgres)
+        self.assertIn("python tools/ci_test_shards.py --suite python", source)
 
 
 if __name__ == "__main__":

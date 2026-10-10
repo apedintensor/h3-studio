@@ -82,4 +82,8 @@ def register_routes(app, *, registry=None, service=None):
     def policy(request: Request, body: dict):
         return response(service.update_policy(principal(request),body))
 
+    @app.post(PREFIX+"/nodes/{node_id}/manual-review")
+    def manual_review(node_id: str, request: Request, body: dict, key: str=Header(...,alias="Idempotency-Key")):
+        return response(service.manual_review(principal(request),node_id,body,key))
+
     return service

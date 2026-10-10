@@ -20,6 +20,7 @@ export function createOperatorClient(options={}){
     start:(body,key)=>api.request(ROOT+'/starts',{method:'POST',body,key}),
     drain:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/drain`,{method:'POST',body,key}),
     stop:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/stop`,{method:'POST',body,key}),
+    manualReview:(nodeId,body,key)=>api.request(ROOT+`/nodes/${id(nodeId)}/manual-review`,{method:'POST',body,key}),
     updatePolicy:body=>api.request(ROOT+'/policy',{method:'PUT',body}),
   };
 }

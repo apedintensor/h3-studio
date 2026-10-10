@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import re
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -68,13 +70,115 @@ class ProviderHTTP:
         self._key = None
 
 
+class OperatorManualReviewReader:
+    """Root host bridge: read committed exact-ID operator audits, never write DB.
+
+    No connection credentials leave the existing database container. This fixed
+    query is opt-in through the protected host service, not browser parameters.
+    """
+    def __init__(self, container, *, database_name='postgres', run=subprocess.run):
+        if not isinstance(container,str) or not re.fullmatch(r'[0-9a-f]{64}',container):
+            raise ValueError('targon_guard_database_container_invalid')
+        if (not isinstance(database_name,str)
+                or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_-]{0,62}',database_name)):
+            raise ValueError('targon_guard_database_name_invalid')
+        self.container,self.database_name,self.run=container,database_name,run
+
+    def __call__(self, uid):
+        if not isinstance(uid,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}',uid):
+            raise ValueError('targon_guard_identity_invalid')
+        identity=self.run(['/usr/bin/docker','inspect','--format',
+            '{{json .Id}} {{json .Config.Labels}}',self.container],text=True,capture_output=True,
+            timeout=15,check=False)
+        try:
+            found,labels_raw=identity.stdout.strip().split(' ',1)
+            labels=json.loads(labels_raw)
+            if (identity.returncode or json.loads(found)!=self.container
+                    or labels.get('com.docker.compose.project')!='sixnine-platform'
+                    or labels.get('com.docker.compose.service')!='db'):
+                raise ValueError
+        except (ValueError,AttributeError):
+            raise ValueError('targon_guard_database_identity_unconfirmed') from None
+        query="""SELECT (CAST(r.facts AS jsonb) || jsonb_build_object('observed_at',r.observed_at))::text
+FROM platform_scaler_receipts r
+JOIN platform_instance_intents i ON i.id=r.intent_id
+JOIN platform_operator_capacity_nodes n ON n.intent_id=i.id
+JOIN platform_operator_capacity_commands c ON c.id=(CAST(r.facts AS jsonb)->>'operation_id')
+JOIN platform_operator_capacity_commands s ON s.id=(CAST(r.facts AS jsonb)->>'stop_operation_id')
+JOIN platform_scaler_actions a ON a.intent_id=i.id
+WHERE r.operation='manual_review' AND i.provider='targon' AND i.state='destroying'
+AND i.provider_instance_id='%s' AND n.desired_state='stopped'
+AND a.destroy_started_at IS NOT NULL
+AND c.kind='manual_review' AND c.state='completed' AND c.actor=(CAST(r.facts AS jsonb)->>'actor')
+AND (CAST(c.payload AS jsonb)->>'node_id')=i.id
+AND (CAST(c.payload AS jsonb)->>'provider_instance_id')=i.provider_instance_id
+AND (CAST(c.payload AS jsonb)->'account_absent')='true'::jsonb
+AND (CAST(c.payload AS jsonb)->'no_continuing_charge')='true'::jsonb
+AND ((CAST(n.payload AS jsonb)->'manual_review')->>'operation_id')=c.id
+AND (CAST(r.facts AS jsonb)->>'instance_id')=i.provider_instance_id
+AND (CAST(r.facts AS jsonb)->>'intent_id')=i.id
+AND c.created_at=r.observed_at
+AND s.kind='stop' AND (CAST(s.payload AS jsonb)->>'node_id')=i.id AND s.created_at<=r.observed_at
+AND NOT EXISTS (SELECT 1 FROM platform_registered_workers w WHERE w.provider=i.provider
+AND w.instance_id=i.provider_instance_id AND (w.current_job_id IS NOT NULL
+OR (w.state!='retired' AND w.expires_at>EXTRACT(EPOCH FROM NOW()))))
+AND NOT EXISTS (SELECT 1 FROM platform_registered_devices d WHERE d.provider=i.provider
+AND d.instance_id=i.provider_instance_id AND d.state!='released')
+AND NOT EXISTS (SELECT 1 FROM platform_attempts t JOIN platform_jobs j ON j.id=t.job_id
+JOIN platform_registered_workers w ON w.id=t.worker_id WHERE w.provider=i.provider
+AND w.instance_id=i.provider_instance_id AND (j.status NOT IN ('succeeded','failed','cancelled')
+OR t.status NOT IN ('succeeded','failed','cancelled') OR ((t.submission_started_at IS NOT NULL
+OR t.upstream_task_id IS NOT NULL) AND t.upstream_stopped!=1)))
+ORDER BY r.observed_at DESC LIMIT 1;""" % uid
+        result=self.run(['/usr/bin/docker','exec','--user','postgres','-i',self.container,
+            'psql','-U','postgres','-d',self.database_name,'-X','-q','-A','-t','-v','ON_ERROR_STOP=1'],
+            input='BEGIN READ ONLY;\n'+query+'\nCOMMIT;',text=True,capture_output=True,timeout=15,check=False)
+        if result.returncode or len(result.stdout.encode('utf-8'))>16384:
+            raise ValueError('targon_guard_manual_review_read_unavailable')
+        raw=result.stdout.strip()
+        return {**json.loads(raw),'source':'operator_database'} if raw else None
+
+
+class ProtectedManualReviewReader:
+    """Root-owned exception audit for exact historical standalone workloads."""
+    def __init__(self, directory, fallback=None):
+        self.root=Path(directory)
+        self.fallback=fallback
+        if not self.root.is_absolute() or '..' in self.root.parts:
+            raise ValueError('targon_guard_manual_review_directory_invalid')
+
+    def __call__(self, uid):
+        from studio_platform.targon_cleanup import UID, _read, _receipt_trust
+        if not isinstance(uid,str) or not UID.fullmatch(uid):
+            raise ValueError('targon_guard_identity_invalid')
+        path=self.root/(uid+'.json')
+        if path.exists():
+            _receipt_trust((self.root,*self.root.parents,path))
+            review=_read(path)
+            if review.get('source')!='protected_operator_attestation':
+                raise ValueError('targon_guard_manual_review_source_invalid')
+            return review
+        return self.fallback(uid) if self.fallback else None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', required=True)
+    parser.add_argument('--manual-review-database-container')
+    parser.add_argument('--manual-review-database-name',help='Verified nonsecret application database name; defaults to postgres')
+    parser.add_argument('--manual-review-directory')
     args = parser.parse_args(argv)
     from studio_platform.targon_cleanup import TargonDeadlineGuardian, _read, _write
     from studio_platform.targon_runtime_aws import AwsTargonLoader, SERVICE, PROFILE, BASE_URL
     try:
+        if args.manual_review_database_name is not None and args.manual_review_database_container is None:
+            raise ValueError('targon_guard_database_container_required')
+        review_reader=None
+        if args.manual_review_database_container is not None:
+            database_name=args.manual_review_database_name if args.manual_review_database_name is not None else 'postgres'
+            review_reader=OperatorManualReviewReader(args.manual_review_database_container,database_name=database_name)
+        if args.manual_review_directory:
+            review_reader=ProtectedManualReviewReader(args.manual_review_directory,review_reader)
         path = Path(args.config)
         if not path.is_absolute() or path.is_symlink():
             raise ValueError
@@ -89,6 +193,7 @@ def main(argv=None):
         credential = loader(SERVICE, profile=PROFILE)
         client = ProviderHTTP(credential.api_key)
         guardian = TargonDeadlineGuardian(config['directory'], client,
+            manual_review_reader=review_reader,
             **{key:config[key] for key in ('org_slug','resource_names','image_names',
                                           'approval_start','approval_end','maximum_seconds')})
     except Exception:

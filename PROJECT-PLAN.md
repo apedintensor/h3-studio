@@ -198,7 +198,7 @@ The missing transition is explicit: D1 #18 is accepted offline in PR #25. PR #33
 
 Follow-up scopes from that integration: D3 #27 resolves last-frame/delivered-duration fidelity; C3 #28 reconciles historical supplier charges and retained reservations; D4 #29 expands and qualifies REF inputs. The first B3 text-to-video proof does not claim those broader controls. Read exact readiness and claims on GitHub; a completed source milestone does not satisfy a real-runtime gate.
 
-G1 #20 tracks Quick Chat API integration and its separate approved frontend publication; G2 #21 tracks the selectively integrated Agent Connect contract and pending live onboarding. The preserved source remains available for comparison; B1 must coordinate the existing admission extraction rather than rebuilding it. Canonical frontend/mock are versioned in private `apedintensor/sixnine-design`; their local paths and generated-release relationship are unchanged.
+G1 #20 tracks Quick Chat API integration and its separate approved frontend publication; G2 #21 tracks the selectively integrated Agent Connect contract and pending live onboarding. The preserved source remains available for comparison; B1 must coordinate the existing admission extraction rather than rebuilding it. Canonical frontend/mock are versioned in public `inkseq/sixnine-design`; their local paths and generated-release relationship are unchanged.
 
 ## 10. Documentation, issue, and status authority
 

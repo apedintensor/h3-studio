@@ -2,7 +2,7 @@
 
 ## Start here
 
-- Read `PROJECT-PLAN.md`, `DECISIONS.md`, `WORKFLOW.md`, `workflow/project.json`, then the assigned issue, parent, latest claim and relevant specification. Check the latest main revision and whether this branch's guidance is stale without switching/resetting a preserved checkout. Use the existing Sixnine Platform Delivery Project: https://github.com/users/apedintensor/projects/2.
+- Read `PROJECT-PLAN.md`, `DECISIONS.md`, `WORKFLOW.md`, `workflow/project.json`, then the assigned issue, parent, latest claim and relevant specification. Check the latest main revision and whether this branch's guidance is stale without switching/resetting a preserved checkout. Use the existing Sixnine Platform Delivery Project: https://github.com/orgs/inkseq/projects/1.
 - `DECISIONS.md` records durable choices and their reasons, not implementation or release status. A material decision change updates its stable record and the affected plan/contract in the same PR; replace conflicting current wording instead of appending an override. Routine UI details need no separate decision.
 - `CURRENT-BASELINE.md` is the single dated source/production overview. It is not a live status endpoint. Replace its observations when rechecked; keep old evidence in Git and issue handoffs, not dated status paragraphs here.
 - Read `GENERATION-CONTRACT.md` before changing admission, workers, engine routing or recovery. Code/tests establish implementation; exact receipts establish deployment and real inference.
@@ -23,7 +23,7 @@
 ## Source and product boundaries
 
 - Business backend: `platform_app.py` / `studio_platform/`. Preserve one authority for ownership, assets, accepted jobs, attempts, budgets and obligations; no parallel backend/job ledger.
-- Canonical frontend: `../video-studio-design/studio-app`, versioned in private `apedintensor/sixnine-design`. Approved Quick Chat interaction: `../video-studio-design/quick-chat-mock` in the same repository.
+- Canonical frontend: `../video-studio-design/studio-app`, versioned in public `inkseq/sixnine-design`. Approved Quick Chat interaction: `../video-studio-design/quick-chat-mock` in the same repository. The backend repository is `inkseq/h3-studio`; resolve the active private `inkseq` Project and issue identifiers through `workflow/project.json`.
 - `yingxu/` is a generated release snapshot. Edit canonical source and compare to the approved mock. Do not silently redesign the UI, edit the snapshot directly or synchronize/publish unapproved frontend changes.
 - Quick Chat sessions/turns/material bindings/card revisions are authoring authority; hidden project/shot objects are compatibility projections. Browser and Agent use the same business API and owner-isolated objects.
 - External Agent setup uses the public one-time connection/helper contract. It does not require the internal AI Registry. Keep connection authority/expiry frozen and never expose permanent keys in chat, logs or discovery pages.

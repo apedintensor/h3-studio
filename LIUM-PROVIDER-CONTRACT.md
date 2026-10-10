@@ -1,6 +1,6 @@
 # Lium 云适配器契约
 
-盘点及官方文档核验日期：2026-10-04。实现：`studio_platform/lium_provider.py`；离线验收：`test_platform_lium_provider.py`。这是可被协调器注入的适配器代码，不代表已租赁、已上线或已完成模型资格验证。默认 `enabled=False`，没有 CLI 启用入口，不影响目前 `max_instances=0` / dry-run 配置。
+原始盘点日期：2026-10-04；计费文档再次核验：2026-10-10。后文“本轮证据”保留原始离线验收范围，不代表当前生产状态；部署与授权窗口查 `CURRENT-BASELINE.md` 及对应回执。实现：`studio_platform/lium_provider.py`；离线验收：`test_platform_lium_provider.py`。这是可被协调器注入的适配器代码，不代表已租赁、已上线或已完成模型资格验证。默认 `enabled=False` 不授予付费操作权限；历史初始 dry-run 配置不描述当前生产状态。
 
 ## 调用边界
 
@@ -34,17 +34,19 @@ Windows DPAPI 加密库不能直接复制到 AWS 使用。AWS 的中央加载器
 
 ## 受信 manifest 与费用限制
 
-`LiumManifest` 固定 `configuration_id`、准确 `model_id`、executor UUID、template UUID、GPU 数、执行槽数、地区标记、每 GPU 小时报价上限（整数 microUSD）、TTL（整数小时，1–720）、审批有效期及公钥内容。`LaunchSpec.offer_id/image_id` 必须分别等于 executor/template UUID。模型 ID、中央资源 ID 和 template ID 不可互换；不按价格自动选其他 executor，不回退默认 template，不接受来自用户请求的 Dockerfile、SSH key 路径或启动脚本。
+`LiumManifest` 固定 `configuration_id`、准确 `model_id`、executor UUID、template UUID、GPU 数、执行槽数、地区标记、每 GPU 小时报价上限（整数 microUSD）、终止调度参数 `termination_hours`（整数小时，1–720，不是计费取整单位）、审批有效期及公钥内容。`LaunchSpec.offer_id/image_id` 必须分别等于 executor/template UUID。模型 ID、中央资源 ID 和 template ID 不可互换；不按价格自动选其他 executor，不回退默认 template，不接受来自用户请求的 Dockerfile、SSH key 路径或启动脚本。
 
 仅接受一条无 authorized_keys 选项的标准公钥内容；不读私钥，也不自动注册/生成 SSH key。固定 template UUID 本身不保证模板内容不会改变，镜像摘要与启动后的实际模型/recipe/依赖资格仍需单独核验。
 
 协调器必须预留精确 `gpu_count` / `execution_slots`，预算至少覆盖 `manifest price cap × gpu_count × manifest termination_hours`，复用原有跨池容量和预算账本。预留是保守占用，不是实际账单；未知创建、未知删除、未知实际费用均保留对应占用。
 
+官方按秒计费：pod 每小时价格 × 实际计费秒数 / 3,600，无一分钟或一小时向上取整；时钟从 deploy request 开始，包含供应商准备时间，按官方已移除流程在 removal request 后不再计费。参考 [Billing](https://docs.lium.io/pod-users/billing)，核验日期 2026-10-10。余额扣款周期和 `termination_hours` 调度粒度不是计费粒度；请求接受时间未知时不能推断已经停止计费。最终结算仍读该 pod 的 ledger `total`，不以本地时长估算替代账单，也不追溯改写已有结算。
+
 创建前读取 `GET /executors` 和 `GET /templates`，检查精确 ID、GPU 数及 `price_per_gpu`。官方将该价格定义为每 GPU 每小时，租赁提交使用固定 `POST /executors/{UUID}/rent`、`pod_name`、`template_id`、`user_public_key`、`gpu_count`、`termination_hours`。[官方 Quickstart](https://docs.lium.io/developers/quickstart)
 
 **GET 报价与 POST 租赁之间存在价格竞态。**固定 executor 的租赁接口未核实支持原子 price-cap 参数，所以 manifest 的 `allow_preflight_only_price_cap` 默认 false；未明确认可该限制就不能提交。即便明确开启，上述费用预留也不能被称为绝对费用上限。未来上线需验证服务器原子价格约束或由运营方另行审批风险，不允许添加猜测参数。
 
-实际 TTL 为审批 TTL 与剩余绝对截止时间向下取整的较小值，另留 60 秒提交余量。剩余不足一小时加余量即拒绝。预检之后紧邻 POST 再核对审批与截止时间。该余量是客户端保守防护，不是已实测的供应商 SLA；服务器具体起算时间、调度延迟和自动销毁效果需真实受控验证。
+提交的终止调度小时数为审批 TTL 与剩余绝对截止时间向下取整的较小值，另留 60 秒提交余量；这只影响最迟停止时间，不表示把实际费用向上取整。剩余不足一小时加余量即拒绝。预检之后紧邻 POST 再核对审批与截止时间。该余量是客户端保守防护，不是已实测的供应商 SLA；服务器具体起算时间、调度延迟和自动销毁效果需真实受控验证。
 
 ## 未知状态与销毁证据
 

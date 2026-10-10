@@ -183,11 +183,14 @@ class TargonCleanupGuard:
 class TargonDeadlineGuardian:
     """Separate privileged process. Only exact protected requests can be removed."""
     def __init__(self, directory, client, *, org_slug, resource_names, image_names,
-                 approval_start, approval_end, maximum_seconds=10800, clock=time.time):
+                 approval_start, approval_end, maximum_seconds=10800, clock=time.time, manual_review_reader=None):
         self.root, self.client, self.clock = Path(directory), client, clock
         self.org_slug, self.resources, self.images = org_slug, set(resource_names), set(image_names)
         self.start, self.end, self.maximum = approval_start, approval_end, maximum_seconds
         self.identity = uuid.uuid4().hex
+        if manual_review_reader is not None and not callable(manual_review_reader):
+            raise ValueError('targon_guard_manual_review_reader_invalid')
+        self.manual_review_reader = manual_review_reader
         if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,62}', org_slug):
             raise ValueError('targon_guard_org_invalid')
         if (not self.root.is_absolute() or '..' in self.root.parts
@@ -213,8 +216,17 @@ class TargonDeadlineGuardian:
                     _receipt_trust((self.root, path.parent, path))
                     old = _read(path)
                     request = _retained_request(old, path.stem)
-                    if old.get('state') == 'removed':
+                    if old.get('state') in {'removed', 'manually_reviewed'}:
                         continue
+                    if self.manual_review_reader is not None:
+                        try:
+                            review = self.manual_review_reader(path.stem)
+                            if review is not None:
+                                self._acknowledge_review(old, request, review, path)
+                                continue
+                        except Exception:
+                            # DB loss/invalid audits cannot suspend deadline enforcement.
+                            degraded = True
                 else:
                     path = self.root/'receipts'/name
                     request, old = _read(requests[name]), None
@@ -232,6 +244,37 @@ class TargonDeadlineGuardian:
             'process_state': 'running',
             'state': 'degraded' if degraded else 'running', 'observed_at': now,
             'reason_code': 'targon_cleanup_pending_or_blocked' if degraded else None})
+
+    def _acknowledge_review(self, old, request, review, path):
+        """Consume an exact committed browser-operator audit through a privileged reader.
+
+        This receipt remains distinct from removed. In particular removal_proof
+        cannot consume it and no budget/invoice is settled by human attestation.
+        """
+        if (not isinstance(review,dict) or review.get('schema_version')!=1
+                or review.get('state')!='manually_reviewed'
+                or review.get('instance_id')!=request['instance_id']
+                or review.get('deadline')!=request['deadline']
+                or old['workload_identity']['org_slug']!=self.org_slug
+                or review.get('account_absent') is not True
+                or review.get('no_continuing_charge') is not True
+                or not isinstance(review.get('actor'),str) or not review['actor']
+                or not isinstance(review.get('operation_id'),str)
+                or not re.fullmatch(r'[0-9a-f-]{36}',review['operation_id'])
+                or not (review.get('source')=='protected_operator_attestation' and review.get('intent_id') is None
+                    or isinstance(review.get('intent_id'),str) and re.fullmatch(r'[0-9a-f-]{36}',review['intent_id']))
+                or type(review.get('observed_at')) not in (int,float)
+                or not math.isfinite(review['observed_at']) or not 0<=review['observed_at']<=self.clock()):
+            raise ValueError('targon_guard_manual_review_invalid')
+        if review.get('source')=='protected_operator_attestation' and (
+                review.get('request_hash')!=old['request_hash']
+                or review.get('workload_identity_hash')!=_hash(old['workload_identity'])
+                or old.get('delete_started_at') is None
+                or review.get('accepted_delete') is not True):
+            raise ValueError('targon_guard_manual_review_identity_invalid')
+        _write(path,{**old,'state':'manually_reviewed','manual_review':review,
+            'manual_reviewed_at':self.clock(),'guardian_id':self.identity,
+            'reason_code':'operator_removal_manually_reviewed'})
 
     def _tick_request(self, request, receipt_path, now, old=None):
         uid, deadline = request.get('instance_id'), request.get('deadline')
