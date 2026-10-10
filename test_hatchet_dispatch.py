@@ -334,7 +334,7 @@ class HatchetDispatchTests(LedgerCase):
         job = self.make_job()
         client = Mock()
         client.stubs.task.return_value.run_no_wait.side_effect = IdempotencyCollisionError("original-run")
-        self.assertEqual(SDKPublisher(client).publish(self.message(job), job), "original-run")
+        self.assertEqual(SDKPublisher(client, self.repo).publish(self.message(job), job), "original-run")
         submitted = client.stubs.task.return_value.run_no_wait.call_args
         self.assertTrue(all(label.required for label in submitted.kwargs["desired_worker_labels"]))
         self.assertEqual(client.stubs.task.call_args.kwargs["name"], workflow_name(job))
