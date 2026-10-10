@@ -10,15 +10,16 @@ from studio_platform.control import WorkerControl
 from studio_platform.hatchet_dispatch import BrokerConfig, ExactJobRunner, HatchetSlotRunner, SDKPublisher
 from studio_platform.repository import jobs, registered_workers
 from studio_platform.storage import LocalObjectStore
-from test_hatchet_dispatch import CountingMock, HatchetDispatchTests, MemoryBackend
+import test_hatchet_dispatch as fixtures
+from test_hatchet_dispatch import CountingMock, MemoryBackend
 from test_platform_repository import LedgerCase
 
 
 class HatchetAffinityTests(LedgerCase):
-    make_job = HatchetDispatchTests.make_job
-    ready = HatchetDispatchTests.ready
-    message = HatchetDispatchTests.message
-    runner = HatchetDispatchTests.runner
+    make_job = fixtures.HatchetDispatchTests.make_job
+    ready = fixtures.HatchetDispatchTests.ready
+    message = fixtures.HatchetDispatchTests.message
+    runner = fixtures.HatchetDispatchTests.runner
 
     def setUp(self):
         super().setUp()
@@ -144,6 +145,36 @@ class HatchetAffinityTests(LedgerCase):
             self.assertEqual(self.callback(job, MemoryBackend(), "one")["reason_code"], "hatchet_claim_unavailable")
         claim.assert_called_once_with("one", "hatchet-test")
         self.assertEqual(self.repo.get_job(self.scope, job["id"])["attempt_no"], 0)
+
+    def test_actual_callback_owner_fairness_yields_then_resumes_same_job_identity(self):
+        active = self.make_job("a1-active")
+        self.now += 1
+        same_owner = self.make_job("a2-queued")
+        self.now += 1
+        other_owner = self.make_job("b-queued", scope=self.other)
+        self.ready("one")
+        self.ready("two")
+        native_one = MemoryBackend()
+        self.runner(active, native_one, worker="one").run_once("one", "hatchet-test")
+        # All jobs were already eligible broker deliveries. Only the original
+        # scheduler transaction may choose the owner-fair candidate.
+        for job in (same_owner, other_owner):
+            self.assertNotIn("sixnine_worker", self.publish(job))
+        result = self.callback(same_owner, MemoryBackend(), "two")
+        self.assertEqual(result["reason_code"], "hatchet_claim_unavailable")
+        self.assertEqual(self.repo.get_job(self.scope, same_owner["id"])["attempt_no"], 0)
+        self.assertEqual(self.repo.get_job(self.other, other_owner["id"])["attempt_no"], 0)
+        self.assertEqual(self.control.get("two")["state"], "ready")
+        native_two = CountingMock(self.directory / "native-two", enabled=True)
+        self.assertEqual(self.callback(other_owner, native_two, "two"),
+            {"job_id": other_owner["id"], "state": "succeeded"})
+        self.assertEqual(self.callback(same_owner, native_two, "two"),
+            {"job_id": same_owner["id"], "state": "succeeded"})
+        resumed = self.repo.get_job(self.scope, same_owner["id"])
+        self.assertEqual((resumed["id"], resumed["attempt_no"]), (same_owner["id"], 1))
+        self.assertEqual((native_two.submits, native_two.fetches), (2, 2))
+        self.assertEqual(len(native_one.submissions), 1)
+        self.assertEqual(self.control.get("one")["current_job_id"], active["id"])
 
     def test_unbound_original_attempt_does_not_fall_back_to_general_replica(self):
         job = self.make_job()
