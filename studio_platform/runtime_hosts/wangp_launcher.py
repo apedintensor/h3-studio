@@ -90,6 +90,12 @@ def shutdown_owned_host(host, session, *, grace_seconds=180, terminate=None,
 
 def resolve_inputs(prepared, inputs, manifest=None):
     settings = prepared.settings
+    from ..inference.wangp_compiler import MAX_SEED
+    # Protect both legacy and native manifests before resolving assets or
+    # dispatching. Never truncate a previously accepted request's seed.
+    seed = settings.get("seed")
+    if type(seed) is not int or not 0 <= seed <= MAX_SEED:
+        raise ValueError("wangp_invalid_seed")
     profile_id = None
     if manifest is not None:
         from ..inference.wangp_compiler import COMPILER_ID as FL_COMPILER_ID, PROFILE_ID as FL_PROFILE_ID

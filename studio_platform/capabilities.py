@@ -246,7 +246,7 @@ def compile_request(body: dict, resolve_asset, *, backend="comfy-worker"):
         if field in controls:
             raise ValueError("音频分块控制尚不可用")
     if controls.get("seed") in (None, ""):
-        controls["seed"] = str(secrets.randbits(64))
+        controls["seed"] = str(secrets.randbits(32 if backend == "wangp-worker" else 64))
     raw_inputs = body.get("inputs", {})
     if not isinstance(raw_inputs, dict) or set(raw_inputs) - {"images", "videos", "audios", "first_frame", "last_frame", "guides"}:
         raise ValueError("输入素材区域无效")

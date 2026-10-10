@@ -105,7 +105,8 @@ class RefCompilerTests(unittest.TestCase):
         changed["components"]["transformer"]["files"][0]["sha256"] = "a"*64
         with self.assertRaisesRegex(ValueError, "manifest_mismatch"):
             H3Ref2VACompiler(EngineManifest.from_dict(changed), None)
-        body = generation_request(recipe_id="h3-base-ref2va-v1", inputs={"images": ["i"]})
+        body = generation_request(recipe_id="h3-base-ref2va-v1", inputs={"images": ["i"]},
+            controls={"duration":5,"resolution":"480P","seed":"4294967295"})
         compiled, fingerprint = compile_request(body, lambda _: {"asset_id":"i", "metadata": metadata()["i"], "model": {}}, backend="wangp-worker")
         self.assertEqual(compiled["recipe_id"], "h3-base-ref2va-v1")
         self.assertEqual(compiled["request"]["mode"], "ref")

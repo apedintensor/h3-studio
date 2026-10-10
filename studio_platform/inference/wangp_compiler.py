@@ -18,6 +18,9 @@ COMPILER_ID = "sixnine-h3-fl2va-bf16-50-v1"
 PROFILE_ID = "h3-fl2va-bf16-50-sdpa-p4-v1"
 MODEL_TYPE = "minimax_h3_fl2va"
 MODEL_ID = "MiniMax-H3-Base-BF16"
+# The pinned runtime calls numpy.random.seed before H3 inference. Unlike the
+# Comfy contract, that entry point only accepts an unsigned 32-bit seed.
+MAX_SEED = (1 << 32) - 1
 FIXED_CONTROLS = {
     "steps": 50, "sampler_name": "euler", "scheduler": "auto", "denoise": 1,
     "shift_video": 12, "shift_audio": 3, "video_decode": "tiled",
@@ -37,7 +40,7 @@ def control_schema():
         "width": {"type": "integer", "minimum": 256, "maximum": 1536, "multipleOf": 32},
         "height": {"type": "integer", "minimum": 256, "maximum": 1536, "multipleOf": 32},
         "seed": {"type": ["string", "null"], "default": None, "pattern": "^[0-9]{1,20}$",
-                 "maximum_decimal": "18446744073709551615"},
+                 "maximum_decimal": str(MAX_SEED)},
     })
     return result
 
@@ -71,7 +74,7 @@ quantization, scheduler substitution or best-effort control dropping occurs.
     seed = value.get("seed", "0")
     if isinstance(seed, bool) or not isinstance(seed, (int, str)) or not re.fullmatch(r"[0-9]{1,20}", str(seed)):
         raise ValueError("wangp_invalid_seed")
-    if not 0 <= int(seed) <= 0xffffffffffffffff:
+    if not 0 <= int(seed) <= MAX_SEED:
         raise ValueError("wangp_invalid_seed")
     value["seed"] = str(int(seed))
     duration = value.get("duration", 5)

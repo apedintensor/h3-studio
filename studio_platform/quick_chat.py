@@ -447,8 +447,16 @@ class QuickChatService:
         scene = next(e for e in project["entities"] if e["type"] == "scene")
         revision_id = "revision-"+uuid.uuid4().hex
         version = card["version"] if card["payload"].get("current_revision_id") is None else card["version"]+1
+        # Choose seeds when authoring a new immutable revision, using the
+        # selected runtime's domain. Reading/replaying old revisions never
+        # rewrites their seeds, requests or identities.
+        seed_bits = 32 if (snapshot.get("deployment_profile_id") is not None
+            or self.settings.execution_backend == "wangp-worker") else 64
         explicit = snapshot["controls"].get("seed")
-        seeds = [str((int(explicit)+i) % (1 << 64)) if explicit is not None else str(secrets.randbits(64)) for i in range(snapshot["copies"])]
+        if explicit is not None and not 0 <= int(explicit) < (1 << seed_bits):
+            raise QuickChatError("wangp_invalid_seed", "当前生成服务的种子须在0至4294967295之间。", 422)
+        seeds = [str((int(explicit)+i) % (1 << seed_bits)) if explicit is not None
+            else str(secrets.randbits(seed_bits)) for i in range(snapshot["copies"])]
         digest = request_hash({"snapshot": snapshot, "seeds": seeds})
         items = []
         for index, seed in enumerate(seeds):

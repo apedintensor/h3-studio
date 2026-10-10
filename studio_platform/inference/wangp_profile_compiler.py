@@ -9,7 +9,7 @@ import re
 
 from .protocol import BackendError
 from .wangp_contract import InputDescriptor, PreparedRequest, canonical_json
-from .wangp_compiler import FIXED_CONTROLS, control_schema as legacy_schema
+from .wangp_compiler import FIXED_CONTROLS, MAX_SEED, control_schema as legacy_schema
 from ..runtime_catalog import get_profile, model_for, supported_cases, validate_manifest
 from ..storage import key_belongs_to, validate_key
 
@@ -62,7 +62,7 @@ def normalize_request(request, metadata, output_spec, profile_id):
         raise ValueError('wangp_unsupported_steps')
     seed = value.get('seed', '0')
     if (isinstance(seed, bool) or not isinstance(seed, (str,int))
-            or not re.fullmatch(r'[0-9]{1,20}', str(seed)) or int(seed) > 0xffffffffffffffff):
+            or not re.fullmatch(r'[0-9]{1,20}', str(seed)) or int(seed) > MAX_SEED):
         raise ValueError('wangp_invalid_seed')
     value['seed'] = str(int(seed))
     if type(value.setdefault('duration', 5)) is not int or value['duration'] != 5:

@@ -14,7 +14,7 @@ from studio_platform.inference.wangp_contract import EngineManifest
 class CompilerTests(unittest.TestCase):
     def request(self):
         return {"model": "MiniMax-H3-Base-BF16", "mode": "fl", "prompt": "Line one\nLine two",
-                "duration": 5, "resolution": "480P", "aspect_ratio": "16:9", "seed": "18446744073709551615"}
+                "duration": 5, "resolution": "480P", "aspect_ratio": "16:9", "seed": "4294967295"}
 
     def test_explicit_full_precision_50_step_mapping_and_native_frames(self):
         request = self.request()
@@ -25,7 +25,7 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual((result["video_length"], result["force_fps"]), (124, "24"))
         self.assertEqual(result["prompt"], request["prompt"])
         self.assertEqual(result["multi_prompts_gen_type"], "FG")
-        self.assertEqual(result["seed"], 2**64 - 1)
+        self.assertEqual(result["seed"], 2**32 - 1)
         self.assertEqual(result["repeat_generation"], 1)
         self.assertEqual(result["image_prompt_type"], "T")
         self.assertEqual(result["custom_settings"]["audio_refinement"], "none")
@@ -61,6 +61,7 @@ class CompilerTests(unittest.TestCase):
         schema = control_schema()
         self.assertEqual(schema["steps"]["enum"], [50])
         self.assertEqual(schema["seed"]["default"], None)
+        self.assertEqual(schema["seed"]["maximum_decimal"], "4294967295")
         self.assertEqual(schema["width"]["multipleOf"], 32)
         self.assertNotIn("video_temporal_size", schema)
 

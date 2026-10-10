@@ -253,7 +253,7 @@ a stable error before staging/submission.
 | BF16 Base | `model_type=minimax_h3_fl2va`, config `bf16,bf16`, startup transformer/text quantization `bf16` | Fixed; no pruned, turbo, INT8, FP8, LoRA or VDN substitution |
 | Steps | `num_inference_steps=50` | Fixed 50; handler's default 20 is explicitly overridden |
 | Prompt | `prompt`, `multi_prompts_gen_type=FG`, enhancer disabled | One prompt including all lines; exactly one task/output |
-| Seed | Decimal uint64 converted to Python integer | Exact value; public admission generates an omitted seed once |
+| Seed | Decimal unsigned 32-bit value (`0`–`4294967295`) converted to Python integer | Exact value; omitted seeds are generated once within this domain. Reject explicit out-of-range seeds before dispatch; never truncate accepted requests |
 | Resolution | Exact `WIDTHxHEIGHT` from the accepted native output spec | Existing 480P/576P/768P/custom area and aspect rules |
 | Duration | Integer `video_length` on native `17*k+5` grid, `force_fps="24"` | 107–362 native frames; preserve both native and requested durations |
 | First/last image | `image_start`, `image_end`; explicit `S`, `TE`, `SE` flags | Zero, one or two image assets; no references/video/audio inputs |
@@ -385,7 +385,7 @@ diagnosis and a separately reviewed repair or a new qualified runtime identity.
 
 `test_platform_wangp_compiler.py` and `test_platform_wangp_session.py` use isolated
 fake Session objects/files only. They cover control rejection, immutable identities,
-role mapping, uint64 seeds, cancellation intent, both outputs, collection retry,
+role mapping, unsigned 32-bit WanGP seeds, cancellation intent, both outputs, collection retry,
 lookup-root binding and escaped output rejection. They do not import WanGP/torch,
 download weights or assert real video/audio quality. Real media validation is the
 Worker's existing responsibility.
