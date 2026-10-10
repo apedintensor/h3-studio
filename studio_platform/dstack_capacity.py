@@ -149,12 +149,14 @@ class DstackStore(Protocol):
     begin_stop commits once, checking original jobs/attempts/collection holds,
     worker retirement and matching immutable run identity in that transaction.
     record merges observations; it MUST retain run_id/incarnation and journals.
-    A false gate never permits another apply/stop. No missing row adoption.
+    Stop retries require a fresh exact-owned RUNNING observation and a bounded
+    durable retry journal under the same original obligation lock. A false gate
+    permits no network side effect. No missing row adoption.
     """
     def load(self, intent_id: str) -> dict: ...
     def begin_apply(self, intent_id: str, binding: dict) -> bool: ...
     def record(self, intent_id: str, observation: dict) -> None: ...
-    def begin_stop(self, intent_id: str, run_id: str) -> bool: ...
+    def begin_stop(self, intent_id: str, run_id: str, *, retry: bool = False) -> bool: ...
 
 
 class DstackClient:
@@ -342,10 +344,12 @@ class DstackCapacity:
         if status in TERMINAL:
             value.update(state="stopped", reason_code="dstack_run_terminal_billing_pending")
             return value
-        if status in {"terminating", "stopping"} or binding.get("stop_started"):
+        if status in {"terminating", "stopping"}:
             value.update(state="stopping", reason_code="dstack_stop_pending")
             return value
         if status != "running":
+            if binding.get("stop_started"):
+                value.update(state="stopping", reason_code="dstack_stop_pending")
             return value
         submission = run.get("latest_job_submission") or {}
         _require(isinstance(submission, dict), "dstack_response_invalid")
@@ -361,6 +365,11 @@ class DstackCapacity:
         if binding.get("provider_instance_id"):
             _require(instance == binding["provider_instance_id"], "dstack_instance_identity_changed")
         value["provider_instance_id"] = instance
+        if binding.get("stop_started"):
+            # The original stop already fenced/retired inference. Keep fresh
+            # provider identity evidence without bootstrapping/reopening it.
+            value.update(state="stopping", reason_code=self._stop_retry_reason(binding))
+            return value
         value["state"] = "runtime_unconfirmed"
         if self.readiness is None:
             return value
@@ -385,17 +394,55 @@ class DstackCapacity:
             reason_code="dstack_runtime_ready_model_load_unobserved" if native.idle else "dstack_runtime_busy")
         return value
 
+    def _stop_retry_reason(self, binding):
+        count, due = binding.get("stop_attempt_count"), binding.get("stop_next_retry_at")
+        if (type(count) is not int or count < 1 or type(due) not in (int, float)
+                or not math.isfinite(due) or due <= 0):
+            return "dstack_stop_retry_journal_unconfirmed"
+        if count >= 5:
+            return "dstack_stop_retry_exhausted"
+        return "dstack_stop_retry_waiting" if self.clock() < due else "dstack_stop_retry_due"
+
     def stop(self, intent_id):
         binding = self.store.load(intent_id)
         _require(isinstance(binding, dict) and binding.get("run_id"), "dstack_owned_run_id_required")
         if binding.get("stop_started"):
-            return self.observe(intent_id)
-        run = self.client.get(run_id=binding["run_id"])
-        _require(run is not None, "dstack_stop_identity_unconfirmed")
-        _owns(run, binding, self.client.project)
-        if not self.store.begin_stop(intent_id, binding["run_id"]):
-            return {"state": "draining", "ready": False, "reason_code": "dstack_business_obligations_pending",
-                "observed_at": self.clock()}
+            # dstack 0.22.3 stop_runs only moves existing nonfinished runs to
+            # TERMINATING under locks; repeating that stop never creates a run.
+            # Source: dstack/_internal/server/services/runs/__init__.py:868-909
+            # in upstream tag 0.22.3 (not the create/update apply endpoint).
+            # An accepted lost response normally already reads TERMINATING.
+            # Only a *new* exact-owned positive RUNNING read can retry a stop
+            # that was never delivered, after the original ledger's due/count
+            # CAS. Cached RUNNING, absent/unknown and terminal reads cannot.
+            observation = self.observe(intent_id)
+            if (observation.get("dstack_status") != "running"
+                    or observation.get("run_id") != binding["run_id"]
+                    or not binding.get("provider_instance_id")
+                    or observation.get("provider_instance_id") != binding["provider_instance_id"]):
+                return observation
+            binding = self.store.load(intent_id)
+            reason = self._stop_retry_reason(binding)
+            if reason != "dstack_stop_retry_due":
+                return {**observation, "reason_code": reason}
+            # observe() has committed the fresh exact identity. This gate must
+            # recheck original jobs, worker retirement and the retry journal
+            # atomically; process-local counters do not survive restart.
+            if not self.store.begin_stop(intent_id, binding["run_id"], retry=True):
+                reason = self._stop_retry_reason(self.store.load(intent_id))
+                return {**observation, "reason_code": reason if reason != "dstack_stop_retry_due"
+                    else "dstack_business_obligations_pending"}
+        else:
+            run = self.client.get(run_id=binding["run_id"])
+            _require(run is not None, "dstack_stop_identity_unconfirmed")
+            _owns(run, binding, self.client.project)
+            if run.get("status") in TERMINAL | {"terminating", "stopping"}:
+                value = self._observation(run, binding)
+                self.store.record(intent_id, value)
+                return value
+            if not self.store.begin_stop(intent_id, binding["run_id"]):
+                return {"state": "draining", "ready": False, "reason_code": "dstack_business_obligations_pending",
+                    "observed_at": self.clock()}
         try:
             self.client.stop(binding["run_name"])
             value = {"state": "stopping", "ready": False, "reason_code": "dstack_stop_pending", "observed_at": self.clock()}

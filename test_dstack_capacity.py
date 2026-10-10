@@ -32,6 +32,7 @@ class Store:
         self.lock = threading.Lock()
         self.obligations = False
         self.events = []
+        self.clock = lambda: 20.
 
     def load(self, intent_id):
         self.assert_identity(intent_id)
@@ -55,14 +56,26 @@ class Store:
         with self.lock:
             self.value.update(copy.deepcopy(observation))
 
-    def begin_stop(self, intent_id, run_id):
+    def begin_stop(self, intent_id, run_id, *, retry=False):
         self.assert_identity(intent_id)
         with self.lock:
             assert self.value["run_id"] == run_id
-            if self.obligations or self.value.get("stop_started"):
+            now = self.clock()
+            if self.obligations:
                 return False
-            self.value["stop_started"] = True
-            self.events.append("stop_committed")
+            if retry:
+                if (not self.value.get("stop_started") or self.value.get("stop_attempt_count", 0) >= 5
+                        or now < self.value.get("stop_next_retry_at", float("inf"))
+                        or self.value.get("dstack_status") != "running"
+                        or not 0 <= now - self.value.get("observed_at", 0) <= 30
+                        or not self.value.get("provider_instance_id")):
+                    return False
+            elif self.value.get("stop_started"):
+                return False
+            count = self.value.get("stop_attempt_count", 0) + 1
+            self.value.update(stop_started=True, stop_attempt_count=count,
+                stop_last_attempt_at=now, stop_next_retry_at=now + min(30 * 2**(count-1), 300))
+            self.events.append("stop_retry_committed" if retry else "stop_committed")
             return True
 
 
@@ -74,6 +87,7 @@ class FakeClient:
         self.run = None
         self.apply_count = self.stop_count = 0
         self.apply_lost = self.stop_lost = False
+        self.stop_not_delivered = False
         self.get_failed = False
 
     def get(self, **kw):
@@ -94,6 +108,9 @@ class FakeClient:
         assert self.store.value["stop_started"]
         assert name == self.run["run_spec"]["run_name"]
         self.stop_count += 1
+        if self.stop_not_delivered:
+            raise DstackError("dstack_api_unavailable")
+        self.run["status"] = "terminating"
         if self.stop_lost:
             raise DstackError("dstack_api_unavailable")
 
@@ -107,7 +124,9 @@ class DstackCapacityTests(unittest.TestCase):
         self.store = Store()
         self.client = FakeClient(self.store)
         self.native = Mock(return_value=HostReadiness("a" * 64, INTENT, "c" * 32, True))
-        self.capacity = DstackCapacity(self.client, self.store, clock=lambda: 20., readiness=self.native)
+        self.now = 20.
+        self.store.clock = lambda: self.now
+        self.capacity = DstackCapacity(self.client, self.store, clock=self.store.clock, readiness=self.native)
 
     def start(self):
         return self.capacity.start(request(), PUB)
@@ -193,16 +212,126 @@ class DstackCapacityTests(unittest.TestCase):
         self.assertEqual(self.client.stop_count, 0)
         self.assertNotIn("stop_started", self.store.value)
 
-    def test_lost_stop_ack_is_not_replayed_or_billed_as_zero(self):
+    def test_accepted_lost_stop_ack_is_not_replayed_or_billed_as_zero(self):
         self.start()
+        self.client.running()
+        self.capacity.observe(INTENT)
         self.client.stop_lost = True
         self.assertEqual(self.capacity.stop(INTENT)["state"], "removal_unknown")
+        self.now += 120
         self.capacity.stop(INTENT)
         self.assertEqual(self.client.stop_count, 1)
         self.client.run["status"] = "terminated"
         value = self.capacity.observe(INTENT)
         self.assertEqual(value["state"], "stopped")
         self.assertEqual(value["billing_state"], "unsettled")
+
+    def interrupted_stop(self):
+        self.start()
+        self.client.running()
+        self.capacity.observe(INTENT)
+        self.client.stop_not_delivered = True
+        self.assertEqual(self.capacity.stop(INTENT)["state"], "removal_unknown")
+
+    def test_stop_not_delivered_retries_original_run_after_durable_backoff(self):
+        self.interrupted_stop()
+        self.now = 49.
+        self.assertEqual(self.capacity.stop(INTENT)["reason_code"], "dstack_stop_retry_waiting")
+        self.assertEqual(self.client.stop_count, 1)
+        self.now = 50.
+        # A new transport/controller must honor the same original retry journal.
+        restarted = DstackCapacity(self.client, self.store, clock=self.store.clock, readiness=self.native)
+        self.client.stop_not_delivered = False
+        self.assertEqual(restarted.stop(INTENT)["state"], "stopping")
+        self.assertEqual(self.client.stop_count, 2)
+        self.assertEqual(self.client.apply_count, 1)
+        self.assertEqual(self.store.value["run_id"], RUN)
+        self.assertEqual(self.store.value["stop_attempt_count"], 2)
+        self.assertEqual(self.store.value["stop_next_retry_at"], 110.)
+        self.assertEqual(self.store.events.count("stop_committed"), 1)
+        self.assertEqual(self.store.events.count("stop_retry_committed"), 1)
+        self.assertEqual(self.native.call_count, 1, "A stopped binding must not bootstrap native runtime")
+
+    def test_stop_retry_unknown_absent_changed_or_nonrunning_is_read_only(self):
+        self.interrupted_stop()
+        self.now = 100.
+        original = copy.deepcopy(self.client.run)
+        for status in ("submitted", "provisioning", "terminating", "terminated"):
+            with self.subTest(status=status):
+                self.client.run = {**copy.deepcopy(original), "status": status}
+                self.capacity.stop(INTENT)
+                self.assertEqual(self.client.stop_count, 1)
+        for mutation in ("run_id", "project", "instance", "gpu_count"):
+            with self.subTest(mutation=mutation):
+                self.client.run = copy.deepcopy(original)
+                if mutation == "run_id":
+                    self.client.run["id"] = "c3333333-3333-4333-8333-333333333333"
+                elif mutation == "project":
+                    self.client.run["project_name"] = "foreign"
+                elif mutation == "instance":
+                    self.client.run["latest_job_submission"]["job_provisioning_data"]["instance_id"] = "changed-instance"
+                else:
+                    self.client.run["latest_job_submission"]["job_provisioning_data"]["instance_type"]["resources"]["gpus"] *= 2
+                self.assertEqual(self.capacity.stop(INTENT)["state"], "observation_unknown")
+                self.assertEqual(self.client.stop_count, 1)
+        self.client.run = None
+        self.assertEqual(self.capacity.stop(INTENT)["state"], "removal_unknown")
+        self.client.run = original
+        self.client.get_failed = True
+        self.assertEqual(self.capacity.stop(INTENT)["state"], "observation_unknown")
+        self.assertEqual(self.client.stop_count, 1)
+        self.assertEqual(self.client.apply_count, 1)
+
+    def test_stop_retry_cap_preserves_explicit_manual_reconciliation(self):
+        self.interrupted_stop()
+        for now, count, due in ((50., 2, 110.), (110., 3, 230.), (230., 4, 470.), (470., 5, 770.)):
+            self.now = now
+            self.assertEqual(self.capacity.stop(INTENT)["state"], "removal_unknown")
+            self.assertEqual(self.store.value["stop_attempt_count"], count)
+            self.assertEqual(self.store.value["stop_next_retry_at"], due)
+        self.now = 10000.
+        value = self.capacity.stop(INTENT)
+        self.assertEqual(value["reason_code"], "dstack_stop_retry_exhausted")
+        self.assertFalse(value["ready"])
+        self.assertEqual(value["billing_state"], "unsettled")
+        self.assertEqual(self.client.stop_count, 5)
+        self.assertEqual(self.client.apply_count, 1)
+
+    def test_stop_retry_missing_journal_and_new_obligations_fail_closed(self):
+        self.interrupted_stop()
+        self.now = 50.
+        self.store.obligations = True
+        self.assertEqual(self.capacity.stop(INTENT)["reason_code"], "dstack_business_obligations_pending")
+        self.store.obligations = False
+        del self.store.value["stop_next_retry_at"]
+        self.assertEqual(self.capacity.stop(INTENT)["reason_code"], "dstack_stop_retry_journal_unconfirmed")
+        self.assertEqual(self.client.stop_count, 1)
+
+    def test_concurrent_stop_recovery_consumes_one_original_retry_per_window(self):
+        self.interrupted_stop()
+        self.now = 50.
+        barrier = threading.Barrier(2)
+        original_get = self.client.get
+        def get(**kw):
+            value = original_get(**kw)
+            barrier.wait(timeout=5)
+            return value
+        self.client.get = get
+        failures = []
+        def stop():
+            try:
+                DstackCapacity(self.client, self.store, clock=self.store.clock).stop(INTENT)
+            except Exception as error:
+                failures.append(type(error).__name__)
+        threads = [threading.Thread(target=stop) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertFalse(failures)
+        self.assertEqual(self.client.stop_count, 2)
+        self.assertEqual(self.client.apply_count, 1)
+        self.assertEqual(self.store.value["stop_attempt_count"], 2)
 
     def test_single_gpu_and_digest_are_required(self):
         with self.assertRaisesRegex(DstackError, "dstack_single_gpu_required"):
