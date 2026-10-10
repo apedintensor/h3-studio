@@ -13,7 +13,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.ci_changes import DOCUMENTS
-REPO, WORKFLOW = 'apedintensor/h3-studio', '.github/workflows/ci.yml'
+REPO, WORKFLOW = 'inkseq/h3-studio', '.github/workflows/ci.yml'
 API = f'repos/{REPO}/actions/workflows/ci.yml'
 SHA = re.compile(r'[0-9a-f]{40}')
 

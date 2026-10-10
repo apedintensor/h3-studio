@@ -23,7 +23,7 @@
 ## Source and product boundaries
 
 - Business backend: `platform_app.py` / `studio_platform/`. Preserve one authority for ownership, assets, accepted jobs, attempts, budgets and obligations; no parallel backend/job ledger.
-- Canonical frontend: `../video-studio-design/studio-app`, versioned in private `apedintensor/sixnine-design`. Approved Quick Chat interaction: `../video-studio-design/quick-chat-mock` in the same repository.
+- Canonical frontend: `../video-studio-design/studio-app`, versioned in public `inkseq/sixnine-design`. Approved Quick Chat interaction: `../video-studio-design/quick-chat-mock` in the same repository. The backend repository is `inkseq/h3-studio`; resolve the retained Project and issue identifiers through `workflow/project.json` rather than assuming the Project moved with the repositories.
 - `yingxu/` is a generated release snapshot. Edit canonical source and compare to the approved mock. Do not silently redesign the UI, edit the snapshot directly or synchronize/publish unapproved frontend changes.
 - Quick Chat sessions/turns/material bindings/card revisions are authoring authority; hidden project/shot objects are compatibility projections. Browser and Agent use the same business API and owner-isolated objects.
 - External Agent setup uses the public one-time connection/helper contract. It does not require the internal AI Registry. Keep connection authority/expiry frozen and never expose permanent keys in chat, logs or discovery pages.

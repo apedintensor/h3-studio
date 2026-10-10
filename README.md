@@ -24,7 +24,7 @@ Material durable decision changes update the record and affected plan/contract t
 - [Earlier architecture](ARCHITECTURE.zh-CN.md), [five-minute walkthrough](START-HERE.zh-CN.md), [delivery report](DELIVERY-REPORT.zh-CN.md), [readiness review](deploy/platform/READINESS-REVIEW.zh-CN.md) and [iteration evidence](ITERATIONS.zh-CN.md): dated background, not the active task list or proof of today's deployment.
 - [Infrastructure/cost observations](deploy/platform/INFRASTRUCTURE.zh-CN.md) and [DNS cutover](deploy/platform/DNS-CUTOVER.zh-CN.md): verify the recorded scope, destination and date before use; old prices, endpoints and rollout windows are not current authority.
 
-Canonical frontend and approved mock live in the private `apedintensor/sixnine-design` repository at `../video-studio-design/studio-app` and `../video-studio-design/quick-chat-mock`. This repository's `yingxu/` is a generated release snapshot maintained by `tools/sync_yingxu_source.py`. Edit canonical source; do not directly edit the snapshot, publish unapproved UX, or put local drafts/media into images.
+Canonical frontend and approved mock live in the public `inkseq/sixnine-design` repository at `../video-studio-design/studio-app` and `../video-studio-design/quick-chat-mock`. The backend is `inkseq/h3-studio`. The existing Delivery Project retains its own owner and identifiers, recorded in `workflow/project.json`; repository transfer does not create a replacement board. This repository's `yingxu/` is a generated release snapshot maintained by `tools/sync_yingxu_source.py`. Edit canonical source; do not directly edit the snapshot, publish unapproved UX, or put local drafts/media into images.
 
 ## Historical standalone workbench
 

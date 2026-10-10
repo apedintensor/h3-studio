@@ -1,6 +1,6 @@
 # Operator capacity and deployment profiles
 
-Accepted direction: 2026-10-09. Delivery and acceptance: [E3 #71](https://github.com/apedintensor/h3-studio/issues/71). This extends the [generation contract](GENERATION-CONTRACT.md); it does not renew a budget or certify a deployed runtime.
+Accepted direction: 2026-10-09. Delivery and acceptance: [E3 #71](https://github.com/inkseq/h3-studio/issues/71). This extends the [generation contract](GENERATION-CONTRACT.md); it does not renew a budget or certify a deployed runtime.
 
 ## One authority
 
@@ -53,7 +53,7 @@ An ambiguous bootstrap is `runtime_state: blocked` with `reason_code: bootstrap_
 
 The console first selects the exact model ID and FL2VA/Ref2VA mode, then reads
 `GET /v1/operator/capacity/candidates?model_id=...&mode=...&ttl_seconds=...`.
-[Issue #89](https://github.com/apedintensor/h3-studio/issues/89) replaces upfront
+[Issue #89](https://github.com/inkseq/h3-studio/issues/89) replaces upfront
 provider/GPU/count selection with ranked Lium/Targon allocations. Each row is a
 complete Lium executor or a Targon resource SKU, not a promised physical host.
 It contains provider/offer identity, GPU type/count, whole-allocation quote,
@@ -97,7 +97,7 @@ observation/preview clears consent. Stock is not a reservation or runtime proof.
 
 ## Legacy stock and next-tier API compatibility
 
-[Issue #85](https://github.com/apedintensor/h3-studio/issues/85) adds advisory
+[Issue #85](https://github.com/inkseq/h3-studio/issues/85) adds advisory
 Lium/Targon stock, independently of the existing binding-based start admission.
 `provider` is optional in a selection; omission still means Lium and remains
 absent in historical canonical selections/hashes. Explicit Targon cannot resolve
@@ -129,7 +129,7 @@ not quoted as cheap one-GPU slices. An available resource count does not prove
 independent physical hosts. Price/metadata and runtime qualification blockers
 are visible even when a larger-GPU suggestion is useful.
 
-The Targon VM adapter under [#86](https://github.com/apedintensor/h3-studio/issues/86)
+The Targon VM adapter under [#86](https://github.com/inkseq/h3-studio/issues/86)
 requires an explicit immutable manifest and protected deployment binding. A
 generic registry still admits only Lium. Targon admission binds the provider,
 organization, resource/image, SSH-key IDs, topology, RAM/disk floors, whole-node

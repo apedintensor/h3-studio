@@ -31,7 +31,7 @@ from .repository import Repository, Scope, request_hash
 from .runtime_catalog import engine_manifest, get_profile, model_for, public_catalog
 from .scaler import LaunchSpec
 
-MINIMUM_LIUM_TTL_SECONDS = 3780  # Provider hour + 60s margin + 120s queue allowance.
+MINIMUM_LIUM_TTL_SECONDS = 3780  # Client whole-hour termination request + submit/queue margins; not a billing minimum.
 SOURCE_NAMES = {"wangp-bootstrap.py", "wangp-manifest.json", "wangp-runtime.json", "wangp-package.tar.gz"}
 
 

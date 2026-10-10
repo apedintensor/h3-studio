@@ -183,7 +183,7 @@ class OperatorTests(LedgerCase):
         self.assertFalse(self.service.preview(self.actor,self.chosen)["can_start"])
         self.assertEqual(self.repo.list_instance_intents(),[])
 
-    def test_provider_hour_rounding_shortens_before_boot_without_resetting_money(self):
+    def test_provider_termination_window_shortens_before_boot_without_resetting_money(self):
         self.registry.bindings[self.binding.binding_id]=replace(self.binding,max_ttl_seconds=7200)
         self.service.update_policy(self.actor,{**self.policy,"expected_version":1,"max_ttl_seconds":7200})
         self.provider.lifetime=lambda tag,instance_id,**kw:{"instance_id":instance_id,

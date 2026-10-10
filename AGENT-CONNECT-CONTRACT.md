@@ -1,6 +1,6 @@
 # Agent connection and shared creation API
 
-This is the G2 contract, following [DEC-008](DECISIONS.md) and [PROJECT-PLAN.md](PROJECT-PLAN.md). Implementation, offline acceptance and frontend/production publication are separate gates tracked in [#21](https://github.com/apedintensor/h3-studio/issues/21). A discoverable website URL grants no account access or permission to spend.
+This is the G2 contract, following [DEC-008](DECISIONS.md) and [PROJECT-PLAN.md](PROJECT-PLAN.md). Implementation, offline acceptance and frontend/production publication are separate gates tracked in [#21](https://github.com/inkseq/h3-studio/issues/21). A discoverable website URL grants no account access or permission to spend.
 
 ## Public discovery and owner authorization
 

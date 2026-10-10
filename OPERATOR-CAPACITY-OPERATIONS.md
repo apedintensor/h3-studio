@@ -1,6 +1,6 @@
 # Operating the GPU capacity console
 
-Delivery: [E3 #71](https://github.com/apedintensor/h3-studio/issues/71). See [the contract](OPERATOR-CAPACITY-CONTRACT.md) for authority and compatibility. This guide describes implemented configuration; it is not a production release or a new spending authorization.
+Delivery: [E3 #71](https://github.com/inkseq/h3-studio/issues/71). See [the contract](OPERATOR-CAPACITY-CONTRACT.md) for authority and compatibility. This guide describes implemented configuration; it is not a production release or a new spending authorization.
 
 ## What is available
 
@@ -90,13 +90,15 @@ The guardian supplies an external deadline, not Targon-native TTL. Loss of its h
 
 ## Start, dispatch and stop
 
-The Lium provider rents integer hours. The requested TTL is an upper stopping bound, not guaranteed uptime; minimum supported request is 3,780 seconds to leave the existing provider/preview margins. The controller records the supplier's verified safe deadline and only shortens the original ledger deadline. Admission checks that deadline plus task and collection margin. Unavailable or stale lifetime proof blocks new dispatch while an already bound task can reconcile/collect. The original budget reservation remains until settlement evidence exists.
+Lium publishes hourly rates but bills per second: pod hourly rate × billable seconds / 3,600, without rounding up to a minute or hour. Billing begins at the deploy request, includes provisioning, and stops at the removal request under the documented lifecycle. This was checked against [official Billing](https://docs.lium.io/pod-users/billing) on 2026-10-10. A request whose acknowledgment is unknown does not prove that billing stopped. Final settlement still uses the exact pod's supplier statement, not a local elapsed-time estimate or dashboard balance.
+
+The current adapter sends an integer `termination_hours` scheduling parameter. Its 3,780-second minimum request window leaves the existing submission/queue margins; it is a client scheduling constraint, not a Lium billing minimum. The requested TTL is an upper stopping bound, not guaranteed uptime. The preview uses hourly rate × chosen seconds / 3,600 rounded only to the accounting microUSD unit; the protected binding may reserve a larger conservative full scheduling cap. Neither amount is an actual charge. The controller records the supplier's verified safe deadline and only shortens the original ledger deadline. Admission checks that deadline plus task and collection margin. Unavailable or stale lifetime proof blocks new dispatch while an already bound task can reconcile/collect. The original budget reservation remains until settlement evidence exists.
 
 Each physical GPU gets its own immutable GPU UUID, private runtime directory, HTTP port, source manifest, worker identity, tunnel and process receipt. Shared downloads use a bounded cache lock. Bootstrap validates the exact prepared WanGP revision and dependency set before registering capacity. It does not run separate synthetic smoke videos. The first accepted user job supplies real generation evidence after output validation and persistence.
 
 Quick Chat selects the deployment profile and FL/REF mode. Saving or revising a card preserves that choice. The API uses optional top-level `deployment_profile_id` on generation plans; omitting it preserves legacy routing. A ready worker must match profile-derived model, configuration, engine digest and recipe. Failure to find matching capacity is visible; a different ready model never substitutes silently. A manual start does not itself submit a video.
 
-Drain stops new claims. Safe stop also waits for bound jobs, output collection and positive per-slot idle proof before removal. An uncertain rental keeps its original identity and reservation. A controller restart does not blindly spawn a replacement for an unobserved child: unknown process ownership is reported and needs recovery under [#60](https://github.com/apedintensor/h3-studio/issues/60). Do not restart a controller with live owned processes as a normal way of changing profiles. Lium supplier TTL and the separately armed Targon guardian have different failure boundaries; neither settles invoices or retrieves lost files.
+Drain stops new claims. Safe stop also waits for bound jobs, output collection and positive per-slot idle proof before removal. An uncertain rental keeps its original identity and reservation. A controller restart does not blindly spawn a replacement for an unobserved child: unknown process ownership is reported and needs recovery under [#60](https://github.com/inkseq/h3-studio/issues/60). Do not restart a controller with live owned processes as a normal way of changing profiles. Lium supplier TTL and the separately armed Targon guardian have different failure boundaries; neither settles invoices or retrieves lost files.
 
 SIGINT/SIGTERM initiate a graceful controller drain: no new rentals, retained original node identities and continued reconciliation/collection. The process closes its local tunnels only after proving that its owned children and bound jobs are finished; this is not a supplier-removal or billing-settlement receipt. The default 900-second grace threshold reports attention rather than forcibly killing collectors. A service manager must not impose a shorter forced-kill timeout (`TimeoutStopSec=infinity` or an explicitly reviewed recovery policy). Forced termination, host loss and adopting a previous process's unknown fleet remain #60; do not claim this orderly shutdown path proves crash recovery.
 
@@ -141,7 +143,7 @@ python tools/run_operator_preview.py --frontend <absolute-canonical-series-direc
 Without `--scan-inventory`, the preview still performs no provider requests.
 This change does not install a production sampler, publish the frontend or
 restart an active capacity controller. Track activation and lifecycle in
-[#86](https://github.com/apedintensor/h3-studio/issues/86). Deploy the reviewed API/cache schema,
+[#86](https://github.com/inkseq/h3-studio/issues/86). Deploy the reviewed API/cache schema,
 sampler and frontend through the existing exact-version release process. Do not
 replace an active controller just to refresh stock. Preserve old ledgers and
 the pending controller recovery work in #60. A scanner error leaves a visible

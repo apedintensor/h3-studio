@@ -22,7 +22,7 @@
 
 平台准备会完整验收确切版本；前端准备只验收前端及发布边界，不运行全套 PostgreSQL 或重建 Python 镜像。不要同时为同一批次重复触发准备任务；已通过且未受修改影响的检查不反复执行。pip/npm 和 BuildKit 缓存用于加速依赖与镜像层，缓存命中不代替验证。
 
-本地入口在 ignored `.release-prepares/提交号-类型/receipt.json` 中先记意图、再执行变更。取消或 dispatch 超时/回应不明会停止；同一意图再次运行会拒绝，不自动重发。通过 `gh run list --repo apedintensor/h3-studio --workflow ci.yml --commit 完整SHA` 及收据核对，保留原意图，不靠删除收据重试。返回的 run ID 只表示观察到确切 SHA 的新准备任务，不表示检查、发布或部署完成。GitHub dispatch 没有直接返回 run ID；出现零个或多个候选时需人工核对。如果普通 push 检查已经完成，当前入口不复用其测试结果；为避免重复，应让本地入口负责该批次第一次 push。PR、其他 SHA、已完成检查及发布/部署任务不会被取消。
+本地入口在 ignored `.release-prepares/提交号-类型/receipt.json` 中先记意图、再执行变更。取消或 dispatch 超时/回应不明会停止；同一意图再次运行会拒绝，不自动重发。通过 `gh run list --repo inkseq/h3-studio --workflow ci.yml --commit 完整SHA` 及收据核对，保留原意图，不靠删除收据重试。返回的 run ID 只表示观察到确切 SHA 的新准备任务，不表示检查、发布或部署完成。GitHub dispatch 没有直接返回 run ID；出现零个或多个候选时需人工核对。如果普通 push 检查已经完成，当前入口不复用其测试结果；为避免重复，应让本地入口负责该批次第一次 push。PR、其他 SHA、已完成检查及发布/部署任务不会被取消。
 
 ## 前端版本与回滚
 
