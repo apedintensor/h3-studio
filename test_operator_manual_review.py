@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select, text, update
 
 from studio_platform.auth import Principal
 from studio_platform.operator_capacity import (OperatorError, operator_commands, operator_nodes,
@@ -185,6 +185,44 @@ class ManualReviewTests(operator_fixtures.OperatorTests):
             budget_account_ids=('owner-budget',),provider='lium',dry_run=False)
         self.assertTrue(next_intent['created'])
         self.assertEqual(self.repo.list_instance_intents()[0]['reserved_cost_microusd'],original['reserved_cost_microusd'])
+
+    def test_postgres_guardian_reader_executes_exact_audit_query(self):
+        if self.repo.engine.dialect.name != 'postgresql':
+            self.skipTest('requires explicitly configured local test PostgreSQL')
+        self.service.manual_review(self.actor,self.node_id,self.body,'pg-reader-review')
+        container='a'*64
+        queries=[]
+        def run(arguments,**options):
+            if arguments[1]=='inspect':
+                return SimpleNamespace(returncode=0,stdout=json.dumps(container)+' '+json.dumps({
+                    'com.docker.compose.project':'sixnine-platform','com.docker.compose.service':'db'}))
+            wrapper=options['input']
+            self.assertTrue(wrapper.startswith('BEGIN READ ONLY;\n') and wrapper.endswith('\nCOMMIT;'))
+            query=wrapper.removeprefix('BEGIN READ ONLY;\n').removesuffix('\nCOMMIT;')
+            queries.append(query)
+            with self.repo.engine.begin() as connection:
+                connection.execute(text('SET TRANSACTION READ ONLY'))
+                value=connection.exec_driver_sql(query).scalar_one_or_none()
+            return SimpleNamespace(returncode=0,stdout=(value or '')+'\n')
+        reader=OperatorManualReviewReader(container,run=run)
+        review=reader(self.uid)
+        self.assertEqual(review['source'],'operator_database')
+        self.assertEqual(review['state'],'manually_reviewed')
+        self.assertEqual(review['instance_id'],self.uid)
+        self.assertEqual(review['intent_id'],self.node_id)
+        self.assertEqual(review['actor'],'superdan')
+        self.assertIs(review['account_absent'],True)
+        self.assertIs(review['no_continuing_charge'],True)
+        self.assertIsNone(reader('wrk-other-not-reviewed'))
+        with self.repo.engine.connect() as connection:
+            command=connection.execute(select(operator_commands).where(
+                operator_commands.c.id==review['operation_id'])).mappings().one()
+        for field in ('account_absent','no_continuing_charge'):
+            with self.repo.transaction() as connection:
+                connection.execute(update(operator_commands).where(operator_commands.c.id==command['id']).values(
+                    payload={**command['payload'],field:'true'}))
+            self.assertIsNone(reader(self.uid))  # A JSON string cannot attest the boolean fact.
+        self.assertEqual(len(queries),4)
 
 
 class GuardianReviewTests(guardian_fixtures.TargonCleanupTests):

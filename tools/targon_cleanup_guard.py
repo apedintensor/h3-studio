@@ -96,23 +96,26 @@ class OperatorManualReviewReader:
                 raise ValueError
         except (ValueError,AttributeError):
             raise ValueError('targon_guard_database_identity_unconfirmed') from None
-        query="""SELECT (r.facts::jsonb || jsonb_build_object('observed_at',r.observed_at))::text
+        query="""SELECT (CAST(r.facts AS jsonb) || jsonb_build_object('observed_at',r.observed_at))::text
 FROM platform_scaler_receipts r
 JOIN platform_instance_intents i ON i.id=r.intent_id
 JOIN platform_operator_capacity_nodes n ON n.intent_id=i.id
-JOIN platform_operator_capacity_commands c ON c.id=r.facts->>'operation_id'
-JOIN platform_operator_capacity_commands s ON s.id=r.facts->>'stop_operation_id'
+JOIN platform_operator_capacity_commands c ON c.id=(CAST(r.facts AS jsonb)->>'operation_id')
+JOIN platform_operator_capacity_commands s ON s.id=(CAST(r.facts AS jsonb)->>'stop_operation_id')
 JOIN platform_scaler_actions a ON a.intent_id=i.id
 WHERE r.operation='manual_review' AND i.provider='targon' AND i.state='destroying'
 AND i.provider_instance_id='%s' AND n.desired_state='stopped'
 AND a.destroy_started_at IS NOT NULL
-AND c.kind='manual_review' AND c.state='completed' AND c.actor=r.facts->>'actor'
-AND c.payload->>'node_id'=i.id AND c.payload->>'provider_instance_id'=i.provider_instance_id
-AND c.payload->>'account_absent'='true' AND c.payload->>'no_continuing_charge'='true'
-AND n.payload->'manual_review'->>'operation_id'=c.id
-AND r.facts->>'instance_id'=i.provider_instance_id AND r.facts->>'intent_id'=i.id
+AND c.kind='manual_review' AND c.state='completed' AND c.actor=(CAST(r.facts AS jsonb)->>'actor')
+AND (CAST(c.payload AS jsonb)->>'node_id')=i.id
+AND (CAST(c.payload AS jsonb)->>'provider_instance_id')=i.provider_instance_id
+AND (CAST(c.payload AS jsonb)->'account_absent')='true'::jsonb
+AND (CAST(c.payload AS jsonb)->'no_continuing_charge')='true'::jsonb
+AND ((CAST(n.payload AS jsonb)->'manual_review')->>'operation_id')=c.id
+AND (CAST(r.facts AS jsonb)->>'instance_id')=i.provider_instance_id
+AND (CAST(r.facts AS jsonb)->>'intent_id')=i.id
 AND c.created_at=r.observed_at
-AND s.kind='stop' AND s.payload->>'node_id'=i.id AND s.created_at<=r.observed_at
+AND s.kind='stop' AND (CAST(s.payload AS jsonb)->>'node_id')=i.id AND s.created_at<=r.observed_at
 AND NOT EXISTS (SELECT 1 FROM platform_registered_workers w WHERE w.provider=i.provider
 AND w.instance_id=i.provider_instance_id AND (w.current_job_id IS NOT NULL
 OR (w.state!='retired' AND w.expires_at>EXTRACT(EPOCH FROM NOW()))))
