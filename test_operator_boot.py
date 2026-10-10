@@ -102,6 +102,9 @@ class OperatorBootTests(unittest.TestCase):
         with self.assertRaisesRegex(BootError,'identity_changed'):
             subject.ports_for(self.config['work_dir'],INTENT,1,31000)
         self.assertTrue(all(s.upload_enabled for s in self.boot.slots))
+        self.assertEqual(a.known_hosts_file,b.known_hosts_file)
+        self.assertEqual(a.host_key_identity,('lium',INTENT,INSTANCE))
+        self.assertEqual(a.known_hosts_file,Path(self.config['work_dir'])/'boot'/INTENT/'ssh'/'known_hosts')
         self.assertFalse(a.smoke_enabled)
         self.assertEqual(a.qualification_profile,QUEUED_TASK_PROFILE)
 

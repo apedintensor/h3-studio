@@ -159,10 +159,16 @@ class BootConfig:
     profile_slot_index: int = -1
     expected_host_gpus: int = 1
     provider: str = 'lium'
+    host_key_identity: tuple[str, str, str] = ()
 
     def __post_init__(self):
         from .inference.outputs import validate_delivery_policy
         validate_delivery_policy(self.execution_backend, self.output_delivery)
+        if self.host_key_identity:
+            from .instance_host_keys import validate_identity
+            validate_identity(self.host_key_identity)
+            if self.host_key_identity[0] != self.provider or not self.deployment_profile_id:
+                raise ValueError('bootstrap_ssh_pin_identity_invalid')
         for field in ("work_dir", "source_dir", "ssh_key_file", "known_hosts_file"):
             if not Path(getattr(self, field)).is_absolute():
                 raise ValueError("bootstrap_paths_must_be_absolute")
@@ -244,6 +250,21 @@ class SSHHost:
         if self.client is not None:
             self.client.close()
         self.client = paramiko.SSHClient()
+        if getattr(config, 'host_key_identity', ()):
+            from .instance_host_keys import HostKeyError, connect_pinned
+            try:
+                connect_pinned(self.client, config, coordinates, {
+                    'port': coordinates['port'], 'username': username,
+                    'key_filename': str(config.ssh_key_file), 'look_for_keys': False, 'allow_agent': False,
+                    'timeout': 15, 'banner_timeout': 15, 'auth_timeout': 15})
+                self._ever_connected = True
+            except HostKeyError as error:
+                self.client.close()
+                raise BootError(error.code) from None
+            except Exception:
+                self.client.close()
+                raise BootError('bootstrap_ssh_unavailable_or_host_key_untrusted') from None
+            return
         config.known_hosts_file.parent.mkdir(parents=True, exist_ok=True)
         if config.known_hosts_file.exists():
             self.client.load_host_keys(str(config.known_hosts_file))
@@ -630,6 +651,8 @@ class BootController:
             value["runtime_python"] = self.config.runtime_python
             value["profile_slot_index"] = self.config.profile_slot_index
             value["expected_host_gpus"] = self.config.expected_host_gpus
+        if self.config.host_key_identity:
+            value["ssh_host_key_identity"] = list(self.config.host_key_identity)
         return value
 
     def _connect_backend(self, intent, directory, state):

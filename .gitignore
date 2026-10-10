@@ -91,6 +91,7 @@ inventory.json
 !studio_platform/execution_policy.py
 !studio_platform/execution_profiles.py
 !studio_platform/operator_boot.py
+!studio_platform/instance_host_keys.py
 !studio_platform/capacity_inventory.py
 !studio_platform/capacity_market.py
 !studio_platform/capacity_scan.py
