@@ -122,10 +122,12 @@ class HatchetAffinityTests(LedgerCase):
 
     def test_busy_replica_yields_new_job_without_stealing_its_current_job(self):
         busy_job = self.make_job("busy")
+        self.now += 1
         offered = self.make_job("offered")
         self.ready("one")
         original = MemoryBackend()
-        self.runner(busy_job, original, worker="one").run_once("one", "hatchet-test")
+        self.assertEqual(self.runner(busy_job, original, worker="one").run_once("one", "hatchet-test")["job_id"],
+            busy_job["id"])
         before = self.repo.get_job(self.scope, busy_job["id"])
         wrong = Mock(wraps=MemoryBackend())
         wrong.kind, wrong.slot_key = "mock", "native-one"
