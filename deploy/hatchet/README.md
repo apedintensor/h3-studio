@@ -98,7 +98,14 @@ test_hatchet_service`. This uses a temporary original SQLite ledger, CPU-labelle
 simulation video/audio and no GPU/provider network calls. Set
 `HATCHET_PROOF_LONG_SECONDS=610` to exercise a task beyond ten minutes. The test
 injects broker-response loss and inference-response loss, checks the original
-attempt/submission count and leaves the older eligible job untouched.
+attempt/submission/fetch count and leaves an older planned draft untouched.
+The fixture follows the production dispatcher recovery cadence from its protected
+broker configuration. If a callback yields during collection backoff, another
+wakeup event may resume the same original job and attempt. The receipt separates
+the original lost-response retry from subsequent recovery event/run counts and
+records the recovery interval; it does not require one broker event for the whole
+business lifecycle. A failure preserves a mode-0600 SQLite diagnostic snapshot
+beside the protected broker configuration, for investigation only.
 
 Engine v0.110.5 observations: the steady registered-workflow proof returned the
 same accepted run ID for duplicate event delivery. One first-boot round accepted

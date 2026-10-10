@@ -154,6 +154,7 @@ class RealHatchetTests(unittest.TestCase):
             start = time.monotonic()
             receipt = None
             next_recovery = 0
+            recovery_scans = 0
             try:
                 # Worker registration is asynchronous; the bridge safely holds
                 # unknown publishing outcomes on this same original event.
@@ -165,6 +166,7 @@ class RealHatchetTests(unittest.TestCase):
                     # Its recovery wakeup must resume that same business job.
                     if time.monotonic() >= next_recovery:
                         dispatcher.recover_wakeups()
+                        recovery_scans += 1
                         next_recovery = time.monotonic()+config.recovery_interval_s
                     publication = dispatcher.publish_once()
                     if publication["state"] != "idle":
@@ -208,6 +210,14 @@ class RealHatchetTests(unittest.TestCase):
                     "broker_event_ids": sorted(event_ids),
                     "broker_call_run_ids": sorted({run for event, run in publisher.calls}),
                     "lost_response_same_event": True,
+                    "original_acceptance_event_id": publisher.calls[0][0],
+                    "lost_acceptance_response_call_run_id": publisher.calls[0][1],
+                    "original_published_run_id": deliveries[0]["external_run_id"],
+                    "recovery_event_count": len(deliveries)-1,
+                    "published_run_count": len({item["external_run_id"] for item in deliveries
+                        if item["external_run_id"]}),
+                    "recovery_interval_s": config.recovery_interval_s,
+                    "recovery_scans": recovery_scans,
                     "original_attempts": 1, "remote_submissions": 1, "artifact_fetches": 1,
                     "video_and_audio": True, "older_job_untouched": True,
                     "event_id": delivery["event_id"], "run_id": delivery["external_run_id"],
