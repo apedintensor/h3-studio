@@ -37,7 +37,7 @@
 
 新 v2 marker 固定 execution commit、镜像身份、worker 兼容指纹、配置、预算周期和控制器身份。API 发布前验证 pin 与真实运行容器，仅同 worker 契约及相同 host bundle 配置允许兼容更新。更新只操作 `app --no-deps`，不重建 db/db-init/caddy/controller。
 
-开发阶段若旧 CPU supervisor 已在内存中加载旧发布代码，先通过一次明确的 `--preserve-unsubmitted-queue` 交接升级该 supervisor，再发布新 app；不因此取消排队测试任务。仅当全部活跃任务都是未创建 attempt、未绑定 worker/lease 的 queued 任务、没有活跃推理或执行 worker 时允许。受保护交接回执记录队列的原身份与不可变请求/执行配置摘要，退役前、使用新镜像核对时及重启前必须完全一致；其他租赁、未知创建记录、预算、期限仍按原规则保留。同版本交接只允许此显式命名模式：确认旧容器正常退出、释放本地所有权后，按其固定 ID 保留并改名归档，记录一次性意图，绝不删除或因结果不明重发。旧 supervisor 的空队列恢复门槛可能因此拒绝收尾；新 supervisor 仍须独立验证干净退出和完整队列证据。普通交接默认仍要求空队列，开启范围只能来自 prepare 的显式授权，successor 不能自行扩大。
+开发阶段若旧 CPU supervisor 已在内存中加载旧发布代码，先通过一次明确的 `--preserve-unsubmitted-queue` 交接升级该 supervisor，再发布新 app；不因此取消排队测试任务。仅当全部活跃任务都是未创建 attempt、未绑定 worker/lease 的 queued 任务、没有活跃推理或执行 worker 时允许。受保护交接回执记录队列的原身份与不可变请求/执行配置摘要，退役前、使用目标固定镜像核对时及重启前必须完全一致；其他租赁、未知创建记录、预算、期限仍按原规则保留。同版本交接只允许此显式命名模式：确认旧容器正常退出、释放本地所有权后，按其固定 ID 保留并改名归档，记录一次性意图，绝不删除或因结果不明重发。旧 supervisor 的空队列恢复门槛可能因此拒绝收尾；新 supervisor 仍须独立验证干净退出和完整队列证据。普通交接默认仍要求空队列，开启范围只能来自 prepare 的显式授权，successor 不能自行扩大。
 
 控制器发出控制命令仍使用固定 execution release；开启/关闭网站准入及最终恢复 CPU 则在 release lock 内重新读取当前 approved app。这样控制器结束不会把网站切回其启动时的旧镜像。预算、排队任务、租赁账本及原截止时间不随网站发布重置。
 
