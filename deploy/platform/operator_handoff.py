@@ -14,6 +14,12 @@ resumed by an arbitrary process or replayed after launch intent is recorded.
 This helper does not install/restart the independent guardian. Its separately
 approved source installation must preserve the original guard config, requests
 and receipts. Normal operator start/restore barriers remain unchanged.
+
+An explicit named ``prepare --preserve-unsubmitted-queue`` can retain an exact
+queued, never-claimed job snapshot during a same-configuration CPU handoff. It
+does not alter, cancel, enqueue or submit jobs, or relax running-work barriers.
+Only this named mode can roll over the same image. Its exact cleanly exited
+container is archived by ID with a durable one-use rename intent, never removed.
 """
 from __future__ import annotations
 
@@ -227,7 +233,7 @@ def unknown_rent_journals(rows, work_dir):
     return result
 
 
-def ledger_summary(rows, binding_hashes, unknown_journals=None):
+def ledger_summary(rows, binding_hashes, unknown_journals=None, *, preserve_unsubmitted_queue=False):
     """Pure validation of a read-only snapshot; no ledger writes or provider calls."""
     import hashlib
     import json
@@ -242,7 +248,37 @@ def ledger_summary(rows, binding_hashes, unknown_journals=None):
                                         allow_nan=False).encode()).hexdigest()
     def stable(row, excluded):
         return {key:value for key,value in row.items() if key not in excluded}
-    check(all(rows['counts'].get(key) == 0 for key in ('active_jobs', 'unsafe_attempts', 'bound_workers')))
+    check(type(preserve_unsubmitted_queue) is bool)
+    check(all(rows['counts'].get(key) == 0 for key in ('unsafe_attempts', 'bound_workers')))
+    queue = None
+    if preserve_unsubmitted_queue:
+        check(all(type(rows['counts'].get(key)) is int for key in ('unsafe_attempts', 'bound_workers')))
+        active_jobs = rows.get('unsubmitted_jobs')
+        check(isinstance(active_jobs, list) and type(rows['counts'].get('active_jobs')) is int
+              and rows['counts']['active_jobs'] == len(active_jobs)
+              and len({job.get('id') for job in active_jobs}) == len(active_jobs))
+        queue = []
+        for job in sorted(active_jobs, key=lambda value:value['id']):
+            check(isinstance(job.get('id'), str)
+                  and re.fullmatch(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', job['id']) is not None
+                  and job.get('status') == 'queued' and job.get('lease_worker_id') is None
+                  and job.get('lease_expires_at') is None and job.get('current_attempt_id') is None
+                  and type(job.get('attempt_no')) is int and job['attempt_no'] == 0
+                  and type(job.get('fence')) is int and job['fence'] == 0
+                  and type(job.get('attempt_count')) is int and job['attempt_count'] == 0
+                  and job.get('cancel_from_status') is None and job.get('result') is None
+                  and isinstance(job.get('request_hash'), str)
+                  and re.fullmatch(r'[a-f0-9]{64}', job['request_hash']) is not None
+                  and isinstance(job.get('request'), dict) and isinstance(job.get('execution_plan'), dict))
+            # Hash complete frozen request/configuration/row bytes in memory.
+            # Only safe IDs and digests leave this read-only probe; prompts,
+            # asset URLs and arbitrary caller idempotency strings never do.
+            queue.append({'job_id':job['id'], 'request_hash':job['request_hash'],
+                'request_snapshot_hash':digest(job['request']),
+                'configuration_snapshot_hash':digest(job['execution_plan']),
+                'record_hash':digest(job)})
+    else:
+        check(rows['counts'].get('active_jobs') == 0)
     intents = {row['id']:row for row in rows['intents']}
     nodes = {row['intent_id']:row for row in rows['nodes']}
     actions = {row['intent_id']:row for row in rows['actions']}
@@ -329,12 +365,17 @@ def ledger_summary(rows, binding_hashes, unknown_journals=None):
     }
     if unknown_journals:
         immutable['unknown_rent_journals'] = unknown_journals
-    return {'schema_version':1, 'immutable_hash':digest(immutable), 'pending_ids':sorted(live),
+    if preserve_unsubmitted_queue:
+        immutable['preserved_unsubmitted_queue'] = queue
+    result = {'schema_version':1, 'immutable_hash':digest(immutable), 'pending_ids':sorted(live),
             'unknown_rent_journals':unknown_journals,
             'accounting_hash':digest([rows['accounts'], rows['reservations']])}
+    if preserve_unsubmitted_queue:
+        result['preserved_unsubmitted_queue'] = queue
+    return result
 
 
-def ledger_probe(directory, environment, *, require_removal_cadence=False):
+def ledger_probe(directory, environment, *, require_removal_cadence=False, preserve_unsubmitted_queue=False):
     # Snapshot is consistent and read-only. No Repository/factory construction,
     # schema initialization, credentials, provider requests or mutation SQL.
     script = inspect.getsource(unknown_rent_journals) + inspect.getsource(ledger_summary) + '''
@@ -359,11 +400,17 @@ with engine.connect() as conn:
  'bound_workers':"SELECT count(*) FROM platform_registered_workers WHERE current_job_id IS NOT NULL OR (state != 'retired' AND expires_at > :now)"}
  observed_at=time.time()
  rows['counts']={key:conn.execute(text(sql),{'now':observed_at}).scalar_one() for key,sql in queries.items()}
+ if PRESERVE_QUEUE:
+  jobs=metadata.tables['platform_jobs']
+  rows['unsubmitted_jobs']=[dict(r) for r in conn.execute(select(jobs).where(jobs.c.status.not_in(['succeeded','failed','cancelled'])).order_by(jobs.c.id)).mappings()]
+  for job in rows['unsubmitted_jobs']:
+   job['attempt_count']=conn.execute(text('SELECT count(*) FROM platform_attempts WHERE job_id=:job_id'),{'job_id':job['id']}).scalar_one()
  journals=unknown_rent_journals(rows,runtime['work_dir'])
- print(json.dumps(ledger_summary(rows,{key:b.fingerprint for key,b in registry.bindings.items()},journals)))
+ print(json.dumps(ledger_summary(rows,{key:b.fingerprint for key,b in registry.bindings.items()},journals,preserve_unsubmitted_queue=PRESERVE_QUEUE)))
 engine.dispose()
 '''
-    script = script.replace('RUNTIME', repr(host.RUNTIME.as_posix()))
+    release.require(type(preserve_unsubmitted_queue) is bool, 'operator_handoff_queue_policy_invalid')
+    script = script.replace('RUNTIME', repr(host.RUNTIME.as_posix())).replace('PRESERVE_QUEUE', repr(preserve_unsubmitted_queue))
     if require_removal_cadence:
         script = ('from studio_platform.scaler import REMOVAL_CHECK_INTERVAL_SECONDS\n'
                   'assert REMOVAL_CHECK_INTERVAL_SECONDS == 60\n') + script
@@ -384,8 +431,50 @@ def current_target(commit):
     return value
 
 
-def prepare(commit, unit, *, journal_id=None):
+def stopped_container_identity(environment, pin, *, container_id=None, name=None):
+    """Bound Docker identity only; never retain Config/env/command inspection."""
+    expected_name = pin['container_name'] if name is None else name
+    reference = pin['container_name'] if container_id is None else container_id
+    raw = release.command(['inspect', reference], environment=environment, timeout=20)
+    rows = json.loads(raw)
+    release.require(isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict),
+                    'operator_handoff_archive_identity_unknown')
+    value = rows[0]
+    labels = value.get('Config', {}).get('Labels', {})
+    state = value.get('State', {})
+    restart = value.get('HostConfig', {}).get('RestartPolicy', {})
+    release.require(isinstance(value.get('Id'), str) and re.fullmatch(r'[a-f0-9]{64}', value['Id'])
+        and (container_id is None or value['Id'] == container_id)
+        and value.get('Name') == '/'+expected_name and value.get('Image') == pin['image_id']
+        and labels.get('com.docker.compose.project') == 'sixnine-platform'
+        and labels.get('com.docker.compose.service') == host.SERVICE
+        and labels.get(host.LABEL) == pin['prepared_hash']
+        and restart.get('Name') == 'no' and restart.get('MaximumRetryCount') == 0,
+        'operator_handoff_archive_identity_changed')
+    release.require(state.get('Running') is False and state.get('Restarting') is False
+        and state.get('Paused') is False and state.get('OOMKilled') is False and state.get('Dead') is False
+        and state.get('Status') == 'exited' and type(state.get('Pid')) is int and state['Pid'] == 0
+        and type(state.get('ExitCode')) is int and state['ExitCode'] == 0,
+        'operator_handoff_archive_exit_unconfirmed')
+    return {'container_id':value['Id'], 'container_name':expected_name, 'image_id':pin['image_id'],
+            'prepared_hash':pin['prepared_hash'], 'state':{key:state[key] for key in
+                ('Running','Restarting','Paused','OOMKilled','Dead','Status','Pid','ExitCode')},
+            'restart_policy':{'Name':'no','MaximumRetryCount':0}}
+
+
+def require_container_name_free(environment, name):
+    # Successful exact-name Docker enumeration is local daemon evidence. An
+    # inspect error is never mistaken for absence or retried through a fallback.
+    raw = release.command(['container', 'ls', '--all', '--filter', 'name=^/'+name+'$',
+                           '--format', '{{.ID}}'], environment=environment, timeout=20)
+    release.require(raw.strip() == b'', 'operator_handoff_archive_name_in_use')
+
+
+def prepare(commit, unit, *, journal_id=None, preserve_unsubmitted_queue=False):
     with locked():
+        release.require(type(preserve_unsubmitted_queue) is bool, 'operator_handoff_queue_policy_invalid')
+        release.require(not preserve_unsubmitted_queue or journal_id is not None,
+                        'operator_handoff_queue_requires_named_journal')
         path = record_path(journal_id)
         release.require(not path.exists() and not path.is_symlink(),
                         'operator_handoff_already_recorded')
@@ -394,7 +483,10 @@ def prepare(commit, unit, *, journal_id=None):
         release.require(pin.get('active') is True and pin.get('state') == 'running',
                         'operator_handoff_active_controller_required')
         target, _, _, image = current_target(commit)
-        release.require(target != old['commit'], 'operator_handoff_target_unchanged')
+        same_target = target == old['commit']
+        release.require(not same_target or preserve_unsubmitted_queue and journal_id is not None,
+                        'operator_handoff_target_unchanged')
+        release.require(not same_target or image == old['image_id'], 'operator_handoff_target_image_changed')
         unit_state = supervisor(unit)
         release.require(int(unit_state['MainPID']) > 0 and unit_state['ActiveState'] == 'active',
                         'operator_handoff_supervisor_not_running')
@@ -402,8 +494,12 @@ def prepare(commit, unit, *, journal_id=None):
         client = supervisor_client(unit_state, pin, directory)
         proof = host.receipt(pin, fresh=True)
         release.require(proof.get('state') in ('running', 'degraded'), 'operator_handoff_receipt_not_running')
-        ledger = ledger_probe(directory, environment)
-        release.require(bool(ledger['pending_ids']), 'operator_handoff_pending_deletion_required')
+        probe_options = {'preserve_unsubmitted_queue':True} if preserve_unsubmitted_queue else {}
+        ledger = ledger_probe(directory, environment, **probe_options)
+        release.require(bool(ledger['pending_ids']) or preserve_unsubmitted_queue
+                        and bool(ledger.get('preserved_unsubmitted_queue')), 'operator_handoff_pending_deletion_required')
+        release.require(not same_target or bool(ledger.get('preserved_unsubmitted_queue')),
+                        'operator_handoff_rollover_queue_required')
         release.require(not ledger.get('unknown_rent_journals') or journal_id is not None,
                         'operator_handoff_unknown_rent_requires_named_journal')
         value = {'schema_version':1, 'phase':'drain_requested', 'target_commit':target, 'target_image_id':image,
@@ -412,13 +508,21 @@ def prepare(commit, unit, *, journal_id=None):
             'ledger':ledger, 'prepared_at':time.time()}
         if journal_id is not None:
             value['journal_id'] = journal_id
+        if preserve_unsubmitted_queue:
+            release.require(isinstance(ledger.get('preserved_unsubmitted_queue'), list),
+                            'operator_handoff_queue_snapshot_missing')
+            value['preserve_unsubmitted_queue'] = True
+        if same_target:
+            value['same_target_rollover'] = True
         # Intent precedes admission/TERM side effects. Any ambiguous outcome is
         # retained for inspection; prepare never retries by removing this file.
         host.atomic(path, value)
         host.request_drain(directory, environment, pin)
         return {'state':'drain_requested', 'target_commit':target,
                 'pending_deletions':len(ledger['pending_ids'])-len(ledger.get('unknown_rent_journals', {})),
-                'pending_unknown_rentals':len(ledger.get('unknown_rent_journals', {}))}
+                'pending_unknown_rentals':len(ledger.get('unknown_rent_journals', {})),
+                **({'preserved_unsubmitted_jobs':len(ledger['preserved_unsubmitted_queue'])}
+                   if preserve_unsubmitted_queue else {})}
 
 
 def successor(*, journal_id=None):
@@ -428,6 +532,15 @@ def successor(*, journal_id=None):
     release.require(value.get('journal_id') == journal_id, 'operator_handoff_journal_identity_changed')
     release.require(value.get('schema_version') == 1 and value.get('phase') == 'drain_requested',
                     'operator_handoff_not_ready_or_already_launched')
+    preserve_queue = value.get('preserve_unsubmitted_queue', False)
+    release.require(type(preserve_queue) is bool and (not preserve_queue or journal_id is not None),
+                    'operator_handoff_queue_policy_invalid')
+    if preserve_queue:
+        release.require(isinstance(value['ledger'].get('preserved_unsubmitted_queue'), list),
+                        'operator_handoff_queue_snapshot_missing')
+    same_target = value.get('same_target_rollover', False)
+    release.require(type(same_target) is bool and (not same_target or preserve_queue and journal_id is not None
+        and bool(value['ledger'].get('preserved_unsubmitted_queue'))), 'operator_handoff_rollover_policy_invalid')
     runtime, old, old_directory, old_environment = host.prepared()
     release.require(old == value['old_prepared'] and
         release._protected_json(host.ROOT/'overlay.json') == value['old_overlay'], 'operator_handoff_configuration_changed')
@@ -447,7 +560,11 @@ def successor(*, journal_id=None):
     release.require(proof.get('state') == 'shutdown_complete' and proof.get('local_connections_released') is True,
                     'operator_handoff_local_ownership_unconfirmed')
     host.no_competing_controller(old_environment)
-    ledger = ledger_probe(old_directory, old_environment)
+    probe_options = {'preserve_unsubmitted_queue':True} if preserve_queue else {}
+    ledger = ledger_probe(old_directory, old_environment, **probe_options)
+    if preserve_queue:
+        release.require(ledger.get('preserved_unsubmitted_queue') == value['ledger']['preserved_unsubmitted_queue'],
+                        'operator_handoff_queue_changed')
     release.require(ledger['immutable_hash'] == value['ledger']['immutable_hash']
         and set(ledger['pending_ids']) <= set(value['ledger']['pending_ids']), 'operator_handoff_ledger_changed')
     unknown = value['ledger'].get('unknown_rent_journals', {})
@@ -458,23 +575,57 @@ def successor(*, journal_id=None):
                         'operator_handoff_accounting_changed')
     commit, directory, environment, image = current_target(value['target_commit'])
     release.require(image == value['target_image_id'], 'operator_handoff_target_image_changed')
+    release.require((commit == old['commit']) is same_target,
+                    'operator_handoff_rollover_target_changed')
+    release.require(not same_target or image == old['image_id'], 'operator_handoff_target_image_changed')
     prepared = {**old, 'commit':commit, 'image_id':image}
     next_pin = host.pin_for(prepared)
+    owners = value['old_overlay']['services']['app']['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS']
+    next_overlay = host.overlay(environment['SIXNINE_IMAGE'], host.default_profile(), runtime, owners=owners)
+    archive = None
+    if same_target:
+        release.require(prepared == old and next_overlay == value['old_overlay'],
+                        'operator_handoff_rollover_configuration_changed')
+        # For a same-image rollover, complete all compatibility/queue gates
+        # before consuming the exact stopped container's original launch name.
+        version = release.command(['compose', 'version', '--short'], environment=environment).decode().strip()
+        host.validate_rendered(json.loads(host.compose(directory, environment, 'config', '--format', 'json')),
+                               directory, version, environment['SIXNINE_IMAGE'], host.default_profile(), runtime, owners=owners)
+        after = ledger_probe(directory, environment, require_removal_cadence=True, **probe_options)
+        release.require(after == ledger, 'operator_handoff_ledger_changed_before_launch')
+        identity = stopped_container_identity(old_environment, pin)
+        archive_name = pin['container_name']+'-retired-'+journal_id
+        require_container_name_free(old_environment, archive_name)
+        archive = {'phase':'rename_intent', 'original':identity, 'archived_name':archive_name}
     # A launch intent is one-use even after a crash or unknown stdin delivery.
     value.update(phase='launch_intent', retired_proof=proof, retired_ledger=ledger, successor_pin=next_pin,
                  launch_intent_at=time.time())
+    if archive is not None:
+        value['container_archive'] = archive
     host.atomic(path, value)
-    owners = value['old_overlay']['services']['app']['environment']['SIXNINE_OPERATOR_CAPACITY_OWNERS']
-    host.atomic(host.ROOT/'overlay.json', host.overlay(environment['SIXNINE_IMAGE'], host.default_profile(), runtime, owners=owners))
+    if archive is not None:
+        # Exactly one rename by immutable ID. If delivery/verification is
+        # uncertain, launch_intent remains consumed; no automatic replay/remove.
+        identity = archive['original']
+        release.command(['rename', identity['container_id'], archive['archived_name']],
+                        environment=old_environment, timeout=20)
+        archived = stopped_container_identity(old_environment, pin,
+            container_id=identity['container_id'], name=archive['archived_name'])
+        release.require(archived == {**identity, 'container_name':archive['archived_name']},
+                        'operator_handoff_archive_identity_changed')
+        require_container_name_free(old_environment, pin['container_name'])
+        value['container_archive'] = {**archive, 'phase':'confirmed', 'archived':archived}
+        host.atomic(path, value)
+    host.atomic(host.ROOT/'overlay.json', next_overlay)
     host.atomic(host.ROOT/'prepared.json', prepared)
     host.atomic(host.ROOT/'active.json', next_pin)
-    version = release.command(['compose', 'version', '--short'], environment=environment).decode().strip()
-    host.validate_rendered(json.loads(host.compose(directory, environment, 'config', '--format', 'json')),
-                           directory, version, environment['SIXNINE_IMAGE'], host.default_profile(), runtime, owners=owners)
-    # Recheck through the replacement image before giving it credentials. This
-    # verifies compatible metadata and preserves every old rental identity.
-    after = ledger_probe(directory, environment, require_removal_cadence=True)
-    release.require(after == ledger, 'operator_handoff_ledger_changed_before_launch')
+    if not same_target:
+        version = release.command(['compose', 'version', '--short'], environment=environment).decode().strip()
+        host.validate_rendered(json.loads(host.compose(directory, environment, 'config', '--format', 'json')),
+                               directory, version, environment['SIXNINE_IMAGE'], host.default_profile(), runtime, owners=owners)
+        # Recheck through the replacement image before giving it credentials.
+        after = ledger_probe(directory, environment, require_removal_cadence=True, **probe_options)
+        release.require(after == ledger, 'operator_handoff_ledger_changed_before_launch')
     return runtime, prepared, directory, environment, next_pin
 
 
@@ -572,14 +723,17 @@ def main(argv=None):
     parser.add_argument('--unit')
     parser.add_argument('--journal-id')
     parser.add_argument('--successor-unit')
+    parser.add_argument('--preserve-unsubmitted-queue', action='store_true')
     args = parser.parse_args(argv)
     try:
         release.check_host(release.ROOT)
         if args.action == 'prepare':
             release.require(args.successor_unit is None, 'operator_handoff_successor_unit_start_only')
-            result = prepare(args.target_commit, args.unit, journal_id=args.journal_id)
+            result = prepare(args.target_commit, args.unit, journal_id=args.journal_id,
+                             preserve_unsubmitted_queue=args.preserve_unsubmitted_queue)
         else:
             release.require(args.target_commit is None and args.unit is None, 'operator_handoff_record_required')
+            release.require(not args.preserve_unsubmitted_queue, 'operator_handoff_queue_prepare_only')
             result = start(journal_id=args.journal_id, successor_unit=args.successor_unit)
         print(json.dumps(result, sort_keys=True))
         return 0

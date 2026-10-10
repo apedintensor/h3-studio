@@ -10,7 +10,7 @@
 | 已确认与 worker 兼容的 API 展示/发现代码 | Python/API/数据库与镜像检查；批准平台包 | 只更新 app；控制器继续使用启动时固定镜像 |
 | 任务协议、准入、账户/数据结构、计费、调度或依赖 | 批次关键回归及完整发布门槛 | 不兼容时拒绝热更；等待任务和账单安全收尾后迁移 |
 
-`api.py`、schema、存储、编译和依赖均保守计入 worker 指纹。当前仅排除 `frontend.py`、`agent_discovery.py` 和分发 Skill 文件。不能把“有兼容热更路径”解释成所有 API 改动都能不排空更新，更不代表多副本 API 零停机：单 app 替换仍可能有短暂请求重试。
+`api.py`、schema、存储、编译和依赖均保守计入 worker 指纹。当前仅排除 `frontend.py`、`agent_discovery.py` 和分发 Skill 文件。开发与公开试用阶段，经完整源码和配置独立审查的 app 更新可以保持现有控制器、队列和租赁；不因新增可选起名凭据与 app 出网就要求取消用户任务。现有精确版本批准路径允许明确记录的 app 配置差异：只新增 Google 起名的环境路径、私有秘密挂载和 app 的 edge 网络；数据库、Caddy、初始化、其他挂载、控制器配置与账本不变。其他配置或协议变化仍需要对应迁移方案。单 app 替换可能有短暂请求重试。
 
 ## 日常批次
 
@@ -20,7 +20,7 @@
 4. 本地准备发布：提交好批次后运行 `python tools/prepare_release.py --kind frontend` 或 `--kind platform`，可加 `--commit` 指定完整 HEAD。入口核对 main、目标仓库、源码干净和远端 SHA，push 一次，只取消同仓库/同 SHA/同 workflow 的未完成普通 push 检查，再 dispatch 一次准备任务。不会同步、commit、安装包、批准或部署。显式 DOCUMENTS 白名单内未提交文档可保留，例如用户的 `SCALING.zh-CN.md`；其他受审阅源码/配置和未跟踪文件必须先处理，ignored 私有文件不扫描。也可在 Actions 手动选择 `deploy=true` 与 `release_kind`，但不要与本地入口重复触发。
 5. 通过独立操作身份核对测试版本与 manifest 摘要，写入 host 对应批准目录，再 dispatch `approved_frontend_commit` 或 `approved_commit`。部署身份不能自批准或安装 root helper。
 
-平台准备会完整验收确切版本；前端准备只验收前端及发布边界，不运行全套 PostgreSQL 或重建 Python 镜像。不要同时为同一批次重复触发准备任务；已通过且未受修改影响的检查不反复执行。pip/npm 和 BuildKit 缓存用于加速依赖与镜像层，缓存命中不代替验证。
+平台准备会完整验收确切版本；前端准备只验收前端及发布边界，不运行全套 PostgreSQL 或重建 Python 镜像。不要同时为同一批次重复触发准备任务；已通过且未受修改影响的检查不反复执行。用户追加发布路径修改时，旧产物不得冒充最终版本；完成新增修改、针对发布边界验证与独立审查后，再准备最终确切版本。pip/npm 和 BuildKit 缓存用于加速依赖与镜像层，缓存命中不代替验证。
 
 本地入口在 ignored `.release-prepares/提交号-类型/receipt.json` 中先记意图、再执行变更。取消或 dispatch 超时/回应不明会停止；同一意图再次运行会拒绝，不自动重发。通过 `gh run list --repo inkseq/h3-studio --workflow ci.yml --commit 完整SHA` 及收据核对，保留原意图，不靠删除收据重试。返回的 run ID 只表示观察到确切 SHA 的新准备任务，不表示检查、发布或部署完成。GitHub dispatch 没有直接返回 run ID；出现零个或多个候选时需人工核对。如果普通 push 检查已经完成，当前入口不复用其测试结果；为避免重复，应让本地入口负责该批次第一次 push。PR、其他 SHA、已完成检查及发布/部署任务不会被取消。
 
@@ -36,6 +36,8 @@
 ## GPU 生命周期
 
 新 v2 marker 固定 execution commit、镜像身份、worker 兼容指纹、配置、预算周期和控制器身份。API 发布前验证 pin 与真实运行容器，仅同 worker 契约及相同 host bundle 配置允许兼容更新。更新只操作 `app --no-deps`，不重建 db/db-init/caddy/controller。
+
+开发阶段若旧 CPU supervisor 已在内存中加载旧发布代码，先通过一次明确的 `--preserve-unsubmitted-queue` 交接升级该 supervisor，再发布新 app；不因此取消排队测试任务。仅当全部活跃任务都是未创建 attempt、未绑定 worker/lease 的 queued 任务、没有活跃推理或执行 worker 时允许。受保护交接回执记录队列的原身份与不可变请求/执行配置摘要，退役前、使用目标固定镜像核对时及重启前必须完全一致；其他租赁、未知创建记录、预算、期限仍按原规则保留。同版本交接只允许此显式命名模式：确认旧容器正常退出、释放本地所有权后，按其固定 ID 保留并改名归档，记录一次性意图，绝不删除或因结果不明重发。旧 supervisor 的空队列恢复门槛可能因此拒绝收尾；新 supervisor 仍须独立验证干净退出和完整队列证据。普通交接默认仍要求空队列，开启范围只能来自 prepare 的显式授权，successor 不能自行扩大。
 
 控制器发出控制命令仍使用固定 execution release；开启/关闭网站准入及最终恢复 CPU 则在 release lock 内重新读取当前 approved app。这样控制器结束不会把网站切回其启动时的旧镜像。预算、排队任务、租赁账本及原截止时间不随网站发布重置。
 

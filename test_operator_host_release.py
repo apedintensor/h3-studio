@@ -450,6 +450,148 @@ class AppReleaseCompatibilityTests(unittest.TestCase):
 
     def check(self):release.operator_app_compatibility(self.root,self.pin,self.execution,self.target)
 
+    def google_configuration(self):
+        """Inert bundle files and fake trusted Compose JSON, never start Docker."""
+        self.renders={}
+        for value in (self.execution,self.target):
+            directory=self.root/'releases'/value['commit']
+            for name in ('compose.yaml','check_config.py'):
+                (directory/name).write_text('inert reviewed '+value['commit']+' '+name)
+                value['files'][name]=release.checksum(directory/name)
+            self.renders[value['commit']]={'name':'sixnine-platform','services':{
+                'app':{'image':'sixnine-platform:'+value['commit'],'environment':{'SIXNINE_GENERATION_ENABLED':'0'},
+                    'secrets':[{'source':'app_database_url','target':'/run/secrets/app_database_url'}],
+                    'networks':{'database':{},'web':{}},'read_only':True,
+                    'volumes':[{'type':'bind','source':'/srv/sixnine/platform-data','target':'/data'}]},
+                'db-init':{'image':'sixnine-platform:'+value['commit'],'volumes':[
+                    {'type':'bind','source':str(directory/'init_database.py'),
+                        'target':'/bootstrap/init_database.py','read_only':True}]},
+                'db':{'image':'postgres@sha256:'+'1'*64,'networks':{'database':{}}},
+                'caddy':{'image':'caddy@sha256:'+'2'*64,'volumes':[
+                    {'type':'bind','source':str(directory/'Caddyfile'),
+                        'target':'/etc/caddy/Caddyfile','read_only':True}]}},
+                'secrets':{'app_database_url':{'file':'/run/sixnine-secrets/app_database_url'}},
+                'networks':{'database':{'internal':True},'web':{'internal':True},'edge':{}},
+                'volumes':{'caddy_data':{},'caddy_config':{}}}
+            (directory/'release-manifest.json').write_text(json.dumps(value))
+        after=self.renders[self.target['commit']]
+        after['services']['app']['environment']['SIXNINE_TITLE_CONFIG_FILE']='/run/secrets/google_titles'
+        after['services']['app']['secrets'].append({'source':'google_titles','target':'/run/secrets/google_titles'})
+        after['services']['app']['networks']['edge']={}
+        after['secrets']['google_titles']={'name':'sixnine-platform_google_titles','file':'/run/sixnine-secrets/google_titles'}
+        self.review.update(schema_version=2,
+            execution_manifest_sha256=release.checksum(self.root/'releases'/self.execution['commit']/'release-manifest.json'),
+            app_manifest_sha256=release.checksum(self.root/'releases'/self.target['commit']/'release-manifest.json'))
+        self.review['review']['app_configuration']='reviewed_google_titles_only'
+        self.stack.enter_context(patch.object(release,'regular'))  # Root file policy has independent boundary tests.
+        self.stack.enter_context(patch.object(release,'deployment_environment',side_effect=lambda p,c:{
+            'SIXNINE_IMAGE':'sixnine-platform:'+c,'SIXNINE_POSTGRES_IMAGE':'postgres@sha256:'+'1'*64,
+            'SIXNINE_CADDY_IMAGE':'caddy@sha256:'+'2'*64}))
+        self.render_commands=[]
+        def compose(directory,environment,*args,**kwargs):
+            self.render_commands.append((directory,environment,args))
+            self.assertEqual(args,('config','--format','json'))
+            return json.dumps(self.renders[directory.name]).encode()
+        self.stack.enter_context(patch.object(release,'compose',side_effect=compose))
+        self.stack.enter_context(patch.object(release,'command',return_value=b'v5.5.1\n'))
+        self.validate=self.stack.enter_context(patch.object(release,'validate'))
+
+    def test_v2_review_accepts_only_google_wiring_and_trusted_render_normalization(self):
+        self.google_configuration();self.approve()
+        before=copy.deepcopy(self.renders)
+        self.check()
+        self.assertEqual(self.renders,before)
+        self.assertEqual(len(self.render_commands),2)
+        self.assertEqual(self.validate.call_count,2)
+        for args in self.validate.call_args_list:
+            self.assertEqual(args.kwargs['compose_version'],'v5.5.1')
+            self.assertIn(args.kwargs['deployment_directory'].name,self.renders)
+        self.assertNotEqual(self.execution['contracts']['worker_compatibility'],self.target['contracts']['worker_compatibility'])
+
+    def test_google_configuration_requires_exact_v2_receipt_before_any_render(self):
+        self.google_configuration()
+        for mutate,code in (
+            (lambda v:v.update(schema_version=1),'host_configuration_change_requires_drain'),
+            (lambda v:v.update(schema_version=True),'host_configuration_change_requires_drain'),
+            (lambda v:v.update(schema_version=3),'host_configuration_change_requires_drain'),
+            (lambda v:v.update(app_manifest_sha256='0'*64),'review_mismatch'),
+            (lambda v:v['review'].update(app_configuration='any_app_change'),'review_mismatch'),
+            (lambda v:v.update(unreviewed=True),'review_mismatch')):
+            value=copy.deepcopy(self.review);mutate(value);self.path.write_text(json.dumps(value))
+            with self.subTest(code=code),self.assertRaisesRegex(release.ReleaseError,code):self.check()
+        self.assertEqual(self.render_commands,[])
+
+    def test_google_review_rejects_other_structural_changes_even_with_exact_receipt(self):
+        self.google_configuration();self.approve()
+        original=copy.deepcopy(self.renders[self.target['commit']])
+        mutations={
+            'generation':lambda c:c['services']['app']['environment'].update(SIXNINE_GENERATION_ENABLED='1'),
+            'security':lambda c:c['services']['app'].update(read_only=False),
+            'data':lambda c:c['services']['app']['volumes'][0].update(source='/srv/other-data'),
+            'database':lambda c:c['services']['db']['networks'].update(edge={}),
+            'controller':lambda c:c['services'].update({'operator-controller':{'image':'unexpected'}}),
+            'network':lambda c:c['networks']['edge'].update(external=True),
+            'egress_options':lambda c:c['services']['app']['networks'].update(edge={'aliases':['other']}),
+            'title_source':lambda c:c['secrets']['google_titles'].update(file='/tmp/google_titles'),
+            'title_target':lambda c:c['services']['app']['secrets'][1].update(target='/run/secrets/other'),
+            'title_mode':lambda c:c['services']['app']['secrets'][1].update(mode=0o644),
+            'duplicate_title':lambda c:c['services']['app']['secrets'].append(copy.deepcopy(c['services']['app']['secrets'][1])),
+            'title_env':lambda c:c['services']['app']['environment'].update(SIXNINE_TITLE_CONFIG_FILE='/tmp/key'),
+            'extra_secret':lambda c:c['secrets'].update(other={'file':'/tmp/other'}),
+            'bootstrap_image':lambda c:c['services']['db-init'].update(image='sixnine-platform:'+'9'*40),
+            'proxy_bind':lambda c:c['services']['caddy']['volumes'][0].update(source='/tmp/Caddyfile'),
+            'bind_options':lambda c:c['services']['db-init']['volumes'][0].update(read_only=False),
+        }
+        for name,mutate in mutations.items():
+            self.renders[self.target['commit']]=copy.deepcopy(original)
+            mutate(self.renders[self.target['commit']])
+            with self.subTest(name=name),self.assertRaisesRegex(release.ReleaseError,'host_configuration_change_requires_drain'):self.check()
+
+    def test_google_review_does_not_allow_proxy_bootstrap_or_unbound_config_files(self):
+        self.google_configuration();self.approve()
+        for name in ('Caddyfile','init_database.py'):
+            old=self.target['files'][name];self.target['files'][name]='8'*64
+            with self.subTest(name=name),self.assertRaisesRegex(release.ReleaseError,'host_configuration_change_requires_drain'):self.check()
+            self.target['files'][name]=old
+        for name in ('compose.yaml','check_config.py'):
+            path=self.root/'releases'/self.target['commit']/name
+            old=path.read_bytes();path.write_text('changed after reviewed manifest')
+            with self.subTest(name=name),self.assertRaisesRegex(release.ReleaseError,'host_configuration_change_requires_drain'):self.check()
+            path.write_bytes(old)
+
+    def test_google_review_requires_additions_not_removal_or_preexisting_wiring(self):
+        self.google_configuration();self.approve()
+        before=self.renders[self.execution['commit']]['services']['app']
+        before['environment']['SIXNINE_TITLE_CONFIG_FILE']='/run/secrets/google_titles'
+        with self.assertRaisesRegex(release.ReleaseError,'host_configuration_change_requires_drain'):self.check()
+        del before['environment']['SIXNINE_TITLE_CONFIG_FILE']
+        after=self.renders[self.target['commit']]['services']['app']
+        del after['environment']['SIXNINE_TITLE_CONFIG_FILE']
+        with self.assertRaisesRegex(release.ReleaseError,'host_configuration_change_requires_drain'):self.check()
+
+    def test_google_review_is_valid_with_open_or_closed_admission_and_original_rollback(self):
+        self.google_configuration();self.approve()
+        for admission in ('open','closed'):
+            self.pin['admission']=admission;self.check()
+        release.operator_app_compatibility(self.root,self.pin,self.execution,
+            {**self.execution,'archive_image_ids':{self.execution['image_id']}})
+
+    def test_google_review_closed_restore_keeps_current_app_and_exact_controller_pin(self):
+        self.google_configuration();self.approve()
+        self.pin['admission']='closed'
+        active=self.operator/'active.json';active.write_text(json.dumps(self.pin))
+        before=active.read_bytes()
+        directory=self.root/'releases'/self.target['commit']
+        with patch.object(release,'current_application',return_value=(self.target['commit'],directory,{})), \
+             patch.object(release,'operator_execution_context',return_value=(host,{},self.pin,self.execution,{})), \
+             patch.object(release,'manifest',return_value=self.target), \
+             patch.object(release,'application_compose') as apply, \
+             patch.object(release,'wait_ready'),patch.object(release,'verify_running_app'), \
+             patch.object(release,'validate_image_archive',return_value=(self.target['image_id'],)):
+            self.assertEqual(release.restore_current_cpu_locked(self.root,operator_pin=self.pin),self.target['commit'])
+        apply.assert_called_once_with(directory,{},'up','-d','--no-deps','app')
+        self.assertEqual(active.read_bytes(),before)
+
     def test_exact_review_permits_app_delta_without_loosening_fingerprints(self):
         self.assertNotEqual(self.execution['contracts']['worker_compatibility'],self.target['contracts']['worker_compatibility'])
         with self.assertRaises(FileNotFoundError):self.check()
@@ -488,11 +630,25 @@ class AppReleaseCompatibilityTests(unittest.TestCase):
         self.commands=[]
         def command(args,**kwargs):
             self.commands.append(args)
+            if args==['compose','version','--short']: return b'v5.5.1\n'
             if args[0]=='ps': return b'abcd1234abcd'
             if args==['inspect','abcd1234abcd']:
                 return json.dumps([{'Name':'/'+self.pin['container_name'],'Image':self.pin['image_id']}]).encode()
             raise AssertionError(args)
         self.stack.enter_context(patch.object(release,'command',side_effect=command))
+
+    def test_google_review_live_context_preserves_queue_leases_and_controller(self):
+        self.google_configuration();self.approve();self.context_patches()
+        ledger=self.operator/'pending-records.json'
+        ledger.write_text('{"accepted_jobs":2,"pending_stop":1,"reserved":17,"original_deadline":1000}')
+        before={p:p.read_bytes() for p in (ledger,self.operator/'active.json',self.operator/'overlay.json')}
+        context=release.operator_deployment_context(self.root,self.target)
+        self.assertEqual(context['image_id'],self.pin['image_id'])
+        self.assertEqual(context['commit'],self.execution['commit'])
+        self.assertEqual(set(context['app_overlay']['services']),{'app'})
+        self.assertTrue(all(p.read_bytes()==value for p,value in before.items()))
+        self.assertTrue(all(args[0] in ('ps','inspect') or args==['compose','version','--short']
+            for args in self.commands))
 
     def test_pending_cleanup_and_billing_survive_live_app_context(self):
         self.approve();self.context_patches()

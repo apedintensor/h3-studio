@@ -103,9 +103,11 @@ The reviewed Compose configuration gives the app outbound connectivity for the
 fixed Google HTTPS endpoint; ingress stays behind Caddy, and provider/GPU
 credentials, controller paths and SSH keys remain outside the app. Legacy
 two-secret/no-egress Compose bundles remain accepted for rollback. This source
-change participates in the conservative worker compatibility fingerprint and
-must follow the existing protected release gate; it is not permission to stop,
-restart or extend a user's GPU rental.
+change participates in the conservative worker compatibility fingerprint.
+An exact independently reviewed app-only compatibility receipt can allow this
+optional title secret and app egress while preserving the existing controller,
+accepted queue and rentals. It does not authorize other service/configuration
+changes, a GPU restart, resubmission or an operating-window extension.
 
 The request is limited to 64 output tokens, 20-second HTTP timeout (5 seconds to
 connect), no retries, and `thinkingConfig.thinkingLevel=minimal`, as supported

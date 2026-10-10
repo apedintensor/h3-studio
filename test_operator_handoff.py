@@ -38,6 +38,27 @@ def ledger_rows():
     }
 
 
+QUEUE_JOB = '00000000-0000-4000-8000-000000000120'
+
+
+def queue_rows(*, queue_only=False):
+    rows = ledger_rows()
+    rows['counts']['active_jobs'] = 1
+    rows['unsubmitted_jobs'] = [{'id':QUEUE_JOB, 'status':'queued', 'lease_worker_id':None,
+        'lease_expires_at':None, 'current_attempt_id':None, 'attempt_no':0, 'fence':0,
+        'attempt_count':0, 'cancel_from_status':None, 'result':None, 'request_hash':'a'*64,
+        'tenant_id':'tenant', 'owner_id':'owner', 'project_id':'project', 'actor_id':'actor',
+        'idempotency_key':'private-key-sentinel', 'created_at':100, 'updated_at':100,
+        'request':{'prompt':'private-prompt-sentinel', 'asset_url':'https://private-media.invalid/'},
+        'execution_plan':{'configuration_id':'frozen-h3', 'pool':'existing', 'model_id':'frozen-model'},
+        'estimated_cost_microusd':100}]
+    if queue_only:
+        for section in ('intents','nodes','actions','commands','reservations'):
+            rows[section] = []
+        rows['accounts'][0]['reserved_microusd'] = 0
+    return rows
+
+
 UNKNOWN_TAG = '00000000-0000-4000-8000-000000000112'
 EXECUTOR = '00000000-0000-4000-8000-000000000113'
 
@@ -129,6 +150,95 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(current['immutable_hash'], original['immutable_hash'])
         self.assertNotEqual(current['accounting_hash'], original['accounting_hash'])
         self.assertEqual(current['pending_ids'], [])
+
+
+class UnsubmittedQueueLedgerTests(unittest.TestCase):
+    def summary(self, rows, *, preserve=True):
+        return handoff.ledger_summary(rows, {'binding':'frozen'}, preserve_unsubmitted_queue=preserve)
+
+    def test_opt_in_snapshots_all_job_identity_request_and_configuration_without_mutation(self):
+        rows = queue_rows(); original = copy.deepcopy(rows)
+        value = self.summary(rows)
+        snapshot = value['preserved_unsubmitted_queue'][0]
+        self.assertEqual(set(snapshot), {'job_id','request_hash','request_snapshot_hash',
+                                        'configuration_snapshot_hash','record_hash'})
+        self.assertEqual(snapshot['job_id'], QUEUE_JOB)
+        self.assertEqual(snapshot['request_hash'], 'a'*64)
+        for key in ('request_snapshot_hash','configuration_snapshot_hash','record_hash'):
+            self.assertRegex(snapshot[key], r'^[a-f0-9]{64}$')
+        self.assertEqual(rows, original)
+        serialized = json.dumps(value)
+        for private in ('private-prompt-sentinel','private-key-sentinel','private-media.invalid',
+                        'frozen-h3','frozen-model','actor','project'):
+            self.assertNotIn(private, serialized)
+
+    def test_default_still_rejects_even_completely_unsubmitted_queued_work(self):
+        with self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+            self.summary(queue_rows(), preserve=False)
+        value = self.summary(ledger_rows(), preserve=False)
+        self.assertNotIn('preserved_unsubmitted_queue',value)
+        self.assertEqual(value['immutable_hash'], 'c93fe6b4151d079457c2113d55908be901893052ef9c524dab2943a81606af43')
+
+    def test_any_prior_claim_attempt_assignment_or_nonqueued_job_blocks(self):
+        for field,value in (('status','planned'), ('status','running'), ('status','waiting_capacity'),
+                           ('lease_worker_id','worker'), ('lease_expires_at',1), ('current_attempt_id','attempt'),
+                           ('attempt_no',1), ('fence',1), ('attempt_count',1), ('cancel_from_status','queued'),
+                           ('result',{}), ('request_hash','invalid'), ('request',None), ('execution_plan',None),
+                           ('id','private-prompt-sentinel'), ('attempt_no',False), ('attempt_count',False)):
+            rows = queue_rows(); rows['unsubmitted_jobs'][0][field] = value
+            with self.subTest(field=field,value=value), self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+                self.summary(rows)
+        for count in ('unsafe_attempts','bound_workers'):
+            rows = queue_rows(); rows['counts'][count] = 1
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+                self.summary(rows)
+
+    def test_complete_count_and_unique_queue_are_required(self):
+        for queue in (None, [], 'not-a-list'):
+            rows = queue_rows(); rows['unsubmitted_jobs'] = queue
+            with self.subTest(queue=queue), self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+                self.summary(rows)
+        rows = queue_rows(); rows['unsubmitted_jobs'] *= 2; rows['counts']['active_jobs'] = 2
+        with self.assertRaisesRegex(ValueError,'ledger_unsafe'): self.summary(rows)
+        rows = queue_rows(); rows['counts']['active_jobs'] = True
+        with self.assertRaisesRegex(ValueError,'ledger_unsafe'): self.summary(rows)
+
+    def test_ownership_request_config_cost_and_timestamp_changes_are_fenced(self):
+        original = self.summary(queue_rows())
+        for field,value in (('tenant_id','another-tenant'), ('owner_id','another-owner'), ('project_id','another-project'),
+                           ('actor_id','another-actor'), ('idempotency_key','another-key'), ('request_hash','b'*64),
+                           ('request',{'prompt':'different'}), ('execution_plan',{'configuration_id':'different'}),
+                           ('estimated_cost_microusd',200), ('updated_at',101)):
+            rows = queue_rows(); rows['unsubmitted_jobs'][0][field] = value
+            changed = self.summary(rows)
+            with self.subTest(field=field):
+                self.assertNotEqual(changed['immutable_hash'], original['immutable_hash'])
+                self.assertNotEqual(changed['preserved_unsubmitted_queue'], original['preserved_unsubmitted_queue'])
+
+    def test_snapshot_order_does_not_depend_on_input_order(self):
+        rows = queue_rows()
+        second = {**rows['unsubmitted_jobs'][0],'id':'00000000-0000-4000-8000-000000000119'}
+        rows['unsubmitted_jobs'].append(second); rows['counts']['active_jobs'] = 2
+        value = self.summary(rows)
+        rows['unsubmitted_jobs'].reverse()
+        self.assertEqual(self.summary(rows),value)
+        self.assertEqual([row['job_id'] for row in value['preserved_unsubmitted_queue']], [second['id'],QUEUE_JOB])
+
+    def test_queue_only_keeps_original_accounting_and_no_rental_obligation(self):
+        rows = queue_rows(queue_only=True)
+        value = self.summary(rows)
+        self.assertEqual(value['pending_ids'], [])
+        self.assertEqual(value['unknown_rent_journals'], {})
+        self.assertEqual(value['accounting_hash'], handoff.ledger_summary(
+            {**rows,'counts':{**rows['counts'],'active_jobs':0}}, {'binding':'frozen'})['accounting_hash'])
+
+    def test_unknown_rental_evidence_is_preserved_under_queue_opt_in(self):
+        rows = unknown_rows(); queued = queue_rows()
+        rows['counts'] = queued['counts']; rows['unsubmitted_jobs'] = queued['unsubmitted_jobs']
+        value = handoff.ledger_summary(rows, {'binding':'frozen'}, unknown_receipt(), preserve_unsubmitted_queue=True)
+        self.assertEqual(value['unknown_rent_journals'],unknown_receipt())
+        with self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+            handoff.ledger_summary(rows, {'binding':'frozen'}, preserve_unsubmitted_queue=True)
 
 
 class UnknownLedgerTests(unittest.TestCase):
@@ -510,6 +620,285 @@ class HostHandoffTests(unittest.TestCase):
         path.write_text(json.dumps({**self.record,'journal_id':token}))
         return path
 
+    def use_queue_ledger(self, *, queue_only=False):
+        self.ledger = handoff.ledger_summary(queue_rows(queue_only=queue_only), {'binding':'frozen'},
+                                            preserve_unsubmitted_queue=True)
+        self.record.update(ledger=self.ledger, preserve_unsubmitted_queue=True)
+        self.probe.return_value = self.ledger
+        return self.new_journal('queue-120')
+
+    def test_queue_only_prepare_is_explicit_named_and_durable_before_drain(self):
+        self.use_queue_ledger(queue_only=True).unlink()
+        original = handoff.record_path().read_bytes()
+        self.supervisor.return_value = {**self.unit,'MainPID':'321','ActiveState':'active'}
+        self.receipt.return_value = {'state':'running'}
+        self.mock(handoff,'only_controller')
+        self.mock(handoff,'supervisor_client',return_value={'supervisor_pid':321,'docker_client_pids':[322]})
+        def before_term(*args):
+            value = json.loads(handoff.record_path('queue-120').read_text())
+            self.assertTrue(value['preserve_unsubmitted_queue'])
+            self.assertEqual(value['ledger'],self.ledger)
+            self.assertEqual(value['old_prepared'],self.old)
+        self.drain.side_effect = before_term
+        result = handoff.prepare('b'*40,'sixnine-old.service',journal_id='queue-120',preserve_unsubmitted_queue=True)
+        self.assertEqual(result['preserved_unsubmitted_jobs'],1)
+        self.assertEqual(result['pending_deletions'],0)
+        self.probe.assert_called_once_with(self.root,self.environment,preserve_unsubmitted_queue=True)
+        self.drain.assert_called_once()
+        self.assertEqual(handoff.record_path().read_bytes(),original)
+
+    def test_queue_flag_without_named_journal_never_closes_admission(self):
+        with self.assertRaisesRegex(release.ReleaseError,'queue_requires_named_journal'):
+            handoff.prepare('b'*40,'sixnine-old.service',preserve_unsubmitted_queue=True)
+        self.probe.assert_not_called(); self.drain.assert_not_called()
+
+    def test_default_queue_only_prepare_remains_strict_and_creates_no_journal(self):
+        self.ledger = handoff.ledger_summary(ledger_rows(), {'binding':'frozen'})
+        self.probe.return_value = {**self.ledger,'pending_ids':[]}
+        self.supervisor.return_value = {**self.unit,'MainPID':'321','ActiveState':'active'}
+        self.receipt.return_value = {'state':'running'}
+        self.mock(handoff,'only_controller')
+        self.mock(handoff,'supervisor_client',return_value={'supervisor_pid':321,'docker_client_pids':[322]})
+        with self.assertRaisesRegex(release.ReleaseError,'pending_deletion_required'):
+            handoff.prepare('b'*40,'sixnine-old.service',journal_id='queue-120')
+        self.assertFalse(handoff.record_path('queue-120').exists())
+        self.probe.assert_called_once_with(self.root,self.environment)
+        self.drain.assert_not_called()
+
+    def test_successor_preserves_queue_snapshot_through_new_image_without_launch(self):
+        path = self.use_queue_ledger(queue_only=True)
+        original = handoff.record_path().read_bytes()
+        runtime, prepared, _, _, _ = handoff.successor(journal_id='queue-120')
+        self.assertEqual(runtime,self.runtime)
+        self.assertEqual(prepared,{**self.old,'commit':'b'*40,'image_id':'new-image'})
+        value = json.loads(path.read_text())
+        self.assertEqual(value['ledger'],self.ledger)
+        self.assertEqual(value['retired_ledger'],self.ledger)
+        self.assertEqual(value['phase'],'launch_intent')
+        self.assertEqual(self.probe.call_args_list[0].kwargs, {'preserve_unsubmitted_queue':True})
+        self.assertEqual(self.probe.call_args_list[1].kwargs,
+                         {'require_removal_cadence':True,'preserve_unsubmitted_queue':True})
+        self.assertEqual(handoff.record_path().read_bytes(),original)
+        self.launch.assert_not_called()
+
+    def test_queue_change_before_successor_never_replaces_pin_or_launches(self):
+        path = self.use_queue_ledger()
+        changed = copy.deepcopy(self.ledger)
+        changed['preserved_unsubmitted_queue'][0]['record_hash'] = 'f'*64
+        self.probe.return_value = changed
+        with self.assertRaisesRegex(release.ReleaseError,'queue_changed'):
+            handoff.successor(journal_id='queue-120')
+        self.assertEqual(json.loads(path.read_text())['phase'],'drain_requested')
+        self.assertEqual(json.loads((self.root/'active.json').read_text()),self.pin)
+        self.launch.assert_not_called()
+
+    def test_queue_change_through_new_image_consumes_intent_and_never_replays(self):
+        path = self.use_queue_ledger()
+        changed = copy.deepcopy(self.ledger)
+        changed['preserved_unsubmitted_queue'][0]['configuration_snapshot_hash'] = 'f'*64
+        self.probe.side_effect = [self.ledger,changed]
+        with self.assertRaisesRegex(release.ReleaseError,'ledger_changed_before_launch'):
+            handoff.successor(journal_id='queue-120')
+        self.assertEqual(json.loads(path.read_text())['phase'],'launch_intent')
+        with self.assertRaisesRegex(release.ReleaseError,'already_launched'):
+            handoff.successor(journal_id='queue-120')
+        self.launch.assert_not_called()
+
+    def test_queue_handoff_cannot_change_budget_or_configuration(self):
+        path = self.use_queue_ledger()
+        self.probe.return_value = {**self.ledger,'accounting_hash':'f'*64}
+        with self.assertRaisesRegex(release.ReleaseError,'accounting_changed'):
+            handoff.successor(journal_id='queue-120')
+        self.probe.return_value = self.ledger
+        self.prepared.return_value = (self.runtime,{**self.old,'runtime_config_sha256':'f'*64},self.root,self.environment)
+        with self.assertRaisesRegex(release.ReleaseError,'configuration_changed'):
+            handoff.successor(journal_id='queue-120')
+        self.assertEqual(json.loads(path.read_text())['phase'],'drain_requested')
+        self.launch.assert_not_called()
+
+    def test_invalid_or_missing_queue_snapshot_policy_rejected_before_pin_writes(self):
+        path = self.use_queue_ledger()
+        original = json.loads(path.read_text())
+        for change in ({'preserve_unsubmitted_queue':1}, {'ledger':{k:v for k,v in self.ledger.items()
+                if k != 'preserved_unsubmitted_queue'}}):
+            path.write_text(json.dumps({**original,**change}))
+            with self.subTest(change=change), self.assertRaisesRegex(release.ReleaseError,'queue_'):
+                handoff.successor(journal_id='queue-120')
+        self.assertEqual(json.loads((self.root/'active.json').read_text()),self.pin)
+        self.launch.assert_not_called()
+
+    def use_same_target_rollover(self):
+        self.record.update(target_commit=self.old['commit'],target_image_id=self.old['image_id'],same_target_rollover=True)
+        path = self.use_queue_ledger(queue_only=True)
+        self.mock(handoff,'current_target',return_value=(self.old['commit'],self.root,self.environment,self.old['image_id']))
+        self.container = {'Id':'c'*64, 'Name':'/'+self.pin['container_name'], 'Image':self.pin['image_id'],
+            'Config':{'Labels':{'com.docker.compose.project':'sixnine-platform',
+                'com.docker.compose.service':host.SERVICE,host.LABEL:self.pin['prepared_hash']},
+                'Env':['private-container-env-sentinel']},
+            'HostConfig':{'RestartPolicy':{'Name':'no','MaximumRetryCount':0}},
+            'State':{'Running':False,'Restarting':False,'Paused':False,'OOMKilled':False,'Dead':False,
+                'Status':'exited','Pid':0,'ExitCode':0}}
+        self.docker_calls = []
+        def command(arguments, **kwargs):
+            self.docker_calls.append(arguments)
+            if arguments == ['compose','version','--short']: return b'2.38.2'
+            if arguments[0] == 'inspect': return json.dumps([self.container]).encode()
+            if arguments[:2] == ['container','ls']: return b''
+            if arguments[0] == 'rename':
+                recorded = json.loads(path.read_text())
+                self.assertEqual(recorded['phase'],'launch_intent')
+                self.assertEqual(recorded['container_archive']['phase'],'rename_intent')
+                self.assertEqual(recorded['retired_proof'],self.receipt.return_value)
+                self.assertEqual(json.loads((self.root/'active.json').read_text()),self.pin)
+                self.assertEqual(arguments[1],self.container['Id'])
+                self.container['Name'] = '/'+arguments[2]
+                return b''
+            raise AssertionError(arguments)
+        self.archive_command = self.mock(release,'command',side_effect=command)
+        return path
+
+    def test_same_target_prepare_requires_named_queue_opt_in_and_exact_image(self):
+        self.use_queue_ledger(queue_only=True).unlink()
+        self.mock(handoff,'current_target',return_value=(self.old['commit'],self.root,self.environment,self.old['image_id']))
+        self.supervisor.return_value = {**self.unit,'MainPID':'321','ActiveState':'active'}
+        self.receipt.return_value = {'state':'running'}
+        self.mock(handoff,'only_controller')
+        self.mock(handoff,'supervisor_client',return_value={'supervisor_pid':321,'docker_client_pids':[322]})
+        with self.assertRaisesRegex(release.ReleaseError,'target_unchanged'):
+            handoff.prepare(self.old['commit'],'sixnine-old.service',journal_id='ordinary')
+        self.drain.assert_not_called()
+        handoff.prepare(self.old['commit'],'sixnine-old.service',journal_id='queue-120',preserve_unsubmitted_queue=True)
+        self.assertTrue(json.loads(handoff.record_path('queue-120').read_text())['same_target_rollover'])
+        self.drain.assert_called_once()
+
+    def test_same_target_rollover_archives_exact_exited_id_and_retains_receipt(self):
+        path = self.use_same_target_rollover()
+        original = handoff.record_path().read_bytes()
+        _, prepared, _, _, pin = handoff.successor(journal_id='queue-120')
+        self.assertEqual(prepared,self.old)
+        self.assertEqual(pin['container_name'],self.pin['container_name'])
+        value = json.loads(path.read_text())
+        archive = value['container_archive']
+        self.assertEqual(archive['phase'],'confirmed')
+        self.assertEqual(archive['original']['container_id'],'c'*64)
+        self.assertEqual(archive['archived']['container_id'],'c'*64)
+        self.assertEqual(archive['archived']['container_name'],self.pin['container_name']+'-retired-queue-120')
+        self.assertEqual(archive['original']['prepared_hash'],self.pin['prepared_hash'])
+        self.assertEqual(value['retired_proof'],self.receipt.return_value)
+        self.assertEqual(value['ledger'],self.ledger)
+        self.assertEqual(value['retired_ledger'],self.ledger)
+        self.assertEqual(handoff.record_path().read_bytes(),original)
+        self.assertNotIn('private-container-env-sentinel',path.read_text())
+        self.assertEqual([call for call in self.docker_calls if call[0] == 'rename'],
+                         [['rename','c'*64,archive['archived_name']]])
+        self.assertIn(['inspect','c'*64],self.docker_calls)
+        self.assertFalse(any(call[0] in ('rm','kill','start') for call in self.docker_calls))
+        with self.assertRaisesRegex(release.ReleaseError,'already_launched'):
+            handoff.successor(journal_id='queue-120')
+        self.launch.assert_not_called()
+
+    def test_same_target_image_configuration_queue_or_exit_change_never_renames(self):
+        path = self.use_same_target_rollover()
+        initial = copy.deepcopy(self.container)
+        for section,field,value in (('State','ExitCode',137), ('State','Running',True),
+                                   ('State','Pid',1), ('State','OOMKilled',True)):
+            self.container = copy.deepcopy(initial); self.container[section][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(release.ReleaseError,'archive_exit_unconfirmed'):
+                handoff.successor(journal_id='queue-120')
+            self.assertEqual(json.loads(path.read_text())['phase'],'drain_requested')
+        self.container = initial
+        with patch.object(host,'overlay',return_value={'changed':'configuration'}):
+            with self.assertRaisesRegex(release.ReleaseError,'rollover_configuration_changed'):
+                handoff.successor(journal_id='queue-120')
+        changed = copy.deepcopy(self.ledger); changed['preserved_unsubmitted_queue'] = []
+        self.probe.side_effect = [self.ledger,changed]
+        with self.assertRaisesRegex(release.ReleaseError,'ledger_changed_before_launch'):
+            handoff.successor(journal_id='queue-120')
+        self.assertFalse(any(call[0] == 'rename' for call in self.docker_calls))
+        self.assertEqual(json.loads(path.read_text())['phase'],'drain_requested')
+        self.launch.assert_not_called()
+
+    def test_archive_unknown_rename_is_consumed_and_never_replayed(self):
+        path = self.use_same_target_rollover()
+        original_command = self.archive_command.side_effect
+        def command(arguments, **kwargs):
+            result = original_command(arguments,**kwargs)
+            if arguments[0] == 'rename':
+                raise release.ReleaseError('container_operation_failed_no_details_logged')
+            return result
+        self.archive_command.side_effect = command
+        with self.assertRaisesRegex(release.ReleaseError,'container_operation_failed'):
+            handoff.successor(journal_id='queue-120')
+        record = json.loads(path.read_text())
+        self.assertEqual(record['phase'],'launch_intent')
+        self.assertEqual(record['container_archive']['phase'],'rename_intent')
+        self.assertEqual(json.loads((self.root/'active.json').read_text()),self.pin)
+        with self.assertRaisesRegex(release.ReleaseError,'already_launched'):
+            handoff.successor(journal_id='queue-120')
+        self.assertEqual(len([call for call in self.docker_calls if call[0] == 'rename']),1)
+        self.launch.assert_not_called()
+
+    def test_archive_collision_or_replacement_identity_cannot_launch(self):
+        path = self.use_same_target_rollover()
+        original_command = self.archive_command.side_effect
+        def occupied(arguments, **kwargs):
+            if arguments[:2] == ['container','ls']: return b'occupied-container\n'
+            return original_command(arguments,**kwargs)
+        self.archive_command.side_effect = occupied
+        with self.assertRaisesRegex(release.ReleaseError,'archive_name_in_use'):
+            handoff.successor(journal_id='queue-120')
+        self.assertEqual(json.loads(path.read_text())['phase'],'drain_requested')
+        self.assertFalse(any(call[0] == 'rename' for call in self.docker_calls))
+        def replaced(arguments, **kwargs):
+            result = original_command(arguments,**kwargs)
+            if arguments == ['inspect','c'*64]:
+                replacement = {**self.container,'Id':'d'*64}
+                return json.dumps([replacement]).encode()
+            return result
+        self.archive_command.side_effect = replaced
+        with self.assertRaisesRegex(release.ReleaseError,'archive_identity_changed'):
+            handoff.successor(journal_id='queue-120')
+        self.assertEqual(json.loads(path.read_text())['phase'],'launch_intent')
+        self.assertEqual(json.loads((self.root/'active.json').read_text()),self.pin)
+        self.launch.assert_not_called()
+
+    def test_same_target_image_or_archive_identity_mismatch_is_rejected_before_rename(self):
+        path = self.use_same_target_rollover()
+        original = copy.deepcopy(self.container)
+        mutations = [lambda row:row.update(Id='invalid'), lambda row:row.update(Name='/different'),
+            lambda row:row.update(Image='different-image'),
+            lambda row:row['Config']['Labels'].update({'com.docker.compose.project':'other-project'}),
+            lambda row:row['Config']['Labels'].update({'com.docker.compose.service':'app'}),
+            lambda row:row['Config']['Labels'].update({host.LABEL:'different-pin'}),
+            lambda row:row['HostConfig']['RestartPolicy'].update(Name='always')]
+        for mutate in mutations:
+            self.container = copy.deepcopy(original); mutate(self.container)
+            with self.subTest(mutate=mutate), self.assertRaisesRegex(release.ReleaseError,'archive_identity_changed'):
+                handoff.successor(journal_id='queue-120')
+            self.assertEqual(json.loads(path.read_text())['phase'],'drain_requested')
+        self.container = original
+        with patch.object(handoff,'current_target',return_value=(self.old['commit'],self.root,self.environment,'different-image')):
+            with self.assertRaisesRegex(release.ReleaseError,'target_image_changed'):
+                handoff.successor(journal_id='queue-120')
+        self.assertFalse(any(call[0] == 'rename' for call in self.docker_calls))
+        self.launch.assert_not_called()
+
+    def test_original_launch_name_must_be_free_after_archive_before_pin_replacement(self):
+        path = self.use_same_target_rollover()
+        original_command = self.archive_command.side_effect
+        def occupied_original(arguments, **kwargs):
+            result = original_command(arguments,**kwargs)
+            if arguments[:2] == ['container','ls'] and arguments[4] == 'name=^/'+self.pin['container_name']+'$':
+                return b'another-container\n'
+            return result
+        self.archive_command.side_effect = occupied_original
+        with self.assertRaisesRegex(release.ReleaseError,'archive_name_in_use'):
+            handoff.successor(journal_id='queue-120')
+        self.assertEqual(json.loads(path.read_text())['phase'],'launch_intent')
+        self.assertEqual(json.loads((self.root/'active.json').read_text()),self.pin)
+        self.assertEqual(len([call for call in self.docker_calls if call[0] == 'rename']),1)
+        self.launch.assert_not_called()
+
     def test_new_journal_rejects_copied_or_changed_record_identity(self):
         path = self.new_journal()
         original = handoff.record_path().read_bytes()
@@ -772,6 +1161,76 @@ class SystemdIdentityTests(unittest.TestCase):
 
 
 class RealSchemaProbeTests(unittest.TestCase):
+    def test_queue_opt_in_reads_complete_real_rows_and_never_changes_jobs_or_money(self):
+        from test_operator_capacity import OperatorTests
+        from sqlalchemy import insert, select, update
+        from studio_platform.repository import jobs, attempts, budget_accounts, budget_reservations
+        from types import SimpleNamespace
+        import sqlalchemy
+        import studio_platform.operator_runtime as runtime
+        from studio_platform.settings import Settings
+        case = OperatorTests(); case.setUp()
+        try:
+            plan = case.repo.create_plan(case.scope, {'recipe_id':'h3-base-fl2va-v1',
+                'request':{'model':'test-h3','prompt':'private-real-probe-prompt'}},
+                {'pool':case.binding.pool,'backend':'disabled','configuration_id':case.binding.configuration_id,
+                 'engine_manifest_digest':case.binding.engine_manifest_digest,'enabled':False}, expires_at=9000)
+            job = case.repo.create_job(case.scope,plan['id'],'private-real-probe-key',budget_account_ids=('owner-budget',))
+            second = case.repo.create_job(case.scope,plan['id'],'private-real-probe-second',budget_account_ids=('owner-budget',))
+            tables = (jobs,attempts,budget_accounts,budget_reservations)
+            def snapshot():
+                with case.repo.engine.connect() as conn:
+                    return [[dict(row) for row in conn.execute(select(table).order_by(table.c[0])).mappings()]
+                            for table in tables]
+            before = snapshot()
+            real_engine = case.repo.engine
+            scripts = []
+            class Connection:
+                def __enter__(self): self.conn = real_engine.connect(); return self
+                def __exit__(self,*args): self.conn.close()
+                def execute(self,statement,*args,**kwargs):
+                    if str(statement).startswith('SET TRANSACTION'): return None
+                    return self.conn.execute(statement,*args,**kwargs)
+            engine = SimpleNamespace(connect=lambda:Connection(),dispose=lambda:None)
+            def compose(*args,**kwargs):
+                script = args[-1]; scripts.append(script); output = io.StringIO()
+                with patch.object(sqlalchemy,'create_engine',return_value=engine), \
+                        patch.object(runtime,'create_registry',return_value=case.registry), \
+                        patch.object(runtime,'load_runtime_config',return_value={'work_dir':'/unused-no-rental'}), \
+                        patch.object(Settings,'from_environment',return_value=SimpleNamespace(database_url='fixture')), \
+                        redirect_stdout(output):
+                    exec(compile(script,'<queue-read-only-probe>','exec'),{})
+                return output.getvalue().encode()
+            with patch.object(host,'compose',side_effect=compose):
+                with self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+                    handoff.ledger_probe(Path('/same-image'),{})
+                original = handoff.ledger_probe(Path('/same-image'),{},preserve_unsubmitted_queue=True)
+                self.assertEqual([row['job_id'] for row in original['preserved_unsubmitted_queue']],
+                                 sorted([job['id'],second['id']]))
+                self.assertEqual(snapshot(),before)
+                self.assertNotIn('private-real-probe',json.dumps(original))
+                self.assertEqual(handoff.ledger_probe(Path('/same-image'),{},preserve_unsubmitted_queue=True,
+                    require_removal_cadence=True),original)
+                # Even a terminal/deferred historical attempt forbids treating
+                # this queued row as never claimed or submitting it again.
+                with case.repo.transaction() as conn:
+                    conn.execute(insert(attempts).values(id='00000000-0000-4000-8000-000000000122',
+                        job_id=job['id'],number=1,status='deferred',fence=1,worker_id='historical',
+                        created_at=case.now,updated_at=case.now,submission_started_at=None,upstream_stopped=1))
+                with self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+                    handoff.ledger_probe(Path('/same-image'),{},preserve_unsubmitted_queue=True)
+                with case.repo.transaction() as conn:
+                    conn.execute(attempts.delete())
+                    conn.execute(update(jobs).where(jobs.c.id == second['id']).values(status='planned'))
+                with self.assertRaisesRegex(ValueError,'ledger_unsafe'):
+                    handoff.ledger_probe(Path('/same-image'),{},preserve_unsubmitted_queue=True)
+            self.assertTrue(all('REPEATABLE READ READ ONLY' in script for script in scripts))
+            self.assertTrue(all('LIMIT' not in script for script in scripts))
+            self.assertEqual(case.provider.creates,[])
+            self.assertEqual(case.provider.destroys,[])
+        finally:
+            case.tearDown(); case.doCleanups()
+
     def test_probe_uses_real_schema_and_preserves_expired_unbound_worker(self):
         # Reuse isolated fixture setup and only its injected fake provider.
         from test_operator_capacity import OperatorTests
