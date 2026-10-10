@@ -370,6 +370,7 @@ inventory.json
 !studio_platform/targon_runtime_aws.py
 !tools/targon_cleanup_guard.py
 !deploy/platform/operator_handoff.py
+!deploy/platform/operator_handoff_continuation.py
 !test_operator_handoff.py
 !deploy/wangp/targon_prepare.py
 !deploy/wangp/profiles/

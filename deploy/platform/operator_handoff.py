@@ -310,7 +310,7 @@ def successor():
     return runtime, prepared, directory, environment, next_pin
 
 
-def start(*, clock=time.monotonic, sleep=time.sleep):
+def start(*, clock=time.monotonic, sleep=time.sleep, successor_factory=None):
     stopping = [False]
     previous = {}
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -320,12 +320,21 @@ def start(*, clock=time.monotonic, sleep=time.sleep):
     try:
         with locked():
             release.require(not stopping[0], 'operator_handoff_interrupted')
-            runtime, prepared, directory, environment, pin = successor()
+            runtime, prepared, directory, environment, pin = (successor_factory or successor)()
             process = host.launch(directory, environment, runtime, pin)
             deadline = clock()+120
             while True:
                 release.require(not stopping[0] and process.poll() is None, 'operator_handoff_startup_unconfirmed')
-                state = host.inspect_controller(environment, pin)
+                try:
+                    state = host.inspect_controller(environment, pin)
+                except release.ReleaseError as error:
+                    # Compose creates the named container asynchronously. Retry
+                    # only Docker command failures; identity/format gates stay fatal.
+                    if str(error) != 'container_operation_failed_no_details_logged':
+                        raise
+                    release.require(clock() < deadline, 'operator_handoff_startup_timeout')
+                    sleep(2)
+                    continue
                 try:
                     proof = host.receipt(pin, fresh=True)
                 except (OSError, ValueError, release.ReleaseError):
