@@ -246,6 +246,7 @@ class QuickChatService(QuickChatTitleMixin):
         p = row["payload"]
         return {"id": row["id"], "title": p["title"], "version": row["version"], "model_id": p["model_id"],
             "title_generation": public_title_state(p),
+            "composer_reset": p.get("composer_reset"),
             "next_settings": p["next_settings"], "input_refs": self._inputs(p["bindings"], p["next_settings"]["recipe_id"]),
             "latest_seq": p["latest_seq"], "web_url": "/quick-chat?session="+row["id"],
             "created_at": row["created_at"], "updated_at": row["updated_at"]}
@@ -401,8 +402,8 @@ class QuickChatService(QuickChatTitleMixin):
                         raise QuickChatError("version_conflict", "素材引用已变化，请重新加载。")
                     if existing and existing["asset_id"] != value["asset_id"]:
                         raise QuickChatError("reference_conflict", "同一引用ID不能更换原始素材。")
-                    values.append({**value, "version": value["version"]+1})
-                values.extend({**v, "enabled": False, "version": v["version"]+1} for v in old.values())
+                    values.append({**value, "version": value["version"]+int(existing is None or value != existing)})
+                values.extend({**v, "enabled": False, "version": v["version"]+int(v["enabled"])} for v in old.values())
                 p = {**session["payload"], "bindings": values}
                 self._put(conn, session, p, bump=True)
                 self._event(conn, principal, session, "materials.updated", session_id)
@@ -445,6 +446,21 @@ class QuickChatService(QuickChatTitleMixin):
         return snapshot, sources
 
     def _create_revision(self, conn, principal, session, card, snapshot, sources, source_revision=None):
+        # The composer is mutable; capture its origin separately from the
+        # immutable generation inputs. Delayed assistant replies must never
+        # capture material edits made after the original turn.
+        origin = session["payload"]["bindings"]
+        if card["payload"].get("current_revision_id"):
+            origin = self._get(conn, principal, card["payload"]["current_revision_id"], session["id"], "revision")["payload"].get("composer_snapshot", {}).get("bindings", [])
+        elif card["payload"].get("turn_id"):
+            origin = self._get(conn, principal, card["payload"]["turn_id"], session["id"], "turn")["payload"]["bindings"]
+        composer = []
+        for binding in origin:
+            value = {k: copy.deepcopy(v) for k, v in binding.items()
+                if k not in {"requested_enabled", "inactive_reason", "effective_enabled", "asset"}}
+            value["enabled"] = binding.get("requested_enabled", binding["enabled"])
+            if value["enabled"]:
+                composer.append(value)
         project_scope = Scope(self.tenant, principal.owner, "__projects")
         where = (self.repo._scope(documents, project_scope), documents.c.kind == "project",
                  documents.c.document_id == session["payload"]["project_id"])
@@ -488,6 +504,7 @@ class QuickChatService(QuickChatTitleMixin):
             actions=[{"op": "entity.create", "entity": {"id": v["shot_id"]}} for v in items], event_type="project.edited")
         revision = self._new(conn, principal, session["id"], "revision", {**snapshot, "card_id": card["id"],
             "version": version, "turn_id": card["payload"].get("turn_id"), "source_revision_id": source_revision,
+            "composer_snapshot": {"bindings": composer},
             "input_hash": digest, "requested_input_hash": digest, "items": items}, ident=revision_id, parent=card["id"],
             business=card["id"]+":"+str(version))
         self._put(conn, card, {**card["payload"], "current_revision_id": revision_id, "title": snapshot["title"]},
@@ -599,14 +616,10 @@ class QuickChatService(QuickChatTitleMixin):
                     "request_hash": plan.get("request_hash"), "plan_id": plan["plan_id"]})
                 value = {**entry, "plan": canonical(plan), "resolved_execution_hash": digest}
             except (ValueError, Conflict, BudgetExceeded, QuickChatError) as exc:
-                value = {**entry, "error_code": exc.code if isinstance(exc, QuickChatError) else "preflight_rejected"}
-                # Only audited static validation text becomes public detail.
-                # Other exceptions may contain private input, paths or provider
-                # diagnostics; never serialize their arguments or str(exc).
-                if isinstance(exc, ValueError) and exc.args == (
-                        "Reference video exceeds the output length; increase duration or explicitly trim the reference",):
-                    value.update(error_code="reference_video_exceeds_output",
-                        error_message="参考视频比输出时长长，请增加生成时长或选取更短片段。")
+                from .generation_diagnostics import preflight_diagnostic
+                value = {**entry, **preflight_diagnostic(exc)}
+                if isinstance(exc, QuickChatError):
+                    value.update(error_code=exc.code, error_message=exc.message)
             with self.repo.transaction() as conn:
                 current = self._get(conn, principal, record["id"], session_id, "preflight", lock=True)
                 items = copy.deepcopy(current["payload"]["items"])
@@ -685,6 +698,8 @@ class QuickChatService(QuickChatTitleMixin):
                 self._event(conn, principal, session, "submission.confirmed", submission["id"])
         if not existing or prior:
             self._admit(principal, session_id, submission["id"])
+        else:
+            self._reset_accepted_composer(principal, session_id, submission["id"])
         return self.get_submission(principal, session_id, submission["id"])
 
     def _admit(self, principal, session_id, submission_id, selected=None, *, allow_blocked=False):
@@ -740,6 +755,57 @@ class QuickChatService(QuickChatTitleMixin):
                 with self.repo.transaction() as conn:
                     current = self._get(conn, principal, execution["id"], session_id, "execution", lock=True)
                     self._put(conn, current, {**current["payload"], "status": "admission_blocked", "error_code": code})
+        self._reset_accepted_composer(principal, session_id, submission_id)
+
+    def _reset_accepted_composer(self, principal, session_id, submission_id):
+        """One durable reset after queue acceptance, never from a read/preflight.
+
+        An interrupted enqueue is reconciled by replaying the original command;
+        a receipt/batch alone does not prove that a video job was accepted.
+        Session-first locking matches normal authoring/submission lock order.
+        """
+        with self.repo.transaction() as conn:
+            session = self._access(principal, session_id, "jobs:write", conn=conn, lock=True)
+            submission = self._get(conn, principal, submission_id, session_id, "submission", lock=True)
+            if submission["payload"].get("composer_reset"):
+                return
+            revision = self._get(conn, principal, submission["payload"]["revision_id"], session_id, "revision")
+            snapshot = revision["payload"].get("composer_snapshot")
+            if snapshot is None:
+                # A legacy card cannot establish which later edits it owns.
+                return
+            item_ids = select(objects.c.id).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id,
+                objects.c.kind == "item", objects.c.parent_id == submission_id)
+            executions = conn.execute(select(objects.c.payload).where(objects.c.tenant == self.tenant,
+                objects.c.owner == principal.owner, objects.c.session_id == session_id,
+                objects.c.kind == "execution", objects.c.parent_id.in_(item_ids))).scalars().all()
+            job_ids = [p["job_id"] for p in executions if p.get("job_id")]
+            if not job_ids:
+                return
+            accepted = conn.execute(select(jobs.c.id).where(jobs.c.tenant_id == self.tenant,
+                jobs.c.owner_id == principal.owner, jobs.c.project_id == session["payload"]["project_id"],
+                jobs.c.id.in_(job_ids), jobs.c.status.in_(("queued", "waiting_capacity", "claimed", "submitting", "submission_unknown",
+                    "running", "collecting", "succeeded", "failed", "cancel_requested", "recovery_hold")))).first()
+            if accepted is None:
+                return
+            captured = {b["binding_id"]: b for b in snapshot["bindings"]}
+            values, cleared, preserved = [], [], []
+            for binding in session["payload"]["bindings"]:
+                ident = binding["binding_id"]
+                if binding.get("enabled") and binding == captured.get(ident):
+                    values.append({**binding, "enabled": False, "version": binding["version"]+1})
+                    cleared.append(ident)
+                else:
+                    values.append(binding)
+                    if binding.get("enabled"):
+                        preserved.append(ident)
+            receipt = {"status": "accepted", "submission_id": submission_id, "revision_id": revision["id"],
+                "turn_id": revision["payload"].get("turn_id"), "session_version": session["version"]+1,
+                "cleared_binding_ids": cleared, "preserved_binding_ids": preserved}
+            self._put(conn, session, {**session["payload"], "bindings": values, "composer_reset": receipt}, bump=True)
+            self._put(conn, submission, {**submission["payload"], "composer_reset": receipt})
+            self._event(conn, principal, session, "submission.composer_reset", submission_id)
 
     def get_submission(self, principal, session_id, submission_id):
         self._access(principal, session_id, "projects:read", "jobs:read")
